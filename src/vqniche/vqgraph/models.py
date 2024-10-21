@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dgl.nn import APPNPConv, GATConv, GraphConv
-from vq import VectorQuantize
+from .vq import VectorQuantize
 
 
 class MLP(nn.Module):

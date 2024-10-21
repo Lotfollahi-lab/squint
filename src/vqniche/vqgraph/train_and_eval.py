@@ -3,7 +3,7 @@ import copy
 import dgl
 import numpy as np
 import torch
-from utils import set_seed
+from .utils import set_seed
 
 """
 1. Train and eval

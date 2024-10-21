@@ -22,7 +22,7 @@ import scipy
 import scipy.sparse as sp
 import torch
 from category_encoders import CatBoostEncoder
-from data_preprocess import (
+from .data_preprocess import (
     binarize_labels,
     eliminate_self_loops_adj,
     largest_connected_components,
