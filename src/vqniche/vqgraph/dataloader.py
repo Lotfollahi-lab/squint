@@ -22,11 +22,12 @@ import scipy
 import scipy.sparse as sp
 import torch
 from category_encoders import CatBoostEncoder
-from data_preprocess import (
+from .data_preprocess import (
     binarize_labels,
     eliminate_self_loops_adj,
     largest_connected_components,
     normalize_adj,
+    rand_train_test_idx,
 )
 from dgl.data.utils import load_graphs
 from google_drive_downloader import GoogleDriveDownloader as gdd

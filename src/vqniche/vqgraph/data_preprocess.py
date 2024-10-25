@@ -169,3 +169,13 @@ def remove_underrepresented_classes(g, train_examples_per_class, val_examples_pe
     keep_indices = [i for i in range(len(g.labels)) if g.labels[i] in keep_classes]
 
     return create_subgraph(g, nodes_to_keep=keep_indices)
+
+def rand_train_test_idx(num_nodes, train_prop=0.7, valid_prop=0.1, ignore_negative=False):
+    indices = np.arange(num_nodes)
+    np.random.shuffle(indices)
+    train_end = int(train_prop * num_nodes)
+    valid_end = int((train_prop + valid_prop) * num_nodes)
+    train_idx = indices[:train_end]
+    valid_idx = indices[train_end:valid_end]
+    test_idx = indices[valid_end:]
+    return train_idx, valid_idx, test_idx
