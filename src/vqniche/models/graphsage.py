@@ -79,7 +79,9 @@ class GraphSAGE(BaseModel):
                  weight_decay: float = 0.0,
                  optimizer_name: str = 'adam',
                  loss_names: List[str] = ['cross_entropy'],
+                 loss_kwargs: dict = {'reduction': 'none'},
                  task: str = 'multiclass',
+                 task_kwargs: dict = {},
                  **kwargs):
         """
         Initializes the GraphSAGE model.
@@ -110,8 +112,12 @@ class GraphSAGE(BaseModel):
             The optimizer name.
         loss_names : list of str
             The loss function names.
+        loss_kwargs : dict
+            Keyword arguments for the loss functions.
         task : str
             The task type.
+        task_kwargs : dict
+            Keyword arguments for the task.
         """
         # Initialize the BaseModel class
         super().__init__(in_channels=in_channels,
@@ -123,7 +129,9 @@ class GraphSAGE(BaseModel):
                             weight_decay=weight_decay,
                             optimizer_name=optimizer_name,
                             loss_names=loss_names,
+                            loss_kwargs=loss_kwargs,
                             task=task,
+                            task_kwargs=task_kwargs,
                             **kwargs)
 
         # Initialize GraphSAGE model from Pytorch Geometric as the encoder

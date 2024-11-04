@@ -18,9 +18,11 @@ class BaseModel(pl.LightningModule):
                  weight_decay: float = 0.0,
                  optimizer_name: str = 'adam',
                  loss_names: List[str] = ['cross_entropy'],
+                 loss_kwargs: dict = {'reduction': 'mean'},
                  task: str = 'multiclass',
+                 task_kwargs: dict = {},
                  **kwargs):
-        super().__init__()
+        super().__init__(**kwargs)
 
         # Encoder parameters
         self.in_channels = in_channels
@@ -30,25 +32,27 @@ class BaseModel(pl.LightningModule):
         # Predictor parameters
         self.out_channels = out_channels
 
-        # Training parameters
+        # Optimizer parameters
         self.dropout = dropout
         self.lr = lr
         self.weight_decay = weight_decay
         self.optimizer_name = optimizer_name
 
-        # Set loss functions
+        # Loss parameters
         self.loss_names = loss_names
-        self.loss_fn_tuples = self.set_loss_fn_tuples(kwargs)
+        self.loss_kwargs = loss_kwargs
+        self.loss_fn_tuples = self.set_loss_fn_tuples(loss_kwargs)
 
-        # Initialize the accuracy metrics based on the task
+        # Accuracy metrics parameters
         self.task = task
-        self.train_acc = Accuracy(task=task, num_classes=out_channels)
-        self.val_acc = Accuracy(task=task, num_classes=out_channels)
-        self.test_acc = Accuracy(task=task, num_classes=out_channels)
+        self.task_kwargs = task_kwargs
+        self.train_acc = Accuracy(task=task, num_classes=out_channels, **task_kwargs)
+        self.val_acc = Accuracy(task=task, num_classes=out_channels, **task_kwargs)
+        self.test_acc = Accuracy(task=task, num_classes=out_channels, **task_kwargs)
 
 
     def set_loss_fn_tuples(self,
-                           loss_kwargs: dict) -> List:
+                           loss_kwargs: dict = {}) -> List:
         """
         Set the loss functions for the encoder.
 
@@ -108,7 +112,7 @@ class BaseModel(pl.LightningModule):
         """
         assert len(self.loss_fn_tuples) > 0, 'No loss functions defined'
 
-        loss = torch.Tensor(0.0)
+        loss = torch.tensor(0.0).to(self.device)
         for loss_fn, loss_fn_data_keys, loss_fn_params in self.loss_fn_tuples:
             _loss_fn_data = {key: loss_data[key] for key in loss_fn_data_keys}
             loss += loss_fn(**_loss_fn_data, **loss_fn_params)
@@ -143,7 +147,7 @@ class BaseModel(pl.LightningModule):
 
 
     def training_step(self,
-                      loss: torch.Tensor,
+                      loss: torch.tensor,
                       preds: torch.Tensor,
                       labels: torch.Tensor) -> torch.Tensor:
         """
@@ -151,7 +155,7 @@ class BaseModel(pl.LightningModule):
 
         Parameters
         ----------
-        loss : torch.Tensor
+        loss : torch.tensor
             The computed loss.
         preds : torch.Tensor
             The predicted class probabilities.
@@ -196,7 +200,16 @@ class BaseModel(pl.LightningModule):
         -----
         This method may be overridden by subclasses to define the validation step. The default implementation computes the validation accuracy and logs it.
         """
-        _, preds, labels = self.common_step(data)
+        unnormalized_logits, preds, labels = self.common_step(data)
+
+        loss_data = {'logits': unnormalized_logits,
+                     'labels': labels}
+        val_loss = self.criterion(loss_data)
+        self.log(name='val_loss',
+                 value=val_loss,
+                 prog_bar=True,
+                 on_step=False,
+                 on_epoch=True)
 
         self.val_acc(preds, labels)
         self.log(name='val_acc',
