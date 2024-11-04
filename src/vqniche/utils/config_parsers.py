@@ -51,5 +51,10 @@ def collect_configs(args: argparse.Namespace) -> Dict:
                     config['data']['graph_kwargs'][key] = True
                 elif value == 'False':
                     config['data']['graph_kwargs'][key] = False
+            elif key == 'overwrite':
+                if value == 'True':
+                    config['experiment'][key] = True
+                elif value == 'False':
+                    config['experiment'][key] = False
 
     return config

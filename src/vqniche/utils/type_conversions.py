@@ -5,7 +5,7 @@ import scipy.sparse as sp
 from sklearn.preprocessing import LabelBinarizer
 
 
-def sparse_mx_to_float_tensor(sparse_mx: sp.csr_matrix) -> torch.FloatTensor:
+def sparse_mx_to_float_tensor(sparse_mx: sp.csr_matrix) -> torch.Tensor:
     """
     Convert a scipy sparse matrix to a PyTorch float tensor.
 
@@ -16,15 +16,15 @@ def sparse_mx_to_float_tensor(sparse_mx: sp.csr_matrix) -> torch.FloatTensor:
 
     Returns:
     --------
-    torch.FloatTensor
-        A dense PyTorch float tensor.
+    torch.Tensor
+        A dense PyTorch float tensor with dtype float32.
     """
-    sparse_mx = sparse_mx.tocoo().astype(np.float32)
-    indices = torch.from_numpy(
-        np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
-    values = torch.from_numpy(sparse_mx.data)
-    shape = torch.Size(sparse_mx.shape)
-    return torch.sparse.FloatTensor(indices, values, shape).to_dense()
+    # Ensure the data is in float32 format directly
+    sparse_mx = sparse_mx.astype(np.float32)
+
+    # Convert directly to dense format as a PyTorch tensor
+    dense_tensor = torch.tensor(sparse_mx.toarray(), dtype=torch.float32)
+    return dense_tensor
 
 
 def pandas_to_torch_one_hot(pandas_series: pd.Series) -> torch.FloatTensor:

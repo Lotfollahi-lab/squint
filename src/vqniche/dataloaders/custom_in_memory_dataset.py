@@ -19,7 +19,8 @@ class CustomInMemoryDataset(InMemoryDataset):
                  data_directory_path: Optional[ str | Path ] = "/lustre/scratch126/cellgen/team361/DATASETS",
                  transform: Optional[Callable] = None,
                  pre_transform: Optional[Callable] = None,
-                 pre_filter: Optional[Callable] = None) -> InMemoryDataset:
+                 pre_filter: Optional[Callable] = None,
+                 overwrite: bool = False) -> InMemoryDataset:
         """
         CustomInMemoryDataset class for loading PyG Data objects from AnnData files.
 
@@ -41,6 +42,8 @@ class CustomInMemoryDataset(InMemoryDataset):
             A function/transform that takes in an original PyG Data object and returns a pre-processed version.
         - pre_filter: Optional[Callable]
             A function that takes in an PyG Data object and returns True if the data object should be included in the final dataset.
+        - overwrite: bool
+            If True, the processed data is overwritten. If False, the processed data is loaded from the processed directory.
 
         Returns:
         -------
@@ -66,6 +69,9 @@ class CustomInMemoryDataset(InMemoryDataset):
                          transform=transform,
                          pre_transform=pre_transform,
                          pre_filter=pre_filter)
+        if overwrite:
+            print("Overwriting the processed data...")
+            self.process()
 
         self.load(self.processed_paths[0])
 
@@ -156,7 +162,8 @@ class CustomInMemoryDataset(InMemoryDataset):
         # add metadata
         data_attributes['metadata_cell_id'] = adata.obs['cell_id']
 
-        print(data_attributes)
+        for key, value in data_attributes.items():
+            print(f"{key}: {value.shape=}, {value.dtype=}, {type(value)=}")
 
         data_list = [Data(**data_attributes)]
 
