@@ -9,8 +9,8 @@ def sparse_mx_to_float_tensor(sparse_mx: sp.csr_matrix) -> torch.FloatTensor:
     """
     Convert a scipy sparse matrix to a PyTorch float tensor.
 
-    Args:
-    ----
+    Parameters:
+    ----------
     sparse_mx : scipy.sparse.csr_matrix
         A sparse matrix in Compressed Sparse Row format.
 
@@ -31,8 +31,8 @@ def pandas_to_torch_one_hot(pandas_series: pd.Series) -> torch.FloatTensor:
     """
     Convert a pandas Series of categorical labels to a PyTorch float tensor of one-hot encoded labels.
 
-    Args:
-    ----
+    Parameters:
+    ----------
     pandas_series : pd.Series
         A pandas Series of categorical labels.
 
