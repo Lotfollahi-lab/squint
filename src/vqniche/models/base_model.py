@@ -2,7 +2,7 @@ import torch
 import torch_geometric
 import pytorch_lightning as pl
 from torchmetrics import Accuracy
-from typing import List, Tuple
+from typing import List, Tuple, Callable
 
 from ..utils.loss import cross_entropy_loss
 
@@ -39,9 +39,8 @@ class BaseModel(pl.LightningModule):
         self.optimizer_name = optimizer_name
 
         # Loss parameters
-        self.loss_names = loss_names
         self.loss_kwargs = loss_kwargs
-        self.loss_fn_tuples = self.set_loss_fn_tuples(loss_kwargs)
+        self.loss_fn_tuples = self.set_loss_fn_tuples(loss_names, loss_kwargs)
 
         # Accuracy metrics parameters
         self.task = task
@@ -52,19 +51,22 @@ class BaseModel(pl.LightningModule):
 
 
     def set_loss_fn_tuples(self,
-                           loss_kwargs: dict = {}) -> List:
+                           loss_fn_names: List[str],
+                           loss_kwargs: dict = {}) -> List[Tuple[str, Callable, List[str], dict]]:
         """
         Set the loss functions for the encoder.
 
         Parameters
         ----------
+        loss_names : List[str]
+            The loss function names.
         loss_kwargs : dict
             Additional keyword arguments.
 
         Returns
         -------
         List
-            The loss functions.
+            One tuple per loss name in loss_names comprising of loss function name (str), loss function (callable), list of data related key strings required to be passed to the loss function, and a dictionary of additional keyword arguments for the loss function.
 
         Notes
         -----
@@ -73,9 +75,9 @@ class BaseModel(pl.LightningModule):
         # initialize a list to store the loss function tuples
         loss_fn_tuples = []
 
-        for loss_name in self.loss_names:
+        for loss_fn_name in loss_fn_names:
             loss_fn_params = {}
-            if loss_name == 'cross_entropy':
+            if loss_fn_name == 'cross_entropy':
                 # set the cross-entropy loss function
                 loss_fn = cross_entropy_loss
 
@@ -87,9 +89,9 @@ class BaseModel(pl.LightningModule):
                 if reduction is not None:
                     loss_fn_params['reduction'] = reduction
             else:
-                raise NotImplementedError(f'{loss_name} Loss not implemented')
+                raise NotImplementedError(f'{loss_fn_name} Loss not implemented')
 
-            loss_fn_tuple = (loss_fn, loss_fn_data_keys, loss_fn_params)
+            loss_fn_tuple = (loss_fn_name, loss_fn, loss_fn_data_keys, loss_fn_params)
             loss_fn_tuples.append(loss_fn_tuple)
 
         return loss_fn_tuples
@@ -112,12 +114,34 @@ class BaseModel(pl.LightningModule):
         """
         assert len(self.loss_fn_tuples) > 0, 'No loss functions defined'
 
-        loss = torch.tensor(0.0).to(self.device)
-        for loss_fn, loss_fn_data_keys, loss_fn_params in self.loss_fn_tuples:
-            _loss_fn_data = {key: loss_data[key] for key in loss_fn_data_keys}
-            loss += loss_fn(**_loss_fn_data, **loss_fn_params)
+        # initialize total_loss = 0.0 with requires_grad=True so that the loss can be backpropagated
+        # total_loss will be computed as the sum of all the loss terms from self.loss_names
+        total_loss = torch.tensor(0.0, requires_grad=True, dtype=torch.float32)
+
+        # during model initialization, self.loss_fn_tuples is set to a list of tuples
+        # one tuple per loss name in self.loss_names
+        # each tuple contains the loss function name, the callable loss function, the data keys required to compute the loss, and the loss function parameters
+        for loss_fn_name, loss_fn, loss_fn_data_keys, loss_fn_params in self.loss_fn_tuples:
+            # extract from loss_data, the data required to compute the current loss function
+            _loss_fn_data = {key: loss_data[key].copy() for key in loss_fn_data_keys}
+
+            # pass the extracted data to the loss function along with the loss function related kwargs
+            loss_fn_value = loss_fn(**_loss_fn_data, **loss_fn_params)
+
+            # add the computed loss to the total_loss
+            total_loss += loss_fn_value.copy()
+
+            # log each computed loss term
+            self.log(name=loss_fn_name,
+                     value=loss_fn_value.copy(),
+                     prog_bar=False,
+                     on_step=False,
+                     on_epoch=True)
+
+            # free up memory by deleting the intermediate loss function data
             del _loss_fn_data
-        return loss
+
+        return total_loss
 
 
     def common_step(self,
@@ -175,14 +199,14 @@ class BaseModel(pl.LightningModule):
 
         self.log(name='train_loss',
                  value=loss,
-                 prog_bar=True,
+                 prog_bar=False,
                  on_step=False,
                  on_epoch=True)
 
         self.train_acc(preds, labels)
         self.log(name='train_acc',
                  value=self.train_acc,
-                 prog_bar=True,
+                 prog_bar=False,
                  on_step=False,
                  on_epoch=True)
 
@@ -207,14 +231,14 @@ class BaseModel(pl.LightningModule):
         val_loss = self.criterion(loss_data)
         self.log(name='val_loss',
                  value=val_loss,
-                 prog_bar=True,
+                 prog_bar=False,
                  on_step=False,
                  on_epoch=True)
 
         self.val_acc(preds, labels)
         self.log(name='val_acc',
                  value=self.val_acc,
-                 prog_bar=True,
+                 prog_bar=False,
                  on_step=False,
                  on_epoch=True)
 
@@ -237,7 +261,7 @@ class BaseModel(pl.LightningModule):
         self.test_acc(preds, labels)
         self.log(name='test_acc',
                  value=self.test_acc,
-                 prog_bar=True,
+                 prog_bar=False,
                  on_step=False,
                  on_epoch=True)
 
