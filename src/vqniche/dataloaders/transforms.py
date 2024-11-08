@@ -44,7 +44,7 @@ def prepare_transforms(transform_list: List[str] = ['SetCustomData',
                                         num_test=test_ratio)
                             )
         elif transform == 'NormalizeFeatures':
-            transforms.append(NormalizeFeatures())
+            transforms.append(NormalizeFeatures(norm_method=norm_method))
         elif transform == 'SetCustomDataKeys':
             transforms.append(SetCustomDataKeys(
                                     feature_key=feature_key,
@@ -88,6 +88,8 @@ class NormalizeFeatures(T.BaseTransform):
         feature_data = getattr(data, self.feature_key)
         if self.norm_method == 'read_depth':
             feature_data = normalize_by_read_depth(feature_data)
+        else:
+            raise ValueError(f"Normalization method {self.norm_method} not found.")
         setattr(data, self.feature_key, feature_data)
         return data
 
