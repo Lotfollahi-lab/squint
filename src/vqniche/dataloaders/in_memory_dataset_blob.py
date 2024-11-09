@@ -28,7 +28,8 @@ Tradeoffs:
     1. Create one dataset_blob.pt per batch of cells in the experiment folder. This is more memory efficient but increases time complexity because, if we have (say) T training epochs, each AnnData batch is loaded and removed from memory T times.
     2. Create an OnDiskDatasetBlob that loads parallely in chunks.
 """
-
+import multiprocessing
+import concurrent.futures
 import scanpy as sc
 from pathlib import Path
 from typing import Optional, Callable, List, Tuple
@@ -42,16 +43,18 @@ from ..utils.type_conversions import sparse_mx_to_float_tensor, pandas_to_torch_
 
 class InMemoryDatasetBlob(InMemoryDataset):
 
-    def __init__(self,
-                 name: str = "sss2-1b_1p",
-                 feature_names: List['str'] = [],
-                 label_names: List['str'] = [],
-                 graph_kwargs: dict = {},
-                 data_directory_path: Optional[ str | Path ] = "/lustre/scratch126/cellgen/team361/DATASETS",
-                 transform: Optional[Callable] = None,
-                 pre_transform: Optional[Callable] = None,
-                 pre_filter: Optional[Callable] = None,
-                 overwrite: bool = False) -> InMemoryDataset:
+    def __init__(
+            self,
+            name: str = "sss2-1b_1p",
+            feature_names: List['str'] = [],
+            label_names: List['str'] = [],
+            graph_kwargs: dict = {},
+            data_directory_path: Optional[ str | Path ] = "/lustre/scratch126/cellgen/team361/DATASETS",
+            transform: Optional[Callable] = None,
+            pre_transform: Optional[Callable] = None,
+            pre_filter: Optional[Callable] = None,
+            overwrite: bool = False
+        ) -> InMemoryDataset:
         """
         CustomInMemoryDataset class for loading PyG Data objects from AnnData files.
 
@@ -119,16 +122,28 @@ class InMemoryDatasetBlob(InMemoryDataset):
         # Process one batch of AnnData into one PyG Data object
         data_batches = []
 
-        # TODO: Parallelize the processing of the individual AnnData batch files
-        for adata_batch_file in self.raw_paths:
-            print(f"Processing {adata_batch_file}...")
-            data_batch = self.process_anndata_batch(adata_batch_file)
+        # parallelize the processing of each batch of AnnData
+        num_cores = multiprocessing.cpu_count()
+        num_files = len(self.raw_paths)
+        max_workers = min(num_cores, num_files)
+        print(f"Number of Cores: {num_cores} | Number of Batches: {num_files}")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for adata_batch_file in self.raw_paths:
+                print(f"Processing {adata_batch_file}...")
+                future = executor.submit(self.process_anndata_batch, adata_batch_file)
+                futures.append(future)
 
-            data_batches.append(data_batch.copy())
-            print("Processed.")
+            for future in concurrent.futures.as_completed(futures):
+                data_batch = future.result()
+                data_batches.append(data_batch.copy())
+                print("Processed.")
 
-            del data_batch
+                del data_batch
 
+        # sort the data batches by batch_idx
+        # batch_id = "batch0", "batch1", ..., "batchN"
+        # batch_idx = 0, 1, ..., N
         data_batches.sort(key=lambda x: int(x['metadata_batch_id'][5:]))
 
         # self.save internally collates all Data objects in data_list into a single blob.
@@ -138,8 +153,10 @@ class InMemoryDatasetBlob(InMemoryDataset):
                   path=self.processed_paths[0])
 
 
-    def process_anndata_batch(self,
-                                adata_batch_file: Path) -> Tuple[Data, str]:
+    def process_anndata_batch(
+            self,
+            adata_batch_file: Path
+        ) -> Tuple[Data, str]:
         """
         Process one single batch of AnnData into a PyG Data object.
 

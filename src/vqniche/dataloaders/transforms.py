@@ -56,7 +56,8 @@ def init_data_transforms(
 
 
 class NormalizeFeatures(T.BaseTransform):
-    def __init__(self,
+    def __init__(
+            self,
             norm_method: str = 'read_depth',
             feature_key: str = 'x'
         ):
