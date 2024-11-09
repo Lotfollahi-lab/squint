@@ -1,1 +1,1 @@
-from .custom_in_memory_dataset import CustomInMemoryDataset
+from .in_memory_dataset_blob import InMemoryDatasetBlob
