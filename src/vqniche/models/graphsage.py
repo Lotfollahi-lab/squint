@@ -59,9 +59,9 @@ Because P_3 and P_4 are both learnable parameters of the model, they will be upd
 import torch
 import torch.nn as nn
 import torch_geometric
-from torch_geometric.nn import GCN as GCN_Encoder
 from torch_geometric.nn import GraphSAGE as SAGE_Encoder
 from typing import List, Union, Callable
+from torch.nn import BatchNorm1d
 
 from .base_model import BaseModel
 
@@ -154,13 +154,16 @@ class GraphSAGE(BaseModel):
 
         # Initialize GraphSAGE model from Pytorch Geometric as the encoder
         # The out_channels parameter is not passed to the SAGE_Encoder (i.e. it is set to None) so that we can separate the encoder from the predictor.
-        self.encoder = SAGE_Encoder(in_channels=in_channels,
-                                    hidden_channels=hidden_channels,
-                                    num_layers=num_layers,
-                                    act_first=act_first,
-                                    act=activation,
-                                    dropout=dropout,
-                                    norm=norm)
+        self.encoder = SAGE_Encoder(
+                            in_channels=in_channels,
+                            hidden_channels=hidden_channels,
+                            num_layers=num_layers,
+                            act_first=act_first,
+                            act=activation,
+                            dropout=dropout,
+                            norm=norm
+                            # norm=BatchNorm1d(hidden_channels)
+                        )
 
         # Instead, we apply this final linear transformation in the predictor module manually to have access to the internal node embeddings via the `embed` function.
         self.predictor = nn.Linear(hidden_channels, out_channels)

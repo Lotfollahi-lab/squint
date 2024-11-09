@@ -28,7 +28,8 @@ Tradeoffs:
     1. Create one dataset_blob.pt per batch of cells in the experiment folder. This is more memory efficient but increases time complexity because, if we have (say) T training epochs, each AnnData batch is loaded and removed from memory T times.
     2. Create an OnDiskDatasetBlob that loads parallely in chunks.
 """
-import multiprocessing
+import os
+import copy
 import concurrent.futures
 import scanpy as sc
 from pathlib import Path
@@ -88,12 +89,8 @@ class InMemoryDatasetBlob(InMemoryDataset):
         """
         self.name = name
 
-        if len(feature_names) > 1:
-            self.feature_names = feature_names
-
-        if len(label_names) > 1:
-            self.label_names = label_names
-
+        self.feature_names = feature_names
+        self.label_names = label_names
         self.graph_kwargs = graph_kwargs
 
         # path to the data directory which contains silver and gold data
@@ -121,9 +118,10 @@ class InMemoryDatasetBlob(InMemoryDataset):
         """
         # Process one batch of AnnData into one PyG Data object
         data_batches = []
+        batch_ids = []
 
         # parallelize the processing of each batch of AnnData
-        num_cores = multiprocessing.cpu_count()
+        num_cores = int(os.environ.get("LSB_DJOB_NUMPROC", 1))
         num_files = len(self.raw_paths)
         max_workers = min(num_cores, num_files)
         print(f"Number of Cores: {num_cores} | Number of Batches: {num_files}")
@@ -135,16 +133,17 @@ class InMemoryDatasetBlob(InMemoryDataset):
                 futures.append(future)
 
             for future in concurrent.futures.as_completed(futures):
-                data_batch = future.result()
-                data_batches.append(data_batch.copy())
-                print("Processed.")
+                data_batch, batch_id = future.result()
+                data_batches.append(copy.deepcopy(data_batch))
+                batch_ids.append(batch_id)
+                print("")
 
                 del data_batch
 
         # sort the data batches by batch_idx
         # batch_id = "batch0", "batch1", ..., "batchN"
         # batch_idx = 0, 1, ..., N
-        data_batches.sort(key=lambda x: int(x['metadata_batch_id'][5:]))
+        data_batches = [x for _, x in sorted(zip(batch_ids, data_batches))]
 
         # self.save internally collates all Data objects in data_list into a single blob.
         # The index is set to 0 so that the collated object is stored at
@@ -215,6 +214,9 @@ class InMemoryDatasetBlob(InMemoryDataset):
                                         key_added=edge_index_name
                             )
 
+        print("Adata:")
+        print(adata_batch)
+
         # ----------------- Build Data Dict -----------------
         batch_dict = {}
 
@@ -236,15 +238,15 @@ class InMemoryDatasetBlob(InMemoryDataset):
         assert len(self.edge_index_names) > 0, "At least one edge index name must be provided"
         for edge_index_name in self.edge_index_names:
             batch_dict[f"edge_index_{edge_index_name}"] = from_scipy_sparse_matrix(
-                                                        adata_batch.obsp[f"{edge_index_name}'_connectivities"]
+                                                        adata_batch.obsp[f"{edge_index_name}_connectivities"]
                                                         )[0]
-
-        # add metadata
-        batch_dict['metadata_cell_id'] = adata_batch.obs['cell_id']
-        batch_dict['metadata_batch_id'] = adata_batch.uns['batch_id']
 
         for key, value in batch_dict.items():
             print(f"{key}: {value.shape=}, {value.dtype=}, {type(value)=}")
+
+        # ----------------- Build Metadata Dict -----------------
+        # TODO: Save cell ids, batch ids, tissue, etc. as metadata
+        batch_id = adata_batch.uns['batch']
 
         # ----------------- Convert Data Dict to PyG Data Object -----------------
         data_batch = Data(**batch_dict)
@@ -257,8 +259,7 @@ class InMemoryDatasetBlob(InMemoryDataset):
         if self.pre_transform is not None:
             data_batch = self.pre_transform(data_batch)
 
-        return data_batch
-
+        return data_batch, batch_id
 
     @property
     def raw_dir(self) -> Path:

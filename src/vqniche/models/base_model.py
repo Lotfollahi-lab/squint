@@ -1,8 +1,10 @@
+import copy
 import torch
 import torch_geometric
 import pytorch_lightning as pl
 from torchmetrics import Accuracy
 from typing import List, Tuple, Callable
+import torch.functional as F
 
 from ..utils.loss import cross_entropy_loss
 
@@ -167,24 +169,23 @@ class BaseModel(pl.LightningModule):
 
         # initialize total_loss = 0.0 with requires_grad=True so that the loss can be backpropagated
         # total_loss will be computed as the sum of all the loss terms from self.loss_names
-        total_loss = torch.tensor(0.0, requires_grad=True, dtype=torch.float32)
+        total_loss = torch.tensor(0.0, requires_grad=True, dtype=torch.float32).to(self.device)
 
         # during model initialization, self.loss_fn_tuples is set to a list of tuples
         # one tuple per loss name in self.loss_names
         # each tuple contains the loss function name, the callable loss function, the data keys required to compute the loss, and the loss function parameters
         for loss_fn_name, loss_fn, loss_fn_data_keys, loss_fn_params in self.loss_fn_tuples:
             # extract from loss_data, the data required to compute the current loss function
-            _loss_fn_data = {key: loss_data[key].copy() for key in loss_fn_data_keys}
+            _loss_fn_data = {key: loss_data[key] for key in loss_fn_data_keys}
 
             # pass the extracted data to the loss function along with the loss function related kwargs
             loss_fn_value = loss_fn(**_loss_fn_data, **loss_fn_params)
-
             # add the computed loss to the total_loss
-            total_loss += loss_fn_value.copy()
+            total_loss += loss_fn_value
 
             # log each computed loss term
             self.log(name=loss_fn_name,
-                     value=loss_fn_value.copy(),
+                     value=loss_fn_value,
                      prog_bar=False,
                      on_step=False,
                      on_epoch=True)

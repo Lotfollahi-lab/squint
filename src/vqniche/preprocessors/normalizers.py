@@ -1,6 +1,7 @@
 import torch
 import scipy.sparse as sp
 from typing import Union
+import scanpy as sc
 
 
 def normalize_by_read_depth(x: Union[sp.csr_matrix , torch.Tensor],
@@ -27,31 +28,6 @@ def normalize_by_read_depth(x: Union[sp.csr_matrix , torch.Tensor],
     ----------
     NicheJEPA (Author: Sebastian Birk)
     """
-    if isinstance(x, sp.csr_matrix):
-        x_hat = x / x.sum(axis=1).reshape(-1, 1) * target_size
-    elif isinstance(x, torch.Tensor):
-        # Convert sparse tensor to COO format if it's not already
-        x = x.coalesce()
-
-        # Extract indices and values
-        indices = x.indices()  # Shape: (2, nnz), where nnz is the number of non-zero elements
-        values = x.values()    # Shape: (nnz,)
-
-        # Compute the sum of each row
-        row_sums = torch.sparse.sum(x, dim=1).to_dense()  # Dense vector of row sums, shape: (num_rows,)
-
-        # Gather row sums corresponding to each non-zero element
-        row_indices = indices[0]  # Row indices of each non-zero element
-        row_sum_values = row_sums[row_indices]  # Shape: (nnz,)
-
-        # Normalize values by the corresponding row sum
-        normalized_values = values / row_sum_values
-
-        # Scale the normalized values by target_size
-        scaled_values = normalized_values * target_size
-
-        # Create a new sparse tensor with the same indices but scaled values
-        x_hat = torch.zeros(x.size(), dtype=scaled_values.dtype)
-        x_hat[indices[0], indices[1]] = scaled_values
+    x_hat = x / x.sum(axis=1).reshape(-1, 1) * target_size
 
     return x_hat
