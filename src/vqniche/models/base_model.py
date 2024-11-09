@@ -8,28 +8,75 @@ from ..utils.loss import cross_entropy_loss
 
 
 class BaseModel(pl.LightningModule):
-    def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 hidden_channels: int = 256,
-                 num_layers: int = 2,
-                 dropout: float = 0.5,
-                 lr: float = 0.01,
-                 weight_decay: float = 0.0,
-                 optimizer_name: str = 'adam',
-                 loss_names: List[str] = ['cross_entropy'],
-                 loss_kwargs: dict = {'reduction': 'mean'},
-                 task: str = 'multiclass',
-                 task_kwargs: dict = {},
-                 **kwargs):
+    def __init__(
+            self,
+            name: str = 'BaseModel',
+            in_channels: int = None,
+            out_channels: int = None,
+            encoder_name: str = 'GraphSAGE',
+            predictor_name: str = 'Linear',
+            hidden_channels: int = 256,
+            num_layers: int = 2,
+            dropout: float = 0.5,
+            lr: float = 0.01,
+            weight_decay: float = 0.0,
+            optimizer_name: str = 'adam',
+            loss_names: List[str] = ['cross_entropy'],
+            loss_kwargs: dict = {'reduction': 'mean'},
+            task_name: str = 'multiclass',
+            task_kwargs: dict = {},
+            **kwargs
+        ) -> None:
+        """
+        Initialize the BaseModel class.
+
+        Parameters
+        ----------
+        - name: str
+            The name of the model.
+        - in_channels: int
+            The number of input channels.
+        - out_channels: int
+            The number of output channels.
+        - encoder_name: str
+            The encoder name.
+        - predictor_name: str
+            The predictor name.
+        - hidden_channels: int
+            The number of hidden channels.
+        - num_layers: int
+            The number of layers.
+        - dropout: float
+            The dropout rate.
+        - lr: float
+            The learning rate.
+        - weight_decay: float
+            The weight decay.
+        - optimizer_name: str
+            The optimizer name.
+        - loss_names: List[str]
+            The loss function names.
+        - loss_kwargs: dict
+            The loss function keyword arguments.
+        - task_name: str
+            The task name.
+        - task_kwargs: dict
+            The task keyword arguments.
+        - kwargs: dict
+            Additional keyword arguments.
+        """
+        self.name = name
+
         super().__init__(**kwargs)
 
         # Encoder parameters
+        self.encoder_name = encoder_name
         self.in_channels = in_channels
         self.hidden_channels = hidden_channels
         self.num_layers = num_layers
 
         # Predictor parameters
+        self.predictor_name = predictor_name
         self.out_channels = out_channels
 
         # Optimizer parameters
@@ -43,24 +90,26 @@ class BaseModel(pl.LightningModule):
         self.loss_fn_tuples = self.set_loss_fn_tuples(loss_names, loss_kwargs)
 
         # Accuracy metrics parameters
-        self.task = task
+        self.task_name = task_name
         self.task_kwargs = task_kwargs
-        self.train_acc = Accuracy(task=task, num_classes=out_channels, **task_kwargs)
-        self.val_acc = Accuracy(task=task, num_classes=out_channels, **task_kwargs)
-        self.test_acc = Accuracy(task=task, num_classes=out_channels, **task_kwargs)
+        self.train_acc = Accuracy(task=task_name, num_classes=out_channels, **task_kwargs)
+        self.val_acc = Accuracy(task=task_name, num_classes=out_channels, **task_kwargs)
+        self.test_acc = Accuracy(task=task_name, num_classes=out_channels, **task_kwargs)
 
 
-    def set_loss_fn_tuples(self,
-                           loss_fn_names: List[str],
-                           loss_kwargs: dict = {}) -> List[Tuple[str, Callable, List[str], dict]]:
+    def set_loss_fn_tuples(
+            self,
+            loss_fn_names: List[str],
+            loss_kwargs: dict = {}
+        ) -> List[Tuple[str, Callable, List[str], dict]]:
         """
         Set the loss functions for the encoder.
 
         Parameters
         ----------
-        loss_names : List[str]
+        - loss_names: List[str]
             The loss function names.
-        loss_kwargs : dict
+        - loss_kwargs: dict
             Additional keyword arguments.
 
         Returns
@@ -97,19 +146,21 @@ class BaseModel(pl.LightningModule):
         return loss_fn_tuples
 
 
-    def criterion(self,
-                loss_data: dict) -> torch.Tensor:
+    def criterion(
+            self,
+            loss_data: dict
+        ) -> torch.Tensor:
         """
         Compute the loss for the model.
 
         Parameters
         ----------
-        loss_data : dict
+        - loss_data: dict
             A collection of data objects required to compute the loss.
 
         Returns
         -------
-        torch.Tensor
+        - torch.Tensor
             The computed loss.
         """
         assert len(self.loss_fn_tuples) > 0, 'No loss functions defined'
@@ -144,23 +195,25 @@ class BaseModel(pl.LightningModule):
         return total_loss
 
 
-    def common_step(self,
-                    data: torch_geometric.data.Data) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def common_step(
+            self,
+            data: torch_geometric.data.Data
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Common step across training, validation, and testing for the model.
 
         Parameters
         ----------
-        data : torch_geometric.data.Data
+        - data: torch_geometric.data.Data
             The input data.
 
         Returns
         -------
-        torch.Tensor
+        - torch.Tensor
             The unnormalized logits.
-        torch.Tensor
+        - torch.Tensor
             The predicted class probabilities.
-        torch.Tensor
+        - torch.Tensor
             The ground truth labels.
         """
         # TODO: Update data to batch if applicable
@@ -170,35 +223,37 @@ class BaseModel(pl.LightningModule):
         return unnormalized_logits, preds, labels
 
 
-    def training_step(self,
-                      loss: torch.tensor,
-                      preds: torch.Tensor,
-                      labels: torch.Tensor) -> torch.Tensor:
+    def training_step(
+            self,
+            train_loss: torch.tensor,
+            preds: torch.Tensor,
+            labels: torch.Tensor
+        ) -> torch.Tensor:
         """
         Training step for the model.
 
         Parameters
         ----------
-        loss : torch.tensor
+        - train_loss: torch.tensor
             The computed loss.
-        preds : torch.Tensor
+        - preds: torch.Tensor
             The predicted class probabilities.
-        labels : torch.Tensor
+        - labels: torch.Tensor
             The ground truth labels.
 
         Returns
         -------
-        torch.Tensor
+        - torch.Tensor
             The training accuracy.
 
         Notes
         -----
         Throws an error if the loss is not computed by the child class. The default implementation logs the training loss, computes the training accuracy, and logs the training accuracy.
         """
-        assert loss is not None, 'Loss not computed'
+        assert train_loss is not None, 'Loss not computed'
 
         self.log(name='train_loss',
-                 value=loss,
+                 value=train_loss,
                  prog_bar=False,
                  on_step=False,
                  on_epoch=True)
@@ -211,20 +266,23 @@ class BaseModel(pl.LightningModule):
                  on_epoch=True)
 
 
-    def validation_step(self, data) -> None:
+    def validation_step(
+            self,
+            val_data: torch_geometric.data.Data
+        ) -> None:
         """
         Validation step for the model.
 
         Parameters
         ----------
-        data : torch_geometric.data.Data
-            The input data.
+        - val_data: torch_geometric.data.Data
+            The input validation data (batch of nodes).
 
         Notes
         -----
         This method may be overridden by subclasses to define the validation step. The default implementation computes the validation accuracy and logs it.
         """
-        unnormalized_logits, preds, labels = self.common_step(data)
+        unnormalized_logits, preds, labels = self.common_step(val_data)
 
         loss_data = {'logits': unnormalized_logits,
                      'labels': labels}
@@ -243,20 +301,23 @@ class BaseModel(pl.LightningModule):
                  on_epoch=True)
 
 
-    def test_step(self, data) -> None:
+    def test_step(
+            self,
+            test_data: torch_geometric.data.Data
+        ) -> None:
         """
         Test step for the model.
 
         Parameters
         ----------
-        data : torch_geometric.data.Data
+        - data: torch_geometric.data.Data
             The input data.
 
         Notes
         -----
         This method may be overridden by subclasses to define the test step. The default implementation computes the test accuracy and logs it.
         """
-        _, preds, labels = self.common_step(data)
+        _, preds, labels = self.common_step(test_data)
 
         self.test_acc(preds, labels)
         self.log(name='test_acc',
@@ -272,7 +333,7 @@ class BaseModel(pl.LightningModule):
 
         Returns
         -------
-        torch.optim.Optimizer
+        - torch.optim.Optimizer
             The configured optimizer.
         """
         # TODO: Add support for multiple optimizers

@@ -59,6 +59,7 @@ Because P_3 and P_4 are both learnable parameters of the model, they will be upd
 import torch
 import torch.nn as nn
 import torch_geometric
+from torch_geometric.nn import GCN as GCN_Encoder
 from torch_geometric.nn import GraphSAGE as SAGE_Encoder
 from typing import List, Union, Callable
 
@@ -66,73 +67,90 @@ from .base_model import BaseModel
 
 
 class GraphSAGE(BaseModel):
-    def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 hidden_channels: int = 256,
-                 num_layers: int = 2,
-                 act_first: bool = True,
-                 activation: Union[str, Callable, None] = "relu",
-                 norm: Union[str, Callable, None] = None,
-                 dropout: float = 0.5,
-                 lr: float = 0.01,
-                 weight_decay: float = 0.0,
-                 optimizer_name: str = 'adam',
-                 loss_names: List[str] = ['cross_entropy'],
-                 loss_kwargs: dict = {'reduction': 'none'},
-                 task: str = 'multiclass',
-                 task_kwargs: dict = {},
-                 **kwargs):
+    def __init__(
+            self,
+            name: str = 'GraphSAGE',
+            in_channels: int = None,
+            out_channels: int = None,
+            encoder_name: str = 'SAGE_Encoder',
+            predictor_name: str = 'Linear',
+            hidden_channels: int = 256,
+            num_layers: int = 2,
+            act_first: bool = True,
+            activation: Union[str, Callable, None] = "relu",
+            norm: Union[str, Callable, None] = None,
+            dropout: float = 0.5,
+            lr: float = 0.01,
+            weight_decay: float = 0.0,
+            optimizer_name: str = 'adam',
+            loss_names: List[str] = ['cross_entropy'],
+            loss_kwargs: dict = {'reduction': 'none'},
+            task_name: str = 'multiclass',
+            task_kwargs: dict = {},
+            **kwargs
+        ):
         """
         Initializes the GraphSAGE model.
 
         Parameters
         ----------
-        in_channels : int
+        - name: str
+            The name of the model.
+        - in_channels: int
             The number of input features.
-        out_channels : int
+        - out_channels: int
             The number of output features.
-        hidden_channels : int
+        - encoder_name: str
+            The name of the encoder module.
+        - predictor_name: str
+            The name of the predictor module.
+        - hidden_channels: int
             The number of hidden features.
-        num_layers : int
+        - num_layers: int
             The number of GraphSAGE encoder layers.
-        act_first : bool
+        - act_first: bool
             Whether to apply the activation function before normalization.
-        activation : str or callable or None
+        - activation: str or callable or None
             The activation function to use.
-        norm : str or callable or None
+        - norm: str or callable or None
             The normalization function to use.
-        dropout : float
+        - dropout: float
             The dropout probability.
-        lr : float
+        - lr: float
             The learning rate.
-        weight_decay : float
+        - weight_decay: float
             The weight decay.
-        optimizer_name : str
+        - optimizer_name: str
             The optimizer name.
-        loss_names : list of str
+        - loss_names: list of str
             The loss function names.
-        loss_kwargs : dict
+        - loss_kwargs: dict
             Keyword arguments for the loss functions.
-        task : str
+        - task_name: str
             The task type.
-        task_kwargs : dict
+        - task_kwargs: dict
             Keyword arguments for the task.
+        - kwargs: dict
+            Additional keyword arguments.
         """
         # Initialize the BaseModel class
-        super().__init__(in_channels=in_channels,
-                            out_channels=out_channels,
-                            hidden_channels=hidden_channels,
-                            num_layers=num_layers,
-                            dropout=dropout,
-                            lr=lr,
-                            weight_decay=weight_decay,
-                            optimizer_name=optimizer_name,
-                            loss_names=loss_names,
-                            loss_kwargs=loss_kwargs,
-                            task=task,
-                            task_kwargs=task_kwargs,
-                            **kwargs)
+        super().__init__(
+                        name=name,
+                        in_channels=in_channels,
+                        out_channels=out_channels,
+                        encoder_name=encoder_name,
+                        predictor_name=predictor_name,
+                        hidden_channels=hidden_channels,
+                        num_layers=num_layers,
+                        dropout=dropout,
+                        lr=lr,
+                        weight_decay=weight_decay,
+                        optimizer_name=optimizer_name,
+                        loss_names=loss_names,
+                        loss_kwargs=loss_kwargs,
+                        task_name=task_name,
+                        task_kwargs=task_kwargs,
+                        **kwargs)
 
         # Initialize GraphSAGE model from Pytorch Geometric as the encoder
         # The out_channels parameter is not passed to the SAGE_Encoder (i.e. it is set to None) so that we can separate the encoder from the predictor.
@@ -148,22 +166,24 @@ class GraphSAGE(BaseModel):
         self.predictor = nn.Linear(hidden_channels, out_channels)
 
 
-    def forward(self,
-                batch_x: torch.Tensor,
-                batch_edge_index: torch.Tensor) -> torch.Tensor:
+    def forward(
+            self,
+            batch_x: torch.Tensor,
+            batch_edge_index: torch.Tensor
+        ) -> torch.Tensor:
         """
         Forward pass of the GraphSAGE model. This is a composition of the forward pass of the encoder and the predictor. The batch of nodes may be the entire set of nodes in the graph or a subset of nodes.
 
         Parameters
         ----------
-        batch_x : torch.Tensor
+        - batch_x: torch.Tensor
             The input features of the batch of nodes.
-        batch_edge_index : torch.Tensor
+        - batch_edge_index: torch.Tensor
             The edge index tensor of the batch of nodes.
 
         Returns
         -------
-        torch.Tensor
+        - torch.Tensor
             The unnormalized logits of the model.
         """
         # calls the forward method of the GraphSAGE encoder
@@ -174,43 +194,47 @@ class GraphSAGE(BaseModel):
 
 
     @torch.no_grad()
-    def embed(self,
-              subgraph_loader: torch_geometric.data.DataLoader) -> torch.Tensor:
+    def embed(
+            self,
+            subgraph_loader: torch_geometric.data.DataLoader
+        ) -> torch.Tensor:
         """
         Computes the internal node embeddings of the GraphSAGE model. These embeddings are of dimension hidden_channels. subgraph_loader is a torch_geometric.data.DataLoader object that may contain the entire graph or a subgraph induced by a batch of nodes.
 
         Parameters
         ----------
-        subgraph_loader : torch_geometric.data.DataLoader
+        - subgraph_loader: torch_geometric.data.DataLoader
             The graph data loader. This maybe the full graph or a batch of nodes.
 
         Returns
         -------
-        torch.Tensor
+        - torch.Tensor
             The internal node embeddings.
 
         Notes
         -----
-        The input to this method is named `graph_loader` and not `batch_loader` to .
+        The input to this method is named `graph_loader` and not `batch_loader` because it may be used to obtain an encoding for any subset of nodes.
         """
         node_embeddings = self.encoder.inference(subgraph_loader)
         return node_embeddings
 
 
     @torch.no_grad()
-    def inference(self,
-                  graph_loader: torch_geometric.data.DataLoader) -> torch.Tensor:
+    def inference(
+            self,
+            graph_loader: torch_geometric.data.DataLoader
+        ) -> torch.Tensor:
         """
         Computes the unnormalized logits of the GraphSAGE model. These logits are of dimension output_channels. This method is used for inference on the full graph.
 
         Parameters
         ----------
-        graph_loader : torch_geometric.data.DataLoader
+        - graph_loader: torch_geometric.data.DataLoader
             The graph data loader.
 
         Returns
         -------
-        torch.Tensor
+        - torch.Tensor
             The unnormalized logits.
         """
         node_embeddings = self.embed(graph_loader)
@@ -218,32 +242,34 @@ class GraphSAGE(BaseModel):
         return unnormalized_logits
 
 
-    def training_step(self,
-                      data: torch_geometric.data.Data) -> torch.Tensor:
+    def training_step(
+            self,
+            train_data: torch_geometric.data.Data
+        ) -> torch.Tensor:
         """
         Training step for the GraphSAGE model. Overrides the training_step method of the BaseModel class to prepare data required for computing loss. Calls super().training_step to log the training loss and accuracy.
 
         Parameters
         ----------
-        data : torch_geometric.data.Data
-            The input data.
+        - train_data: torch_geometric.data.Data
+            The input train data (batch of nodes).
 
         Returns
         -------
-        torch.Tensor
+        - torch.Tensor
             The computed loss.
         """
         # collect data required for computing the loss
-        unnormalized_logits, preds, labels = self.common_step(data)
+        unnormalized_logits, preds, labels = self.common_step(train_data)
 
         # prepare dictionary of data at current step for computing loss
         loss_data = {'logits': unnormalized_logits,
                      'labels': labels}
 
         # compute loss
-        loss = self.criterion(loss_data)
+        train_loss = self.criterion(loss_data)
 
         # log the training loss and accuracy
-        super().training_step(loss, preds, labels)
+        super().training_step(train_loss, preds, labels)
 
-        return loss
+        return train_loss
