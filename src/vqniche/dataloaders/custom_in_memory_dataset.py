@@ -1,7 +1,37 @@
+"""
+Define `Data` to refer to a PyG Data object, an attributed graph, that is constructed from a single batch of AnnData where each batch is a collection of cells originating from the same sample. Each `Data` object will have one or more of each type of the following attribute:
+- `x_<feature_name>`: Node features (e.g.,cell-gene counts or neighborhood-gene counts)
+- `y_<label_name>`: Node labels (e.g., cell types or niche types)
+- `edge_index_<edge_index_name>`: Edge index (e.g., spatial neighbors via Delaunay triangulation or radius-based neighbors)
+- `metadata_<metadata_name>`: Metadata (e.g., cell ids, batch ids, tissue, etc.)
+We construct these attributes from the AnnData object stored as an `.h5ad` file on disk.
+
+Next, define `Dataset` to refer to a PyG InMemoryDataset object comprising of collection of AnnData batches, i.e. `Data` objects. From an implementation perspective, we consider the Dataset to be a "blob" because we collate (combine) the individual Data objects (built previously from AnnData batches) into a single file called `dataset_blob.pt` before saving to disk.
+
+For example, consider creating a DatasetBlob for `xhs1000-39b_1p` (Xenium Human Skin | id = 1000 | 39 batches | 1 gene panel). When we first process this data, we create 39 Data objects, each an attributed graph representation of the corresponding batch of cells, and save them all into `dataset_blob.pt`. When we load the DatasetBlob, we load the `dataset_blob.pt` file and then access the individual Data objects as needed.
+
+Usage:
+>>> dataset_blob = InMemoryDatasetBlob(name='xhs1000-39b_1p',
+                                        label_names=['cell_types'],
+                                        graph_kwargs={'delaunay': True},
+                                        data_directory_path='/path/to/data',
+                                        transform=transform)
+>>> data = dataset[<batch-index>] # get a single Data object corresponding to a batch-index 7
+
+Tradeoffs:
+-------
+- One dataset_blob.pt across all batches of cells in the experiment folder vs one data.pt per batch of cells in the experiment folder.
+- One dataset_blob.pt is easier to manage and load than multiple data.pt files. During training, we can load the entire dataset in one go and use one or more batches per model as needed. This is useful because the subsequent subgraph sampling and batching can be done on the fly.
+- For each epoch, we subset the dataset_blob by batch(es) and then sample subgraphs from the batch(es) for training. This is more time efficient than sampling subgraphs from each batch separately, but requires more memory.
+- Memory usage is a concern because the entire dataset is loaded into memory at once. This is not a problem for small datasets but can be a bottleneck for large datasets.
+- For larger datasets, we have two options:
+    1. Create one dataset_blob.pt per batch of cells in the experiment folder. This is more memory efficient but increases time complexity because, if we have (say) T training epochs, each AnnData batch is loaded and removed from memory T times.
+    2. Create an OnDiskDatasetBlob that loads parallely in chunks.
+"""
+
 import scanpy as sc
-import anndata as ad
 from pathlib import Path
-from typing import Optional, Callable, List
+from typing import Optional, Callable, List, Tuple
 
 from torch_geometric.data import InMemoryDataset, Data
 from torch_geometric.utils.convert import from_scipy_sparse_matrix
@@ -10,11 +40,12 @@ from ..preprocessors.graph_constructors import spatial_neighbors
 from ..utils.type_conversions import sparse_mx_to_float_tensor, pandas_to_torch_one_hot
 
 
-class CustomInMemoryDataset(InMemoryDataset):
+class InMemoryDatasetBlob(InMemoryDataset):
 
     def __init__(self,
                  name: str = "sss2-1b_1p",
-                 label_names: List['str'] = ['cell_types'],
+                 feature_names: List['str'] = [],
+                 label_names: List['str'] = [],
                  graph_kwargs: dict = {},
                  data_directory_path: Optional[ str | Path ] = "/lustre/scratch126/cellgen/team361/DATASETS",
                  transform: Optional[Callable] = None,
@@ -28,8 +59,10 @@ class CustomInMemoryDataset(InMemoryDataset):
         ----------
         - name: str
             Name of the dataset.
+        - feature_names: List[str]
+            List of feature names to be constructed for the dataset.
         - label_names: List[str]
-            List of label names to be used for the dataset.
+            List of label names to be constructed for the dataset.
         - graph_kwargs: dict
             Dictionary containing the keyword arguments for the graph construction.
         - data_directory_path: str | Path
@@ -43,7 +76,7 @@ class CustomInMemoryDataset(InMemoryDataset):
         - pre_filter: Optional[Callable]
             A function that takes in an PyG Data object and returns True if the data object should be included in the final dataset.
         - overwrite: bool
-            If True, the processed data is overwritten. If False, the processed data is loaded from the processed directory.
+            If True, the existing processed data is overwritten and then loaded. If False, the processed data is loaded from the processed directory.
 
         Returns:
         -------
@@ -52,8 +85,11 @@ class CustomInMemoryDataset(InMemoryDataset):
         """
         self.name = name
 
-        assert len(label_names) > 0, "At least one label name must be provided"
-        self.label_names = label_names
+        if len(feature_names) > 1:
+            self.feature_names = feature_names
+
+        if len(label_names) > 1:
+            self.label_names = label_names
 
         self.graph_kwargs = graph_kwargs
 
@@ -65,15 +101,147 @@ class CustomInMemoryDataset(InMemoryDataset):
         self.data_directory_path = data_directory_path
 
         # root = Root directory where the processed data is saved.
+        # rerun the self.process if the processed data is not found or if overwrite is set to True.
         super().__init__(root=self.processed_dir,
                          transform=transform,
                          pre_transform=pre_transform,
-                         pre_filter=pre_filter)
-        if overwrite:
-            print("Overwriting the processed data...")
-            self.process()
+                         pre_filter=pre_filter,
+                         force_reload=overwrite)
 
+        # This index is set to 0 because there is only one processed data file.
         self.load(self.processed_paths[0])
+
+
+    def process(self) -> None:
+        """
+        Process the raw (silver) data and save it to the processed (gold) directory as a PyG InMemoryDataset. This method is called either when specifically `data.pt` is not found or when overwrite (force_reload) is set to True. Otherwise, `dataset_blob.pt` is loaded directly without calling this function.
+        """
+        # Process one batch of AnnData into one PyG Data object
+        data_batches = []
+
+        # TODO: Parallelize the processing of the individual AnnData batch files
+        for adata_batch_file in self.raw_paths:
+            print(f"Processing {adata_batch_file}...")
+            data_batch = self.process_anndata_batch(adata_batch_file)
+
+            data_batches.append(data_batch.copy())
+            print("Processed.")
+
+            del data_batch
+
+        data_batches.sort(key=lambda x: int(x['metadata_batch_id'][5:]))
+
+        # self.save internally collates all Data objects in data_list into a single blob.
+        # The index is set to 0 so that the collated object is stored at
+        # path "self.processed_dir/dataset_blob.pt".
+        self.save(data_list=data_batches,
+                  path=self.processed_paths[0])
+
+
+    def process_anndata_batch(self,
+                                adata_batch_file: Path) -> Tuple[Data, str]:
+        """
+        Process one single batch of AnnData into a PyG Data object.
+
+        Parameters:
+        ----------
+        - adata_batch_file: Path
+            Path to the batch of AnnData file.
+
+        Returns:
+        -------
+        - Data
+            A PyG Data object containing the processed data.
+        """
+        # Read the AnnData file from disk
+        adata_batch = sc.read(adata_batch_file)
+
+        # ----------------- Build Neighborhood Graphs -----------------
+        assert self.graph_kwargs['delaunay'] or len(self.graph_kwargs['radii']) > 0, "Either `delaunay` or `radii` must be provided."
+
+        self.edge_index_names = []
+
+        coord_type = self.graph_kwargs['coord_type']
+        spatial_key = self.graph_kwargs['spatial_key']
+        delaunay_radius_union = self.graph_kwargs['delaunay_radius_union']
+        set_diag = self.graph_kwargs['set_diag']
+
+        if self.graph_kwargs['delaunay']:
+            edge_index_name = f"{spatial_key}_delaunay"
+            self.edge_index_names.append(edge_index_name)
+            print("Computing spatial neighbors with Delaunay Triangulation...")
+            adata_batch = spatial_neighbors(
+                                        adata_batch,
+                                        coord_type=coord_type,
+                                        spatial_key=spatial_key,
+                                        delaunay=True,
+                                        radius=None,
+                                        set_diag=set_diag,
+                                        key_added=edge_index_name
+                            )
+
+        if len(self.graph_kwargs['radii']) > 0:
+            for radius in self.graph_kwargs['radii']:
+                if delaunay_radius_union:
+                    edge_index_name = f"{spatial_key}_delaunay_radius_{radius}"
+                else:
+                    edge_index_name = f"{spatial_key}_radius_{radius}"
+                self.edge_index_names.append(edge_index_name)
+                print(f"Computing spatial neighbors with radius {radius}...")
+                adata_batch = spatial_neighbors(
+                                        adata_batch,
+                                        coord_type=coord_type,
+                                        spatial_key=spatial_key,
+                                        delaunay=delaunay_radius_union,
+                                        radius=radius,
+                                        set_diag=set_diag,
+                                        key_added=edge_index_name
+                            )
+
+        # ----------------- Build Data Dict -----------------
+        batch_dict = {}
+
+        # build for node features (sparse csr matrix to float tensor)
+        assert len(self.feature_names) > 0, "At least one feature name must be provided"
+        for feature_name in self.feature_names:
+            batch_dict[f'x_{feature_name}'] = sparse_mx_to_float_tensor(
+                                                    adata_batch.X
+                                                )
+
+        # build for node labels (categorical pandas series to one hot tensor)
+        assert len(self.label_names) > 0, "At least one label name must be provided"
+        for label_name in self.label_names:
+            batch_dict[f"y_{label_name}"] = pandas_to_torch_one_hot(
+                                                adata_batch.obs[label_name]
+                                            )
+
+        # build for edge index (sparse csr matrix to edge index style tensor)
+        assert len(self.edge_index_names) > 0, "At least one edge index name must be provided"
+        for edge_index_name in self.edge_index_names:
+            batch_dict[f"edge_index_{edge_index_name}"] = from_scipy_sparse_matrix(
+                                                        adata_batch.obsp[f"{edge_index_name}'_connectivities"]
+                                                        )[0]
+
+        # add metadata
+        batch_dict['metadata_cell_id'] = adata_batch.obs['cell_id']
+        batch_dict['metadata_batch_id'] = adata_batch.uns['batch_id']
+
+        for key, value in batch_dict.items():
+            print(f"{key}: {value.shape=}, {value.dtype=}, {type(value)=}")
+
+        # ----------------- Convert Data Dict to PyG Data Object -----------------
+        data_batch = Data(**batch_dict)
+
+        del adata_batch, batch_dict
+
+        if self.pre_filter is not None:
+            data_batch = self.pre_filter(data_batch)
+
+        if self.pre_transform is not None:
+            data_batch = self.pre_transform(data_batch)
+
+        return data_batch
+
 
     @property
     def raw_dir(self) -> Path:
@@ -83,15 +251,6 @@ class CustomInMemoryDataset(InMemoryDataset):
         silver_data_path = self.data_directory_path / 'silver'
         raw_dir = silver_data_path / self.name
         return raw_dir
-
-    @property
-    def processed_dir(self) -> str:
-        """
-        Return the path to the processed data directory.
-        """
-        gold_data_path = self.data_directory_path / 'gold'
-        processed_dir = str(gold_data_path / 'in-memory-PyG-data' / self.name)
-        return processed_dir
 
     @property
     def raw_file_names(self) -> List[Path]:
@@ -111,69 +270,17 @@ class CustomInMemoryDataset(InMemoryDataset):
         return self.raw_file_names
 
     @property
+    def processed_dir(self) -> str:
+        """
+        Return the path to the processed data directory.
+        """
+        gold_data_path = self.data_directory_path / 'gold'
+        processed_dir = str(gold_data_path / 'in-memory-PyG-dataset-blob' / self.name)
+        return processed_dir
+
+    @property
     def processed_file_names(self) -> List[Data]:
         """
         Return the list of processed file names.
         """
-        return ['data.pt']
-
-    def process(self) -> None:
-        """
-        Process the raw data and save it to the processed data directory as a PyG InMemoryDataset. This method is called when the processed data is not found in the processed directory. Otherwise, the processed data is loaded from the processed directory.
-        """
-        data_attributes = {}
-
-        # Read all AnnData files and convert them to one single PyG Data object
-        # TODO: Explore the possibility of having a collection of PyG Data objects
-
-        # TODO: Parallelize the processing of the AnnData files
-        adata_batch_list = []
-        for adata_batch_file in self.raw_paths:
-            # Read the AnnData file
-            print(f"Reading {adata_batch_file}...")
-            adata_batch = sc.read(adata_batch_file)
-
-            adata_batch_list.append(adata_batch)
-
-        print("Concatenating AnnData files...")
-        adata = ad.concat(adata_batch_list,
-                          join='inner',
-                          axis=0)
-
-        print("Computing spatial neighbors...")
-        adata, key_name = spatial_neighbors(adata,
-                                            **self.graph_kwargs
-                                            )
-
-        # build for node features (sparse csr matrix to float tensor)
-        data_attributes['x_cell_gene_counts'] = sparse_mx_to_float_tensor(adata.X)
-
-        # build for edge index (sparse csr matrix to edge index style tensor)
-        data_attributes[f"edge_index_{key_name}"] = from_scipy_sparse_matrix(
-                                            adata.obsp[key_name + '_connectivities']
-                                            )[0]
-
-        # build for node labels (categorical pandas series to one hot tensor)
-        for label_name in self.label_names:
-            data_attributes[f"y_{label_name}"] = pandas_to_torch_one_hot(
-                                            adata.obs[label_name]
-                                            )
-
-        # add metadata
-        data_attributes['metadata_cell_id'] = adata.obs['cell_id']
-
-        for key, value in data_attributes.items():
-            print(f"{key}: {value.shape=}, {value.dtype=}, {type(value)=}")
-
-        data_list = [Data(**data_attributes)]
-
-        del data_attributes, adata
-
-        if self.pre_filter is not None:
-            data_list = [self.pre_filter(data) for data in data_list]
-
-        if self.pre_transform is not None:
-            data_list = [self.pre_transform(data) for data in data_list]
-
-        self.save(data_list=data_list,
-                  path=self.processed_paths[0])
+        return ['dataset_blob.pt']
