@@ -3,7 +3,7 @@ import torch
 import torch_geometric
 import pytorch_lightning as pl
 from torchmetrics import Accuracy
-from typing import List, Tuple, Callable
+from typing import List, Tuple, Callable, Optional
 import torch.functional as F
 
 from ..utils.loss import cross_entropy_loss
@@ -68,6 +68,8 @@ class BaseModel(pl.LightningModule):
             Additional keyword arguments.
         """
         self.name = name
+
+        self.save_hyperparameters()
 
         super().__init__(**kwargs)
 
@@ -150,7 +152,8 @@ class BaseModel(pl.LightningModule):
 
     def criterion(
             self,
-            loss_data: dict
+            loss_data: dict,
+            batch_size: Optional[int] = None
         ) -> torch.Tensor:
         """
         Compute the loss for the model.
@@ -159,6 +162,8 @@ class BaseModel(pl.LightningModule):
         ----------
         - loss_data: dict
             A collection of data objects required to compute the loss.
+        - batch_size: int
+            The number of samples in the current batch. Required for logging.
 
         Returns
         -------
@@ -184,11 +189,15 @@ class BaseModel(pl.LightningModule):
             total_loss += loss_fn_value
 
             # log each computed loss term
-            self.log(name=loss_fn_name,
-                     value=loss_fn_value,
-                     prog_bar=False,
-                     on_step=False,
-                     on_epoch=True)
+            self.log(
+                    name=loss_fn_name,
+                    value=loss_fn_value,
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                    batch_size=batch_size,
+                    sync_dist=True,
+                    )
 
             # free up memory by deleting the intermediate loss function data
             del _loss_fn_data
@@ -228,8 +237,9 @@ class BaseModel(pl.LightningModule):
             self,
             train_loss: torch.tensor,
             preds: torch.Tensor,
-            labels: torch.Tensor
-        ) -> torch.Tensor:
+            labels: torch.Tensor,
+            train_batch_size: Optional[int] = None
+        ) -> None:
         """
         Training step for the model.
 
@@ -241,65 +251,94 @@ class BaseModel(pl.LightningModule):
             The predicted class probabilities.
         - labels: torch.Tensor
             The ground truth labels.
+        - train_batch_size: int
+            The number of samples in the current training batch.
 
         Returns
         -------
-        - torch.Tensor
-            The training accuracy.
+        - None
+            Child classes must return training loss.
 
         Notes
         -----
         Throws an error if the loss is not computed by the child class. The default implementation logs the training loss, computes the training accuracy, and logs the training accuracy.
         """
-        assert train_loss is not None, 'Loss not computed'
+        assert train_loss is not None, 'Train Loss not computed'
 
-        self.log(name='train_loss',
-                 value=train_loss,
-                 prog_bar=False,
-                 on_step=False,
-                 on_epoch=True)
+        self.log(
+                name='train_loss',
+                value=train_loss,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                batch_size=train_batch_size,
+                sync_dist=True,
+                )
 
         self.train_acc(preds, labels)
-        self.log(name='train_acc',
-                 value=self.train_acc,
-                 prog_bar=False,
-                 on_step=False,
-                 on_epoch=True)
+        self.log(
+                name='train_acc',
+                value=self.train_acc,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                batch_size=train_batch_size,
+                sync_dist=True,
+                )
 
 
     def validation_step(
             self,
-            val_data: torch_geometric.data.Data
+            val_loss: torch.tensor,
+            preds: torch.Tensor,
+            labels: torch.Tensor,
+            val_batch_size: Optional[int] = None
         ) -> None:
         """
         Validation step for the model.
 
         Parameters
         ----------
-        - val_data: torch_geometric.data.Data
-            The input validation data (batch of nodes).
+        - val_loss: torch.tensor
+            The computed loss.
+        - preds: torch.Tensor
+            The predicted class probabilities.
+        - labels: torch.Tensor
+            The ground truth labels.
+        - val_batch_size: int
+            The number of samples in the current validation batch.
+
+        Returns
+        -------
+        - None
+            Child classes must return validation loss.
 
         Notes
         -----
-        This method may be overridden by subclasses to define the validation step. The default implementation computes the validation accuracy and logs it.
+        Throws an error if the loss is not computed by the child class. The default implementation logs the validation loss, computes the validation accuracy, and logs the validation accuracy.
         """
-        unnormalized_logits, preds, labels = self.common_step(val_data)
+        assert val_loss is not None, 'Validation Loss not computed'
 
-        loss_data = {'logits': unnormalized_logits,
-                     'labels': labels}
-        val_loss = self.criterion(loss_data)
-        self.log(name='val_loss',
-                 value=val_loss,
-                 prog_bar=False,
-                 on_step=False,
-                 on_epoch=True)
+        self.log(
+                name='val_loss',
+                value=val_loss,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                batch_size=val_batch_size,
+                sync_dist=True,
+                )
 
         self.val_acc(preds, labels)
-        self.log(name='val_acc',
-                 value=self.val_acc,
-                 prog_bar=False,
-                 on_step=False,
-                 on_epoch=True)
+        self.log(
+                name='val_acc',
+                value=self.val_acc,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                batch_size=val_batch_size,
+                sync_dist=True,
+                )
 
 
     def test_step(
@@ -318,14 +357,20 @@ class BaseModel(pl.LightningModule):
         -----
         This method may be overridden by subclasses to define the test step. The default implementation computes the test accuracy and logs it.
         """
+        test_batch_size = test_data.size(0)
+
         _, preds, labels = self.common_step(test_data)
 
         self.test_acc(preds, labels)
-        self.log(name='test_acc',
-                 value=self.test_acc,
-                 prog_bar=False,
-                 on_step=False,
-                 on_epoch=True)
+        self.log(
+                name='test_acc',
+                value=self.test_acc,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                batch_size=test_batch_size,
+                sync_dist=True,
+                )
 
 
     def configure_optimizers(self) -> torch.optim.Optimizer:

@@ -262,17 +262,74 @@ class GraphSAGE(BaseModel):
         - torch.Tensor
             The computed loss.
         """
+        train_batch_size = train_data.size(0)
+
         # collect data required for computing the loss
         unnormalized_logits, preds, labels = self.common_step(train_data)
 
         # prepare dictionary of data at current step for computing loss
-        loss_data = {'logits': unnormalized_logits,
-                     'labels': labels}
+        train_loss_data = {
+                        'logits': unnormalized_logits,
+                        'labels': labels,
+                        }
 
         # compute loss
-        train_loss = self.criterion(loss_data)
+        train_loss = self.criterion(
+                        loss_data=train_loss_data,
+                        batch_size=train_batch_size
+                        )
 
         # log the training loss and accuracy
-        super().training_step(train_loss, preds, labels)
+        super().training_step(
+                train_loss,
+                preds,
+                labels,
+                train_batch_size
+            )
 
         return train_loss
+
+
+    def validation_step(
+            self,
+            val_data: torch_geometric.data.Data
+        ) -> torch.Tensor:
+        """
+        Validation step for the GraphSAGE model. Overrides the validation_step method of the BaseModel class to prepare data required for computing loss. Calls super().validation_step to log the validation loss and accuracy.
+
+        Parameters
+        ----------
+        - val_data: torch_geometric.data.Data
+            The input validation data (batch of nodes).
+
+        Returns
+        -------
+        - torch.Tensor
+            The computed loss.
+        """
+        val_batch_size = val_data.size(0)
+
+        # collect data required for computing the loss
+        unnormalized_logits, preds, labels = self.common_step(val_data)
+
+        # prepare dictionary of data at current step for computing loss
+        val_loss_data = {
+                        'logits': unnormalized_logits,
+                        'labels': labels,
+                        }
+
+        # compute loss
+        val_loss = self.criterion(
+                        loss_data=val_loss_data,
+                        batch_size=val_batch_size
+                        )
+
+        # log the validation loss and accuracy
+        super().validation_step(
+                val_loss,
+                preds,
+                labels,
+                val_batch_size
+            )
+
+        return val_loss
