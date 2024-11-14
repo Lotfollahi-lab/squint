@@ -12,12 +12,10 @@ The customization is controlled by the train_loader_type parameter.
 
 - We use the third option 'custom' to allow for any other combination of Loader and Sampler. This is not implemented yet.
 """
-import torch
-import pytorch_lightning as pl
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.data.lightning import LightningNodeData
 
-from typing import Union, Optional, Callable
+from typing import Optional
 from torch_geometric.data import Data
 
 
@@ -26,39 +24,40 @@ class InMemoryDataModule(LightningNodeData):
         self,
         data_batch: Data,
         num_cores: int = 1,
-        train_loader_type: str = 'neighbor',
-        train_loader_name: Optional[str] = 'NeighborLoader',
-        train_loader_kwargs: Optional[dict] = None,
+        train_loader_name: Optional[str] = 'DefaultNodeLoader',
+        train_loader_kwargs: Optional[dict] = {'batch_size': 1024, 'num_workers': 2},
         train_sampler_name: Optional[str] = 'NeighborSampler',
-        train_sampler_kwargs: Optional[dict] = None,
+        train_sampler_kwargs: Optional[dict] = {'num_neighbors': [25, 10]},
+        val_loader_name: str = 'DefaultNodeLoader',
+        test_loader_name: str = 'DefaultNodeLoader',
         **kwargs
     ) -> None:
-        if train_loader_type == 'full':
-            assert train_loader_name == 'FullLoader', f"train_loader_name must be 'FullLoader' for train_loader_type='full'."
-
+        if train_loader_name == 'FullLoader':
+            # set train_loader_type to 'full' to use the default DataLoader
+            train_loader_type = 'full'
             # batch size is set to 1 to avoid memory issues
             train_loader_kwargs['batch_size'] = 1
             # num_workers is set to 0 to avoid DataLoader issues
             train_loader_kwargs['num_workers'] = 0
 
-            assert train_sampler_name is None, f"train_sampler_name must be None for train_loader_type='full'."
+            assert train_sampler_name is None, f"train_sampler_name must be None for train_loader_name='FullLoader'."
 
             # sampler_kwargs must be set to None
             self.train_sampler_kwargs = {}
 
-            # node_sampler must be set to None
+            # set self.train_sampler Callable to None
             self.train_sampler = None
 
-        elif train_loader_type == 'neighbor':
-            assert train_loader_name == 'NeighborLoader', f"train_loader_name must be 'NeighborLoader' for train_loader_type='neighbor'."
-
+        elif train_loader_name == 'DefaultNodeLoader':
+            # set train_loader_type to 'neighbor' to use the default NodeLoader with NeighborSampler
+            train_loader_type = 'neighbor'
             # batch size and other kwargs remain unchanged
             # set num_workers to half of the available cores
             num_workers = max(num_cores // 2, 1)
             train_loader_kwargs['num_workers'] = num_workers
 
-            # NOTE: Only NeighborSampler is supported for now with train_loader_type='neighbor'
-            assert train_sampler_name == 'NeighborSampler', f"train_sampler_name must be 'NeighborSampler' for train_loader_type='neighbor'."
+            # set train_sampler_name to 'NeighborSampler'
+            train_sampler_name = 'NeighborSampler'
 
             # train_sampler_kwargs remain unchanged
             self.train_sampler_kwargs = train_sampler_kwargs
@@ -67,20 +66,27 @@ class InMemoryDataModule(LightningNodeData):
             # This will be gettable via the self.graph_sampler attribute.
             self.train_sampler = None
 
-        elif train_loader_type == 'custom':
-            # train_loader to be a callable function of type torch_geometric.loader.DataLoader in self.train_dataloader() below
+        else:
+            # for all other cases, set train_loader_type to 'custom'
+            train_loader_type = 'custom'
+            # train_loader will be set to a Callable of type torch_geometric.loader.DataLoader in self.train_dataloader() below
             # set loader_kwargs to be a dictionary of arguments to be passed to the train_loader
-            # set node_sampler to be a callable function of type torch_geometric.sampler.BaseSampler. Cannot be None.
-            # if sampler_name == 'GraphSAINTSampler':
+
+            assert train_sampler_name is not None, "train_sampler_name must be provided for train_loader_type='custom'."
+            # set train_sampler_kwargs
+            # set node_sampler to be a Callable of type torch_geometric.sampler.BaseSampler here before super.__init__() is called. Cannot be None.
+            # if train_sampler_name == 'GraphSAINTSampler':
                 # self.train_sampler = ...
             raise NotImplementedError("Custom train loader not implemented.")
-        else:
-            raise ValueError(f"Train Loader type {train_loader_type} not found.")
 
         self.train_loader_type = train_loader_type
-        self.train_loader_kwargs = train_loader_kwargs
         self.train_loader_name = train_loader_name
+        self.train_loader_kwargs = train_loader_kwargs
+
         self.train_sampler_name = train_sampler_name
+
+        self.val_loader_name = val_loader_name
+        self.test_loader_name = test_loader_name
 
         super().__init__(
             data=data_batch,
@@ -96,10 +102,17 @@ class InMemoryDataModule(LightningNodeData):
         print(f"Train Sampler Name: {self.train_sampler_name}")
 
 
+    @property
+    def train_shuffle(self) -> bool:
+        shuffle = self.train_loader_kwargs.get('shuffle', False)
+        return shuffle
+
+
     def train_dataloader(self):
-        if self.train_loader_type == 'full':
+        if self.train_loader_type in ['full', 'neighbor']:
             return super().train_dataloader()
-        elif self.train_loader_type == 'neighbor':
+        elif self.train_loader_type == 'custom':
+            raise NotImplementedError("Custom train loader not implemented.")
             return NeighborLoader(
                 data=self.data,
                 input_nodes=self.input_train_nodes,
@@ -110,33 +123,42 @@ class InMemoryDataModule(LightningNodeData):
                 **self.train_loader_kwargs,
                 **self.train_sampler_kwargs
             )
-        elif self.train_loader_type == 'custom':
-            raise NotImplementedError("Custom train loader not implemented.")
 
 
     def val_dataloader(self):
-        # NeighborLoader + NeighborSampler
-        val_subgraph_loader = NeighborLoader(
-                                data=self.data,
-                                input_nodes=None,
-                                input_time=self.input_val_time,
-                                input_id=self.input_val_id,
-                                shuffle=False,
-                                **self.train_loader_kwargs,
-                                **self.train_sampler_kwargs
-                            )
-        return val_subgraph_loader
+        if self.val_loader_name == 'DefaultNodeLoader':
+            return super().val_dataloader()
+
+        else:
+            raise NotImplementedError("Custom val loader not implemented.")
+
+            # NeighborLoader + NeighborSampler
+            val_subgraph_loader = NeighborLoader(
+                                    data=self.data,
+                                    input_nodes=None,
+                                    input_time=self.input_val_time,
+                                    input_id=self.input_val_id,
+                                    shuffle=False,
+                                    **self.train_loader_kwargs,
+                                    **self.train_sampler_kwargs
+                                )
+            return val_subgraph_loader
 
 
     def test_dataloader(self):
-        # NeighborLoader + NeighborSampler
-        test_graph_loader = NeighborLoader(
-                                data=self.data,
-                                input_nodes=None,
-                                input_time=self.input_test_time,
-                                input_id=self.input_test_id,
-                                shuffle=False,
-                                **self.train_loader_kwargs,
-                                **self.train_sampler_kwargs
-                            )
-        return test_graph_loader
+        if self.test_loader_name == 'DefaultNodeLoader':
+            return super().test_dataloader()
+
+        else:
+            raise NotImplementedError("Custom test loader not implemented.")
+            # NeighborLoader + NeighborSampler
+            test_graph_loader = NeighborLoader(
+                                    data=self.data,
+                                    input_nodes=None,
+                                    input_time=self.input_test_time,
+                                    input_id=self.input_test_id,
+                                    shuffle=False,
+                                    **self.train_loader_kwargs,
+                                    **self.train_sampler_kwargs
+                                )
+            return test_graph_loader
