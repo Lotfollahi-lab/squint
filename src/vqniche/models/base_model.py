@@ -69,8 +69,6 @@ class BaseModel(pl.LightningModule):
         """
         self.name = name
 
-        self.save_hyperparameters()
-
         super().__init__(**kwargs)
 
         # Encoder parameters
@@ -99,6 +97,8 @@ class BaseModel(pl.LightningModule):
         self.train_acc = Accuracy(task=task_name, num_classes=out_channels, **task_kwargs)
         self.val_acc = Accuracy(task=task_name, num_classes=out_channels, **task_kwargs)
         self.test_acc = Accuracy(task=task_name, num_classes=out_channels, **task_kwargs)
+
+        self.save_hyperparameters()
 
 
     def set_loss_fn_tuples(
@@ -153,7 +153,7 @@ class BaseModel(pl.LightningModule):
     def criterion(
             self,
             loss_data: dict,
-            batch_size: Optional[int] = None
+            curr_batch_size: Optional[int] = None
         ) -> torch.Tensor:
         """
         Compute the loss for the model.
@@ -162,7 +162,7 @@ class BaseModel(pl.LightningModule):
         ----------
         - loss_data: dict
             A collection of data objects required to compute the loss.
-        - batch_size: int
+        - curr_batch_size: int
             The number of samples in the current batch. Required for logging.
 
         Returns
@@ -195,7 +195,7 @@ class BaseModel(pl.LightningModule):
                     prog_bar=False,
                     on_step=False,
                     on_epoch=True,
-                    batch_size=batch_size,
+                    batch_size=curr_batch_size,
                     sync_dist=True,
                     )
 
@@ -205,172 +205,47 @@ class BaseModel(pl.LightningModule):
         return total_loss
 
 
-    def common_step(
-            self,
-            data: torch_geometric.data.Data
-        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Common step across training, validation, and testing for the model.
-
-        Parameters
-        ----------
-        - data: torch_geometric.data.Data
-            The input data.
-
-        Returns
-        -------
-        - torch.Tensor
-            The unnormalized logits.
-        - torch.Tensor
-            The predicted class probabilities.
-        - torch.Tensor
-            The ground truth labels.
-        """
-        # TODO: Update data to batch if applicable
-        unnormalized_logits = self(data.x, data.edge_index)[:data.batch_size]
-        preds = unnormalized_logits.softmax(dim=-1) # predicted class probabilities
-        labels = data.y[:data.batch_size]
-        return unnormalized_logits, preds, labels
-
-
-    def training_step(
-            self,
-            train_loss: torch.tensor,
-            preds: torch.Tensor,
-            labels: torch.Tensor,
-            train_batch_size: Optional[int] = None
+    def log_metrics(
+        self,
+        mode: str = 'train',
+        loss_value: torch.Tensor = None,
+        acc_value: torch.Tensor = None,
+        curr_batch_size: int = None,
         ) -> None:
         """
-        Training step for the model.
+        Log total loss (if available) and accuracy for the model during training, validation, and testing.
 
         Parameters
         ----------
-        - train_loss: torch.tensor
+        - mode: str
+            The mode of the model (train, val, test).
+        - loss_value: torch.Tensor
             The computed loss.
-        - preds: torch.Tensor
-            The predicted class probabilities.
-        - labels: torch.Tensor
-            The ground truth labels.
-        - train_batch_size: int
-            The number of samples in the current training batch.
-
-        Returns
-        -------
-        - None
-            Child classes must return training loss.
-
-        Notes
-        -----
-        Throws an error if the loss is not computed by the child class. The default implementation logs the training loss, computes the training accuracy, and logs the training accuracy.
+        - acc_value: torch.Tensor
+            The computed accuracy.
+        - curr_batch_size: int
+            The number of samples in the current batch.
         """
-        assert train_loss is not None, 'Train Loss not computed'
-
-        self.log(
-                name='train_loss',
-                value=train_loss,
+        if loss_value is not None:
+            self.log(
+                name=f'{mode}_loss',
+                value=loss_value,
                 prog_bar=False,
                 on_step=False,
                 on_epoch=True,
-                batch_size=train_batch_size,
+                batch_size=curr_batch_size,
                 sync_dist=True,
-                )
-
-        self.train_acc(preds, labels)
-        self.log(
-                name='train_acc',
-                value=self.train_acc,
-                prog_bar=False,
-                on_step=False,
-                on_epoch=True,
-                batch_size=train_batch_size,
-                sync_dist=True,
-                )
-
-
-    def validation_step(
-            self,
-            val_loss: torch.tensor,
-            preds: torch.Tensor,
-            labels: torch.Tensor,
-            val_batch_size: Optional[int] = None
-        ) -> None:
-        """
-        Validation step for the model.
-
-        Parameters
-        ----------
-        - val_loss: torch.tensor
-            The computed loss.
-        - preds: torch.Tensor
-            The predicted class probabilities.
-        - labels: torch.Tensor
-            The ground truth labels.
-        - val_batch_size: int
-            The number of samples in the current validation batch.
-
-        Returns
-        -------
-        - None
-            Child classes must return validation loss.
-
-        Notes
-        -----
-        Throws an error if the loss is not computed by the child class. The default implementation logs the validation loss, computes the validation accuracy, and logs the validation accuracy.
-        """
-        assert val_loss is not None, 'Validation Loss not computed'
+            )
 
         self.log(
-                name='val_loss',
-                value=val_loss,
-                prog_bar=False,
-                on_step=False,
-                on_epoch=True,
-                batch_size=val_batch_size,
-                sync_dist=True,
-                )
-
-        self.val_acc(preds, labels)
-        self.log(
-                name='val_acc',
-                value=self.val_acc,
-                prog_bar=False,
-                on_step=False,
-                on_epoch=True,
-                batch_size=val_batch_size,
-                sync_dist=True,
-                )
-
-
-    def test_step(
-            self,
-            test_data: torch_geometric.data.Data
-        ) -> None:
-        """
-        Test step for the model.
-
-        Parameters
-        ----------
-        - data: torch_geometric.data.Data
-            The input data.
-
-        Notes
-        -----
-        This method may be overridden by subclasses to define the test step. The default implementation computes the test accuracy and logs it.
-        """
-        test_batch_size = test_data.size(0)
-
-        _, preds, labels = self.common_step(test_data)
-
-        self.test_acc(preds, labels)
-        self.log(
-                name='test_acc',
-                value=self.test_acc,
-                prog_bar=False,
-                on_step=False,
-                on_epoch=True,
-                batch_size=test_batch_size,
-                sync_dist=True,
-                )
+            name=f'{mode}_acc',
+            value=acc_value,
+            prog_bar=False,
+            on_step=False,
+            on_epoch=True,
+            batch_size=curr_batch_size,
+            sync_dist=True,
+        )
 
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
@@ -400,3 +275,72 @@ class BaseModel(pl.LightningModule):
         This method should be overridden by subclasses to define the forward pass.
         """
         raise NotImplementedError('Forward method not implemented')
+
+
+    def training_step(
+        self,
+        train_batch: torch_geometric.data.Data,
+        batch_idx: Optional[int] = None,
+        ) -> torch.Tensor:
+        """
+        Training step for the model.
+
+        Parameters
+        ----------
+        - train_batch: torch_geometric.data.Data
+            The training batch.
+        - batch_idx: int
+            The batch index.
+
+        Returns
+        -------
+        - torch.Tensor
+            The computed loss.
+        """
+        raise NotImplementedError('Training step not implemented')
+
+
+    def validation_step(
+        self,
+        val_batch: torch_geometric.data.Data,
+        batch_idx: Optional[int] = None,
+        ) -> torch.Tensor:
+        """
+        Validation step for the model.
+
+        Parameters
+        ----------
+        - val_batch: torch_geometric.data.Data
+            The validation batch.
+        - batch_idx: int
+            The batch index.
+
+        Returns
+        -------
+        - torch.Tensor
+            The computed validation loss.
+        """
+        raise NotImplementedError('Validation step not implemented')
+
+
+    def test_step(
+        self,
+        test_batch: torch_geometric.data.Data,
+        batch_idx: Optional[int] = None,
+        ) -> torch.Tensor:
+        """
+        Test step for the model.
+
+        Parameters
+        ----------
+        - test_batch: torch_geometric.data.Data
+            The test batch.
+        - batch_idx: int
+            The batch index.
+
+        Returns
+        -------
+        - torch.Tensor
+            The computed test accuracy.
+        """
+        raise NotImplementedError('Test step not implemented')

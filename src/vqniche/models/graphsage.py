@@ -162,7 +162,6 @@ class GraphSAGE(BaseModel):
                             act=activation,
                             dropout=dropout,
                             norm=norm
-                            # norm=BatchNorm1d(hidden_channels)
                         )
 
         # Instead, we apply this final linear transformation in the predictor module manually to have access to the internal node embeddings via the `embed` function.
@@ -191,7 +190,7 @@ class GraphSAGE(BaseModel):
         """
         # calls the forward method of the GraphSAGE encoder
         batch_node_embeddings = self.encoder(batch_x, batch_edge_index)
-        # applies linear transformation on the internal node embeddings
+        # calls the forward method of the GraphSAGE predictor
         unnormalized_logits = self.predictor(batch_node_embeddings)
         return unnormalized_logits
 
@@ -247,44 +246,50 @@ class GraphSAGE(BaseModel):
 
     def training_step(
             self,
-            train_data: torch_geometric.data.Data
+            train_batch: torch_geometric.data.Data
         ) -> torch.Tensor:
         """
-        Training step for the GraphSAGE model. Overrides the training_step method of the BaseModel class to prepare data required for computing loss. Calls super().training_step to log the training loss and accuracy.
+        Definition of a single training step of the GraphSAGE model on the current batch of nodes received from the training dataloader at the current training epoch.
 
         Parameters
         ----------
-        - train_data: torch_geometric.data.Data
+        - train_batch: torch_geometric.data.Data
             The input train data (batch of nodes).
 
         Returns
         -------
         - torch.Tensor
-            The computed loss.
+            The computed loss for this batch.
         """
-        train_batch_size = train_data.size(0)
+        # execute the forward of the GraphSAGE model
 
-        # collect data required for computing the loss
-        unnormalized_logits, preds, labels = self.common_step(train_data)
+        # This slicing is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the target nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of target nodes is equal to the batch size. The remaining entries of the forward output are the logits for the sampled neighbors of the target nodes.
+        unnormalized_logits_batch = self(train_batch.x, train_batch.edge_index)[:train_batch.batch_size]
 
-        # prepare dictionary of data at current step for computing loss
+        # prepare dictionary of data required for computing loss
         train_loss_data = {
-                        'logits': unnormalized_logits,
-                        'labels': labels,
+                        'logits': unnormalized_logits_batch,
+                        'labels': train_batch.y[:train_batch.batch_size],
                         }
 
-        # compute loss
+        # compute train loss
         train_loss = self.criterion(
                         loss_data=train_loss_data,
-                        batch_size=train_batch_size
+                        curr_batch_size=train_batch.batch_size
                         )
 
+        # compute the predicted class probabilities (normalized logits)
+        preds_batch = unnormalized_logits_batch.softmax(dim=-1)
+
+        # compute the training accuracy
+        self.train_acc(preds_batch, train_batch.y[:train_batch.batch_size])
+
         # log the training loss and accuracy
-        super().training_step(
-                train_loss,
-                preds,
-                labels,
-                train_batch_size
+        self.log_metrics(
+                mode='train',
+                loss_value=train_loss,
+                acc_value=self.train_acc,
+                curr_batch_size=train_batch.batch_size,
             )
 
         return train_loss
@@ -292,44 +297,85 @@ class GraphSAGE(BaseModel):
 
     def validation_step(
             self,
-            val_data: torch_geometric.data.Data
+            val_batch: torch_geometric.data.Data
         ) -> torch.Tensor:
         """
-        Validation step for the GraphSAGE model. Overrides the validation_step method of the BaseModel class to prepare data required for computing loss. Calls super().validation_step to log the validation loss and accuracy.
+        Definition of a single validation step of the GraphSAGE model on the current batch of nodes received from the validation dataloader at the current training epoch.
 
         Parameters
         ----------
-        - val_data: torch_geometric.data.Data
+        - val_batch: torch_geometric.data.Data
             The input validation data (batch of nodes).
 
         Returns
         -------
         - torch.Tensor
-            The computed loss.
+            The computed loss for this batch.
         """
-        val_batch_size = val_data.size(0)
+        # execute the forward of the GraphSAGE model
+        unnormalized_logits_batch = self(val_batch.x, val_batch.edge_index)[:val_batch.batch_size]
 
-        # collect data required for computing the loss
-        unnormalized_logits, preds, labels = self.common_step(val_data)
-
-        # prepare dictionary of data at current step for computing loss
+        # prepare dictionary of data required for computing loss
         val_loss_data = {
-                        'logits': unnormalized_logits,
-                        'labels': labels,
+                        'logits': unnormalized_logits_batch,
+                        'labels': val_batch.y[:val_batch.batch_size],
                         }
 
-        # compute loss
+        # compute validation loss
         val_loss = self.criterion(
                         loss_data=val_loss_data,
-                        batch_size=val_batch_size
+                        curr_batch_size=val_batch.batch_size
                         )
 
+        # compute the predicted class probabilities (normalized logits)
+        preds_batch = unnormalized_logits_batch.softmax(dim=-1)
+
+        # compute the validation accuracy
+        self.val_acc(preds_batch, val_batch.y[:val_batch.batch_size])
+
         # log the validation loss and accuracy
-        super().validation_step(
-                val_loss,
-                preds,
-                labels,
-                val_batch_size
+        self.log_metrics(
+                mode='val',
+                loss_value=val_loss,
+                acc_value=self.val_acc,
+                curr_batch_size=val_batch.batch_size,
             )
 
         return val_loss
+
+
+    def test_step(
+            self,
+            test_batch: torch_geometric.data.Data
+        ) -> torch.Tensor:
+        """
+        Definition of a single test step of the GraphSAGE model on the current batch of nodes received from the test dataloader at the current training epoch.
+
+        Parameters
+        ----------
+        - test_batch: torch_geometric.data.Data
+            The input test data (batch of nodes).
+
+        Returns
+        -------
+        - torch.Tensor
+            The computed loss for this batch.
+        """
+        # execute the forward of the GraphSAGE model
+        unnormalized_logits_batch = self(test_batch.x, test_batch.edge_index)[:test_batch.batch_size]
+
+        # compute the predicted class probabilities (normalized logits)
+        preds_batch = unnormalized_logits_batch.softmax(dim=-1)
+
+        # compute the test accuracy
+        self.test_acc(preds_batch, test_batch.y[:test_batch.batch_size])
+
+        # log the test loss and accuracy
+        self.log_metrics(
+                mode='test',
+                loss_value=None,
+                acc_value=self.test_acc,
+                curr_batch_size=test_batch.batch_size,
+            )
+
+        return self.test_acc
