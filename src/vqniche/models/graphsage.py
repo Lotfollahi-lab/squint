@@ -61,7 +61,6 @@ import torch.nn as nn
 import torch_geometric
 from torch_geometric.nn import GraphSAGE as SAGE_Encoder
 from typing import List, Union, Callable
-from torch.nn import BatchNorm1d
 
 from .base_model import BaseModel
 
@@ -87,6 +86,7 @@ class GraphSAGE(BaseModel):
             loss_kwargs: dict = {'reduction': 'none'},
             task_name: str = 'multiclass',
             task_kwargs: dict = {},
+            inference_mode: str = 'batch-wise',
             **kwargs
         ):
         """
@@ -130,6 +130,8 @@ class GraphSAGE(BaseModel):
             The task type.
         - task_kwargs: dict
             Keyword arguments for the task.
+        - inference_mode: str
+            The inference mode. Choose from 'batch-wise' or 'layer-wise'.
         - kwargs: dict
             Additional keyword arguments.
         """
@@ -150,6 +152,7 @@ class GraphSAGE(BaseModel):
                         loss_kwargs=loss_kwargs,
                         task_name=task_name,
                         task_kwargs=task_kwargs,
+                        inference_mode=inference_mode,
                         **kwargs)
 
         # Initialize GraphSAGE model from Pytorch Geometric as the encoder
@@ -166,33 +169,6 @@ class GraphSAGE(BaseModel):
 
         # Instead, we apply this final linear transformation in the predictor module manually to have access to the internal node embeddings via the `embed` function.
         self.predictor = nn.Linear(hidden_channels, out_channels)
-
-
-    def forward(
-            self,
-            batch_x: torch.Tensor,
-            batch_edge_index: torch.Tensor
-        ) -> torch.Tensor:
-        """
-        Forward pass of the GraphSAGE model. This is a composition of the forward pass of the encoder and the predictor. The batch of nodes may be the entire set of nodes in the graph or a subset of nodes.
-
-        Parameters
-        ----------
-        - batch_x: torch.Tensor
-            The input features of the batch of nodes.
-        - batch_edge_index: torch.Tensor
-            The edge index tensor of the batch of nodes.
-
-        Returns
-        -------
-        - torch.Tensor
-            The unnormalized logits of the model.
-        """
-        # calls the forward method of the GraphSAGE encoder
-        batch_node_embeddings = self.encoder(batch_x, batch_edge_index)
-        # calls the forward method of the GraphSAGE predictor
-        unnormalized_logits = self.predictor(batch_node_embeddings)
-        return unnormalized_logits
 
 
     @torch.no_grad()
@@ -217,7 +193,26 @@ class GraphSAGE(BaseModel):
         -----
         The input to this method is named `graph_loader` and not `batch_loader` because it may be used to obtain an encoding for any subset of nodes.
         """
-        node_embeddings = self.encoder.inference(subgraph_loader)
+        node_embeddings = subgraph_loader.data.x.to(self.device)
+        print(f"{node_embeddings.shape=}")
+        for i in range(self.encoder.num_layers):
+            hs = []
+            for batch in subgraph_loader:
+                print(f"{batch.batch_size=}")
+                # print(f"{batch.n_id=}")
+                print(f"{batch.n_id[:batch.batch_size]}")
+                print(f'{batch.n_id.shape=}')
+                h = node_embeddings[batch.n_id].to(self.device)
+                h = self.encoder.inference_per_layer(
+                        i,
+                        h,
+                        batch.edge_index.to(self.device),
+                        batch.batch_size
+                    )
+                hs.append(h.to(self.device))
+
+            node_embeddings = torch.cat(hs, dim=0)
+        print(f"{node_embeddings.shape=}")
         return node_embeddings
 
 
@@ -239,57 +234,70 @@ class GraphSAGE(BaseModel):
         - torch.Tensor
             The unnormalized logits.
         """
+        # Compute the internal node embeddings without gradients
         node_embeddings = self.embed(graph_loader)
+
+        # forward pass through the predictor
         unnormalized_logits = self.predictor(node_embeddings)
+
         return unnormalized_logits
 
 
     def training_step(
             self,
-            train_batch: torch_geometric.data.Data
+            train_batch: torch_geometric.data.Data,
+            batch_idx: int,
         ) -> torch.Tensor:
         """
         Definition of a single training step of the GraphSAGE model on the current batch of nodes received from the training dataloader at the current training epoch.
 
         Parameters
         ----------
-        - train_batch: torch_geometric.data.Data
+        - batch: torch_geometric.data.Data
             The input train data (batch of nodes).
+        - batch_idx: int
+            The index of the current batch of data.
+
 
         Returns
         -------
         - torch.Tensor
             The computed loss for this batch.
         """
+        batch_size = train_batch.batch_size
+
         # execute the forward of the GraphSAGE model
 
         # This slicing is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the target nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of target nodes is equal to the batch size. The remaining entries of the forward output are the logits for the sampled neighbors of the target nodes.
-        unnormalized_logits_batch = self(train_batch.x, train_batch.edge_index)[:train_batch.batch_size]
+        unnormalized_logits_batch = self(
+                                        train_batch.x,
+                                        train_batch.edge_index
+                                    )[:batch_size]
 
         # prepare dictionary of data required for computing loss
         train_loss_data = {
                         'logits': unnormalized_logits_batch,
-                        'labels': train_batch.y[:train_batch.batch_size],
+                        'labels': train_batch.y[:batch_size],
                         }
 
         # compute train loss
         train_loss = self.criterion(
                         loss_data=train_loss_data,
-                        curr_batch_size=train_batch.batch_size
+                        curr_batch_size=batch_size
                         )
 
         # compute the predicted class probabilities (normalized logits)
         preds_batch = unnormalized_logits_batch.softmax(dim=-1)
 
         # compute the training accuracy
-        self.train_acc(preds_batch, train_batch.y[:train_batch.batch_size])
+        self.train_acc(preds_batch, train_batch.y[:batch_size])
 
         # log the training loss and accuracy
         self.log_metrics(
                 mode='train',
                 loss_value=train_loss,
                 acc_value=self.train_acc,
-                curr_batch_size=train_batch.batch_size,
+                curr_batch_size=batch_size,
             )
 
         return train_loss
@@ -312,33 +320,44 @@ class GraphSAGE(BaseModel):
         - torch.Tensor
             The computed loss for this batch.
         """
-        # execute the forward of the GraphSAGE model
-        unnormalized_logits_batch = self(val_batch.x, val_batch.edge_index)[:val_batch.batch_size]
+        batch_size = val_batch.batch_size
+
+        if self.inference_mode == 'batch-wise':
+            # execute the forward of the GraphSAGE model
+            unnormalized_logits_batch = self(
+                                            val_batch.x,
+                                            val_batch.edge_index
+                                        )[:batch_size]
+
+        elif self.inference_mode == 'layer-wise':
+            print(f"{val_batch.n_id[:batch_size].shape=}")
+            print(f"{self.val_logits.shape=}")
+            unnormalized_logits_batch = self.val_logits[val_batch.n_id[:batch_size]]
 
         # prepare dictionary of data required for computing loss
         val_loss_data = {
                         'logits': unnormalized_logits_batch,
-                        'labels': val_batch.y[:val_batch.batch_size],
+                        'labels': val_batch.y[:batch_size],
                         }
 
         # compute validation loss
         val_loss = self.criterion(
                         loss_data=val_loss_data,
-                        curr_batch_size=val_batch.batch_size
+                        curr_batch_size=batch_size
                         )
 
         # compute the predicted class probabilities (normalized logits)
         preds_batch = unnormalized_logits_batch.softmax(dim=-1)
 
         # compute the validation accuracy
-        self.val_acc(preds_batch, val_batch.y[:val_batch.batch_size])
+        self.val_acc(preds_batch, val_batch.y[:batch_size])
 
         # log the validation loss and accuracy
         self.log_metrics(
                 mode='val',
                 loss_value=val_loss,
                 acc_value=self.val_acc,
-                curr_batch_size=val_batch.batch_size,
+                curr_batch_size=batch_size,
             )
 
         return val_loss
@@ -361,21 +380,30 @@ class GraphSAGE(BaseModel):
         - torch.Tensor
             The computed loss for this batch.
         """
-        # execute the forward of the GraphSAGE model
-        unnormalized_logits_batch = self(test_batch.x, test_batch.edge_index)[:test_batch.batch_size]
+        batch_size = test_batch.batch_size
+
+        if self.inference_mode == 'batch-wise':
+            # execute the forward of the GraphSAGE model
+            unnormalized_logits_batch = self(
+                                            test_batch.x,
+                                            test_batch.edge_index
+                                        )[:batch_size]
+
+        elif self.inference_mode == 'layer-wise':
+            unnormalized_logits_batch = self.test_logits[test_batch.n_id[:batch_size]]
 
         # compute the predicted class probabilities (normalized logits)
         preds_batch = unnormalized_logits_batch.softmax(dim=-1)
 
         # compute the test accuracy
-        self.test_acc(preds_batch, test_batch.y[:test_batch.batch_size])
+        self.test_acc(preds_batch, test_batch.y[:batch_size])
 
         # log the test loss and accuracy
         self.log_metrics(
                 mode='test',
                 loss_value=None,
                 acc_value=self.test_acc,
-                curr_batch_size=test_batch.batch_size,
+                curr_batch_size=batch_size,
             )
 
         return self.test_acc

@@ -27,6 +27,7 @@ class BaseModel(pl.LightningModule):
             loss_kwargs: dict = {'reduction': 'mean'},
             task_name: str = 'multiclass',
             task_kwargs: dict = {},
+            inference_mode: Optional[str] = 'layer-wise',
             **kwargs
         ) -> None:
         """
@@ -64,6 +65,8 @@ class BaseModel(pl.LightningModule):
             The task name.
         - task_kwargs: dict
             The task keyword arguments.
+        - inference_mode: Optional[str]
+            The inference mode. Choose from 'batch-wise' or 'layer-wise'.
         - kwargs: dict
             Additional keyword arguments.
         """
@@ -97,6 +100,20 @@ class BaseModel(pl.LightningModule):
         self.train_acc = Accuracy(task=task_name, num_classes=out_channels, **task_kwargs)
         self.val_acc = Accuracy(task=task_name, num_classes=out_channels, **task_kwargs)
         self.test_acc = Accuracy(task=task_name, num_classes=out_channels, **task_kwargs)
+
+        # Option 1 -- batch-wise (default)
+        # for epoch in epochs:
+        #    for batch in loader:
+        #       for layer in model.layers:
+        #         layer.forward(batch)
+        # Option 2 -- layer-wise
+        # for epoch in epochs:
+        #    for layer in model.layers:
+        #       for batch in loader:
+        #         layer.forward(batch)
+        if inference_mode not in ['batch-wise', 'layer-wise']:
+            raise ValueError(f"Invalid inference mode: {inference_mode}.")
+        self.inference_mode = inference_mode
 
         self.save_hyperparameters()
 
@@ -205,6 +222,35 @@ class BaseModel(pl.LightningModule):
         return total_loss
 
 
+    def forward(
+            self,
+            batch_x: torch.Tensor,
+            batch_edge_index: torch.Tensor
+        ) -> torch.Tensor:
+        """
+        Forward pass of a standard GNN model. This is a composition of the forward pass of the encoder and the predictor. The batch of nodes may be the entire set of nodes in the graph or a subset of nodes.
+
+        Parameters
+        ----------
+        - batch_x: torch.Tensor
+            The input features of the batch of nodes.
+        - batch_edge_index: torch.Tensor
+            The edge index tensor of the batch of nodes.
+
+        Returns
+        -------
+        - torch.Tensor
+            The unnormalized logits of the model.
+        """
+        # calls the forward method of the Model's encoder
+        batch_node_embeddings = self.encoder(batch_x, batch_edge_index)
+
+        # calls the forward method of the Model's predictor
+        unnormalized_logits = self.predictor(batch_node_embeddings)
+
+        return unnormalized_logits
+
+
     def log_metrics(
         self,
         mode: str = 'train',
@@ -246,6 +292,32 @@ class BaseModel(pl.LightningModule):
             batch_size=curr_batch_size,
             sync_dist=True,
         )
+
+
+    def on_validation_epoch_start(self) -> None:
+        if self.inference_mode == 'batch-wise':
+            print("Batch-wise Inference for Validation")
+
+        elif self.inference_mode == 'layer-wise':
+            print("Layer-wise Inference for Validation")
+            self.val_logits = self.inference(
+                                self.trainer.datamodule.val_dataloader()
+                                )
+
+        return super().on_validation_epoch_start()
+
+
+    def on_test_epoch_start(self) -> None:
+        if self.inference_mode == 'batch-wise':
+            print("Batch-wise Inference for Testing")
+
+        elif self.inference_mode == 'layer-wise':
+            print("Layer-wise Inference for Testing")
+            self.test_logits = self.inference(
+                                self.trainer.datamodule.test_dataloader()
+                                )
+
+        return super().on_test_epoch_start()
 
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
