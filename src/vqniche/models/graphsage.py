@@ -136,7 +136,7 @@ class GraphSAGE(BaseModel):
             Additional keyword arguments.
         """
         # Initialize the BaseModel class
-        super().__init__(
+        super(GraphSAGE, self).__init__(
                         name=name,
                         in_channels=in_channels,
                         out_channels=out_channels,
@@ -153,7 +153,8 @@ class GraphSAGE(BaseModel):
                         task_name=task_name,
                         task_kwargs=task_kwargs,
                         inference_mode=inference_mode,
-                        **kwargs)
+                        **kwargs
+                    )
 
         # Initialize GraphSAGE model from Pytorch Geometric as the encoder
         # The out_channels parameter is not passed to the SAGE_Encoder (i.e. it is set to None) so that we can separate the encoder from the predictor.
@@ -194,14 +195,9 @@ class GraphSAGE(BaseModel):
         The input to this method is named `graph_loader` and not `batch_loader` because it may be used to obtain an encoding for any subset of nodes.
         """
         node_embeddings = subgraph_loader.data.x.to(self.device)
-        print(f"{node_embeddings.shape=}")
         for i in range(self.encoder.num_layers):
             hs = []
             for batch in subgraph_loader:
-                print(f"{batch.batch_size=}")
-                # print(f"{batch.n_id=}")
-                print(f"{batch.n_id[:batch.batch_size]}")
-                print(f'{batch.n_id.shape=}')
                 h = node_embeddings[batch.n_id].to(self.device)
                 h = self.encoder.inference_per_layer(
                         i,
@@ -212,7 +208,6 @@ class GraphSAGE(BaseModel):
                 hs.append(h.to(self.device))
 
             node_embeddings = torch.cat(hs, dim=0)
-        print(f"{node_embeddings.shape=}")
         return node_embeddings
 
 
@@ -271,7 +266,7 @@ class GraphSAGE(BaseModel):
         # This slicing is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the target nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of target nodes is equal to the batch size. The remaining entries of the forward output are the logits for the sampled neighbors of the target nodes.
         unnormalized_logits_batch = self(
                                         train_batch.x,
-                                        train_batch.edge_index
+                                        train_batch.edge_index,
                                     )[:batch_size]
 
         # prepare dictionary of data required for computing loss
@@ -330,8 +325,6 @@ class GraphSAGE(BaseModel):
                                         )[:batch_size]
 
         elif self.inference_mode == 'layer-wise':
-            print(f"{val_batch.n_id[:batch_size].shape=}")
-            print(f"{self.val_logits.shape=}")
             unnormalized_logits_batch = self.val_logits[val_batch.n_id[:batch_size]]
 
         # prepare dictionary of data required for computing loss

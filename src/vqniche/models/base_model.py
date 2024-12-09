@@ -72,7 +72,7 @@ class BaseModel(pl.LightningModule):
         """
         self.name = name
 
-        super().__init__(**kwargs)
+        super(BaseModel, self).__init__(**kwargs)
 
         # Encoder parameters
         self.encoder_name = encoder_name
@@ -222,35 +222,6 @@ class BaseModel(pl.LightningModule):
         return total_loss
 
 
-    def forward(
-            self,
-            batch_x: torch.Tensor,
-            batch_edge_index: torch.Tensor
-        ) -> torch.Tensor:
-        """
-        Forward pass of a standard GNN model. This is a composition of the forward pass of the encoder and the predictor. The batch of nodes may be the entire set of nodes in the graph or a subset of nodes.
-
-        Parameters
-        ----------
-        - batch_x: torch.Tensor
-            The input features of the batch of nodes.
-        - batch_edge_index: torch.Tensor
-            The edge index tensor of the batch of nodes.
-
-        Returns
-        -------
-        - torch.Tensor
-            The unnormalized logits of the model.
-        """
-        # calls the forward method of the Model's encoder
-        batch_node_embeddings = self.encoder(batch_x, batch_edge_index)
-
-        # calls the forward method of the Model's predictor
-        unnormalized_logits = self.predictor(batch_node_embeddings)
-
-        return unnormalized_logits
-
-
     def log_metrics(
         self,
         mode: str = 'train',
@@ -294,30 +265,33 @@ class BaseModel(pl.LightningModule):
         )
 
 
-    def on_validation_epoch_start(self) -> None:
-        if self.inference_mode == 'batch-wise':
-            print("Batch-wise Inference for Validation")
+    def forward(
+            self,
+            batch_x: torch.Tensor,
+            batch_edge_index: torch.Tensor
+        ) -> torch.Tensor:
+        """
+        Forward pass of a standard GNN model. This is a composition of the forward pass of the encoder and the predictor. The batch of nodes may be the entire set of nodes in the graph or a subset of nodes.
 
-        elif self.inference_mode == 'layer-wise':
-            print("Layer-wise Inference for Validation")
-            self.val_logits = self.inference(
-                                self.trainer.datamodule.val_dataloader()
-                                )
+        Parameters
+        ----------
+        - batch_x: torch.Tensor
+            The input features of the batch of nodes.
+        - batch_edge_index: torch.Tensor
+            The edge index tensor of the batch of nodes.
 
-        return super().on_validation_epoch_start()
+        Returns
+        -------
+        - torch.Tensor
+            The unnormalized logits of the model.
+        """
+        # calls the forward method of the Model's encoder
+        batch_node_embeddings = self.encoder(batch_x, batch_edge_index)
 
+        # calls the forward method of the Model's predictor
+        unnormalized_logits = self.predictor(batch_node_embeddings)
 
-    def on_test_epoch_start(self) -> None:
-        if self.inference_mode == 'batch-wise':
-            print("Batch-wise Inference for Testing")
-
-        elif self.inference_mode == 'layer-wise':
-            print("Layer-wise Inference for Testing")
-            self.test_logits = self.inference(
-                                self.trainer.datamodule.test_dataloader()
-                                )
-
-        return super().on_test_epoch_start()
+        return unnormalized_logits
 
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
@@ -336,17 +310,6 @@ class BaseModel(pl.LightningModule):
                                     weight_decay=self.weight_decay)
         else:
             raise NotImplementedError(f'Optimizer {self.optimizer_name} not implemented')
-
-
-    def forward(self):
-        """
-        Forward pass of the model.
-
-        Notes
-        -----
-        This method should be overridden by subclasses to define the forward pass.
-        """
-        raise NotImplementedError('Forward method not implemented')
 
 
     def training_step(
@@ -372,6 +335,19 @@ class BaseModel(pl.LightningModule):
         raise NotImplementedError('Training step not implemented')
 
 
+    def on_validation_epoch_start(self) -> None:
+        if self.inference_mode == 'batch-wise':
+            print("Applying inference Batch-wise for Validation")
+
+        elif self.inference_mode == 'layer-wise':
+            print("Applying inference Layer-wise for Validation")
+            self.val_logits = self.inference(
+                                self.trainer.datamodule.val_dataloader()
+                                )
+
+        return super().on_validation_epoch_start()
+
+
     def validation_step(
         self,
         val_batch: torch_geometric.data.Data,
@@ -393,6 +369,19 @@ class BaseModel(pl.LightningModule):
             The computed validation loss.
         """
         raise NotImplementedError('Validation step not implemented')
+
+
+    def on_test_epoch_start(self) -> None:
+        if self.inference_mode == 'batch-wise':
+            print("Applying inference Batch-wise for Testing")
+
+        elif self.inference_mode == 'layer-wise':
+            print("Applying inference Layer-wise for Testing")
+            self.test_logits = self.inference(
+                                self.trainer.datamodule.test_dataloader()
+                                )
+
+        return super().on_test_epoch_start()
 
 
     def test_step(

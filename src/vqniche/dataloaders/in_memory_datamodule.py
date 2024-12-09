@@ -91,6 +91,7 @@ class InMemoryDataModule(LightningNodeData):
         self.test_loader_name = test_loader_name
         self.use_full_graph_for_inference = use_full_graph_for_inference
 
+        self.train_loader_kwargs = kwargs
 
         super().__init__(
             data=data,
@@ -137,7 +138,6 @@ class InMemoryDataModule(LightningNodeData):
 
 
     def val_dataloader(self):
-        print(f"Val Loader Name: {self.val_loader_name}")
         input_nodes = None if self.use_full_graph_for_inference else self.input_val_nodes
 
         if self.val_loader_name == 'DefaultNodeLoader':
@@ -160,7 +160,6 @@ class InMemoryDataModule(LightningNodeData):
 
 
     def test_dataloader(self):
-        print(f"Test Loader Name: {self.test_loader_name}")
         input_nodes = None if self.use_full_graph_for_inference else self.input_test_nodes
 
         if self.test_loader_name == 'DefaultNodeLoader':
