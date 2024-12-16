@@ -131,8 +131,9 @@ class SetExperimentDataKeys(T.BaseTransform):
         data.num_features = data.x.shape[1]
         data.num_classes = data.y.shape[1]
 
-        delattr(data, self.feature_key)
-        delattr(data, self.label_key)
-        delattr(data, self.edge_index_key)
+        # delete extra features, labels, and edge indices from the data object to reduce memory footprint during training
+        for key in list(data.__dict__.keys()):
+            if key.startswith('x_') or key.startswith('y_') or key.startswith('edge_index_'):
+                delattr(data, key)
 
         return data
