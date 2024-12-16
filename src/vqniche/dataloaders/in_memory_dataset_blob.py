@@ -1,8 +1,8 @@
 """
-Define `Data` to refer to a PyG Data object, an attributed graph, that is constructed from a single batch of AnnData where each batch is a collection of cells originating from the same sample. Each `Data` object will have one or more of each type of the following attribute:
+Define `Data` to refer to a PyG Data object that is constructed from a single batch of AnnData where each batch is a collection of cells originating from the same sample. Each `Data` object will have one or more of each type of the following attribute:
 - `x_<feature_name>`: Node features (e.g.,cell-gene counts or neighborhood-gene counts)
 - `y_<label_name>`: Node labels (e.g., cell types or niche types)
-- `edge_index_<edge_index_name>`: Edge index (e.g., spatial neighbors via Delaunay triangulation or radius-based neighbors)
+- `edge_index_<edge_index_name>`: Edge index (e.g., spatial neighbors via Delaunay triangulation or radius-based neighbors or k-nearest neighbors)
 - `metadata_<metadata_name>`: Metadata (e.g., cell ids, batch ids, tissue, etc.)
 We construct these attributes from the AnnData object stored as an `.h5ad` file on disk.
 
@@ -16,7 +16,7 @@ Usage:
                                         graph_kwargs={'delaunay': True},
                                         data_directory_path='/path/to/data',
                                         transform=transform)
->>> data = dataset[<batch-index>] # get a single Data object corresponding to a batch-index 7
+>>> data = dataset[<batch-index>] # get a single Data object corresponding to a batch-index (say, 7)
 
 Tradeoffs:
 -------
@@ -38,7 +38,7 @@ from typing import Optional, Callable, List, Tuple
 from torch_geometric.data import InMemoryDataset, Data
 from torch_geometric.utils.convert import from_scipy_sparse_matrix
 
-from ..preprocessors.graph_constructors import spatial_neighbors
+from ..preprocessors.graph_constructors import set_edge_index_name, spatial_neighbors
 from ..utils.type_conversions import sparse_mx_to_float_tensor, pandas_to_torch_one_hot
 
 
@@ -102,11 +102,13 @@ class InMemoryDatasetBlob(InMemoryDataset):
 
         # root = Root directory where the processed data is saved.
         # rerun the self.process if the processed data is not found or if overwrite is set to True.
-        super().__init__(root=self.processed_dir,
-                         transform=transform,
-                         pre_transform=pre_transform,
-                         pre_filter=pre_filter,
-                         force_reload=overwrite)
+        super().__init__(
+            root=self.processed_dir,
+            transform=transform,
+            pre_transform=pre_transform,
+            pre_filter=pre_filter,
+            force_reload=overwrite
+        )
 
         # This index is set to 0 because there is only one processed data file.
         self.load(self.processed_paths[0])
@@ -148,13 +150,17 @@ class InMemoryDatasetBlob(InMemoryDataset):
         # self.save internally collates all Data objects in data_list into a single blob.
         # The index is set to 0 so that the collated object is stored at
         # path "self.processed_dir/dataset_blob.pt".
-        self.save(data_list=data_batches,
-                  path=self.processed_paths[0])
+        self.save(
+            data_list=data_batches,
+            path=self.processed_paths[0],
+        )
+
+        del data_batches
 
 
     def process_anndata_batch(
             self,
-            adata_batch_file: Path
+            adata_batch_file: Path,
         ) -> Tuple[Data, str]:
         """
         Process one single batch of AnnData into a PyG Data object.
@@ -173,46 +179,41 @@ class InMemoryDatasetBlob(InMemoryDataset):
         adata_batch = sc.read(adata_batch_file)
 
         # ----------------- Build Neighborhood Graphs -----------------
-        assert self.graph_kwargs['delaunay'] or len(self.graph_kwargs['radii']) > 0, "Either `delaunay` or `radii` must be provided."
-
         self.edge_index_names = []
 
         coord_type = self.graph_kwargs['coord_type']
         spatial_key = self.graph_kwargs['spatial_key']
-        delaunay_radius_union = self.graph_kwargs['delaunay_radius_union']
-        set_diag = self.graph_kwargs['set_diag']
+        include_self_loop = self.graph_kwargs['include_self_loop']
 
-        if self.graph_kwargs['delaunay']:
-            edge_index_name = f"{spatial_key}_delaunay"
-            self.edge_index_names.append(edge_index_name)
-            print("Computing spatial neighbors with Delaunay Triangulation...")
-            adata_batch = spatial_neighbors(
-                                        adata_batch,
-                                        coord_type=coord_type,
-                                        spatial_key=spatial_key,
-                                        delaunay=True,
-                                        radius=None,
-                                        set_diag=set_diag,
-                                        key_added=edge_index_name
-                            )
-
-        if len(self.graph_kwargs['radii']) > 0:
-            for radius in self.graph_kwargs['radii']:
-                if delaunay_radius_union:
-                    edge_index_name = f"{spatial_key}_delaunay_radius_{radius}"
+        for delaunay in [True, False]:
+            for radius in self.graph_kwargs['radius_list'] + [None]:
+                # n_neighs is used only if delaunay is False
+                if delaunay:
+                    n_neighs_list = [None]
                 else:
-                    edge_index_name = f"{spatial_key}_radius_{radius}"
-                self.edge_index_names.append(edge_index_name)
-                print(f"Computing spatial neighbors with radius {radius}...")
-                adata_batch = spatial_neighbors(
-                                        adata_batch,
-                                        coord_type=coord_type,
+                    n_neighs_list = self.graph_kwargs['n_neighs_list']
+
+                for n_neighs in n_neighs_list:
+                    # set key name for edge index based on delaunay, radius, n_neighs
+                    edge_index_name = set_edge_index_name(
                                         spatial_key=spatial_key,
-                                        delaunay=delaunay_radius_union,
-                                        radius=radius,
-                                        set_diag=set_diag,
-                                        key_added=edge_index_name
-                            )
+                                        delaunay=delaunay,
+                                        n_neighs=n_neighs,
+                                        radius=radius
+                                    )
+                    self.edge_index_names.append(edge_index_name)
+
+                    print(f"Computing spatial neighbors with delaunay={delaunay}, radius={radius}, n_neighs={n_neighs} at key {edge_index_name}...")
+                    adata_batch = spatial_neighbors(
+                                            adata_batch,
+                                            coord_type=coord_type,
+                                            spatial_key=spatial_key,
+                                            delaunay=delaunay,
+                                            n_neighs=n_neighs,
+                                            radius=radius,
+                                            include_self_loop=include_self_loop,
+                                            key_added=edge_index_name
+                                )
 
         print("Adata:")
         print(adata_batch)
@@ -228,7 +229,6 @@ class InMemoryDatasetBlob(InMemoryDataset):
                                                 )
 
         # build for node labels (categorical pandas series to one hot tensor)
-        assert len(self.label_names) > 0, "At least one label name must be provided"
         for label_name in self.label_names:
             batch_dict[f"y_{label_name}"] = pandas_to_torch_one_hot(
                                                 adata_batch.obs[label_name]
