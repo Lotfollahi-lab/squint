@@ -1,12 +1,10 @@
-import copy
 import torch
 import torch_geometric
 import pytorch_lightning as pl
 from torchmetrics import Accuracy
-from typing import List, Tuple, Callable, Optional
-import torch.functional as F
+from typing import List, Tuple, Callable, Optional, Literal
 
-from ..utils.loss import cross_entropy_loss
+from ..utils.loss import *
 
 
 class BaseModel(pl.LightningModule):
@@ -27,7 +25,7 @@ class BaseModel(pl.LightningModule):
             loss_kwargs: dict = {'reduction': 'mean'},
             task_name: str = 'multiclass',
             task_kwargs: dict = {},
-            inference_mode: Optional[str] = 'layer-wise',
+            inference_mode: Literal['batch-wise', 'layer-wise'] = 'batch-wise',
             **kwargs
         ) -> None:
         """
@@ -65,7 +63,7 @@ class BaseModel(pl.LightningModule):
             The task name.
         - task_kwargs: dict
             The task keyword arguments.
-        - inference_mode: Optional[str]
+        - inference_mode: Literal['batch-wise', 'layer-wise']
             The inference mode. Choose from 'batch-wise' or 'layer-wise'.
         - kwargs: dict
             Additional keyword arguments.
@@ -111,8 +109,6 @@ class BaseModel(pl.LightningModule):
         #    for layer in model.layers:
         #       for batch in loader:
         #         layer.forward(batch)
-        if inference_mode not in ['batch-wise', 'layer-wise']:
-            raise ValueError(f"Invalid inference mode: {inference_mode}.")
         self.inference_mode = inference_mode
 
         self.save_hyperparameters()
@@ -145,7 +141,9 @@ class BaseModel(pl.LightningModule):
         # initialize a list to store the loss function tuples
         loss_fn_tuples = []
 
+        print("Setting the following loss terms as criterion for training:")
         for loss_fn_name in loss_fn_names:
+            print(f"Loss function: {loss_fn_name}")
             loss_fn_params = {}
             if loss_fn_name == 'cross_entropy':
                 # set the cross-entropy loss function
@@ -158,6 +156,50 @@ class BaseModel(pl.LightningModule):
                 reduction = loss_kwargs.get('reduction')
                 if reduction is not None:
                     loss_fn_params['reduction'] = reduction
+            elif loss_fn_name == 'vqgraph_attribute_reconstruction':
+                loss_fn = vqgraph_attribute_reconstruction
+
+                loss_fn_data_keys = ['h_pre_vq_conv', 'h_node']
+
+                scaling_node_gamma = loss_kwargs.get('scaling_node_gamma')
+                if scaling_node_gamma is not None:
+                    loss_fn_params['scaling_node_gamma'] = scaling_node_gamma
+
+            elif loss_fn_name == 'vqgraph_adjacency_reconstruction':
+                loss_fn = vqgraph_adjacency_reconstruction
+
+                loss_fn_data_keys = ['batch_edge_index', 'h_edge']
+
+                scaling_edge_gamma = loss_kwargs.get('scaling_edge_gamma')
+                if scaling_edge_gamma is not None:
+                    loss_fn_params['scaling_edge_gamma'] = scaling_edge_gamma
+
+            elif loss_fn_name == 'vqgraph_commitment_loss':
+                loss_fn = vqgraph_commitment_loss
+
+                loss_fn_data_keys = ['h_pre_vq_conv', 'h_vq']
+
+                commitment_weight = loss_kwargs.get('commitment_weight')
+                if commitment_weight is not None:
+                    loss_fn_params['commitment_weight'] = commitment_weight
+
+            elif loss_fn_name == 'vqgraph_codebook_loss':
+                loss_fn = vqgraph_codebook_loss
+
+                loss_fn_data_keys = ['codebook_embeddings']
+
+                codebook_reg_weight = loss_kwargs.get('codebook_reg_weight')
+                if codebook_reg_weight is not None:
+                    loss_fn_params['codebook_reg_weight'] = codebook_reg_weight
+
+                codebook_reg_active_codes_only = loss_kwargs.get('codebook_reg_active_codes_only')
+                if codebook_reg_active_codes_only is not None:
+                    loss_fn_params['codebook_reg_active_codes_only'] = codebook_reg_active_codes_only
+
+                codebook_reg_max_codes = loss_kwargs.get('codebook_reg_max_codes')
+                if codebook_reg_max_codes is not None:
+                    loss_fn_params['codebook_reg_max_codes'] = codebook_reg_max_codes
+
             else:
                 raise NotImplementedError(f'{loss_fn_name} Loss not implemented')
 
@@ -335,12 +377,33 @@ class BaseModel(pl.LightningModule):
         raise NotImplementedError('Training step not implemented')
 
 
+    def on_train_epoch_end(self) -> None:
+        """
+        Callback function to be executed at the end of each training epoch.
+
+        Notes:
+        ------
+        - We use this hook to print the total training loss at the end of each epoch to monitor the training progress.
+        """
+        # Access the outputs through the trainer's logged metrics
+        train_loss = self.trainer.callback_metrics.get('train_loss')
+        if train_loss is not None:
+            print(f"Train Loss at Epoch {self.current_epoch}: {train_loss}")
+        super().on_train_epoch_end()
+
+
     def on_validation_epoch_start(self) -> None:
+        """
+        Callback function to be executed at the start of each validation epoch.
+
+        Notes:
+        ------
+        - We use this hook to obtain the unnormalized logits for the validation set if the inference mode is 'layer-wise'. Otherwise, we do nothing.
+        """
         if self.inference_mode == 'batch-wise':
-            print("Applying inference Batch-wise for Validation")
+            pass
 
         elif self.inference_mode == 'layer-wise':
-            print("Applying inference Layer-wise for Validation")
             self.val_logits = self.inference(
                                 self.trainer.datamodule.val_dataloader()
                                 )
@@ -371,12 +434,32 @@ class BaseModel(pl.LightningModule):
         raise NotImplementedError('Validation step not implemented')
 
 
+    def on_validation_epoch_end(self) -> None:
+        """
+        Callback function to be executed at the end of each validation epoch.
+
+        Notes:
+        ------
+        - We use this hook to print the total validation loss at the end of each epoch to monitor the validation progress.
+        """
+        val_loss = self.trainer.callback_metrics.get('val_loss')
+        if val_loss is not None:
+            print(f"Validation Loss at Epoch {self.current_epoch}: {val_loss}\n")
+        super().on_validation_epoch_end()
+
+
     def on_test_epoch_start(self) -> None:
+        """
+        Callback function to be executed at the start of each test epoch.
+
+        Notes:
+        ------
+        - We use this hook to obtain the unnormalized logits for the test set if the inference mode is 'layer-wise'. Otherwise, we do nothing.
+        """
         if self.inference_mode == 'batch-wise':
-            print("Applying inference Batch-wise for Testing")
+            pass
 
         elif self.inference_mode == 'layer-wise':
-            print("Applying inference Layer-wise for Testing")
             self.test_logits = self.inference(
                                 self.trainer.datamodule.test_dataloader()
                                 )
