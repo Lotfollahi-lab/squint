@@ -135,6 +135,8 @@ class InMemoryDatasetBlob(InMemoryDataset):
                 self.label_categories[label_name].update(adata_batch.obs[label_name].unique())
 
         for label_name in self.label_names:
+            # sorting the categories for consistency across batches so that the one-hot encoding is consistent. e.g. when the one-hot encoding is [0, 1, 0], the label name is the second name in the sorted list of that label.
+            self.label_categories[label_name] = sorted(list(self.label_categories[label_name]))
             print(f"Label Name: {label_name} | {self.label_categories[label_name]=}")
 
         # ----------------- Second Pass over AnnData Batches -----------------
