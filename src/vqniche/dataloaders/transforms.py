@@ -1,3 +1,5 @@
+from torch_geometric.data import Data
+
 import torch_geometric.transforms as T
 from typing import Any, List
 
@@ -80,8 +82,8 @@ class NormalizeFeatures(T.BaseTransform):
 
     def forward(
             self,
-            data: Any
-        ) -> Any:
+            data: Data
+        ) -> Data:
         """
         Normalize the features of the PyG Data object.
         """
@@ -120,8 +122,8 @@ class SetExperimentDataKeys(T.BaseTransform):
 
     def forward(
             self,
-            data: Any
-        ) -> Any:
+            data: Data
+        ) -> Data:
         """
         Set Experiment data keys for the PyG Data object.
         """
@@ -132,7 +134,7 @@ class SetExperimentDataKeys(T.BaseTransform):
         data.num_classes = data.y.shape[1]
 
         # delete extra features, labels, and edge indices from the data object to reduce memory footprint during training
-        for key in list(data.__dict__.keys()):
+        for key in list(data.keys()):
             if key.startswith('x_') or key.startswith('y_') or key.startswith('edge_index_'):
                 delattr(data, key)
 
