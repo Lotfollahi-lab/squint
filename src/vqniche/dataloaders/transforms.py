@@ -133,13 +133,6 @@ class SetExperimentDataKeys(T.BaseTransform):
         data.num_features = data.x.shape[1]
         data.num_classes = data.y.shape[1]
 
-        # set metadata for the data object
-        data.cell_id = getattr(data, 'cell_id', None)
-        data.dataset_id = getattr(data, 'dataset_id', None)
-        data.tissue = getattr(data, 'tissue', None)
-        data.species = getattr(data, 'species', None)
-        data.batch = getattr(data, 'batch', None)
-
         # delete extra features, labels, and edge indices from the data object to reduce memory footprint during training
         for key in list(data.keys()):
             if key.startswith('x_') or key.startswith('y_') or key.startswith('edge_index_'):
