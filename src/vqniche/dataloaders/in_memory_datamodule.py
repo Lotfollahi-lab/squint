@@ -13,9 +13,10 @@ The customization is controlled by the train_loader_type parameter.
 - We use the third option 'custom' to allow for any other combination of Loader and Sampler. This is not implemented yet.
 """
 from torch_geometric.loader import NeighborLoader
+from torch_geometric.sampler import NeighborSampler
 from torch_geometric.data.lightning import LightningNodeData
 
-from typing import Optional, List
+from typing import Optional
 from torch_geometric.data import Data
 
 
@@ -25,10 +26,9 @@ class InMemoryDataModule(LightningNodeData):
         num_cores: int = 1,
         data: Data = None,
         train_loader_name: Optional[str] = 'DefaultNodeLoader',
-        batch_size: Optional[int] = 1024,
-        num_workers: Optional[int] = 2,
+        train_loader_params: Optional[dict] = {'batch_size': 1024},
         train_sampler_name: Optional[str] = 'NeighborSampler',
-        num_neighbors: Optional[List[int]] = [25, 10],
+        train_sampler_params: Optional[dict] = {'num_neighbors': [25, 10]},
         val_loader_name: str = 'NeighborLoader',
         test_loader_name: str = 'NeighborLoader',
         use_full_graph_for_inference: bool = True,
@@ -53,7 +53,10 @@ class InMemoryDataModule(LightningNodeData):
         elif train_loader_name == 'DefaultNodeLoader':
             # set train_loader_type to 'neighbor' to use the default NodeLoader with NeighborSampler
             train_loader_type = 'neighbor'
+
             # batch size and other kwargs remain unchanged
+            batch_size = train_loader_params.get('batch_size', 1024)
+
             # set num_workers to half of the available cores
             num_workers = max(num_cores // 2, 1)
 
@@ -61,6 +64,7 @@ class InMemoryDataModule(LightningNodeData):
             train_sampler_name = 'NeighborSampler'
 
             # train_sampler_kwargs remain unchanged
+            num_neighbors = train_sampler_params.get('num_neighbors', [25, 10])
 
             # Parent Class in Lightning will reset node_sampler to torch_geometric.loader.NeighborSampler and initialize it with the given sampler kwargs.
             # This will be gettable via the self.graph_sampler attribute.
@@ -68,16 +72,28 @@ class InMemoryDataModule(LightningNodeData):
 
         else:
             # for all other cases, set train_loader_type to 'custom'
+            # train_loader will be set to a Callable of type torch_geometric.loader.DataLoader in self.train_dataloader()
             train_loader_type = 'custom'
-            # train_loader will be set to a Callable of type torch_geometric.loader.DataLoader in self.train_dataloader() below
+
+            # set batch_size to the given value
+            batch_size = train_loader_params.get('batch_size', 1024)
+
             # set loader_kwargs to be a dictionary of arguments to be passed to the train_loader
+            num_workers = max(num_cores // 2, 1)
 
             assert train_sampler_name is not None, "train_sampler_name must be provided for train_loader_type='custom'."
+
+            num_neighbors = train_sampler_params.get('num_neighbors', [25, 10])
+
             # set train_sampler_kwargs
             # set node_sampler to be a Callable of type torch_geometric.sampler.BaseSampler here before super.__init__() is called. Cannot be None.
-            # if train_sampler_name == 'GraphSAINTSampler':
-                # self.train_sampler = ...
-            raise NotImplementedError("Custom train loader not implemented.")
+            if train_sampler_name == 'NeighborSampler':
+                self.train_sampler = NeighborSampler(
+                    data=data,
+                    num_neighbors=num_neighbors,
+                )
+            else:
+                raise NotImplementedError(f"Train Sampler {train_sampler_name} not implemented.")
 
         self.train_loader_type = train_loader_type
         self.train_loader_name = train_loader_name
@@ -91,7 +107,8 @@ class InMemoryDataModule(LightningNodeData):
         self.test_loader_name = test_loader_name
         self.use_full_graph_for_inference = use_full_graph_for_inference
 
-        self.train_loader_kwargs = kwargs
+        self.train_loader_params = train_loader_params
+        self.train_sampler_params = train_sampler_params
 
         super().__init__(
             data=data,
@@ -110,7 +127,7 @@ class InMemoryDataModule(LightningNodeData):
 
     @property
     def train_shuffle(self) -> bool:
-        shuffle = self.train_loader_kwargs.get('shuffle', False)
+        shuffle = self.train_loader_params.get('shuffle', False)
         return shuffle
 
 
@@ -121,6 +138,19 @@ class InMemoryDataModule(LightningNodeData):
         elif self.train_loader_type == 'custom':
 
             if self.train_loader_name == 'NeighborLoader':
+                print("Using NeighborLoader")
+                # print(getattr(self, 'graph_sampler', None))
+                # print(self.input_train_nodes)
+                # return NeighborLoader(
+                #     data=self.data,
+                #     batch_size=self.batch_size,
+                #     num_workers=self.num_workers,
+                #     input_nodes=self.input_train_nodes,
+                #     input_time=self.input_train_time,
+                #     input_id=self.input_train_id,
+                #     neighbor_sampler=getattr(self, 'graph_sampler', None),
+                #     num_neighbors=self.num_neighbors,
+                # )
                 return NeighborLoader(
                     data=self.data,
                     batch_size=self.batch_size,
@@ -128,9 +158,8 @@ class InMemoryDataModule(LightningNodeData):
                     input_nodes=self.input_train_nodes,
                     input_time=self.input_train_time,
                     input_id=self.input_train_id,
-                    neighbor_sampler=getattr(self, 'graph_sampler', None),
+                    neighbor_sampler=self.train_sampler,
                     num_neighbors=self.num_neighbors,
-                    shuffle=self.train_shuffle,
                 )
 
             else:
