@@ -40,6 +40,9 @@ class InMemoryDataModule(LightningNodeData):
                             x=data.x,
                             edge_index=data.edge_index,
                             y=data.y,
+                            train_mask=data.train_mask,
+                            val_mask=data.val_mask,
+                            test_mask=data.test_mask,
                         )
 
         if train_loader_name == 'FullLoader':
@@ -129,7 +132,6 @@ class InMemoryDataModule(LightningNodeData):
         print(f"Train Loader Type: {self.train_loader_type}")
         print(f"Train Loader Name: {self.train_loader_name}")
         print(f"Train Sampler Name: {self.train_sampler_name}")
-
 
     @property
     def train_shuffle(self) -> bool:
