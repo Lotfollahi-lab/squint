@@ -6,7 +6,9 @@ from sklearn.preprocessing import LabelBinarizer
 from torch_geometric.utils import to_scipy_sparse_matrix
 
 
-def sparse_mx_to_float_tensor(sparse_mx: sp.csr_matrix) -> torch.Tensor:
+def sparse_mx_to_float_tensor(
+        sparse_mx: sp.csr_matrix
+    ) -> torch.Tensor:
     """
     Convert a scipy sparse matrix to a PyTorch float tensor.
 
@@ -28,7 +30,10 @@ def sparse_mx_to_float_tensor(sparse_mx: sp.csr_matrix) -> torch.Tensor:
     return dense_tensor
 
 
-def pandas_to_torch_one_hot(pandas_series: pd.Series) -> torch.FloatTensor:
+def pandas_to_torch_one_hot(
+        pandas_series: pd.Series,
+        categories: list[str] | None = None
+    ) -> torch.FloatTensor:
     """
     Convert a pandas Series of categorical labels to a PyTorch float tensor of one-hot encoded labels.
 
@@ -36,15 +41,32 @@ def pandas_to_torch_one_hot(pandas_series: pd.Series) -> torch.FloatTensor:
     ----------
     pandas_series : pd.Series
         A pandas Series of categorical labels.
+    categories : list[str]
+        A list of categories for the categorical labels.
 
     Returns:
     --------
     torch.FloatTensor
         A PyTorch float tensor of one-hot encoded labels.
     """
-    numerical_labels = pandas_series.astype('category').values.codes
-    one_hot_labels = LabelBinarizer().fit_transform(numerical_labels)
-    return torch.tensor(one_hot_labels, dtype=torch.float32)
+    if categories is None:
+        categories = sorted(pandas_series.unique())
+
+    # Create a categorical series with all possible categories
+    cat_series = pd.Categorical(pandas_series, categories=categories)
+
+    # Convert to one-hot using all categories
+    one_hot = pd.get_dummies(cat_series, prefix='', prefix_sep='')
+
+    # Ensure all categories are present (even if they weren't in this batch)
+    for cat in categories:
+        if cat not in one_hot.columns:
+            one_hot[cat] = 0
+
+    # Sort columns to ensure consistent order
+    one_hot = one_hot[sorted(one_hot.columns)]
+
+    return torch.tensor(one_hot.values, dtype=torch.float32)
 
 
 def edge_index_to_adjacency_tensor(
