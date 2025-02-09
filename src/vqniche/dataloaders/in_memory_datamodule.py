@@ -1,7 +1,7 @@
 """
 Extends the LightningNodeData class for two reasons:
 1. So that we can inherit all the nice properties of the parent classes including setup, prepare_data and infer train-val-test nodes
-2. To provide a more flexible way to create PyTorch Lightning DataModules that are compatible with PyTorch Geometric for our use case we split the Pytorch Geometric GNN models into separate encoder and predictor submodules.
+2. To provide a more flexible way to create PyTorch Lightning DataModules that are compatible with PyTorch Geometric for our use case wherein we split the Pytorch Geometric GNN models into separate encoder and predictor submodules.
     - This is useful for using a custom Loader for validation and testing and a different Loader+Sampler combination for training.
 
 The customization is controlled by the train_loader_type parameter.
@@ -34,6 +34,14 @@ class InMemoryDataModule(LightningNodeData):
         use_full_graph_for_inference: bool = True,
         **kwargs
     ) -> None:
+        # keep only the necessary data for the loaders
+        # this is necessary because metadata such as cell-ids cannot be used because loaders require tensors that don't have dtype as strings
+        data_for_loader = Data(
+                            x=data.x,
+                            edge_index=data.edge_index,
+                            y=data.y,
+                        )
+
         if train_loader_name == 'FullLoader':
             # set train_loader_type to 'full' to use the default DataLoader
             train_loader_type = 'full'
@@ -85,13 +93,11 @@ class InMemoryDataModule(LightningNodeData):
 
             num_neighbors = train_sampler_params.get('num_neighbors', [25, 10])
 
-            # set train_sampler_kwargs
             # set node_sampler to be a Callable of type torch_geometric.sampler.BaseSampler here before super.__init__() is called. Cannot be None.
+            # This will be gettable via the self.graph_sampler attribute.
+            # This is necessary because the parent class will reset node_sampler to None if train_loader_type is 'full' or 'neighbor'.
             if train_sampler_name == 'NeighborSampler':
-                self.train_sampler = NeighborSampler(
-                    data=data,
-                    num_neighbors=num_neighbors,
-                )
+                self.train_sampler = NeighborSampler
             else:
                 raise NotImplementedError(f"Train Sampler {train_sampler_name} not implemented.")
 
@@ -111,7 +117,7 @@ class InMemoryDataModule(LightningNodeData):
         self.train_sampler_params = train_sampler_params
 
         super().__init__(
-            data=data,
+            data=data_for_loader,
             loader=self.train_loader_type,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
@@ -136,60 +142,50 @@ class InMemoryDataModule(LightningNodeData):
             return super().train_dataloader()
 
         elif self.train_loader_type == 'custom':
-
             if self.train_loader_name == 'NeighborLoader':
-                print("Using NeighborLoader")
-                # print(getattr(self, 'graph_sampler', None))
-                # print(self.input_train_nodes)
-                # return NeighborLoader(
-                #     data=self.data,
-                #     batch_size=self.batch_size,
-                #     num_workers=self.num_workers,
-                #     input_nodes=self.input_train_nodes,
-                #     input_time=self.input_train_time,
-                #     input_id=self.input_train_id,
-                #     neighbor_sampler=getattr(self, 'graph_sampler', None),
-                #     num_neighbors=self.num_neighbors,
-                # )
-                return NeighborLoader(
-                    data=self.data,
-                    batch_size=self.batch_size,
-                    num_workers=self.num_workers,
-                    input_nodes=self.input_train_nodes,
-                    input_time=self.input_train_time,
-                    input_id=self.input_train_id,
-                    neighbor_sampler=self.train_sampler,
-                    num_neighbors=self.num_neighbors,
-                )
+                # NeighborLoader + NeighborSampler
+                # setting neighbor_sampler to None inherently sets the neighbor_sampler = NeighborSampler in the case of NeighborLoader
+                train_subgraph_loader = NeighborLoader(
+                                            data=self.data,
+                                            input_nodes=self.input_train_nodes,
+                                            batch_size=self.batch_size,
+                                            num_workers=self.num_workers,
+                                            neighbor_sampler=None,
+                                            num_neighbors=self.num_neighbors,
+                                        )
+                return train_subgraph_loader
 
             else:
-                raise NotImplementedError(f"Train {self.train_loader_name} not implemented.")
+                raise NotImplementedError(f"{self.train_loader_name} for Training not implemented.")
 
 
     def val_dataloader(self):
-        input_nodes = None if self.use_full_graph_for_inference else self.input_val_nodes
+        num_neighbors = None if self.use_full_graph_for_inference else self.num_neighbors
 
         if self.val_loader_name == 'DefaultNodeLoader':
             return super().val_dataloader()
 
         elif self.val_loader_name == 'NeighborLoader':
             # NeighborLoader + NeighborSampler
+            # setting input_nodes to self.input_val_nodes ensures that the validation accuracy is computed only on the validation nodes
+            # setting neighbor_sampler to None inherently sets the neighbor_sampler = NeighborSampler in the case of NeighborLoader
+            # setting num_neighbors to None ensures that the full graph is used for inference during validation of the nodes in the validation set
             val_subgraph_loader = NeighborLoader(
-                                    data=self.data,
-                                    input_nodes=input_nodes,
-                                    batch_size=self.batch_size,
-                                    num_workers=self.num_workers,
-                                    neighbor_sampler=getattr(self, 'graph_sampler', None),
-                                    num_neighbors=self.num_neighbors,
-                                )
+                                        data=self.data,
+                                        input_nodes=self.input_val_nodes,
+                                        batch_size=self.batch_size,
+                                        num_workers=self.num_workers,
+                                        neighbor_sampler=None,
+                                        num_neighbors=num_neighbors,
+                                    )
             return val_subgraph_loader
 
         else:
-            raise NotImplementedError(f"Val {self.val_loader_name} not implemented.")
+            raise NotImplementedError(f"{self.val_loader_name} for Validation not implemented.")
 
 
     def test_dataloader(self):
-        input_nodes = None if self.use_full_graph_for_inference else self.input_test_nodes
+        num_neighbors = None if self.use_full_graph_for_inference else self.num_neighbors
 
         if self.test_loader_name == 'DefaultNodeLoader':
             return super().test_dataloader()
@@ -197,14 +193,14 @@ class InMemoryDataModule(LightningNodeData):
         elif self.test_loader_name == 'NeighborLoader':
             # NeighborLoader + NeighborSampler
             test_subgraph_loader = NeighborLoader(
-                                    data=self.data,
-                                    input_nodes=input_nodes,
-                                    batch_size=self.batch_size,
-                                    num_workers=self.num_workers,
-                                    neighbor_sampler=getattr(self, 'graph_sampler', None),
-                                    num_neighbors=self.num_neighbors,
-                                )
+                                        data=self.data,
+                                        input_nodes=self.input_test_nodes,
+                                        batch_size=self.batch_size,
+                                        num_workers=self.num_workers,
+                                        neighbor_sampler=None,
+                                        num_neighbors=num_neighbors,
+                                    )
             return test_subgraph_loader
 
         else:
-            raise NotImplementedError(f"Test {self.test_loader_name} not implemented.")
+            raise NotImplementedError(f"{self.test_loader_name} for Testing not implemented.")
