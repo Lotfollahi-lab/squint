@@ -1,7 +1,8 @@
 import torch
 import torch.nn.functional as F
-from vqniche.utils.type_conversions import edge_index_to_adjacency_tensor
+from torch_geometric.utils import from_scipy_sparse_matrix
 
+from vqniche.utils.type_conversions import edge_index_to_adjacency_tensor
 from vqniche.utils.vqgraph_helpers import l2norm
 
 
@@ -176,3 +177,50 @@ def vqgraph_codebook_loss(
     codebook_loss = (cosine_sim**2).sum() / (h * n**2) - (1 / n)
 
     return codebook_loss * codebook_reg_weight
+
+
+def nichecompass_adjacency_reconstruction(
+    batch_edge_index: torch.Tensor,
+    h_edge: torch.Tensor,
+    scaling_edge_gamma: float = 0.03
+    ) -> torch.Tensor:
+    """
+    Compute the adjacency reconstruction loss as in NicheCompass.
+
+    Parameters
+    ----------
+    batch_edge_index: torch.Tensor
+        The edge index of the batch
+    h_edge: torch.Tensor
+        The quantized edge embedding obtained from a Linear Decoder layer on the output of the VQ layer
+    scaling_edge_gamma: float
+        The scaling factor for the adjacency reconstruction loss.
+
+    Returns
+    -------
+    torch.Tensor
+        The computed adjacency reconstruction loss.
+
+    Notes
+    -----
+    - Source: https://github.com/Lotfollahi-lab/nichecompass/blob/main/src/nichecompass/modules/losses.py
+    """
+    # Determine weighting of positive examples
+    pos_labels = (batch_edge_index == 1.).sum(dim=0)
+    neg_labels = (batch_edge_index == 0.).sum(dim=0)
+    pos_weight = neg_labels / pos_labels
+
+    adj_quantized = torch.matmul(h_edge, h_edge.t())
+    adj_quantized = (adj_quantized - adj_quantized.min()) / (adj_quantized.max() - adj_quantized.min())
+    adj_quantized = adj_quantized.to(batch_edge_index.device)
+    batch_edge_index_quantized = from_scipy_sparse_matrix(adj_quantized.cpu().numpy())[0].to(batch_edge_index.device)
+
+    # Compute weighted bce loss from logits for numerical stability
+    return F.binary_cross_entropy_with_logits(
+                input=batch_edge_index_quantized,
+                target=batch_edge_index,
+                pos_weight=pos_weight
+            ) * scaling_edge_gamma
+
+
+
