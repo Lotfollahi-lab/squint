@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.functional as F
+import torch.nn.functional as F
 from torch.cuda.amp import autocast
 
 import pytorch_lightning as pl
