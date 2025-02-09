@@ -267,12 +267,12 @@ class InMemoryDatasetBlob(InMemoryDataset):
             print(f"{key}: {value.shape=}, {value.dtype=}, {type(value)=}")
 
         # ----------------- Add Metadata -----------------
-        batch_dict['cell_id'] = adata_batch.obs['cell_id'].to_numpy().reshape(-1, 1)
+        batch_dict['cell_id'] = adata_batch.obs['cell_id'].to_list()
 
-        batch_dict['dataset_id'] = np.array(adata_batch.uns['dataset_id']).reshape(-1, 1)
-        batch_dict['tissue'] = np.array(adata_batch.uns['tissue']).reshape(-1, 1)
-        batch_dict['species'] = np.array(adata_batch.uns['species']).reshape(-1, 1)
-        batch_dict['batch'] = np.array(adata_batch.uns['batch']).reshape(-1, 1)
+        batch_dict['dataset_id'] = adata_batch.uns['dataset_id']
+        batch_dict['tissue'] = adata_batch.uns['tissue']
+        batch_dict['species'] = adata_batch.uns['species']
+        batch_dict['batch'] = adata_batch.uns['batch']
 
         # ----------------- Convert Data Dict to PyG Data Object -----------------
         data_batch = Data(**batch_dict)
