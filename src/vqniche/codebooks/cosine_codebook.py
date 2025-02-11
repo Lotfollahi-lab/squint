@@ -106,7 +106,9 @@ class CosineSimCodebook(pl.LightningModule):
 
     @autocast(enabled=False)
     def forward(self, x):
-        if x.ndim == 2:
+        input_is_2dim = x.ndim == 2
+
+        if input_is_2dim:
             x = rearrange(x, "b d -> b 1 d")
 
         needs_codebook_dim = x.ndim < 4
@@ -164,7 +166,7 @@ class CosineSimCodebook(pl.LightningModule):
         if needs_codebook_dim:
             quantize, embed_ind = map(lambda t: rearrange(t, "1 ... -> ..."), (quantize, embed_ind))
 
-        if x.ndim == 2:
+        if input_is_2dim:
             quantize = rearrange(quantize, "b 1 d -> b d")
             embed_ind = rearrange(embed_ind, "b 1 -> b")
 
