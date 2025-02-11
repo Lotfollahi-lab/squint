@@ -245,7 +245,7 @@ class BaseModel(pl.LightningModule):
             # pass the extracted data to the loss function along with the loss function related kwargs
             loss_fn_value = loss_fn(**_loss_fn_data, **loss_fn_params)
             # add the computed loss to the total_loss
-            total_loss += loss_fn_value
+            total_loss = torch.add(total_loss, loss_fn_value)
 
             # log each computed loss term
             self.log(
