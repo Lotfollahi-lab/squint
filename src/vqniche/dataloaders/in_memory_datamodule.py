@@ -21,7 +21,6 @@ KEY INFO:
 ---> The Loader + Sampler combination is kept the same across training, validation and testing.
 """
 import os
-from copy import deepcopy
 from typing import Literal, Optional, Callable
 
 from torch.utils.data import DataLoader
@@ -34,7 +33,6 @@ NUM_CORES = 1
 NUM_WORKERS = 1
 BATCH_SIZE = 1024
 NUM_NEIGHBORS = [5, 5]
-MAX_NUM_NEIGHBORS = [1000, 1000]
 
 
 class InMemoryDataModule(LightningNodeData):
@@ -193,6 +191,12 @@ class InMemoryDataModule(LightningNodeData):
             **self.sampler_params
         )
 
+        # None = all nodes in the graph
+        # without this, inference at the GNN layer will get out-of-index error
+        if self.use_full_graph_for_inference:
+            self.input_val_nodes = None
+            self.input_test_nodes = None
+
 
     def set_custom_loader_class(
         self,
@@ -248,13 +252,10 @@ class InMemoryDataModule(LightningNodeData):
             return super().train_dataloader()
 
         else:
-                # set sampler parameters for training
-                train_sampler_params = deepcopy(self.sampler_params)
-
                 # instantiate the sampler class for training
                 train_sampler = self.sampler_class(
                                 data=self.data,
-                                **train_sampler_params,
+                                **self.sampler_params,
                             )
 
                 # instantiate the loader class for training
@@ -264,7 +265,7 @@ class InMemoryDataModule(LightningNodeData):
                                             input_nodes=self.input_train_nodes,
                                             neighbor_sampler=train_sampler,
                                             **self.loader_params,
-                                            **train_sampler_params,
+                                            **self.sampler_params,
                                         )
                 return train_loader
 
@@ -273,22 +274,16 @@ class InMemoryDataModule(LightningNodeData):
         """
         This function constructs the DataLoader object for validation based on the settings defined in the constructor of the InMemoryDataModule class. If the loader_name is set to 'DefaultFullLoader' or 'DefaultNodeLoader', the function will call the parent class' val_dataloader() function. Otherwise, it will instantiate `self.loader_class` with `self.sampler_class`.
 
-        If `use_full_graph_for_inference` is set to True, the number of neighbors will be set to the maximum number of neighbors for inference.
+        If `use_full_graph_for_inference` is set to True, input_nodes is set to None. That is, all nodes are used.
         """
         if self.loader_name in ['DefaultFullLoader', 'DefaultNodeLoader']:
             return super().val_dataloader()
 
         else:
-            # set sampler parameters for validation
-            val_sampler_params = deepcopy(self.sampler_params)
-            # set the number of neighbors to maximum for inference
-            if self.use_full_graph_for_inference:
-                val_sampler_params['num_neighbors'] = MAX_NUM_NEIGHBORS
-
             # instantiate the sampler class for validation
             val_sampler = self.sampler_class(
                                 data=self.data,
-                                **val_sampler_params,
+                                **self.sampler_params,
                             )
 
             # instantiate the loader class for validation
@@ -298,7 +293,7 @@ class InMemoryDataModule(LightningNodeData):
                                         input_nodes=self.input_val_nodes,
                                         neighbor_sampler=val_sampler,
                                         **self.loader_params,
-                                        **val_sampler_params,
+                                        **self.sampler_params,
                                     )
             return val_loader
 
@@ -307,22 +302,16 @@ class InMemoryDataModule(LightningNodeData):
         """
         This function constructs the DataLoader object for testing based on the settings defined in the constructor of the InMemoryDataModule class. If the loader_name is set to 'DefaultFullLoader' or 'DefaultNodeLoader', the function will call the parent class' test_dataloader() function. Otherwise, it will instantiate `self.loader_class` with `self.sampler_class`.
 
-        If `use_full_graph_for_inference` is set to True, the number of neighbors will be set to the maximum number of neighbors for inference.
+        If `use_full_graph_for_inference` is set to True, input_nodes is set to None. That is, all nodes are used.
         """
         if self.loader_name in ['DefaultFullLoader', 'DefaultNodeLoader']:
             return super().test_dataloader()
 
         else:
-            # set sampler parameters for testing
-            test_sampler_params = deepcopy(self.sampler_params)
-            # set the number of neighbors to maximum for inference
-            if self.use_full_graph_for_inference:
-                test_sampler_params['num_neighbors'] = MAX_NUM_NEIGHBORS
-
             # instantiate the sampler class for testing
             test_sampler = self.sampler_class(
                                 data=self.data,
-                                **test_sampler_params,
+                                **self.sampler_params,
                             )
 
             # instantiate the loader class for testing
@@ -332,6 +321,6 @@ class InMemoryDataModule(LightningNodeData):
                                         input_nodes=self.input_test_nodes,
                                         neighbor_sampler=test_sampler,
                                         **self.loader_params,
-                                        **test_sampler_params,
+                                        **self.sampler_params,
                                     )
             return test_loader
