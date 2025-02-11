@@ -30,9 +30,11 @@ Tradeoffs:
 """
 import os
 import copy
-import concurrent.futures
-import scanpy as sc
 from pathlib import Path
+import concurrent.futures
+
+import numpy as np
+import scanpy as sc
 from typing import Optional, Callable, List, Tuple
 
 from torch_geometric.data import InMemoryDataset, Data
@@ -118,9 +120,30 @@ class InMemoryDatasetBlob(InMemoryDataset):
         """
         Process the raw (silver) data and save it to the processed (gold) directory as a PyG InMemoryDataset. This method is called either when specifically `data.pt` is not found or when overwrite (force_reload) is set to True. Otherwise, `dataset_blob.pt` is loaded directly without calling this function.
         """
+        # ----------------- First Pass over AnnData Batches -----------------
+        # This pass is used to collect the unique categories for each label name across all batches.
+        # NOTE: So far, this only does this for labels. This needs to be extended to features in the future when we have multiple gene panels across dataset-ids.
+        # QUESTION: Can we parallelize this across batches?
+        self.label_categories = {
+            label_name: set()
+            for label_name in self.label_names
+        }
+
+        for adata_batch_file in self.raw_paths:
+            adata_batch = sc.read(adata_batch_file)
+            for label_name in self.label_names:
+                self.label_categories[label_name].update(adata_batch.obs[label_name].unique())
+
+        for label_name in self.label_names:
+            # sorting the categories for consistency across batches so that the one-hot encoding is consistent. e.g. when the one-hot encoding is [0, 1, 0], the label name is the second name in the sorted list of that label.
+            self.label_categories[label_name] = sorted(list(self.label_categories[label_name]))
+            print(f"Label Name: {label_name} | {self.label_categories[label_name]=}")
+
+        # ----------------- Second Pass over AnnData Batches -----------------
+        # This pass is used to process each batch of AnnData into a PyG Data object.
+
         # Process one batch of AnnData into one PyG Data object
         data_batches = []
-        batch_ids = []
 
         # parallelize the processing of each batch of AnnData
         num_cores = int(os.environ.get("LSB_DJOB_NUMPROC", 1))
@@ -135,9 +158,8 @@ class InMemoryDatasetBlob(InMemoryDataset):
                 futures.append(future)
 
             for future in concurrent.futures.as_completed(futures):
-                data_batch, batch_id = future.result()
+                data_batch = future.result()
                 data_batches.append(copy.deepcopy(data_batch))
-                batch_ids.append(batch_id)
                 print("")
 
                 del data_batch
@@ -145,7 +167,8 @@ class InMemoryDatasetBlob(InMemoryDataset):
         # sort the data batches by batch_idx
         # batch_id = "batch0", "batch1", ..., "batchN"
         # batch_idx = 0, 1, ..., N
-        data_batches = [x for _, x in sorted(zip(batch_ids, data_batches))]
+        # NOTE: If we have multiple dataset ids, this needs sorting by two keys simultaneously: dataset-id and batch-id.
+        data_batches = sorted(data_batches, key=lambda data_batch: data_batch.batch)
 
         # self.save internally collates all Data objects in data_list into a single blob.
         # The index is set to 0 so that the collated object is stored at
@@ -231,7 +254,8 @@ class InMemoryDatasetBlob(InMemoryDataset):
         # build for node labels (categorical pandas series to one hot tensor)
         for label_name in self.label_names:
             batch_dict[f"y_{label_name}"] = pandas_to_torch_one_hot(
-                                                adata_batch.obs[label_name]
+                                                adata_batch.obs[label_name],
+                                                categories=self.label_categories[label_name]
                                             )
 
         # build for edge index (sparse csr matrix to edge index style tensor)
@@ -244,9 +268,13 @@ class InMemoryDatasetBlob(InMemoryDataset):
         for key, value in batch_dict.items():
             print(f"{key}: {value.shape=}, {value.dtype=}, {type(value)=}")
 
-        # ----------------- Build Metadata Dict -----------------
-        # TODO: Save cell ids, batch ids, tissue, etc. as metadata
-        batch_id = adata_batch.uns['batch']
+        # ----------------- Add Metadata -----------------
+        batch_dict['cell_id'] = adata_batch.obs['cell_id'].to_list()
+
+        batch_dict['dataset_id'] = adata_batch.uns['dataset_id']
+        batch_dict['tissue'] = adata_batch.uns['tissue']
+        batch_dict['species'] = adata_batch.uns['species']
+        batch_dict['batch'] = adata_batch.uns['batch']
 
         # ----------------- Convert Data Dict to PyG Data Object -----------------
         data_batch = Data(**batch_dict)
@@ -259,7 +287,8 @@ class InMemoryDatasetBlob(InMemoryDataset):
         if self.pre_transform is not None:
             data_batch = self.pre_transform(data_batch)
 
-        return data_batch, batch_id
+        return data_batch
+
 
     @property
     def raw_dir(self) -> Path:
