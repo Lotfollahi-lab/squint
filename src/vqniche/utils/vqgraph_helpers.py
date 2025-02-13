@@ -1,3 +1,5 @@
+# Reference: https://github.com/YangLing0818/VQGraph/blob/main/vq.py
+
 import torch
 import torch.distributed as distributed
 import torch.nn.functional as F

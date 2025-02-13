@@ -1,12 +1,14 @@
 """
+Our implementation of VQGraph is built off of the code published by the authors of the VQGraph paper (source: https://github.com/YangLing0818/VQGraph/). We adapt it to work within our setup of Pytorch Geometric, Dataset-Blob, Pytorch Lightning, and Encoder-Predictor setup.
 
+The VQGraph model is a graph neural network model that uses vector quantization (VQ) to encode node embeddings. The VQGraph model consists of a VQGraph_Encoder module and a Linear predictor module. The VQGraph_Encoder module is responsible for encoding the input node embeddings using a graph-convolution module followed by vector quantization, while the Linear predictor module is responsible for predicting the output node embeddings. We use the Euclidean distance as the distance metric for vector quantization (i.e. Euclidean Codebook).
 """
 
 import torch
 import torch.nn as nn
 import torch_geometric
 from ..encoders.vqgraph_encoder import VQGraph_Encoder
-from typing import List, Union, Callable
+from typing import List, Union, Callable, Literal
 
 from .base_model import BaseModel
 
@@ -14,45 +16,47 @@ from .base_model import BaseModel
 class VQGraph(BaseModel):
     def __init__(
             self,
-            name: str = 'VQGraph',
+            model_name: str = 'VQGraph',
+            encoder_name: str = 'VQGraph_Encoder',
+            predictor_name: str = 'Linear',
             in_channels: int = None,
             out_channels: int = None,
-            encoder_name: str = 'VQGraph_Encoder',
             graphconv_layer_name: str = 'SAGEConv',
-            predictor_name: str = 'Linear',
             hidden_channels: int = 64,
             num_layers: int = 2,
             act_first: bool = True,
             activation: Union[str, Callable, None] = "relu",
             norm: Union[str, Callable, None] = None,
             dropout: float = 0.5,
+            codebook_params: dict = {},
+            optimizer_name: str = 'adam',
             lr: float = 0.01,
             weight_decay: float = 0.0,
-            optimizer_name: str = 'adam',
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'none'},
             task_name: str = 'multiclass',
             task_kwargs: dict = {},
-            inference_mode: str = 'batch-wise',
-            **kwargs
+            inference_mode: Literal['batch-wise', 'layer-wise'] = 'batch-wise',
         ):
         """
         Initializes the VQGraph model.
 
         Parameters
         ----------
-        - name: str
+        - model_name: str
             The name of the model.
+        - encoder_name: str
+            The name of the encoder module.
+        - predictor_name: str
+            The name of the predictor module.
+
         - in_channels: int
             The number of input features.
         - out_channels: int
             The number of output features.
-        - encoder_name: str
-            The name of the encoder module.
+
         - graphconv_layer_name: str
             The name of the graph convolutional layer.
-        - predictor_name: str
-            The name of the predictor module.
         - hidden_channels: int
             The number of hidden features.
         - num_layers: int
@@ -65,61 +69,65 @@ class VQGraph(BaseModel):
             The normalization function to use.
         - dropout: float
             The dropout probability.
+        - codebook_params: dict
+            Keyword arguments for the codebook.
+
+        - optimizer_name: str
+            The optimizer name.
         - lr: float
             The learning rate.
         - weight_decay: float
             The weight decay.
-        - optimizer_name: str
-            The optimizer name.
+
         - loss_names: list of str
             The loss function names.
         - loss_kwargs: dict
             Keyword arguments for the loss functions.
+
         - task_name: str
             The task type.
         - task_kwargs: dict
             Keyword arguments for the task.
+
         - inference_mode: str
             The inference mode. Choose from 'batch-wise' or 'layer-wise'.
-        - kwargs: dict
-            Additional keyword arguments.
         """
         # Initialize the BaseModel class
-        super(VQGraph, self).__init__(
-                        name=name,
-                        in_channels=in_channels,
-                        out_channels=out_channels,
-                        encoder_name=encoder_name,
-                        predictor_name=predictor_name,
-                        hidden_channels=hidden_channels,
-                        num_layers=num_layers,
-                        dropout=dropout,
-                        lr=lr,
-                        weight_decay=weight_decay,
-                        optimizer_name=optimizer_name,
-                        loss_names=loss_names,
-                        loss_kwargs=loss_kwargs,
-                        task_name=task_name,
-                        task_kwargs=task_kwargs,
-                        inference_mode=inference_mode,
-                        **kwargs
-                    )
+        super().__init__(
+            model_name=model_name,
+            encoder_name=encoder_name,
+            predictor_name=predictor_name,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            optimizer_name=optimizer_name,
+            lr=lr,
+            weight_decay=weight_decay,
+            loss_names=loss_names,
+            loss_kwargs=loss_kwargs,
+            task_name=task_name,
+            task_kwargs=task_kwargs,
+            inference_mode=inference_mode,
+        )
 
         # Initialize VQGraph encoder module.
         # The out_channels parameter is not passed to the VQGraph_Encoder (i.e. it is set to None) so that we can separate the encoder from the predictor.
         self.encoder = VQGraph_Encoder(
-                            graphconv_layer_name=graphconv_layer_name,
                             in_channels=in_channels,
                             hidden_channels=hidden_channels,
+                            graphconv_layer_name=graphconv_layer_name,
                             num_layers=num_layers,
                             act_first=act_first,
                             activation=activation,
                             dropout=dropout,
                             norm=norm,
+                            **codebook_params
                         )
 
         # Instead, we apply this final linear transformation in the predictor module manually to have access to the internal node embeddings via the `embed` function.
-        self.predictor = nn.Linear(hidden_channels, out_channels)
+        self.predictor = nn.Linear(
+                            in_features=hidden_channels,
+                            out_features=out_channels
+                            )
 
 
     def forward(
@@ -129,6 +137,34 @@ class VQGraph(BaseModel):
         ) -> torch.Tensor:
         """
         Forward pass of the VQGraph model.
+
+        Parameters:
+        ----------
+        - batch_x: torch.Tensor
+            The input features of the batch of nodes.
+        - batch_edge_index: torch.Tensor
+            The edge index tensor of the batch of nodes.
+
+        Returns
+        -------
+        - h_pre_vq_conv: torch.Tensor
+            Forward (output) of the pre-VQ Graph Convolution module.
+        - h_vq: torch.Tensor
+            VQ-encoded node embeddings.
+        - indices: torch.Tensor
+            The indices of the node embeddings mapped to codebook embeddings.
+        - dist: torch.Tensor
+            The distances between the node embeddings and the codebook embeddings.
+        - codebook_embeddings: torch.Tensor
+            The codebook embeddings.
+        - h_node: torch.Tensor
+            The decoded node attributes.
+        - h_edge: torch.Tensor
+            The decoded adjacency embeddings.
+        - h_post_vq_conv: torch.Tensor
+            Forward (output) of the post-VQ Graph Convolution module.
+        - unnormalized_logits_batch: torch.Tensor
+            The unnormalized logits for the batch of nodes (output of the predictor module).
         """
         # execute the forward of the VQGraph_Encoder model
         h_pre_vq_conv, \
@@ -179,7 +215,7 @@ class VQGraph(BaseModel):
 
         Returns
         -------
-        - torch.Tensor
+        - train_loss: torch.Tensor
             The computed loss for this batch.
         """
         batch_size = train_batch.batch_size
@@ -252,7 +288,7 @@ class VQGraph(BaseModel):
 
         Returns
         -------
-        - torch.Tensor
+        - val_loss: torch.Tensor
             The computed loss for this batch.
         """
         batch_size = val_batch.batch_size
@@ -326,7 +362,7 @@ class VQGraph(BaseModel):
 
         Returns
         -------
-        - torch.Tensor
+        - test_loss: torch.Tensor
             The computed loss for this batch.
         """
         batch_size = test_batch.batch_size

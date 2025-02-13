@@ -8,13 +8,14 @@ from einops import rearrange, pack, repeat, unpack
 
 from vqniche.codebooks.cosine_codebook import CosineSimCodebook
 
+
 class VQGraph_Encoder(pl.LightningModule):
 
     def __init__(
         self,
-        graphconv_layer_name: str = 'SAGEConv',
         in_channels: int = None,
         hidden_channels: int = 256,
+        graphconv_layer_name: str = 'SAGEConv',
         num_layers: int = 2,
         act_first: bool = True,
         activation: Union[str, Callable, None] = "relu",
@@ -32,7 +33,7 @@ class VQGraph_Encoder(pl.LightningModule):
         use_ddp: bool = False,
         sample_codebook_temp: float = 0.0,
     ):
-        super(VQGraph_Encoder, self).__init__()
+        super().__init__()
 
         # graph convolution
         self.graphconv_layer_name = graphconv_layer_name
@@ -110,24 +111,27 @@ class VQGraph_Encoder(pl.LightningModule):
 
         If the vq_location is 'feature-space', the hidden channels are set to the in_channels and the number of layers is set to num_layers - 1. If the vq_location is 'latent-space', the hidden channels are set to the hidden_channels and the number of layers is set to num_layers.
 
-        Args:
-            - in_channels: int
-                The input dimension of the Graph Convolution module.
-            - hidden_channels: int
-                The hidden dimension of the Graph Convolution module.
-            - num_layers: int
-                The number of layers in the pre-VQ Graph Convolution module.
-            - act_first: bool
-                Whether to apply the activation function before the normalization layer.
-            - activation: Union[str, Callable, None]
-                The activation function to apply.
-            - dropout: float
-                The dropout rate.
-            - norm: Union[str, Callable, None]
-                The normalization layer to apply.
+        Parameters
+        ----------
+        - in_channels: int
+            The input dimension of the Graph Convolution module.
+        - hidden_channels: int
+            The hidden dimension of the Graph Convolution module.
+        - num_layers: int
+            The number of layers in the pre-VQ Graph Convolution module.
+        - act_first: bool
+            Whether to apply the activation function before the normalization layer.
+        - activation: Union[str, Callable, None]
+            The activation function to apply.
+        - dropout: float
+            The dropout rate.
+        - norm: Union[str, Callable, None]
+            The normalization layer to apply.
 
-        Returns:
-            - SAGE_Encoder: The Graph Convolution module.
+        Returns
+        -------
+        - SAGE_Encoder: torch.nn.Module
+            The Graph Convolution module.
         """
         if self.graphconv_layer_name == 'SAGEConv':
             print(f"Graph Convolution applied from {in_channels} to {hidden_channels} across {num_layers} layer(s).")
@@ -150,9 +154,10 @@ class VQGraph_Encoder(pl.LightningModule):
         """
         Retrieves the codebook embeddingsfrom the codebook class.
 
-        Returns:
-            - codebook_embeddings: torch.Tensor
-                The codebook embeddings retrieved from the codebook class.
+        Returns
+        -------
+        - codebook_embeddings: torch.Tensor
+            The codebook embeddings retrieved from the codebook class.
         """
         # NOTE: This function is not used in the forward pass.
         codebook_embeddings = self._codebook.embed
@@ -166,13 +171,15 @@ class VQGraph_Encoder(pl.LightningModule):
         """
         Retrieves the codes from the codebook class based on the provided indices.
 
-        Args:
-            - indices: torch.Tensor
-                The indices of the codes to retrieve.
+        Parameters
+        ----------
+        - indices: torch.Tensor
+            The indices of the codes to retrieve.
 
-        Returns:
-            - codes: torch.Tensor
-                The codes retrieved from the codebook class.
+        Returns
+        -------
+        - codes: torch.Tensor
+            The codes retrieved from the codebook class.
         """
         # NOTE: This function is not used in the forward pass.
         codebook = self.codebook
@@ -201,6 +208,32 @@ class VQGraph_Encoder(pl.LightningModule):
         ) -> torch.Tensor:
         """
         Forward pass of the VQGraph_Encoder model.
+
+        Parameters:
+        ----------
+        - batch_x: torch.Tensor
+            The input features of the batch of nodes.
+        - batch_edge_index: torch.Tensor
+            The edge index tensor of the batch of nodes.
+
+        Returns
+        -------
+        - h_pre_vq_conv: torch.Tensor
+            Forward (output) of the pre-VQ Graph Convolution module.
+        - h_vq: torch.Tensor
+            VQ-encoded node embeddings.
+        - indices: torch.Tensor
+            The indices of the node embeddings mapped to codebook embeddings.
+        - dist: torch.Tensor
+            The distances between the node embeddings and the codebook embeddings.
+        - codebook_embeddings: torch.Tensor
+            The codebook embeddings.
+        - h_node: torch.Tensor
+            The decoded node attributes.
+        - h_edge: torch.Tensor
+            The decoded adjacency embeddings.
+        - h_post_vq_conv: torch.Tensor
+            Forward (output) of the post-VQ Graph Convolution module.
         """
         # pre-VQ Graph Convolution
         h_pre_vq_conv = self.pre_vq_conv_module(

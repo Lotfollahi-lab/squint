@@ -1,11 +1,14 @@
+"""
+CosineSimCodebook class is a PyTorch Lightning Module that implements the cosine similarity codebook for the VQ-VAE model.
+
+Reference: https://github.com/YangLing0818/VQGraph/blob/main/vq.py
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import autocast
 
 import pytorch_lightning as pl
-
-from typing import List, Tuple, Callable, Optional, Union
 from einops import einsum, rearrange
 
 from vqniche.utils.vqgraph_helpers import l2norm, \

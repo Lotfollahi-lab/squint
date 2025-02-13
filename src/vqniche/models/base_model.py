@@ -10,83 +10,71 @@ from ..utils.loss import *
 class BaseModel(pl.LightningModule):
     def __init__(
             self,
-            name: str = 'BaseModel',
-            in_channels: int = None,
-            out_channels: int = None,
+            model_name: str = 'BaseModel',
             encoder_name: str = 'GraphSAGE',
             predictor_name: str = 'Linear',
-            hidden_channels: int = 256,
-            num_layers: int = 2,
-            dropout: float = 0.5,
+            in_channels: int = None,
+            out_channels: int = None,
+            optimizer_name: str = 'adam',
             lr: float = 0.01,
             weight_decay: float = 0.0,
-            optimizer_name: str = 'adam',
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'mean'},
             task_name: str = 'multiclass',
             task_kwargs: dict = {},
             inference_mode: Literal['batch-wise', 'layer-wise'] = 'batch-wise',
-            **kwargs
         ) -> None:
         """
         Initialize the BaseModel class.
 
         Parameters
         ----------
-        - name: str
+        - model_name: str
             The name of the model.
-        - in_channels: int
-            The number of input channels.
-        - out_channels: int
-            The number of output channels.
         - encoder_name: str
             The encoder name.
         - predictor_name: str
             The predictor name.
-        - hidden_channels: int
-            The number of hidden channels.
-        - num_layers: int
-            The number of layers.
-        - dropout: float
-            The dropout rate.
+
+        - in_channels: int
+            The number of input channels.
+        - out_channels: int
+            The number of output channels.
+
+        - optimizer_name: str
+            The optimizer name.
         - lr: float
             The learning rate.
         - weight_decay: float
             The weight decay.
-        - optimizer_name: str
-            The optimizer name.
+
         - loss_names: List[str]
             The loss function names.
         - loss_kwargs: dict
             The loss function keyword arguments.
+
         - task_name: str
             The task name.
         - task_kwargs: dict
             The task keyword arguments.
+
         - inference_mode: Literal['batch-wise', 'layer-wise']
             The inference mode. Choose from 'batch-wise' or 'layer-wise'.
-        - kwargs: dict
-            Additional keyword arguments.
         """
-        self.name = name
-
-        super(BaseModel, self).__init__(**kwargs)
-
-        # Encoder parameters
+        self.model_name = model_name
         self.encoder_name = encoder_name
-        self.in_channels = in_channels
-        self.hidden_channels = hidden_channels
-        self.num_layers = num_layers
-
-        # Predictor parameters
         self.predictor_name = predictor_name
+
+        super().__init__()
+
+        # Data parameters
+        self.in_channels = in_channels
         self.out_channels = out_channels
 
         # Optimizer parameters
-        self.dropout = dropout
+        self.optimizer_name = optimizer_name
         self.lr = lr
         self.weight_decay = weight_decay
-        self.optimizer_name = optimizer_name
 
         # Loss parameters
         self.loss_kwargs = loss_kwargs
@@ -95,9 +83,21 @@ class BaseModel(pl.LightningModule):
         # Accuracy metrics parameters
         self.task_name = task_name
         self.task_kwargs = task_kwargs
-        self.train_acc = Accuracy(task=task_name, num_classes=out_channels, **task_kwargs)
-        self.val_acc = Accuracy(task=task_name, num_classes=out_channels, **task_kwargs)
-        self.test_acc = Accuracy(task=task_name, num_classes=out_channels, **task_kwargs)
+        self.train_acc = Accuracy(
+                            task=task_name,
+                            num_classes=out_channels,
+                            **task_kwargs
+                            )
+        self.val_acc = Accuracy(
+                            task=task_name,
+                            num_classes=out_channels,
+                            **task_kwargs
+                            )
+        self.test_acc = Accuracy(
+                            task=task_name,
+                            num_classes=out_channels,
+                            **task_kwargs
+                            )
 
         # Option 1 -- batch-wise (default)
         # for epoch in epochs:
@@ -120,7 +120,7 @@ class BaseModel(pl.LightningModule):
             loss_kwargs: dict = {}
         ) -> List[Tuple[str, Callable, List[str], dict]]:
         """
-        Set the loss functions for the encoder.
+        Set the loss functions for the model.
 
         Parameters
         ----------
@@ -131,7 +131,7 @@ class BaseModel(pl.LightningModule):
 
         Returns
         -------
-        List
+        loss_fn_tuples: List
             One tuple per loss name in loss_names comprising of loss function name (str), loss function (callable), list of data related key strings required to be passed to the loss function, and a dictionary of additional keyword arguments for the loss function.
 
         Notes
@@ -226,8 +226,8 @@ class BaseModel(pl.LightningModule):
 
         Returns
         -------
-        - torch.Tensor
-            The computed loss.
+        - total_loss: torch.Tensor
+            The total computed loss across all loss terms.
         """
         assert len(self.loss_fn_tuples) > 0, 'No loss functions defined'
 
@@ -324,7 +324,7 @@ class BaseModel(pl.LightningModule):
 
         Returns
         -------
-        - torch.Tensor
+        - unnormalized_logits: torch.Tensor
             The unnormalized logits of the model.
         """
         # calls the forward method of the Model's encoder
@@ -347,9 +347,11 @@ class BaseModel(pl.LightningModule):
         """
         # TODO: Add support for multiple optimizers
         if self.optimizer_name == 'adam':
-            return torch.optim.Adam(params=self.parameters(),
-                                    lr=self.lr,
-                                    weight_decay=self.weight_decay)
+            return torch.optim.Adam(
+                params=self.parameters(),
+                lr=self.lr,
+                weight_decay=self.weight_decay
+            )
         else:
             raise NotImplementedError(f'Optimizer {self.optimizer_name} not implemented')
 
