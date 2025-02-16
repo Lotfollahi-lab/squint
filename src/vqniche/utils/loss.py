@@ -1,9 +1,10 @@
 import torch
 import torch.nn.functional as F
-from torch_geometric.utils import from_scipy_sparse_matrix
 
 from vqniche.utils.type_conversions import edge_index_to_adjacency_tensor
 from vqniche.utils.vqgraph_helpers import l2norm
+from vqniche.utils.loss_utils import compute_dispersion
+from scvi.distributions import NegativeBinomial, ZeroInflatedNegativeBinomial
 
 
 def cross_entropy_loss(logits: torch.Tensor,
@@ -213,7 +214,10 @@ def nichecompass_adjacency_reconstruction(
     adj_quantized = torch.matmul(h_edge, h_edge.t())
     adj_quantized = (adj_quantized - adj_quantized.min()) / (adj_quantized.max() - adj_quantized.min())
     adj_quantized = adj_quantized.to(batch_edge_index.device)
-    batch_edge_index_quantized = from_scipy_sparse_matrix(adj_quantized.cpu().numpy())[0].to(batch_edge_index.device)
+    batch_edge_index_quantized = adj_quantized.nonzero(as_tuple=False).t()
+    # batch_edge_index_quantized = from_scipy_sparse_matrix(
+    #                                 adj_quantized.detach().cpu().numpy()
+    #                                 )[0].to(batch_edge_index.device)
 
     # Compute weighted bce loss from logits for numerical stability
     return F.binary_cross_entropy_with_logits(
@@ -223,4 +227,71 @@ def nichecompass_adjacency_reconstruction(
             ) * scaling_edge_gamma
 
 
+def negative_binomial_attribute_reconstruction(
+    h_pre_vq_conv: torch.Tensor,
+    h_node: torch.Tensor,
+    batch_ids: torch.Tensor,
+    num_samples: int = 3,
+    theta: float = 1.0,
+    eps: float = 1e-8,
+    scaling_node_gamma: float = 0.001
+    ) -> torch.Tensor:
+    """
+    Compute the negative binomial loss.
 
+    Parameters
+    ----------
+    h_pre_vq_conv: torch.Tensor
+        The latent node embedding obtained from the pre-VQ graph convolution layer(s).
+    h_node: torch.Tensor
+        The quantized node embedding obtained from a Linear Decoder layer on the output of the VQ layer
+    scaling_node_gamma: float
+        The scaling factor for the node attribute reconstruction loss.
+
+    Returns
+    -------
+    torch.Tensor
+        The computed node attribute reconstruction loss.
+    """
+    batch_ids = torch.ones(
+                    h_node.shape[0],
+                    dtype=torch.long,
+                    device=h_node.device
+                )
+
+    dispersion = compute_dispersion(
+        input_tensor=batch_ids,
+        n_genes=h_node.shape[1],
+        theta=theta,
+        device=h_node.device
+    )
+    print(f"{dispersion=}")
+    print(f"{dispersion.shape=}")
+    print(f"{h_node=}")
+    print(f"{h_node.shape=}")
+    print(f"{h_pre_vq_conv=}")
+    print(f"{h_pre_vq_conv.shape=}")
+
+    nb_distribution = NegativeBinomial(
+                        mu=h_node,
+                        theta=dispersion
+                        )
+    nb_loss = -nb_distribution.log_prob(
+                                h_pre_vq_conv
+                            ).sum(dim=-1).mean()
+    print(-nb_distribution.log_prob(
+                                h_pre_vq_conv
+                            ).sum(dim=-1))
+    print(f"{nb_loss=}")
+    # log_dispersion_h_node_eps = torch.log(dispersion + h_node + eps)
+
+    # log_likelihood_nb = (
+    #     dispersion * (torch.log(dispersion + eps) - log_dispersion_h_node_eps)
+    #     + h_pre_vq_conv * (torch.log(h_node + eps) - log_dispersion_h_node_eps)
+    #     + torch.lgamma(h_pre_vq_conv + dispersion)
+    #     - torch.lgamma(dispersion)
+    #     - torch.lgamma(h_pre_vq_conv + 1))
+
+    # nb_loss = torch.mean(-log_likelihood_nb.sum(-1))
+
+    return nb_loss * scaling_node_gamma

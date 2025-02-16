@@ -165,6 +165,15 @@ class BaseModel(pl.LightningModule):
                 if scaling_node_gamma is not None:
                     loss_fn_params['scaling_node_gamma'] = scaling_node_gamma
 
+            elif loss_fn_name == 'negative_binomial_attribute_reconstruction':
+                loss_fn = negative_binomial_attribute_reconstruction
+
+                loss_fn_data_keys = ['h_pre_vq_conv', 'h_node', 'batch_ids']
+
+                scaling_node_gamma = loss_kwargs.get('scaling_node_gamma')
+                if scaling_node_gamma is not None:
+                    loss_fn_params['scaling_node_gamma'] = scaling_node_gamma
+
             elif loss_fn_name == 'vqgraph_adjacency_reconstruction':
                 loss_fn = vqgraph_adjacency_reconstruction
 
