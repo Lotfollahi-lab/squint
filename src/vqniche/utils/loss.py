@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from typing import Literal
 
 from vqniche.utils.type_conversions import edge_index_to_adjacency_tensor
 from vqniche.utils.vqgraph_helpers import l2norm
@@ -7,9 +8,10 @@ from vqniche.utils.loss_utils import compute_dispersion
 from scvi.distributions import NegativeBinomial, ZeroInflatedNegativeBinomial
 
 
-def cross_entropy_loss(logits: torch.Tensor,
-                       labels: torch.Tensor,
-                       reduction: str = "mean"
+def cross_entropy(
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        wt_cross_entropy: float = 1.0
     ) -> torch.Tensor:
     """
     Compute the cross-entropy loss for multiclass classification.
@@ -18,130 +20,217 @@ def cross_entropy_loss(logits: torch.Tensor,
     ----------
     logits : torch.Tensor
         Unnormalized logits.
+        Dimensions: (batch_size, num_classes)
     labels : torch.Tensor
         Ground truth class indices or class probabilities.
+        Dimensions: (batch_size,)
+    wt_cross_entropy : float
+        The scaling factor for the cross-entropy loss.
 
     Returns
     -------
-    torch.Tensor
-        The computed cross-entropy loss.
+    ce_loss: torch.Tensor
+        The computed cross-entropy loss weighted by `wt_cross_entropy`.
 
     Notes
     -----
     Cross entropy loss can take predicted class probabilities as input. But we are using the unnormalized logits as input for numerical stability and because the cross_entropy function in PyTorch automatically applies the softmax function to the logits.
     """
-    return F.cross_entropy(
-        input=logits,
-        target=labels,
-        reduction=reduction
-    )
+    ce_loss = F.cross_entropy(
+                input=logits,
+                target=labels,
+                reduction='mean',
+            )
+    return ce_loss * wt_cross_entropy
 
 
-def vqgraph_attribute_reconstruction(
-    h_pre_vq_conv: torch.Tensor,
-    h_node: torch.Tensor,
-    scaling_node_gamma: float = 0.001
+def mse_attribute_reconstruction(
+        pred_attr: torch.Tensor,
+        target_attr: torch.Tensor,
+        wt_attr_reconstr: float = 0.1
     ) -> torch.Tensor:
     """
-    Compute the node attribute reconstruction loss for VQGraph.
+    Compute the mean squared error (MSE) between the estimated attributes from the decoder module and the target attributes.
 
     Parameters
     ----------
-    h_pre_vq_conv: torch.Tensor
-        The latent node embedding obtained from the pre-VQ graph convolution layer(s).
-    h_node: torch.Tensor
-        The quantized node embedding obtained from a Linear Decoder layer on the output of the VQ layer
-    scaling_node_gamma: float
+    pred_attr: torch.Tensor
+        The output from the attribute decoder module.
+        Dimensions: (batch_size, num_genes)
+    target_attr: torch.Tensor
+        The target attributes.
+        Dimensions: (batch_size, num_genes)
+    wt_attr_reconstr: float
         The scaling factor for the node attribute reconstruction loss.
 
     Returns
     -------
-    torch.Tensor
+    mse_attr_reconstr_loss: torch.Tensor
         The computed node attribute reconstruction loss.
+
+    Notes
+    -----
+    In VQGraph, `pred_attr` is the output from the Linear attribute decoder module (after vector quantization) and `target_attr` is the node embedding from the pre-VQ graph convolution layer(s).
     """
+    mse_attr_reconstr_loss = F.mse_loss(
+                                input=target_attr,
+                                target=pred_attr,
+                                reduction='mean',
+                            )
+    return mse_attr_reconstr_loss * wt_attr_reconstr
 
-    return F.mse_loss(
-        input=h_node,
-        target=h_pre_vq_conv,
-        reduction='mean'
-    ) * scaling_node_gamma
 
-
-def vqgraph_adjacency_reconstruction(
-    batch_edge_index: torch.Tensor,
-    h_edge: torch.Tensor,
-    scaling_edge_gamma: float = 0.03
+def nb_attribute_reconstruction(
+        pred_attr: torch.Tensor,
+        target_attr: torch.Tensor,
+        distribution: Literal['zinb', 'nb'] = 'nb',
+        dispersion_theta: float = 1.0,
+        wt_attr_reconstr: float = 0.1,
     ) -> torch.Tensor:
     """
-    Compute the adjacency reconstruction loss for VQGraph.
+    Compute the negative binomial loss.
 
     Parameters
     ----------
+    pred_attr: torch.Tensor
+        The output from the attribute decoder module.
+        Dimensions: (batch_size, num_genes)
+    target_attr: torch.Tensor
+        The target attributes.
+        Dimensions: (batch_size, num_genes)
+    distribution: str
+        The distribution to use for the negative binomial loss. Can be 'nb' or 'zinb'.
+    dispersion_theta: float
+        The `theta` parameter to compute dispersion of batch-ids for the negative binomial distribution.
+    wt_attr_reconstr: float
+        The scaling factor for the node attribute reconstruction loss.
+
+    Returns
+    -------
+    nb_loss: torch.Tensor
+        The computed node attribute reconstruction loss.
+    """
+    # TODO: Replace with batch_ids from the dataloader
+    batch_ids = torch.ones(
+                    pred_attr.shape[0], # batch_size
+                    dtype=torch.float32,
+                    device=pred_attr.device
+                )
+
+    dispersion = compute_dispersion(
+        input=batch_ids,
+        num_out_features=pred_attr.shape[1], # num_genes
+        theta=dispersion_theta,
+        device=pred_attr.device
+    )
+
+    if distribution == 'zinb':
+        nb_distribution = ZeroInflatedNegativeBinomial(
+                        mu=pred_attr,
+                        theta=dispersion
+                        )
+    elif distribution == 'nb':
+        nb_distribution = NegativeBinomial(
+                            mu=pred_attr,
+                            theta=dispersion
+                            )
+
+    nb_loss = -nb_distribution.log_prob(
+                                target_attr
+                            ).sum(dim=-1).mean()
+
+
+    return nb_loss * wt_attr_reconstr
+
+
+def mse_adjacency_reconstruction(
+        pred_adj: torch.Tensor,
+        batch_edge_index: torch.Tensor,
+        wt_adj_reconstr: float = 0.1
+    ) -> torch.Tensor:
+    """
+    Compute the mean squared error (MSE) between the estimated adjacency from the decoder module and the original adjacency.
+
+    Parameters
+    ----------
+    pred_adj: torch.Tensor
+        The output from the adjacency decoder module.
+        Dimensions: (batch_size, num_genes)
     batch_edge_index: torch.Tensor
         The edge index of the batch
-    h_edge: torch.Tensor
-        The quantized edge embedding obtained from a Linear Decoder layer on the output of the VQ layer
-    scaling_edge_gamma: float
+        Dimensions: (2, num_edges)
+    wt_adj_reconstr: float
         The scaling factor for the adjacency reconstruction loss.
 
     Returns
     -------
-    torch.Tensor
+    mse_adj_reconstr_loss: torch.Tensor
         The computed adjacency reconstruction loss.
+
+    Notes
+    -----
+    In VQGraph, `pred_adj` is the output from the Linear adjacency decoder module (after vector quantization) and `batch_edge_index` is the edge index of the batch.
     """
+    # TODO: fix using global node ID
     batch_adjacency_matrix = edge_index_to_adjacency_tensor(
         edge_index=batch_edge_index,
-        num_nodes=h_edge.shape[0],
+        num_nodes=pred_adj.shape[0],
         device=batch_edge_index.device
     )
 
-    adj_quantized = torch.matmul(h_edge, h_edge.t())
+    adj_quantized = torch.matmul(pred_adj, pred_adj.t())
     adj_quantized = (adj_quantized - adj_quantized.min()) / (adj_quantized.max() - adj_quantized.min())
     adj_quantized = adj_quantized.to(batch_adjacency_matrix.device)
 
-    return torch.sqrt(F.mse_loss(
+    mse_adj_reconstr_loss = torch.sqrt(F.mse_loss(
         input=adj_quantized,
         target=batch_adjacency_matrix,
         reduction='mean'
-    )) * scaling_edge_gamma
+    ))
+
+    return mse_adj_reconstr_loss * wt_adj_reconstr
 
 
-def vqgraph_commitment_loss(
-    h_pre_vq_conv: torch.Tensor,
-    h_vq: torch.Tensor,
-    commitment_weight: float = 0.25
+def mse_commitment_loss(
+        pred_commit: torch.Tensor,
+        target_commit: torch.Tensor,
+        wt_commit: float = 0.25
     ) -> torch.Tensor:
     """
-    Compute the commitment loss for VQGraph.
+    Compute the commitment loss for the VQ layer using a straight-through estimator.
 
     Parameters
     ----------
-    h_pre_vq_conv: torch.Tensor
+    pred_commit: torch.Tensor
         The latent node embedding obtained from the pre-VQ graph convolution layer(s).
-    h_vq: torch.Tensor
-        The quantized node embedding obtained from a Linear Decoder layer on the output of the VQ layer
-    commitment_weight: float
+        Dimensions: (batch_size, num_genes)
+    target_commit: torch.Tensor
+        The quantized node embedding obtained from a Linear Decoder layer on the output of the VQ layer.
+        Dimensions: (batch_size, num_genes)
+    wt_commit: float
         The scaling factor for the commitment loss.
 
     Returns
     -------
-    torch.Tensor
+    mse_commit_loss: torch.Tensor
         The computed commitment loss.
     """
-    h_vq = h_pre_vq_conv + (h_vq - h_pre_vq_conv).detach()
-    detached_h_vq = h_vq.detach()
-    return F.mse_loss(
-        input=h_pre_vq_conv,
-        target=detached_h_vq,
-        reduction='mean'
-    ) * commitment_weight
+    target_commit = pred_commit + (target_commit - pred_commit).detach()
+    detached_target = target_commit.detach()
+
+    mse_commit_loss = F.mse_loss(
+                        input=pred_commit,
+                        target=detached_target,
+                        reduction='mean',
+                    )
+    return mse_commit_loss * wt_commit
 
 
-def vqgraph_codebook_loss(
-    codebook_embeddings: torch.Tensor,
-    codebook_reg_weight: float = 0.001,
-    codebook_reg_active_codes_only: bool = False,
-    codebook_reg_max_codes: int = None
+def l2_codebook_loss(
+        codebook_embeddings: torch.Tensor,
+        wt_codebook: float = 0.2,
+        codebook_reg_active_codes_only: bool = False,
+        codebook_reg_max_codes: int = None
     ) -> torch.Tensor:
     """
     Compute the codebook loss for VQGraph.
@@ -150,12 +239,18 @@ def vqgraph_codebook_loss(
     ----------
     codebook_embeddings: torch.Tensor
         The codebook embeddings.
+        Dimensions: (codebook_size, num_genes)
     codebook_reg_weight: float
         The scaling factor for the codebook loss.
     codebook_reg_active_codes_only: bool
         Whether to only calculate the codebook loss for the active codes.
     codebook_reg_max_codes: int
         The maximum number of codes to use for the codebook loss.
+
+    Returns
+    -------
+    codebook_loss: torch.Tensor
+        The computed codebook loss.
 
     Notes:
     -----
@@ -177,121 +272,4 @@ def vqgraph_codebook_loss(
 
     codebook_loss = (cosine_sim**2).sum() / (h * n**2) - (1 / n)
 
-    return codebook_loss * codebook_reg_weight
-
-
-def nichecompass_adjacency_reconstruction(
-    batch_edge_index: torch.Tensor,
-    h_edge: torch.Tensor,
-    scaling_edge_gamma: float = 0.03
-    ) -> torch.Tensor:
-    """
-    Compute the adjacency reconstruction loss as in NicheCompass.
-
-    Parameters
-    ----------
-    batch_edge_index: torch.Tensor
-        The edge index of the batch
-    h_edge: torch.Tensor
-        The quantized edge embedding obtained from a Linear Decoder layer on the output of the VQ layer
-    scaling_edge_gamma: float
-        The scaling factor for the adjacency reconstruction loss.
-
-    Returns
-    -------
-    torch.Tensor
-        The computed adjacency reconstruction loss.
-
-    Notes
-    -----
-    - Source: https://github.com/Lotfollahi-lab/nichecompass/blob/main/src/nichecompass/modules/losses.py
-    """
-    # Determine weighting of positive examples
-    pos_labels = (batch_edge_index == 1.).sum(dim=0)
-    neg_labels = (batch_edge_index == 0.).sum(dim=0)
-    pos_weight = neg_labels / pos_labels
-
-    adj_quantized = torch.matmul(h_edge, h_edge.t())
-    adj_quantized = (adj_quantized - adj_quantized.min()) / (adj_quantized.max() - adj_quantized.min())
-    adj_quantized = adj_quantized.to(batch_edge_index.device)
-    batch_edge_index_quantized = adj_quantized.nonzero(as_tuple=False).t()
-    # batch_edge_index_quantized = from_scipy_sparse_matrix(
-    #                                 adj_quantized.detach().cpu().numpy()
-    #                                 )[0].to(batch_edge_index.device)
-
-    # Compute weighted bce loss from logits for numerical stability
-    return F.binary_cross_entropy_with_logits(
-                input=batch_edge_index_quantized,
-                target=batch_edge_index,
-                pos_weight=pos_weight
-            ) * scaling_edge_gamma
-
-
-def negative_binomial_attribute_reconstruction(
-    h_pre_vq_conv: torch.Tensor,
-    h_node: torch.Tensor,
-    batch_ids: torch.Tensor,
-    num_samples: int = 3,
-    theta: float = 1.0,
-    eps: float = 1e-8,
-    scaling_node_gamma: float = 0.001
-    ) -> torch.Tensor:
-    """
-    Compute the negative binomial loss.
-
-    Parameters
-    ----------
-    h_pre_vq_conv: torch.Tensor
-        The latent node embedding obtained from the pre-VQ graph convolution layer(s).
-    h_node: torch.Tensor
-        The quantized node embedding obtained from a Linear Decoder layer on the output of the VQ layer
-    scaling_node_gamma: float
-        The scaling factor for the node attribute reconstruction loss.
-
-    Returns
-    -------
-    torch.Tensor
-        The computed node attribute reconstruction loss.
-    """
-    batch_ids = torch.ones(
-                    h_node.shape[0],
-                    dtype=torch.long,
-                    device=h_node.device
-                )
-
-    dispersion = compute_dispersion(
-        input_tensor=batch_ids,
-        n_genes=h_node.shape[1],
-        theta=theta,
-        device=h_node.device
-    )
-    print(f"{dispersion=}")
-    print(f"{dispersion.shape=}")
-    print(f"{h_node=}")
-    print(f"{h_node.shape=}")
-    print(f"{h_pre_vq_conv=}")
-    print(f"{h_pre_vq_conv.shape=}")
-
-    nb_distribution = NegativeBinomial(
-                        mu=h_node,
-                        theta=dispersion
-                        )
-    nb_loss = -nb_distribution.log_prob(
-                                h_pre_vq_conv
-                            ).sum(dim=-1).mean()
-    print(-nb_distribution.log_prob(
-                                h_pre_vq_conv
-                            ).sum(dim=-1))
-    print(f"{nb_loss=}")
-    # log_dispersion_h_node_eps = torch.log(dispersion + h_node + eps)
-
-    # log_likelihood_nb = (
-    #     dispersion * (torch.log(dispersion + eps) - log_dispersion_h_node_eps)
-    #     + h_pre_vq_conv * (torch.log(h_node + eps) - log_dispersion_h_node_eps)
-    #     + torch.lgamma(h_pre_vq_conv + dispersion)
-    #     - torch.lgamma(dispersion)
-    #     - torch.lgamma(h_pre_vq_conv + 1))
-
-    # nb_loss = torch.mean(-log_likelihood_nb.sum(-1))
-
-    return nb_loss * scaling_node_gamma
+    return codebook_loss * wt_codebook

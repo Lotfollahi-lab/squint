@@ -238,17 +238,15 @@ class VQGraph(BaseModel):
         # prepare dictionary of data required for computing loss
         # This slicing is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the target nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of target nodes is equal to the batch size. The remaining entries of the forward output are the logits for the sampled neighbors of the target nodes.
         train_loss_data = {
-                        'h_pre_vq_conv': h_pre_vq_conv[:batch_size],
-                        'h_vq': h_vq[:batch_size],
-                        'indices': indices[:batch_size],
-                        'dist': dist[:batch_size],
-                        'codebook_embeddings': codebook_embeddings[:batch_size],
-                        'h_node': h_node[:batch_size],
-                        'h_edge': h_edge[:batch_size],
-                        'h_post_vq_conv': h_post_vq_conv[:batch_size],
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': train_batch.y[:batch_size],
+                        'pred_attr': h_node[:batch_size],
+                        'target_attr': h_pre_vq_conv[:batch_size],
+                        'pred_adj': h_edge[:batch_size],
                         'batch_edge_index': train_batch.edge_index,
+                        'pred_commit': h_pre_vq_conv[:batch_size],
+                        'target_commit': h_vq[:batch_size],
+                        'codebook_embeddings': codebook_embeddings[:batch_size],
                         }
 
         # compute train loss
@@ -313,16 +311,15 @@ class VQGraph(BaseModel):
 
         # prepare dictionary of data required for computing loss
         val_loss_data = {
-                        'h_pre_vq_conv': h_pre_vq_conv[:batch_size],
-                        'h_vq': h_vq[:batch_size],
-                        'indices': indices[:batch_size],
-                        'dist': dist[:batch_size],
-                        'codebook_embeddings': codebook_embeddings[:batch_size],
-                        'h_node': h_node[:batch_size],
-                        'h_edge': h_edge[:batch_size],
-                        'h_post_vq_conv': h_post_vq_conv[:batch_size],
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': val_batch.y[:batch_size],
+                        'pred_attr': h_node[:batch_size],
+                        'target_attr': h_pre_vq_conv[:batch_size],
+                        'pred_adj': h_edge[:batch_size],
+                        'batch_edge_index': val_batch.edge_index,
+                        'pred_commit': h_pre_vq_conv[:batch_size],
+                        'target_commit': h_vq[:batch_size],
+                        'codebook_embeddings': codebook_embeddings[:batch_size],
                         }
 
         # compute validation loss

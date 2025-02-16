@@ -145,61 +145,71 @@ class BaseModel(pl.LightningModule):
         for loss_fn_name in loss_fn_names:
             print(f"Loss function: {loss_fn_name}")
             loss_fn_params = {}
+
             if loss_fn_name == 'cross_entropy':
                 # set the cross-entropy loss function
-                loss_fn = cross_entropy_loss
+                loss_fn = cross_entropy
 
                 # set key names for data required to compute cross-entropy loss
                 loss_fn_data_keys = ['logits', 'labels']
 
                 # set keyword parameters for cross-entropy loss
-                reduction = loss_kwargs.get('reduction')
-                if reduction is not None:
-                    loss_fn_params['reduction'] = reduction
-            elif loss_fn_name == 'vqgraph_attribute_reconstruction':
-                loss_fn = vqgraph_attribute_reconstruction
+                wt_cross_entropy = loss_kwargs.get('wt_cross_entropy')
+                if wt_cross_entropy is not None:
+                    loss_fn_params['wt_cross_entropy'] = wt_cross_entropy
 
-                loss_fn_data_keys = ['h_pre_vq_conv', 'h_node']
+            elif loss_fn_name == 'mse_attribute_reconstruction':
+                loss_fn = mse_attribute_reconstruction
 
-                scaling_node_gamma = loss_kwargs.get('scaling_node_gamma')
-                if scaling_node_gamma is not None:
-                    loss_fn_params['scaling_node_gamma'] = scaling_node_gamma
+                loss_fn_data_keys = ['pred_attr', 'target_attr']
 
-            elif loss_fn_name == 'negative_binomial_attribute_reconstruction':
-                loss_fn = negative_binomial_attribute_reconstruction
+                wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
+                if wt_attr_reconstr is not None:
+                    loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
 
-                loss_fn_data_keys = ['h_pre_vq_conv', 'h_node', 'batch_ids']
+            elif loss_fn_name == 'nb_attribute_reconstruction':
+                loss_fn = nb_attribute_reconstruction
 
-                scaling_node_gamma = loss_kwargs.get('scaling_node_gamma')
-                if scaling_node_gamma is not None:
-                    loss_fn_params['scaling_node_gamma'] = scaling_node_gamma
+                loss_fn_data_keys = ['pred_attr', 'target_attr']
 
-            elif loss_fn_name == 'vqgraph_adjacency_reconstruction':
-                loss_fn = vqgraph_adjacency_reconstruction
+                distribution = loss_kwargs.get('distribution')
+                if 'distribution' is not None:
+                    loss_fn_params['distribution'] = distribution
 
-                loss_fn_data_keys = ['batch_edge_index', 'h_edge']
+                dispersion_theta = loss_kwargs.get('dispersion_theta')
+                if dispersion_theta is not None:
+                    loss_fn_params['dispersion_theta'] = dispersion_theta
 
-                scaling_edge_gamma = loss_kwargs.get('scaling_edge_gamma')
-                if scaling_edge_gamma is not None:
-                    loss_fn_params['scaling_edge_gamma'] = scaling_edge_gamma
+                wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
+                if wt_attr_reconstr is not None:
+                    loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
 
-            elif loss_fn_name == 'vqgraph_commitment_loss':
-                loss_fn = vqgraph_commitment_loss
+            elif loss_fn_name == 'mse_adjacency_reconstruction':
+                loss_fn = mse_adjacency_reconstruction
 
-                loss_fn_data_keys = ['h_pre_vq_conv', 'h_vq']
+                loss_fn_data_keys = ['pred_adj', 'batch_edge_index']
 
-                commitment_weight = loss_kwargs.get('commitment_weight')
-                if commitment_weight is not None:
-                    loss_fn_params['commitment_weight'] = commitment_weight
+                wt_adj_reconstr = loss_kwargs.get('wt_adj_reconstr')
+                if wt_adj_reconstr is not None:
+                    loss_fn_params['wt_adj_reconstr'] = wt_adj_reconstr
 
-            elif loss_fn_name == 'vqgraph_codebook_loss':
-                loss_fn = vqgraph_codebook_loss
+            elif loss_fn_name == 'mse_commitment_loss':
+                loss_fn = mse_commitment_loss
+
+                loss_fn_data_keys = ['pred_commit', 'target_commit']
+
+                wt_commit = loss_kwargs.get('wt_commit')
+                if wt_commit is not None:
+                    loss_fn_params['wt_commit'] = wt_commit
+
+            elif loss_fn_name == 'l2_codebook_loss':
+                loss_fn = l2_codebook_loss
 
                 loss_fn_data_keys = ['codebook_embeddings']
 
-                codebook_reg_weight = loss_kwargs.get('codebook_reg_weight')
-                if codebook_reg_weight is not None:
-                    loss_fn_params['codebook_reg_weight'] = codebook_reg_weight
+                wt_codebook = loss_kwargs.get('wt_codebook')
+                if wt_codebook is not None:
+                    loss_fn_params['wt_codebook'] = wt_codebook
 
                 codebook_reg_active_codes_only = loss_kwargs.get('codebook_reg_active_codes_only')
                 if codebook_reg_active_codes_only is not None:
