@@ -113,7 +113,7 @@ def nb_attribute_reconstruction(
     # TODO: Replace with batch_ids from the dataloader
     batch_ids = torch.ones(
                     pred_attr.shape[0], # batch_size
-                    dtype=torch.float32,
+                    dtype=torch.long,
                     device=pred_attr.device
                 )
 
@@ -126,19 +126,17 @@ def nb_attribute_reconstruction(
 
     if distribution == 'zinb':
         nb_distribution = ZeroInflatedNegativeBinomial(
-                        mu=pred_attr,
-                        theta=dispersion
-                        )
+                            mu=pred_attr,
+                            theta=dispersion
+                            )
     elif distribution == 'nb':
         nb_distribution = NegativeBinomial(
                             mu=pred_attr,
                             theta=dispersion
                             )
-
     nb_loss = -nb_distribution.log_prob(
                                 target_attr
                             ).sum(dim=-1).mean()
-
 
     return nb_loss * wt_attr_reconstr
 

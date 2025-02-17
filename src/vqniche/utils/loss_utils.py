@@ -37,9 +37,9 @@ def compute_dispersion(
     """
     # Shape of one_hot currently: (batch_size, num_classes)
     one_hot = F.one_hot(
-            input,
-            num_classes=-1 # automatically infer the number of classes
-        ).float().to(device)
+                    input,
+                    num_classes=-1 # automatically infer the number of classes
+                ).float().to(device)
 
     # If `input` is of shape (batch_size, *), then `one_hot` will be of shape (batch_size, *, num_classes)
     num_classes = one_hot.shape[-1]
@@ -49,6 +49,7 @@ def compute_dispersion(
                     dtype=torch.float32,
                     device=device
                 ) * theta
+    weight = torch.nn.Parameter(weight)
 
     # Shape of F.linear: (batch_size, num_classes) x (num_out_features, num_classes).t() -> (batch_size, num_out_features)
     dispersions = F.linear(
