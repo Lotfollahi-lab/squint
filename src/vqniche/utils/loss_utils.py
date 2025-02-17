@@ -49,7 +49,6 @@ def compute_dispersion(
                     dtype=torch.float32,
                     device=device
                 ) * theta
-    weight = torch.nn.Parameter(weight)
 
     # Shape of F.linear: (batch_size, num_classes) x (num_out_features, num_classes).t() -> (batch_size, num_out_features)
     dispersions = F.linear(
