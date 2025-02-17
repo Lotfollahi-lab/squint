@@ -1,94 +1,80 @@
-import copy
 import torch
 import torch_geometric
 import pytorch_lightning as pl
 from torchmetrics import Accuracy
-from typing import List, Tuple, Callable, Optional
-import torch.functional as F
+from typing import List, Tuple, Callable, Optional, Literal
 
-from ..utils.loss import cross_entropy_loss
+from ..utils.loss import *
 
 
 class BaseModel(pl.LightningModule):
     def __init__(
             self,
-            name: str = 'BaseModel',
-            in_channels: int = None,
-            out_channels: int = None,
+            model_name: str = 'BaseModel',
             encoder_name: str = 'GraphSAGE',
             predictor_name: str = 'Linear',
-            hidden_channels: int = 256,
-            num_layers: int = 2,
-            dropout: float = 0.5,
+            in_channels: int = None,
+            out_channels: int = None,
+            optimizer_name: str = 'adam',
             lr: float = 0.01,
             weight_decay: float = 0.0,
-            optimizer_name: str = 'adam',
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'mean'},
             task_name: str = 'multiclass',
             task_kwargs: dict = {},
-            inference_mode: Optional[str] = 'layer-wise',
-            **kwargs
+            inference_mode: Literal['batch-wise', 'layer-wise'] = 'batch-wise',
         ) -> None:
         """
         Initialize the BaseModel class.
 
         Parameters
         ----------
-        - name: str
+        - model_name: str
             The name of the model.
-        - in_channels: int
-            The number of input channels.
-        - out_channels: int
-            The number of output channels.
         - encoder_name: str
             The encoder name.
         - predictor_name: str
             The predictor name.
-        - hidden_channels: int
-            The number of hidden channels.
-        - num_layers: int
-            The number of layers.
-        - dropout: float
-            The dropout rate.
+
+        - in_channels: int
+            The number of input channels.
+        - out_channels: int
+            The number of output channels.
+
+        - optimizer_name: str
+            The optimizer name.
         - lr: float
             The learning rate.
         - weight_decay: float
             The weight decay.
-        - optimizer_name: str
-            The optimizer name.
+
         - loss_names: List[str]
             The loss function names.
         - loss_kwargs: dict
             The loss function keyword arguments.
+
         - task_name: str
             The task name.
         - task_kwargs: dict
             The task keyword arguments.
-        - inference_mode: Optional[str]
+
+        - inference_mode: Literal['batch-wise', 'layer-wise']
             The inference mode. Choose from 'batch-wise' or 'layer-wise'.
-        - kwargs: dict
-            Additional keyword arguments.
         """
-        self.name = name
-
-        super(BaseModel, self).__init__(**kwargs)
-
-        # Encoder parameters
+        self.model_name = model_name
         self.encoder_name = encoder_name
-        self.in_channels = in_channels
-        self.hidden_channels = hidden_channels
-        self.num_layers = num_layers
-
-        # Predictor parameters
         self.predictor_name = predictor_name
+
+        super().__init__()
+
+        # Data parameters
+        self.in_channels = in_channels
         self.out_channels = out_channels
 
         # Optimizer parameters
-        self.dropout = dropout
+        self.optimizer_name = optimizer_name
         self.lr = lr
         self.weight_decay = weight_decay
-        self.optimizer_name = optimizer_name
 
         # Loss parameters
         self.loss_kwargs = loss_kwargs
@@ -97,9 +83,21 @@ class BaseModel(pl.LightningModule):
         # Accuracy metrics parameters
         self.task_name = task_name
         self.task_kwargs = task_kwargs
-        self.train_acc = Accuracy(task=task_name, num_classes=out_channels, **task_kwargs)
-        self.val_acc = Accuracy(task=task_name, num_classes=out_channels, **task_kwargs)
-        self.test_acc = Accuracy(task=task_name, num_classes=out_channels, **task_kwargs)
+        self.train_acc = Accuracy(
+                            task=task_name,
+                            num_classes=out_channels,
+                            **task_kwargs
+                            )
+        self.val_acc = Accuracy(
+                            task=task_name,
+                            num_classes=out_channels,
+                            **task_kwargs
+                            )
+        self.test_acc = Accuracy(
+                            task=task_name,
+                            num_classes=out_channels,
+                            **task_kwargs
+                            )
 
         # Option 1 -- batch-wise (default)
         # for epoch in epochs:
@@ -111,8 +109,6 @@ class BaseModel(pl.LightningModule):
         #    for layer in model.layers:
         #       for batch in loader:
         #         layer.forward(batch)
-        if inference_mode not in ['batch-wise', 'layer-wise']:
-            raise ValueError(f"Invalid inference mode: {inference_mode}.")
         self.inference_mode = inference_mode
 
         self.save_hyperparameters()
@@ -124,7 +120,7 @@ class BaseModel(pl.LightningModule):
             loss_kwargs: dict = {}
         ) -> List[Tuple[str, Callable, List[str], dict]]:
         """
-        Set the loss functions for the encoder.
+        Set the loss functions for the model.
 
         Parameters
         ----------
@@ -135,7 +131,7 @@ class BaseModel(pl.LightningModule):
 
         Returns
         -------
-        List
+        loss_fn_tuples: List
             One tuple per loss name in loss_names comprising of loss function name (str), loss function (callable), list of data related key strings required to be passed to the loss function, and a dictionary of additional keyword arguments for the loss function.
 
         Notes
@@ -145,19 +141,84 @@ class BaseModel(pl.LightningModule):
         # initialize a list to store the loss function tuples
         loss_fn_tuples = []
 
+        print("Setting the following loss terms as criterion for training:")
         for loss_fn_name in loss_fn_names:
+            print(f"Loss function: {loss_fn_name}")
             loss_fn_params = {}
+
             if loss_fn_name == 'cross_entropy':
                 # set the cross-entropy loss function
-                loss_fn = cross_entropy_loss
+                loss_fn = cross_entropy
 
                 # set key names for data required to compute cross-entropy loss
                 loss_fn_data_keys = ['logits', 'labels']
 
                 # set keyword parameters for cross-entropy loss
-                reduction = loss_kwargs.get('reduction')
-                if reduction is not None:
-                    loss_fn_params['reduction'] = reduction
+                wt_cross_entropy = loss_kwargs.get('wt_cross_entropy')
+                if wt_cross_entropy is not None:
+                    loss_fn_params['wt_cross_entropy'] = wt_cross_entropy
+
+            elif loss_fn_name == 'mse_attribute_reconstruction':
+                loss_fn = mse_attribute_reconstruction
+
+                loss_fn_data_keys = ['pred_attr', 'target_attr']
+
+                wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
+                if wt_attr_reconstr is not None:
+                    loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
+
+            elif loss_fn_name == 'nb_attribute_reconstruction':
+                loss_fn = nb_attribute_reconstruction
+
+                loss_fn_data_keys = ['pred_attr', 'target_attr']
+
+                distribution = loss_kwargs.get('distribution')
+                if 'distribution' is not None:
+                    loss_fn_params['distribution'] = distribution
+
+                dispersion_theta = loss_kwargs.get('dispersion_theta')
+                if dispersion_theta is not None:
+                    loss_fn_params['dispersion_theta'] = dispersion_theta
+
+                wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
+                if wt_attr_reconstr is not None:
+                    loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
+
+            elif loss_fn_name == 'mse_adjacency_reconstruction':
+                loss_fn = mse_adjacency_reconstruction
+
+                loss_fn_data_keys = ['pred_adj', 'batch_edge_index']
+
+                wt_adj_reconstr = loss_kwargs.get('wt_adj_reconstr')
+                if wt_adj_reconstr is not None:
+                    loss_fn_params['wt_adj_reconstr'] = wt_adj_reconstr
+
+            elif loss_fn_name == 'mse_commitment_loss':
+                loss_fn = mse_commitment_loss
+
+                loss_fn_data_keys = ['pred_commit', 'target_commit']
+
+                wt_commit = loss_kwargs.get('wt_commit')
+                if wt_commit is not None:
+                    loss_fn_params['wt_commit'] = wt_commit
+
+            elif loss_fn_name == 'l2_codebook_loss':
+                loss_fn = l2_codebook_loss
+
+                loss_fn_data_keys = ['codebook_embeddings']
+
+                wt_codebook = loss_kwargs.get('wt_codebook')
+                if wt_codebook is not None:
+                    loss_fn_params['wt_codebook'] = wt_codebook
+
+                codebook_reg_active_codes_only = loss_kwargs.get('codebook_reg_active_codes_only')
+                if codebook_reg_active_codes_only is not None:
+                    loss_fn_params['codebook_reg_active_codes_only'] = codebook_reg_active_codes_only
+
+                codebook_reg_max_codes = loss_kwargs.get('codebook_reg_max_codes')
+                if codebook_reg_max_codes is not None:
+                    loss_fn_params['codebook_reg_max_codes'] = codebook_reg_max_codes
+
             else:
                 raise NotImplementedError(f'{loss_fn_name} Loss not implemented')
 
@@ -184,8 +245,8 @@ class BaseModel(pl.LightningModule):
 
         Returns
         -------
-        - torch.Tensor
-            The computed loss.
+        - total_loss: torch.Tensor
+            The total computed loss across all loss terms.
         """
         assert len(self.loss_fn_tuples) > 0, 'No loss functions defined'
 
@@ -203,7 +264,7 @@ class BaseModel(pl.LightningModule):
             # pass the extracted data to the loss function along with the loss function related kwargs
             loss_fn_value = loss_fn(**_loss_fn_data, **loss_fn_params)
             # add the computed loss to the total_loss
-            total_loss += loss_fn_value
+            total_loss = torch.add(total_loss, loss_fn_value)
 
             # log each computed loss term
             self.log(
@@ -282,7 +343,7 @@ class BaseModel(pl.LightningModule):
 
         Returns
         -------
-        - torch.Tensor
+        - unnormalized_logits: torch.Tensor
             The unnormalized logits of the model.
         """
         # calls the forward method of the Model's encoder
@@ -305,9 +366,11 @@ class BaseModel(pl.LightningModule):
         """
         # TODO: Add support for multiple optimizers
         if self.optimizer_name == 'adam':
-            return torch.optim.Adam(params=self.parameters(),
-                                    lr=self.lr,
-                                    weight_decay=self.weight_decay)
+            return torch.optim.Adam(
+                params=self.parameters(),
+                lr=self.lr,
+                weight_decay=self.weight_decay
+            )
         else:
             raise NotImplementedError(f'Optimizer {self.optimizer_name} not implemented')
 
@@ -335,12 +398,33 @@ class BaseModel(pl.LightningModule):
         raise NotImplementedError('Training step not implemented')
 
 
+    def on_train_epoch_end(self) -> None:
+        """
+        Callback function to be executed at the end of each training epoch.
+
+        Notes:
+        ------
+        - We use this hook to print the total training loss at the end of each epoch to monitor the training progress.
+        """
+        # Access the outputs through the trainer's logged metrics
+        train_loss = self.trainer.callback_metrics.get('train_loss')
+        if train_loss is not None:
+            print(f"Train Loss at Epoch {self.current_epoch}: {train_loss}")
+        super().on_train_epoch_end()
+
+
     def on_validation_epoch_start(self) -> None:
+        """
+        Callback function to be executed at the start of each validation epoch.
+
+        Notes:
+        ------
+        - We use this hook to obtain the unnormalized logits for the validation set if the inference mode is 'layer-wise'. Otherwise, we do nothing.
+        """
         if self.inference_mode == 'batch-wise':
-            print("Applying inference Batch-wise for Validation")
+            pass
 
         elif self.inference_mode == 'layer-wise':
-            print("Applying inference Layer-wise for Validation")
             self.val_logits = self.inference(
                                 self.trainer.datamodule.val_dataloader()
                                 )
@@ -371,12 +455,32 @@ class BaseModel(pl.LightningModule):
         raise NotImplementedError('Validation step not implemented')
 
 
+    def on_validation_epoch_end(self) -> None:
+        """
+        Callback function to be executed at the end of each validation epoch.
+
+        Notes:
+        ------
+        - We use this hook to print the total validation loss at the end of each epoch to monitor the validation progress.
+        """
+        val_loss = self.trainer.callback_metrics.get('val_loss')
+        if val_loss is not None:
+            print(f"Validation Loss at Epoch {self.current_epoch}: {val_loss}\n")
+        super().on_validation_epoch_end()
+
+
     def on_test_epoch_start(self) -> None:
+        """
+        Callback function to be executed at the start of each test epoch.
+
+        Notes:
+        ------
+        - We use this hook to obtain the unnormalized logits for the test set if the inference mode is 'layer-wise'. Otherwise, we do nothing.
+        """
         if self.inference_mode == 'batch-wise':
-            print("Applying inference Batch-wise for Testing")
+            pass
 
         elif self.inference_mode == 'layer-wise':
-            print("Applying inference Layer-wise for Testing")
             self.test_logits = self.inference(
                                 self.trainer.datamodule.test_dataloader()
                                 )

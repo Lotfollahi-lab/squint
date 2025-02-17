@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from sklearn.preprocessing import LabelBinarizer
+from torch_geometric.utils import to_scipy_sparse_matrix
 
 
 def sparse_mx_to_float_tensor(
@@ -66,3 +67,35 @@ def pandas_to_torch_one_hot(
     one_hot = one_hot[sorted(one_hot.columns)]
 
     return torch.tensor(one_hot.values, dtype=torch.float32)
+
+
+def edge_index_to_adjacency_tensor(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    device: torch.device
+    ) -> torch.Tensor:
+    """
+    Convert an edge index to an adjacency tensor.
+
+    Parameters:
+    ----------
+    edge_index: torch.Tensor
+        The edge index to convert to an adjacency tensor.
+    num_nodes: int
+        The number of nodes in the graph.
+    device: torch.device
+        The device to use for the adjacency tensor.
+
+    Returns:
+    --------
+    torch.Tensor
+        The adjacency tensor.
+    """
+    adjacency_matrix = to_scipy_sparse_matrix(
+                        edge_index,
+                        num_nodes=num_nodes
+                        ).toarray()
+    adjacency_tensor = sparse_mx_to_float_tensor(
+                        sp.csr_matrix(adjacency_matrix)
+                        ).to(device)
+    return adjacency_tensor
