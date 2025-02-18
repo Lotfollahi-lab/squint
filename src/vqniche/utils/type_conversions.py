@@ -2,8 +2,7 @@ import torch
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-from sklearn.preprocessing import LabelBinarizer
-from torch_geometric.utils import to_scipy_sparse_matrix
+from torch_geometric.utils import to_undirected, to_dense_adj
 
 
 def sparse_mx_to_float_tensor(
@@ -70,9 +69,7 @@ def pandas_to_torch_one_hot(
 
 
 def edge_index_to_adjacency_tensor(
-    edge_index: torch.Tensor,
-    num_nodes: int,
-    device: torch.device
+        edge_index: torch.Tensor,
     ) -> torch.Tensor:
     """
     Convert an edge index to an adjacency tensor.
@@ -81,21 +78,18 @@ def edge_index_to_adjacency_tensor(
     ----------
     edge_index: torch.Tensor
         The edge index to convert to an adjacency tensor.
-    num_nodes: int
-        The number of nodes in the graph.
-    device: torch.device
-        The device to use for the adjacency tensor.
+        Dimensions: (2, num_edges)
 
     Returns:
     --------
-    torch.Tensor
+    adjacency_matrix: torch.Tensor
         The adjacency tensor.
+        Dimensions: (edge_index.max() + 1, edge_index.max() + 1)
     """
-    adjacency_matrix = to_scipy_sparse_matrix(
-                        edge_index,
-                        num_nodes=num_nodes
-                        ).toarray()
-    adjacency_tensor = sparse_mx_to_float_tensor(
-                        sp.csr_matrix(adjacency_matrix)
-                        ).to(device)
-    return adjacency_tensor
+    # to_undirected ensures that the adjacency matrix is symmetric
+    # to_dense_adj returns a tensor of shape (1, num_nodes, num_nodes)
+    # here, num_nodes = edge_index.max() + 1
+    adjacency_matrix = to_dense_adj(
+                        to_undirected(edge_index).to(torch.long)
+                        )[0]
+    return adjacency_matrix
