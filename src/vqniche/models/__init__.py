@@ -1,2 +1,5 @@
-from .base_model import BaseModel
-from .graphsage import GraphSAGE
+from . import (
+    base_model,
+    graphsage,
+    vqgraph,
+)

@@ -7,11 +7,10 @@ The VQGraph model is a graph neural network model that uses vector quantization 
 import torch
 import torch.nn as nn
 import torch_geometric
-from ..encoders.vqgraph_encoder import VQGraph_Encoder
 from typing import List, Union, Callable, Literal
 
 from .base_model import BaseModel
-from ..utils.type_conversions import edge_index_to_adjacency_tensor
+from ..encoders.vqgraph_encoder import VQGraph_Encoder
 
 
 class VQGraph(BaseModel):
