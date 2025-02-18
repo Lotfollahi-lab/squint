@@ -11,6 +11,7 @@ from ..encoders.vqgraph_encoder import VQGraph_Encoder
 from typing import List, Union, Callable, Literal
 
 from .base_model import BaseModel
+from ..utils.type_conversions import edge_index_to_adjacency_tensor
 
 
 class VQGraph(BaseModel):
@@ -247,6 +248,8 @@ class VQGraph(BaseModel):
                         'pred_commit': h_pre_vq_conv[:batch_size],
                         'target_commit': h_vq[:batch_size],
                         'codebook_embeddings': codebook_embeddings[:batch_size],
+                        'batch_input_id': train_batch.input_id,
+                        'batch_nid': train_batch.n_id,
                         }
 
         # compute train loss
@@ -320,6 +323,8 @@ class VQGraph(BaseModel):
                         'pred_commit': h_pre_vq_conv[:batch_size],
                         'target_commit': h_vq[:batch_size],
                         'codebook_embeddings': codebook_embeddings[:batch_size],
+                        'batch_input_id': val_batch.input_id,
+                        'batch_nid': val_batch.n_id,
                         }
 
         # compute validation loss
