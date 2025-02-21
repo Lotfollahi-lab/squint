@@ -180,6 +180,10 @@ class InMemoryDataModule(LightningNodeData):
                             val_mask=data.val_mask,
                             test_mask=data.test_mask,
                         )
+        # keep all other keys that start with 'y_'
+        for key in list(data.keys()):
+            if key.startswith('y_'):
+                setattr(data_for_loader, key, data[key])
 
         # call the parent class constructor
         super().__init__(

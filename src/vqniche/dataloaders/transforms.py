@@ -135,7 +135,7 @@ class SetExperimentDataKeys(T.BaseTransform):
 
         # delete extra features, labels, and edge indices from the data object to reduce memory footprint during training
         for key in list(data.keys()):
-            if key.startswith('x_') or key.startswith('y_') or key.startswith('edge_index_'):
+            if key.startswith('x_') or key.startswith('edge_index_'):
                 delattr(data, key)
 
         return data
