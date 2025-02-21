@@ -254,7 +254,8 @@ class VQGraph(BaseModel):
         # compute train loss
         train_loss = self.criterion(
                         loss_data=train_loss_data,
-                        curr_batch_size=batch_size
+                        curr_batch_size=batch_size,
+                        mode='train',
                         )
 
         # compute the predicted class probabilities (normalized logits)
@@ -329,7 +330,8 @@ class VQGraph(BaseModel):
         # compute validation loss
         val_loss = self.criterion(
                         loss_data=val_loss_data,
-                        curr_batch_size=batch_size
+                        curr_batch_size=batch_size,
+                        mode='val',
                         )
 
         # compute the predicted class probabilities (normalized logits)

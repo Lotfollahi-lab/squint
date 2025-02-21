@@ -231,7 +231,8 @@ class BaseModel(pl.LightningModule):
     def criterion(
             self,
             loss_data: dict,
-            curr_batch_size: Optional[int] = None
+            curr_batch_size: Optional[int] = None,
+            mode: Literal['train', 'val'] = 'train',
         ) -> torch.Tensor:
         """
         Compute the loss for the model.
@@ -242,11 +243,13 @@ class BaseModel(pl.LightningModule):
             A collection of data objects required to compute the loss.
         - curr_batch_size: int
             The number of samples in the current batch. Required for logging.
+        - mode: Literal['train', 'val']
+            The mode of the model (train, val).
 
         Returns
         -------
         - total_loss: torch.Tensor
-            The total computed loss across all loss terms.
+            The total computed loss across all loss terms for the current batch.
         """
         assert len(self.loss_fn_tuples) > 0, 'No loss functions defined'
 
@@ -268,7 +271,7 @@ class BaseModel(pl.LightningModule):
 
             # log each computed loss term
             self.log(
-                    name=loss_fn_name,
+                    name=f"{mode}_{loss_fn_name}",
                     value=loss_fn_value,
                     prog_bar=False,
                     on_step=False,
@@ -376,9 +379,9 @@ class BaseModel(pl.LightningModule):
 
 
     def training_step(
-        self,
-        train_batch: torch_geometric.data.Data,
-        batch_idx: Optional[int] = None,
+            self,
+            train_batch: torch_geometric.data.Data,
+            batch_idx: Optional[int] = None,
         ) -> torch.Tensor:
         """
         Training step for the model.
@@ -402,15 +405,18 @@ class BaseModel(pl.LightningModule):
         """
         Callback function to be executed at the end of each training epoch.
 
-        Notes:
-        ------
-        - We use this hook to print the total training loss at the end of each epoch to monitor the training progress.
+        Notes
+        -----
+        - We use this hook to log the train and validation loss terms and accuracies in the training loop.
         """
-        # Access the outputs through the trainer's logged metrics
-        train_loss = self.trainer.callback_metrics.get('train_loss')
-        if train_loss is not None:
-            print(f"Train Loss at Epoch {self.current_epoch}: {train_loss}")
-        super().on_train_epoch_end()
+        # log the metrics at the end of each epoch
+        print(f"Metrics logged in Epoch {self.current_epoch}:")
+        keys = ['epoch'] + list(self.trainer.callback_metrics.keys())
+        values = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
+        print(keys)
+        print(values)
+        print('\n')
+        return super().on_train_epoch_end()
 
 
     def on_validation_epoch_start(self) -> None:
@@ -433,9 +439,9 @@ class BaseModel(pl.LightningModule):
 
 
     def validation_step(
-        self,
-        val_batch: torch_geometric.data.Data,
-        batch_idx: Optional[int] = None,
+            self,
+            val_batch: torch_geometric.data.Data,
+            batch_idx: Optional[int] = None,
         ) -> torch.Tensor:
         """
         Validation step for the model.
@@ -463,9 +469,6 @@ class BaseModel(pl.LightningModule):
         ------
         - We use this hook to print the total validation loss at the end of each epoch to monitor the validation progress.
         """
-        val_loss = self.trainer.callback_metrics.get('val_loss')
-        if val_loss is not None:
-            print(f"Validation Loss at Epoch {self.current_epoch}: {val_loss}\n")
         super().on_validation_epoch_end()
 
 
@@ -489,9 +492,9 @@ class BaseModel(pl.LightningModule):
 
 
     def test_step(
-        self,
-        test_batch: torch_geometric.data.Data,
-        batch_idx: Optional[int] = None,
+            self,
+            test_batch: torch_geometric.data.Data,
+            batch_idx: Optional[int] = None,
         ) -> torch.Tensor:
         """
         Test step for the model.
