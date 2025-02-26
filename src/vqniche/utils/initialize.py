@@ -6,8 +6,8 @@ import torch_geometric.transforms as T
 from pytorch_lightning.loggers import WandbLogger
 
 from ..preprocessors.graph_constructors import set_edge_index_name
-from ..dataloaders.transforms import SetExperimentDataKeys, init_data_transforms
-from ..dataloaders.in_memory_dataset_blob import InMemoryDatasetBlob
+from ..dataset.transforms import SetExperimentDataKeys, init_data_transforms
+from ..dataset.in_memory_dataset_blob import InMemoryDatasetBlob
 from ..dataloaders.in_memory_datamodule import InMemoryDataModule
 from ..models.graphsage import GraphSAGE
 from ..models.vqgraph import VQGraph
@@ -147,6 +147,7 @@ def initialize_data_and_model(config: dict):
     # --------------------- Load Data (one batch) ---------------------
     # load PyG data object corresponding to batch_idx (e.g. AnnData batch0)
     data_batch = dataset_blob[batch_idx]
+    assert batch_idx == data_batch.batch, f"Batch index mismatch: {batch_idx} != {data_batch.batch}"
 
     # --------------------- Initialize DataModule ---------------------
     # set parameters for data loader and sampler for training, validation, and testing
