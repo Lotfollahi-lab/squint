@@ -195,12 +195,6 @@ class InMemoryDataModule(LightningNodeData):
             **self.sampler_params
         )
 
-        # None = all nodes in the graph
-        # without this, inference at the GNN layer will get out-of-index error
-        if self.use_full_graph_for_inference:
-            self.input_val_nodes = None
-            self.input_test_nodes = None
-
 
     def set_custom_loader_class(
         self,
@@ -256,22 +250,22 @@ class InMemoryDataModule(LightningNodeData):
             return super().train_dataloader()
 
         else:
-                # instantiate the sampler class for training
-                train_sampler = self.sampler_class(
-                                data=self.data,
-                                **self.sampler_params,
-                            )
+            # instantiate the sampler class for training
+            train_sampler = self.sampler_class(
+                            data=self.data,
+                            **self.sampler_params,
+                        )
 
-                # instantiate the loader class for training
-                train_loader = self.loader_class(
-                                            data=self.data,
-                                            num_workers=self.num_workers,
-                                            input_nodes=self.input_train_nodes,
-                                            neighbor_sampler=train_sampler,
-                                            **self.loader_params,
-                                            **self.sampler_params,
-                                        )
-                return train_loader
+            # instantiate the loader class for training
+            train_loader = self.loader_class(
+                                        data=self.data,
+                                        num_workers=self.num_workers,
+                                        input_nodes=self.input_train_nodes,
+                                        neighbor_sampler=train_sampler,
+                                        **self.loader_params,
+                                        **self.sampler_params,
+                                    )
+            return train_loader
 
 
     def val_dataloader(self):
@@ -284,10 +278,14 @@ class InMemoryDataModule(LightningNodeData):
             return super().val_dataloader()
 
         else:
+            sampler_params = self.sampler_params
+            if self.use_full_graph_for_inference:
+                sampler_params['num_neighbors'] = [-1] * len(self.sampler_params['num_neighbors'])
+
             # instantiate the sampler class for validation
             val_sampler = self.sampler_class(
                                 data=self.data,
-                                **self.sampler_params,
+                                **sampler_params,
                             )
 
             # instantiate the loader class for validation
@@ -297,7 +295,7 @@ class InMemoryDataModule(LightningNodeData):
                                         input_nodes=self.input_val_nodes,
                                         neighbor_sampler=val_sampler,
                                         **self.loader_params,
-                                        **self.sampler_params,
+                                        **sampler_params,
                                     )
             return val_loader
 
@@ -312,10 +310,14 @@ class InMemoryDataModule(LightningNodeData):
             return super().test_dataloader()
 
         else:
+            sampler_params = self.sampler_params
+            if self.use_full_graph_for_inference:
+                sampler_params['num_neighbors'] = [-1] * len(self.sampler_params['num_neighbors'])
+
             # instantiate the sampler class for testing
             test_sampler = self.sampler_class(
                                 data=self.data,
-                                **self.sampler_params,
+                                **sampler_params,
                             )
 
             # instantiate the loader class for testing
@@ -325,6 +327,6 @@ class InMemoryDataModule(LightningNodeData):
                                         input_nodes=self.input_test_nodes,
                                         neighbor_sampler=test_sampler,
                                         **self.loader_params,
-                                        **self.sampler_params,
+                                        **sampler_params,
                                     )
             return test_loader
