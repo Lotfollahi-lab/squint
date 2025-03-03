@@ -1,3 +1,6 @@
+import wandb
+import pandas as pd
+
 import torch
 import torch_geometric
 import pytorch_lightning as pl
@@ -410,12 +413,14 @@ class BaseModel(pl.LightningModule):
         - We use this hook to log the train and validation loss terms and accuracies in the training loop.
         """
         # log the metrics at the end of each epoch
-        print(f"Metrics logged in Epoch {self.current_epoch}:")
-        keys = ['epoch'] + list(self.trainer.callback_metrics.keys())
-        values = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
-        print(keys)
-        print(values)
-        print('\n')
+        columns = ['epoch'] + list(self.trainer.callback_metrics.keys())
+        metrics_data = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
+
+        self.logger.log_table(
+            key='train_val_epoch_metrics',
+            columns=columns,
+            data=[metrics_data],
+        )
         return super().on_train_epoch_end()
 
 

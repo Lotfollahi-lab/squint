@@ -1,7 +1,8 @@
 from pathlib import Path
+from typing import Dict
 
-import torch
 import pytorch_lightning as pl
+from torch_geometric.data import Data
 import torch_geometric.transforms as T
 from pytorch_lightning.loggers import WandbLogger
 
@@ -14,69 +15,29 @@ from ..models.vqgraph import VQGraph
 
 
 def initialize_logger(
-        config: dict,
-        param_strings: dict,
-    ):
-    dataset_name = config['dataset']['dataset_name']
-    model_name = config['model']['model_name']
+        config: Dict,
+    ) -> WandbLogger:
+    wandb_tags = [
+                    config['dataset']['dataset_name'],
+                    f"batch={config['dataset']['batch_idx']}",
+                    config['model']['model_name'],
+                ]
 
-    # --------------------- Wandb ---------------------
-    if config['logging']['enabled'] :
-        # set logging directory
-        wandb_log_dir = Path(config['logging']['root_log_dir']) / dataset_name / config['experiment']['mode']
-        wandb_log_dir = wandb_log_dir / param_strings['batch'] / param_strings['datakeys'] / param_strings['transform'] / param_strings['loader_sampler'] / model_name
-        wandb_log_dir.mkdir(parents=True, exist_ok=True)
+    wandb_log_dir = set_wandb_log_dir(config)
+    logger = WandbLogger(
+                project="VQNiche",
+                save_dir=wandb_log_dir,
+                log_model=config['logging']['log_model'],
+                offline=config['logging']['offline'],
+                tags=wandb_tags,
+            )
 
-        wandb_tags = [
-                        dataset_name,
-                        model_name,
-                        param_strings['batch'],
-                    ]
-
-        # initialize wandb logger
-        logger = WandbLogger(
-                        project="VQNiche",
-                        save_dir=wandb_log_dir,
-                        log_model=config['logging']['log_model'],
-                        offline=config['logging']['offline'],
-                        tags=wandb_tags,
-                    )
-
-        # configure model checkpointing
-        ckpt_log_dir = Path(logger.experiment.dir) / 'checkpoints'
-
-    else:
-        logger = None
-        ckpt_log_dir = Path("./test/checkpoints")
-
-    ckpt_log_dir.mkdir(parents=True, exist_ok=True)
-
-    # --------------------- Checkpoints ---------------------
-    checkpoint_params = config['trainer']['checkpoint_params']
-    checkpoints = [
-                    pl.callbacks.ModelCheckpoint(
-                        dirpath=ckpt_log_dir,
-                        filename='{epoch}-{val_acc:.2f}',
-                        **checkpoint_params
-                        )
-                    ]
-
-    return logger, \
-            checkpoints
+    return logger
 
 
-
-def initialize_data_and_model(config: dict):
-    param_strings = {}
-
-    # --------------------- Determinism Settings ---------------------
-    # set seed for reproducibility
-    seed = config['experiment']['seed']
-    pl.seed_everything(seed)
-
-    # set backend deterministic as true
-    torch.backends.cudnn.deterministic = True
-
+def initialize_dataset_blob(
+        config: Dict,
+    ) -> InMemoryDatasetBlob:
     # --------------------- Set Data Keys ---------------------
     # decide which node features to use in this experiment
     feature_name = config['dataset']['feature_name']
@@ -100,10 +61,6 @@ def initialize_data_and_model(config: dict):
     # decide which node labels to use in this experiment
     label_name = config['dataset']['label_name']
 
-    # set data keys directory name
-    datakeys_param_str = f"{edge_index_name}_{label_name}"
-    param_strings['datakeys'] = datakeys_param_str
-
     # --------------------- Initialize Data Transforms ---------------------
     ExperimentDataKeys = SetExperimentDataKeys(
                             feature_name=feature_name,
@@ -122,10 +79,6 @@ def initialize_data_and_model(config: dict):
     # initialize a composed transform
     transforms = T.Compose([ExperimentDataKeys] + DataTransforms)
 
-    # set transform directory name
-    transform_param_str = f"trainratio={1-transform_params['val_ratio']-transform_params['test_ratio']}"
-    param_strings['transform'] = transform_param_str
-
     # --------------------- Initialize Dataset Blob ---------------------
     # set root data directory
     root_data_dir = config['dataset']['root_data_dir']
@@ -138,18 +91,14 @@ def initialize_data_and_model(config: dict):
                         data_directory_path=root_data_dir,
                         transform=transforms
                     )
-    batch_idx = config['dataset']['batch_idx']
 
-    # set batch directory name
-    batch_idx_param_str = f"batch={batch_idx}"
-    param_strings['batch'] = batch_idx_param_str
+    return dataset_blob
 
-    # --------------------- Load Data (one batch) ---------------------
-    # load PyG data object corresponding to batch_idx (e.g. AnnData batch0)
-    data_batch = dataset_blob[batch_idx]
-    assert batch_idx == data_batch.batch, f"Batch index mismatch: {batch_idx} != {data_batch.batch}"
 
-    # --------------------- Initialize DataModule ---------------------
+def initialize_datamodule(
+        config: Dict,
+        data: Data,
+    ) -> pl.LightningDataModule:
     # set parameters for data loader and sampler for training, validation, and testing
     loader_name = config['datamodule']['loader_name']
     loader_params = config['datamodule']['loader_params']
@@ -160,18 +109,21 @@ def initialize_data_and_model(config: dict):
     inference_params = config['datamodule']['inference_params']
 
     datamodule_batch = InMemoryDataModule(
-                            data=data_batch,
+                            data=data,
                             loader_name=loader_name,
                             loader_params=loader_params,
                             sampler_name=sampler_name,
                             sampler_params=sampler_params,
                             **inference_params,
                         )
-    # set loader and sampler directory name
-    loader_sampler_param_str = f"{loader_name}_batchsize={loader_params['batch_size']}_neighbors={'_'.join([str(i) for i in sampler_params['num_neighbors']])}"
-    param_strings['loader_sampler'] = loader_sampler_param_str
+    return datamodule_batch
 
-    # --------------------- Initialize Model ---------------------
+
+def initialize_model(
+        config: Dict,
+        in_channels: int,
+        out_channels: int,
+    ) -> pl.LightningModule:
     # get model, optimizer, loss, and task parameters
     model_name = config['model']['model_name']
     encoder_name = config['model']['encoder_name']
@@ -193,17 +145,39 @@ def initialize_data_and_model(config: dict):
                 model_name=model_name,
                 encoder_name=encoder_name,
                 predictor_name=predictor_name,
-                in_channels=data_batch.num_features,
-                out_channels=data_batch.num_classes,
+                in_channels=in_channels,
+                out_channels=out_channels,
                 **encoder_params,
                 **optimizer_params,
                 **loss_params,
                 **task_params,
                 **inference_params,
             )
+    return model
 
-    return data_batch, \
-            datamodule_batch, \
-            model, \
-            param_strings
 
+def set_wandb_log_dir(
+        config: Dict,
+    ) -> Path:
+
+    wandb_log_dir = Path(config['logging']['root_log_dir']) / config['dataset']['dataset_name'] / config['experiment']['mode']
+
+    wandb_log_dir = wandb_log_dir / f"batch={config['dataset']['batch_idx']}"
+
+    edge_index_name = set_edge_index_name(
+                        spatial_key=config['dataset']['graph_params']['spatial_key'],
+                        delaunay=config['dataset']['graph_params']['delaunay'],
+                        n_neighs=config['dataset']['graph_params']['n_neighs'],
+                        radius=config['dataset']['graph_params']['radius'],
+                    )
+    wandb_log_dir = wandb_log_dir / f"{edge_index_name}_{config['dataset']['label_name']}"
+
+    wandb_log_dir = wandb_log_dir / f"trainratio={1-config['dataset']['transform_params']['val_ratio']-config['dataset']['transform_params']['test_ratio']}"
+
+    wandb_log_dir = wandb_log_dir / f"{config['datamodule']['loader_name']}_batchsize={config['datamodule']['loader_params']['batch_size']}_neighbors={'_'.join([str(i) for i in config['datamodule']['sampler_params']['num_neighbors']])}"
+
+    wandb_log_dir = wandb_log_dir / config['model']['model_name']
+
+    wandb_log_dir.mkdir(parents=True, exist_ok=True)
+
+    return wandb_log_dir
