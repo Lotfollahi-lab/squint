@@ -132,6 +132,8 @@ class SetExperimentDataKeys(T.BaseTransform):
         data.edge_index = getattr(data, self.edge_index_key)
         data.num_features = data.x.shape[1]
         data.num_classes = data.y.shape[1]
+        data.num_nodes = data.x.shape[0]
+        data.num_edges = data.edge_index.shape[1]
 
         # delete extra features, labels, and edge indices from the data object to reduce memory footprint during training
         for key in list(data.keys()):
