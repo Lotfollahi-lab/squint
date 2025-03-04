@@ -1,5 +1,6 @@
 import wandb
 import pandas as pd
+from pathlib import Path
 
 import torch
 import torch_geometric
@@ -113,6 +114,8 @@ class BaseModel(pl.LightningModule):
         #       for batch in loader:
         #         layer.forward(batch)
         self.inference_mode = inference_mode
+
+        self.train_val_epoch_metrics = pd.DataFrame()
 
         self.save_hyperparameters()
 
@@ -416,6 +419,10 @@ class BaseModel(pl.LightningModule):
         columns = ['epoch'] + list(self.trainer.callback_metrics.keys())
         metrics_data = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
 
+        self.train_val_epoch_metrics = pd.concat(
+            [self.train_val_epoch_metrics, pd.DataFrame([metrics_data], columns=columns)],
+            ignore_index=True
+        )
         self.logger.log_table(
             key='train_val_epoch_metrics',
             columns=columns,
@@ -517,3 +524,13 @@ class BaseModel(pl.LightningModule):
             The computed test accuracy.
         """
         raise NotImplementedError('Test step not implemented')
+
+    def on_fit_end(self):
+        epoch_metrics_fname = Path(self.logger.experiment.dir) / 'train_val_epoch_metrics.csv'
+        self.train_val_epoch_metrics.to_csv(
+            path_or_buf=epoch_metrics_fname,
+            sep=',',
+            index=False
+        )
+
+        return super().on_fit_end()
