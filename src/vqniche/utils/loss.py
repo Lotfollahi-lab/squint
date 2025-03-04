@@ -2,9 +2,9 @@ import torch
 import torch.nn.functional as F
 from typing import Literal, Optional
 
-from vqniche.utils.type_conversions import edge_index_to_adjacency_tensor
-from vqniche.utils.vqgraph_helpers import l2norm
-from vqniche.utils.loss_utils import compute_dispersion
+from ..utils.type_conversions import edge_index_to_adjacency_tensor
+from ..utils.vqgraph_helpers import l2norm
+from ..utils.loss_utils import compute_dispersion
 from scvi.distributions import NegativeBinomial, ZeroInflatedNegativeBinomial
 
 
