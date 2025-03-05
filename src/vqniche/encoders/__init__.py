@@ -1,1 +1,3 @@
-from . import vqgraph_encoder
+from . import (
+    vqgraph_encoder,
+)

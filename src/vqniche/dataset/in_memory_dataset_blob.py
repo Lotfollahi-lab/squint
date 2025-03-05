@@ -165,10 +165,12 @@ class InMemoryDatasetBlob(InMemoryDataset):
                 del data_batch
 
         # sort the data batches by batch_idx
-        # batch_id = "batch0", "batch1", ..., "batchN"
+        # batch_id = 0, 1, ..., N
         # batch_idx = 0, 1, ..., N
         # NOTE: If we have multiple dataset ids, this needs sorting by two keys simultaneously: dataset-id and batch-id.
-        data_batches = sorted(data_batches, key=lambda data_batch: data_batch.batch)
+        data_batches = sorted(data_batches, key=lambda data_batch: data_batch.adata_batch_id)
+        for i, data_batch in enumerate(data_batches):
+            print(f"i: {i}, Batch: {data_batch.adata_batch_id}, Type: {type(data_batch.adata_batch_id)}")
 
         # self.save internally collates all Data objects in data_list into a single blob.
         # The index is set to 0 so that the collated object is stored at
@@ -274,7 +276,8 @@ class InMemoryDatasetBlob(InMemoryDataset):
         batch_dict['dataset_id'] = adata_batch.uns['dataset_id']
         batch_dict['tissue'] = adata_batch.uns['tissue']
         batch_dict['species'] = adata_batch.uns['species']
-        batch_dict['batch'] = adata_batch.uns['batch']
+        batch_dict['adata_batch_id'] = int(adata_batch.uns['batch'][5:])
+        print(f"{batch_dict['adata_batch_id']=}, {adata_batch.uns['batch']=}")
 
         # ----------------- Convert Data Dict to PyG Data Object -----------------
         data_batch = Data(**batch_dict)

@@ -7,11 +7,10 @@ The VQGraph model is a graph neural network model that uses vector quantization 
 import torch
 import torch.nn as nn
 import torch_geometric
-from ..encoders.vqgraph_encoder import VQGraph_Encoder
 from typing import List, Union, Callable, Literal
 
 from .base_model import BaseModel
-from ..utils.type_conversions import edge_index_to_adjacency_tensor
+from ..encoders.vqgraph_encoder import VQGraph_Encoder
 
 
 class VQGraph(BaseModel):
@@ -255,7 +254,8 @@ class VQGraph(BaseModel):
         # compute train loss
         train_loss = self.criterion(
                         loss_data=train_loss_data,
-                        curr_batch_size=batch_size
+                        curr_batch_size=batch_size,
+                        mode='train',
                         )
 
         # compute the predicted class probabilities (normalized logits)
@@ -330,7 +330,8 @@ class VQGraph(BaseModel):
         # compute validation loss
         val_loss = self.criterion(
                         loss_data=val_loss_data,
-                        curr_batch_size=batch_size
+                        curr_batch_size=batch_size,
+                        mode='val',
                         )
 
         # compute the predicted class probabilities (normalized logits)

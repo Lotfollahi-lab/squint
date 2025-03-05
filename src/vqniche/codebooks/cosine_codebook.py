@@ -11,7 +11,7 @@ from torch.cuda.amp import autocast
 import pytorch_lightning as pl
 from einops import einsum, rearrange
 
-from vqniche.utils.vqgraph_helpers import l2norm, \
+from ..utils.vqgraph_helpers import l2norm, \
     uniform_init, \
     kmeans, \
     gumbel_sample, \

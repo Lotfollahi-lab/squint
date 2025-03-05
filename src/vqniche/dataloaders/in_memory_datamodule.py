@@ -2,7 +2,7 @@
 This class extends the Pytorch Lightning's LightningDataModule class to provide a more flexible way to create PyTorch Lightning DataModules that are compatible with PyTorch Geometric for our use case wherein we split the Pytorch Geometric GNN models into separate encoder and predictor submodules.
 This has two main advantages:
 1. We can inherit all the nice properties of the parent classes including `setup`, `prepare_data` and `infer train-val-test` nodes. These can also be overriden in the future if necessary.
-2. We can define our custom train, validation and test dataloaders that are compatible with PyTorch Geometric's DataLoader and Sampler classes.
+2. We can define our custom train, validation, test, and inference dataloaders that are compatible with PyTorch Geometric's DataLoader and Sampler classes.
 
 Initializing this class requires defining a Loader and a Sampler along with their corresponding parameters.
 
@@ -19,6 +19,9 @@ The `sampler_params` argument is a dictionary that can be used to define the arg
 
 KEY INFO:
 ---> The Loader + Sampler combination is kept the same across training, validation and testing.
+---> The input data to this class must be a single PyTorch Geometric Data object. If the experiment requires multiple tissue sections, the data must be concatenated before being passed to this class.
+---> The `infer_dataloader` method is provided to allow for inference on the full graph. This is useful for downstream tasks that require the full graph to be used.
+---> The `use_full_graph_for_inference` parameter is used to control whether the full graph is used for validation, testing, and inference or not. If set to True, the sampler is configured to return the full neighborhood for each node in the graph.
 """
 import os
 from typing import Literal, Optional, Callable
@@ -51,7 +54,7 @@ class InMemoryDataModule(LightningNodeData):
         Parameters:
         -----------
         - data: Data
-            PyTorch Geometric Data object that contains the graph data.
+            A single PyTorch Geometric Data object that contains the graph data.
         - loader_name: Literal['DefaultFullLoader', 'DefaultNodeLoader', 'NeighborLoader']
             Name of the DataLoader class that will be used to load the data.
         - loader_params: Optional[dict]
@@ -63,6 +66,8 @@ class InMemoryDataModule(LightningNodeData):
         - use_full_graph_for_inference: bool
             Whether to use the full graph for inference or not. This is implemented by setting the number of neighbors to the maximum number of neighbors for inference.
         """
+        assert isinstance(data, Data), f"data must be of type torch_geometric.data.Data, but got {type(data)}."
+
         # get the number of available cores
         num_cores_available = int(os.environ.get(
                                 "LSB_DJOB_NUMPROC",
@@ -180,6 +185,10 @@ class InMemoryDataModule(LightningNodeData):
                             val_mask=data.val_mask,
                             test_mask=data.test_mask,
                         )
+        # keep all other keys that start with 'y_'
+        for key in list(data.keys()):
+            if key.startswith('y_'):
+                setattr(data_for_loader, key, data[key])
 
         # call the parent class constructor
         super().__init__(
@@ -190,12 +199,6 @@ class InMemoryDataModule(LightningNodeData):
             **self.loader_params,
             **self.sampler_params
         )
-
-        # None = all nodes in the graph
-        # without this, inference at the GNN layer will get out-of-index error
-        if self.use_full_graph_for_inference:
-            self.input_val_nodes = None
-            self.input_test_nodes = None
 
 
     def set_custom_loader_class(
@@ -252,22 +255,22 @@ class InMemoryDataModule(LightningNodeData):
             return super().train_dataloader()
 
         else:
-                # instantiate the sampler class for training
-                train_sampler = self.sampler_class(
-                                data=self.data,
-                                **self.sampler_params,
-                            )
+            # instantiate the sampler class for training
+            train_sampler = self.sampler_class(
+                            data=self.data,
+                            **self.sampler_params,
+                        )
 
-                # instantiate the loader class for training
-                train_loader = self.loader_class(
-                                            data=self.data,
-                                            num_workers=self.num_workers,
-                                            input_nodes=self.input_train_nodes,
-                                            neighbor_sampler=train_sampler,
-                                            **self.loader_params,
-                                            **self.sampler_params,
-                                        )
-                return train_loader
+            # instantiate the loader class for training
+            train_loader = self.loader_class(
+                                        data=self.data,
+                                        num_workers=self.num_workers,
+                                        input_nodes=self.input_train_nodes,
+                                        neighbor_sampler=train_sampler,
+                                        **self.loader_params,
+                                        **self.sampler_params,
+                                    )
+            return train_loader
 
 
     def val_dataloader(self):
@@ -280,21 +283,28 @@ class InMemoryDataModule(LightningNodeData):
             return super().val_dataloader()
 
         else:
+            # reuse user-defined sampler parameters
+            sampler_params = self.sampler_params
+
+            if self.use_full_graph_for_inference:
+                # update num_neighbors to -1 so that the neighbors are not sampled.
+                sampler_params['num_neighbors'] = [-1] * len(self.sampler_params['num_neighbors'])
+
             # instantiate the sampler class for validation
             val_sampler = self.sampler_class(
                                 data=self.data,
-                                **self.sampler_params,
+                                **sampler_params,
                             )
 
             # instantiate the loader class for validation
             val_loader = self.loader_class(
-                                        data=self.data,
-                                        num_workers=self.num_workers,
-                                        input_nodes=self.input_val_nodes,
-                                        neighbor_sampler=val_sampler,
-                                        **self.loader_params,
-                                        **self.sampler_params,
-                                    )
+                                data=self.data,
+                                num_workers=self.num_workers,
+                                input_nodes=self.input_val_nodes,
+                                neighbor_sampler=val_sampler,
+                                **self.loader_params,
+                                **sampler_params,
+                            )
             return val_loader
 
 
@@ -308,19 +318,56 @@ class InMemoryDataModule(LightningNodeData):
             return super().test_dataloader()
 
         else:
+            # reuse user-defined sampler parameters
+            sampler_params = self.sampler_params
+
+            if self.use_full_graph_for_inference:
+                # update num_neighbors to -1 so that the neighbors are not sampled.
+                sampler_params['num_neighbors'] = [-1] * len(self.sampler_params['num_neighbors'])
+
             # instantiate the sampler class for testing
             test_sampler = self.sampler_class(
                                 data=self.data,
-                                **self.sampler_params,
+                                **sampler_params,
                             )
 
             # instantiate the loader class for testing
             test_loader = self.loader_class(
-                                        data=self.data,
-                                        num_workers=self.num_workers,
-                                        input_nodes=self.input_test_nodes,
-                                        neighbor_sampler=test_sampler,
-                                        **self.loader_params,
-                                        **self.sampler_params,
-                                    )
+                                data=self.data,
+                                num_workers=self.num_workers,
+                                input_nodes=self.input_test_nodes,
+                                neighbor_sampler=test_sampler,
+                                **self.loader_params,
+                                **sampler_params,
+                            )
             return test_loader
+
+
+    def infer_dataloader(self):
+        """
+        This method returns a DataLoader object for all the nodes in the graph and does not sample neighbors.
+        This is intended to be useful for downstream tasks that require the full graph to be used.
+        """
+        # reuse user-defined sampler parameters
+        sampler_params = self.sampler_params
+
+        # update num_neighbors to -1 so that the neighbors are not sampled.
+        sampler_params['num_neighbors'] = [-1] * len(self.sampler_params['num_neighbors'])
+
+        # instantiate the sampler class to control the behavior of the loader
+        infer_sampler = self.sampler_class(
+                            data=self.data,
+                            **sampler_params,
+                        )
+
+        # instantiate the loader class for inference
+        # input_nodes is set to None. That is, all nodes are used.
+        infer_loader = self.loader_class(
+                                    data=self.data,
+                                    num_workers=self.num_workers,
+                                    input_nodes=None,
+                                    neighbor_sampler=infer_sampler,
+                                    **self.loader_params,
+                                    **sampler_params,
+                                )
+        return infer_loader

@@ -1,1 +1,3 @@
-from .cosine_codebook import CosineSimCodebook
+from . import (
+    cosine_codebook,
+)
