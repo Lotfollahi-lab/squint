@@ -19,7 +19,7 @@ def initialize_logger(
     ) -> WandbLogger:
     wandb_tags = [
                     config['dataset']['dataset_name'],
-                    f"batch={config['dataset']['batch_idx']}",
+                    f"batch={config['dataset']['adata_batch_idx']}",
                     config['model']['model_name'],
                 ]
 
@@ -162,7 +162,7 @@ def set_wandb_log_dir(
 
     wandb_log_dir = Path(config['logging']['root_log_dir']) / config['dataset']['dataset_name'] / config['experiment']['mode']
 
-    wandb_log_dir = wandb_log_dir / f"batch={config['dataset']['batch_idx']}"
+    wandb_log_dir = wandb_log_dir / f"batch={config['dataset']['adata_batch_idx']}"
 
     edge_index_name = set_edge_index_name(
                         spatial_key=config['dataset']['graph_params']['spatial_key'],
