@@ -418,16 +418,14 @@ class BaseModel(pl.LightningModule):
         # log the metrics at the end of each epoch
         columns = ['epoch'] + list(self.trainer.callback_metrics.keys())
         metrics_data = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
+        print(columns)
+        print(metrics_data)
 
         self.train_val_epoch_metrics = pd.concat(
             [self.train_val_epoch_metrics, pd.DataFrame([metrics_data], columns=columns)],
             ignore_index=True
         )
-        self.logger.log_table(
-            key='train_val_epoch_metrics',
-            columns=columns,
-            data=[metrics_data],
-        )
+
         return super().on_train_epoch_end()
 
 

@@ -17,10 +17,11 @@ class VQGraph(BaseModel):
     def __init__(
             self,
             model_name: str = 'VQGraph',
-            encoder_name: str = 'VQGraph_Encoder',
+            encoder_name: str = 'VQGraph_InputSpace_Encoder',
             predictor_name: str = 'Linear',
             in_channels: int = None,
             out_channels: int = None,
+            apply_vq_on_latent_space: bool = True,
             graphconv_layer_name: str = 'SAGEConv',
             hidden_channels: int = 64,
             num_layers: int = 2,
@@ -54,6 +55,8 @@ class VQGraph(BaseModel):
             The number of input features.
         - out_channels: int
             The number of output features.
+        - apply_vq_on_latent_space: bool
+            Whether to apply vector quantization on the latent space or the input space.
 
         - graphconv_layer_name: str
             The name of the graph convolutional layer.
@@ -114,6 +117,7 @@ class VQGraph(BaseModel):
         self.encoder = VQGraph_Encoder(
                             in_channels=in_channels,
                             hidden_channels=hidden_channels,
+                            apply_vq_on_latent_space=apply_vq_on_latent_space,
                             graphconv_layer_name=graphconv_layer_name,
                             num_layers=num_layers,
                             act_first=act_first,
@@ -271,6 +275,16 @@ class VQGraph(BaseModel):
                 acc_value=self.train_acc,
                 curr_batch_size=batch_size,
             )
+
+        # log codebook utilization
+        # TODO: fix this
+        self.log(
+            name=f"codebook_utilization",
+            value=len(torch.unique(indices)),
+            prog_bar=False,
+            on_step=False,
+            on_epoch=True,
+        )
 
         return train_loss
 

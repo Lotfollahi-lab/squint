@@ -15,6 +15,7 @@ class VQGraph_Encoder(pl.LightningModule):
         self,
         in_channels: int = None,
         hidden_channels: int = 256,
+        apply_vq_on_latent_space: bool = True,
         graphconv_layer_name: str = 'SAGEConv',
         num_layers: int = 2,
         act_first: bool = True,
@@ -35,6 +36,13 @@ class VQGraph_Encoder(pl.LightningModule):
     ):
         super().__init__()
 
+        if apply_vq_on_latent_space:
+            print("Applying VQ on the latent space.")
+            vq_dim = hidden_channels
+        else:
+            print("Applying VQ on the input space.")
+            vq_dim = in_channels
+
         # graph convolution
         self.graphconv_layer_name = graphconv_layer_name
 
@@ -43,7 +51,7 @@ class VQGraph_Encoder(pl.LightningModule):
 
         self.pre_vq_conv_module = self._init_graph_conv_module(
             in_channels=in_channels,
-            hidden_channels=in_channels,
+            hidden_channels=vq_dim,
             num_layers=num_layers - 1,
             act_first=act_first,
             activation=activation,
@@ -53,12 +61,12 @@ class VQGraph_Encoder(pl.LightningModule):
 
         # initialize codebook class
         self._codebook = CosineSimCodebook(
-            dim=in_channels,
+            dim=vq_dim,
             learnable_codebook=learnable_codebook, # True
-            num_codebooks=num_codebooks,
+            num_codebooks=num_codebooks, # 1
             codebook_size=codebook_size,
             decay=decay,
-            eps=eps,
+            eps=eps, # 1e-5
             kmeans_init=kmeans_init, # False
             kmeans_iters=kmeans_iters, # 10
             sync_kmeans=sync_kmeans, # True
@@ -70,21 +78,21 @@ class VQGraph_Encoder(pl.LightningModule):
         # initialize the decoder module for the node attributes
         print("Initializing the decoder module for node attributes.")
         self.decoder_node = nn.Linear(
-                                in_features=in_channels,
-                                out_features=in_channels
+                                in_features=vq_dim,
+                                out_features=vq_dim
                             )
 
         # initialize the decoder module for the adjacency matrix
         print("Initializing the decoder module for the adjacency matrix.")
         self.decoder_edge = nn.Linear(
-                                in_features=in_channels,
-                                out_features=in_channels
+                                in_features=vq_dim,
+                                out_features=vq_dim
                             )
 
         # initialize the post-VQ Graph Convolution module
         print("Initializing the post-VQ Graph Convolution module.")
         self.post_vq_conv_module = self._init_graph_conv_module(
-            in_channels=in_channels,
+            in_channels=vq_dim,
             hidden_channels=hidden_channels,
             num_layers=1,
             act_first=act_first,
