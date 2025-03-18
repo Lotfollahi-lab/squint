@@ -209,16 +209,17 @@ class VQGraph(BaseModel):
     # def embed(
 
 
-    def compute_codebook_utilization(self) -> int:
+    def get_sorted_indices(self) -> List[int]:
         """
-        Compute total codebook utilization across all batches in the inference dataloader.
+        Get the codebook indices sorted by the node ids. `infer_dataloader` is used to get loop over all nodes in the graph.
 
         Returns
         -------
-        - total_utilization: int
-            Total number of unique codebook indices used.
+        - sorted_indices: List[int]
+            List of sorted codebook indices.
         """
-        unique_codes = set()
+        sorted_indices = []
+        node_ids = []
 
         # Iterate through inference dataloader
         for batch in self.trainer.datamodule.infer_dataloader():
@@ -226,9 +227,14 @@ class VQGraph(BaseModel):
             batch = batch.to(self.device)
             # Get indices from forward pass
             _, _, indices, _, _, _, _, _, _ = self(batch.x, batch.edge_index)
-            unique_codes.update(indices[:batch.batch_size].tolist())
+            sorted_indices.extend(indices[:batch.batch_size].tolist())
+            node_ids.extend(batch.n_id[:batch.batch_size].tolist())
 
-        return len(unique_codes)
+        # Sort node_ids and unique_codes based on the sorted order of node_ids
+        sorted_indices = sorted(range(len(node_ids)), key=lambda i: node_ids[i])
+        sorted_indices = [sorted_indices[i] for i in sorted_indices]
+
+        return sorted_indices
 
 
     def training_step(
@@ -444,10 +450,10 @@ class VQGraph(BaseModel):
 
     def on_train_epoch_end(self) -> None:
         if self.log_codebook_utilization:
-            total_utilization = self.compute_codebook_utilization()
+            sorted_indices = self.get_sorted_indices()
             self.log(
-                name="total_codebook_utilization",
-                value=total_utilization,
+                name="codebook_utilization",
+                value=len(set(sorted_indices)),
                 prog_bar=False,
                 on_step=False,
                 on_epoch=True,
