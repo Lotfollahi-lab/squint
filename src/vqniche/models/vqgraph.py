@@ -3,6 +3,7 @@ Our implementation of VQGraph is built off of the code published by the authors 
 
 The VQGraph model is a graph neural network model that uses vector quantization (VQ) to encode node embeddings. The VQGraph model consists of a VQGraph_Encoder module and a Linear predictor module. The VQGraph_Encoder module is responsible for encoding the input node embeddings using a graph-convolution module followed by vector quantization, while the Linear predictor module is responsible for predicting the output node embeddings. We use the Euclidean distance as the distance metric for vector quantization (i.e. Euclidean Codebook).
 """
+import pandas as pd
 
 import torch
 import torch.nn as nn
@@ -29,6 +30,7 @@ class VQGraph(BaseModel):
             activation: Union[str, Callable, None] = "relu",
             norm: Union[str, Callable, None] = None,
             dropout: float = 0.5,
+            log_codebook_utilization: bool = False,
             codebook_params: dict = {},
             optimizer_name: str = 'adam',
             lr: float = 0.01,
@@ -72,6 +74,8 @@ class VQGraph(BaseModel):
             The normalization function to use.
         - dropout: float
             The dropout probability.
+        - log_codebook_utilization: bool
+            Whether to log the codebook utilization.
         - codebook_params: dict
             Keyword arguments for the codebook.
 
@@ -132,6 +136,8 @@ class VQGraph(BaseModel):
                             in_features=hidden_channels,
                             out_features=out_channels
                             )
+
+        self.log_codebook_utilization = log_codebook_utilization
 
 
     def forward(
@@ -201,6 +207,29 @@ class VQGraph(BaseModel):
     # NOTE: Add the following method to the BaseModel class.
     # @torch.no_grad()
     # def embed(
+
+
+    def compute_codebook_utilization(self) -> int:
+        """
+        Compute total codebook utilization across all batches in the inference dataloader.
+
+        Returns
+        -------
+        - total_utilization: int
+            Total number of unique codebook indices used.
+        """
+        unique_codes = set()
+
+        # Iterate through inference dataloader
+        for batch in self.trainer.datamodule.infer_dataloader():
+            # Move batch to same device as model
+            batch = batch.to(self.device)
+            # Get indices from forward pass
+            _, _, indices, _, _, _, _, _, _ = self(batch.x, batch.edge_index)
+            unique_codes.update(indices[:batch.batch_size].tolist())
+
+        return len(unique_codes)
+
 
     def training_step(
             self,
@@ -275,16 +304,6 @@ class VQGraph(BaseModel):
                 acc_value=self.train_acc,
                 curr_batch_size=batch_size,
             )
-
-        # log codebook utilization
-        # TODO: fix this
-        self.log(
-            name=f"codebook_utilization",
-            value=len(torch.unique(indices)),
-            prog_bar=False,
-            on_step=False,
-            on_epoch=True,
-        )
 
         return train_loss
 
@@ -388,7 +407,7 @@ class VQGraph(BaseModel):
             # execute the forward of the GraphSAGE model
             _, \
             _, \
-            _, \
+            indices, \
             _, \
             _, \
             _, \
@@ -417,4 +436,20 @@ class VQGraph(BaseModel):
                 curr_batch_size=batch_size,
             )
 
+        # Update unique codes with the current batch's indices
+        self.unique_codes.update(indices.tolist())
+
         return self.test_acc
+
+
+    def on_train_epoch_end(self) -> None:
+        if self.log_codebook_utilization:
+            total_utilization = self.compute_codebook_utilization()
+            self.log(
+                name="total_codebook_utilization",
+                value=total_utilization,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+            )
+        return super().on_train_epoch_end()
