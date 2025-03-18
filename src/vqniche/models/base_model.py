@@ -293,11 +293,11 @@ class BaseModel(pl.LightningModule):
 
 
     def log_metrics(
-        self,
-        mode: str = 'train',
-        loss_value: torch.Tensor = None,
-        acc_value: torch.Tensor = None,
-        curr_batch_size: int = None,
+            self,
+            mode: str = 'train',
+            loss_value: torch.Tensor = None,
+            acc_value: torch.Tensor = None,
+            curr_batch_size: int = None,
         ) -> None:
         """
         Log total loss (if available) and accuracy for the model during training, validation, and testing.
@@ -416,13 +416,13 @@ class BaseModel(pl.LightningModule):
         - We use this hook to log the train and validation loss terms and accuracies in the training loop.
         """
         # log the metrics at the end of each epoch
-        columns = ['epoch'] + list(self.trainer.callback_metrics.keys())
-        metrics_data = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
-        print(columns)
-        print(metrics_data)
+        metric_names = ['epoch'] + list(self.trainer.callback_metrics.keys())
+        metrics_values = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
+        for metric_name, metric_value in zip(metric_names, metrics_values):
+            print(f"{metric_name}: {metric_value}")
 
         self.train_val_epoch_metrics = pd.concat(
-            [self.train_val_epoch_metrics, pd.DataFrame([metrics_data], columns=columns)],
+            [self.train_val_epoch_metrics, pd.DataFrame([metrics_values], columns=metric_names)],
             ignore_index=True
         )
 
