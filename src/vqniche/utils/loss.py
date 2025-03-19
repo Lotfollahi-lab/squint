@@ -203,7 +203,7 @@ def mse_adjacency_reconstruction(
     # quantize the predicted adjacency matrix coming from the decoder
     # then, subset the quantized adjacency matrix to only include the nodes in the current batch
     adj_quantized = torch.matmul(pred_adj.detach(), pred_adj.detach().t())
-    adj_quantized = (adj_quantized - adj_quantized.min()) / (adj_quantized.max() - adj_quantized.min())
+    adj_quantized = (adj_quantized - adj_quantized.min()) / (adj_quantized.max() - adj_quantized.min() + 1e-8)
     adj_quantized = adj_quantized.to(global_batch_adj.device)
 
     # compute the mean root squared error between the quantized adjacency matrix and the original adjacency matrix
