@@ -194,8 +194,7 @@ class VQGraph_Encoder(pl.LightningModule):
         is_multiheaded = codebook.ndim > 2
 
         if not is_multiheaded:
-            codes = codebook[indices]
-            return rearrange(codes, "... h d -> ... (h d)")
+            return codebook[indices]
 
         indices, ps = pack([indices], "b * h")
         indices = rearrange(indices, "b n h -> b h n")
