@@ -3,7 +3,7 @@ Our implementation of VQGraph is built off of the code published by the authors 
 
 The VQGraph model is a graph neural network model that uses vector quantization (VQ) to encode node embeddings. The VQGraph model consists of a VQGraph_Encoder module and a Linear predictor module. The VQGraph_Encoder module is responsible for encoding the input node embeddings using a graph-convolution module followed by vector quantization, while the Linear predictor module is responsible for predicting the output node embeddings. We use the Euclidean distance as the distance metric for vector quantization (i.e. Euclidean Codebook).
 """
-import pandas as pd
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -23,6 +23,8 @@ class VQGraph(BaseModel):
             in_channels: int = None,
             out_channels: int = None,
             apply_vq_on_latent_space: bool = True,
+            use_for_prediction: Literal['node-embeddings', 'codebook-embeddings'] = 'node-embeddings',
+            log_codebook_utilization: bool = False,
             graphconv_layer_name: str = 'SAGEConv',
             hidden_channels: int = 64,
             num_layers: int = 2,
@@ -30,7 +32,6 @@ class VQGraph(BaseModel):
             activation: Union[str, Callable, None] = "relu",
             norm: Union[str, Callable, None] = None,
             dropout: float = 0.5,
-            log_codebook_utilization: bool = False,
             codebook_params: dict = {},
             optimizer_name: str = 'adam',
             lr: float = 0.01,
@@ -59,6 +60,10 @@ class VQGraph(BaseModel):
             The number of output features.
         - apply_vq_on_latent_space: bool
             Whether to apply vector quantization on the latent space or the input space.
+        - use_for_prediction: Literal['node-embeddings', 'codebook-embeddings']
+            Whether to use the node embeddings or the codebook embeddings for prediction.
+        - log_codebook_utilization: bool
+            Whether to log the codebook utilization.
 
         - graphconv_layer_name: str
             The name of the graph convolutional layer.
@@ -74,8 +79,6 @@ class VQGraph(BaseModel):
             The normalization function to use.
         - dropout: float
             The dropout probability.
-        - log_codebook_utilization: bool
-            Whether to log the codebook utilization.
         - codebook_params: dict
             Keyword arguments for the codebook.
 
@@ -137,13 +140,13 @@ class VQGraph(BaseModel):
                             out_features=out_channels
                             )
 
+        self.use_for_prediction = use_for_prediction
         self.log_codebook_utilization = log_codebook_utilization
 
-
     def forward(
-        self,
-        batch_x: torch.Tensor,
-        batch_edge_index: torch.Tensor
+            self,
+            batch_x: torch.Tensor,
+            batch_edge_index: torch.Tensor
         ) -> torch.Tensor:
         """
         Forward pass of the VQGraph model.
@@ -190,8 +193,13 @@ class VQGraph(BaseModel):
                             batch_edge_index
                         )
 
-        # Apply the predictor to the VQ-encoded node embeddings.
-        unnormalized_logits_batch = self.predictor(h_post_vq_conv)
+        if self.use_for_prediction == 'node-embeddings':
+            # Apply the predictor to the VQ-encoded node embeddings.
+            unnormalized_logits_batch = self.predictor(h_post_vq_conv)
+        elif self.use_for_prediction == 'codebook-embeddings':
+            # Apply the predictor to the codebook embeddings.
+            codes = self.encoder.get_codes_from_indices(indices)
+            unnormalized_logits_batch = self.predictor(codes)
 
         return h_pre_vq_conv, \
             h_vq, \
@@ -208,7 +216,7 @@ class VQGraph(BaseModel):
     # @torch.no_grad()
     # def embed(
 
-
+    @torch.no_grad()
     def get_sorted_indices(self) -> List[int]:
         """
         Get the codebook indices sorted by the node ids. `infer_dataloader` is used to get loop over all nodes in the graph.
@@ -230,9 +238,7 @@ class VQGraph(BaseModel):
             sorted_indices.extend(indices[:batch.batch_size].tolist())
             node_ids.extend(batch.n_id[:batch.batch_size].tolist())
 
-        # Sort node_ids and unique_codes based on the sorted order of node_ids
-        sorted_indices = sorted(range(len(node_ids)), key=lambda i: node_ids[i])
-        sorted_indices = [sorted_indices[i] for i in sorted_indices]
+        sorted_indices = [sorted_indices[i] for i in np.argsort(node_ids)]
 
         return sorted_indices
 
@@ -240,7 +246,6 @@ class VQGraph(BaseModel):
     def training_step(
             self,
             train_batch: torch_geometric.data.Data,
-            batch_idx: int,
         ) -> torch.Tensor:
         """
         Definition of a single training step of the GraphSAGE model on the current batch of nodes received from the training dataloader at the current training epoch.
@@ -249,8 +254,6 @@ class VQGraph(BaseModel):
         ----------
         - batch: torch_geometric.data.Data
             The input train data (batch of nodes).
-        - batch_idx: int
-            The index of the current batch of data.
 
         Returns
         -------
@@ -295,7 +298,7 @@ class VQGraph(BaseModel):
                         loss_data=train_loss_data,
                         curr_batch_size=batch_size,
                         mode='train',
-                        )
+                    )
 
         # compute the predicted class probabilities (normalized logits)
         preds_batch = unnormalized_logits_batch.softmax(dim=-1)
@@ -307,7 +310,7 @@ class VQGraph(BaseModel):
         self.log_metrics(
                 mode='train',
                 loss_value=train_loss,
-                acc_value=self.train_acc,
+                acc_value=self.train_acc.compute(),
                 curr_batch_size=batch_size,
             )
 
@@ -383,7 +386,7 @@ class VQGraph(BaseModel):
         self.log_metrics(
                 mode='val',
                 loss_value=val_loss,
-                acc_value=self.val_acc,
+                acc_value=self.val_acc.compute(),
                 curr_batch_size=batch_size,
             )
 
@@ -438,7 +441,7 @@ class VQGraph(BaseModel):
         self.log_metrics(
                 mode='test',
                 loss_value=None,
-                acc_value=self.test_acc,
+                acc_value=self.test_acc.compute(),
                 curr_batch_size=batch_size,
             )
 

@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 import torch_geometric
 import pytorch_lightning as pl
+import torchmetrics
 from torchmetrics import Accuracy
 from typing import List, Tuple, Callable, Optional, Literal
 
@@ -312,6 +313,10 @@ class BaseModel(pl.LightningModule):
         - curr_batch_size: int
             The number of samples in the current batch.
         """
+        assert acc_value is not None, 'Accuracy value is None'
+        if isinstance(acc_value, torchmetrics.Metric):
+            raise ValueError(f"Accuracy value is a torchmetrics.Metric object: {acc_value}.")
+
         if loss_value is not None:
             self.log(
                 name=f'{mode}_loss',
