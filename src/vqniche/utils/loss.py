@@ -141,13 +141,13 @@ def mse_adjacency_reconstruction(
     return mse_adj_reconstr_loss * wt_adj_reconstr
 
 
-def mse_commitment_loss(
+def mse_total_codebook_loss(
         pred_commit: torch.Tensor,
         target_commit: torch.Tensor,
-        wt_commit: float = 0.25
+        wt_total_codebook: float = 0.25
     ) -> torch.Tensor:
     """
-    Compute the commitment loss for the VQ layer using a straight-through estimator.
+    Computes the total codebook loss defined as the sum of the commit loss and code loss for the VQGraph encoder as in the original VQGraph implementation.
 
     Parameters
     ----------
@@ -157,60 +157,63 @@ def mse_commitment_loss(
     target_commit: torch.Tensor
         The quantized node embedding obtained from a Linear Decoder layer on the output of the VQ layer.
         Dimensions: (batch_size, num_genes)
-    wt_commit: float
-        The scaling factor for the commitment loss.
+    wt_total_codebook: float
+        The scaling factor for the total codebook loss.
 
     Returns
     -------
-    mse_commit_loss: torch.Tensor
-        The computed commitment loss.
-    """
-    target_commit = pred_commit + (target_commit - pred_commit).detach()
-    detached_target = target_commit.detach()
+    total_codebook_loss: torch.Tensor
+        The computed total codebook loss.
 
-    mse_commit_loss = F.mse_loss(
+    Notes
+    -----
+    - The pred_commit for VQGraph is the output from the pre-VQ graph convolution layer(s).
+    - The target_commit for VQGraph is the output from the VQ layer (i.e. the quantized node embedding obtained from the codebook).
+    """
+    detached_target = target_commit.detach()
+    mse_total_codebook_loss = F.mse_loss(
                         input=pred_commit,
                         target=detached_target,
                         reduction='mean',
                     )
-    return mse_commit_loss * wt_commit
+    return mse_total_codebook_loss * wt_total_codebook
 
 
-def l2_codebook_loss(
+def l2_codebook_orthogonal_regularization_loss(
         codebook_embeddings: torch.Tensor,
-        wt_codebook: float = 0.2,
+        wt_codebook_orthogonal_regularization: float = 0.2,
         codebook_reg_active_codes_only: bool = False,
         codebook_reg_max_codes: int = None
     ) -> torch.Tensor:
     """
-    Compute the codebook loss for VQGraph.
+    Compute the codebook orthogonal regularization loss for VQGraph.
 
     Parameters
     ----------
     codebook_embeddings: torch.Tensor
         The codebook embeddings.
         Dimensions: (codebook_size, num_genes)
-    codebook_reg_weight: float
-        The scaling factor for the codebook loss.
+    wt_codebook_orthogonal_regularization: float
+        The scaling factor for the codebook orthogonal regularization loss.
     codebook_reg_active_codes_only: bool
-        Whether to only calculate the codebook loss for the active codes.
+        Whether to only calculate the codebook orthogonal regularization loss for the active codes.
     codebook_reg_max_codes: int
-        The maximum number of codes to use for the codebook loss.
+        The maximum number of codes to use for the codebook orthogonal regularization loss.
 
     Returns
     -------
-    codebook_loss: torch.Tensor
-        The computed codebook loss.
+    codebook_orthogonal_regularization_loss: torch.Tensor
+        The computed codebook orthogonal regularization loss.
 
     Notes:
     -----
     - Source --> Equation (3) from https://arxiv.org/abs/2112.00384
     """
     if codebook_reg_active_codes_only:
-        raise NotImplementedError("Codebook loss for active codes only is not implemented.")
+        raise NotImplementedError("Codebook orthogonal regularization loss for active codes only is not implemented.")
 
     if codebook_reg_max_codes is not None:
-        raise NotImplementedError("Codebook loss for max codes is not implemented.")
+        raise NotImplementedError("Codebook orthogonal regularization loss for max codes is not implemented.")
 
     h, n = codebook_embeddings.shape[:2]
     normed_codes = l2norm(codebook_embeddings)
@@ -220,6 +223,6 @@ def l2_codebook_loss(
         normed_codes
         )
 
-    codebook_loss = (cosine_sim**2).sum() / (h * n**2) - (1 / n)
+    codebook_orthogonal_regularization_loss = (cosine_sim**2).sum() / (h * n**2) - (1 / n)
 
-    return codebook_loss * wt_codebook
+    return codebook_orthogonal_regularization_loss * wt_codebook_orthogonal_regularization

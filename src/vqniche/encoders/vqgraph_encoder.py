@@ -72,7 +72,7 @@ class VQGraph_Encoder(pl.LightningModule):
             sync_kmeans=sync_kmeans, # True
             threshold_ema_dead_code=threshold_ema_dead_code, # 0
             use_ddp=use_ddp, # False
-            sample_codebook_temp=sample_codebook_temp, # 0.0
+            sample_codebook_temp=sample_codebook_temp, # 1.0
         )
 
         # initialize the decoder module for the node attributes
@@ -254,6 +254,7 @@ class VQGraph_Encoder(pl.LightningModule):
         dist, \
         codebook_embeddings \
             = self._codebook(h_pre_vq_conv)
+        h_vq = h_pre_vq_conv + (h_vq - h_pre_vq_conv).detach()
 
         # decode the VQ-encoded node embeddings to recover the node attributes
         h_node = self.decoder_node(h_vq)
