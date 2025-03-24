@@ -1,11 +1,8 @@
 import torch
 import torch.nn.functional as F
-from typing import Literal, Optional
 
 from ..utils.type_conversions import edge_index_to_adjacency_tensor
 from ..utils.vqgraph_helpers import l2norm
-from ..utils.loss_utils import compute_dispersion
-from scvi.distributions import NegativeBinomial, ZeroInflatedNegativeBinomial
 
 
 def cross_entropy(
@@ -78,80 +75,6 @@ def mse_attribute_reconstruction(
                                 reduction='mean',
                             )
     return mse_attr_reconstr_loss * wt_attr_reconstr
-
-
-def nb_attribute_reconstruction(
-        pred_attr: torch.Tensor,
-        target_attr: torch.Tensor,
-        dispersion: Optional[torch.Tensor] = None,
-        distribution: Literal['zinb', 'nb'] = 'nb',
-        dispersion_theta: float = 1.0,
-        wt_attr_reconstr: float = 0.1,
-    ) -> torch.Tensor:
-    """
-    Compute the negative binomial loss.
-
-    Parameters
-    ----------
-    pred_attr: torch.Tensor
-        The output from the attribute decoder module.
-        Dimensions: (batch_size, num_genes)
-    target_attr: torch.Tensor
-        The target attributes.
-        Dimensions: (batch_size, num_genes)
-    dispersion: torch.Tensor
-        The dispersion parameter for the negative binomial distribution. Can be `None` if not provided.
-    distribution: str
-        The distribution to use for the negative binomial loss. Can be 'nb' or 'zinb'.
-    dispersion_theta: float
-        The `theta` parameter to compute dispersion of batch-ids for the negative binomial distribution.
-    wt_attr_reconstr: float
-        The scaling factor for the node attribute reconstruction loss.
-
-    Returns
-    -------
-    nb_loss: torch.Tensor
-        The computed node attribute reconstruction loss.
-
-    Notes
-    -----
-    - If we set `target_attr` to be the raw count data, we could repurpose this to be used for a Count Decoder in the future.
-    - Otherwise, with real-valued tensors, this returns NaNs.
-    """
-    if dispersion is None:
-        # TODO: Replace with batch_ids from the dataloader
-        batch_ids = torch.ones(
-                        pred_attr.shape[0], # batch_size
-                        dtype=torch.long,
-                        device=pred_attr.device
-                    )
-
-        dispersion = compute_dispersion(
-            input=batch_ids,
-            num_out_features=pred_attr.shape[1], # num_genes
-            theta=dispersion_theta,
-            device=pred_attr.device
-        )
-    else:
-        dispersion = dispersion.expand(
-                        pred_attr.shape[0], -1
-                    ).to(pred_attr.device) # (batch_size, num_genes)
-
-    if distribution == 'zinb':
-        nb_distribution = ZeroInflatedNegativeBinomial(
-                            mu=pred_attr,
-                            theta=dispersion
-                            )
-    elif distribution == 'nb':
-        nb_distribution = NegativeBinomial(
-                            mu=pred_attr,
-                            theta=dispersion
-                            )
-    nb_loss = -nb_distribution.log_prob(
-                                target_attr
-                            ).sum(dim=-1).mean()
-
-    return nb_loss * wt_attr_reconstr
 
 
 def mse_adjacency_reconstruction(

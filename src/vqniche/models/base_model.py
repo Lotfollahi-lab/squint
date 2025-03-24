@@ -173,23 +173,6 @@ class BaseModel(pl.LightningModule):
                 if wt_attr_reconstr is not None:
                     loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
 
-            elif loss_fn_name == 'nb_attribute_reconstruction':
-                loss_fn = nb_attribute_reconstruction
-
-                loss_fn_data_keys = ['pred_attr', 'target_attr']
-
-                distribution = loss_kwargs.get('distribution')
-                if 'distribution' is not None:
-                    loss_fn_params['distribution'] = distribution
-
-                dispersion_theta = loss_kwargs.get('dispersion_theta')
-                if dispersion_theta is not None:
-                    loss_fn_params['dispersion_theta'] = dispersion_theta
-
-                wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
-                if wt_attr_reconstr is not None:
-                    loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
-
             elif loss_fn_name == 'mse_adjacency_reconstruction':
                 loss_fn = mse_adjacency_reconstruction
 
