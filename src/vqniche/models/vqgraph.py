@@ -3,15 +3,17 @@ Our implementation of VQGraph is built off of the code published by the authors 
 
 The VQGraph model is a graph neural network model that uses vector quantization (VQ) to encode node embeddings. The VQGraph model consists of a VQGraph_Encoder module and a Linear predictor module. The VQGraph_Encoder module is responsible for encoding the input node embeddings using a graph-convolution module followed by vector quantization, while the Linear predictor module is responsible for predicting the output node embeddings. We use the Euclidean distance as the distance metric for vector quantization (i.e. Euclidean Codebook).
 """
+from typing import List, Union, Callable, Literal
+
 import numpy as np
 
 import torch
 import torch.nn as nn
 import torch_geometric
-from typing import List, Union, Callable, Literal
 
 from .base_model import BaseModel
 from ..encoders.vqgraph_encoder import VQGraph_Encoder
+from ..utils import metrics
 
 
 class VQGraph(BaseModel):
@@ -38,8 +40,6 @@ class VQGraph(BaseModel):
             weight_decay: float = 0.0,
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'none'},
-            task_name: str = 'multiclass',
-            task_kwargs: dict = {},
             inference_mode: Literal['batch-wise', 'layer-wise'] = 'batch-wise',
         ):
         """
@@ -94,11 +94,6 @@ class VQGraph(BaseModel):
         - loss_kwargs: dict
             Keyword arguments for the loss functions.
 
-        - task_name: str
-            The task type.
-        - task_kwargs: dict
-            Keyword arguments for the task.
-
         - inference_mode: str
             The inference mode. Choose from 'batch-wise' or 'layer-wise'.
         """
@@ -114,8 +109,6 @@ class VQGraph(BaseModel):
             weight_decay=weight_decay,
             loss_names=loss_names,
             loss_kwargs=loss_kwargs,
-            task_name=task_name,
-            task_kwargs=task_kwargs,
             inference_mode=inference_mode,
         )
 
@@ -138,7 +131,7 @@ class VQGraph(BaseModel):
         self.predictor = nn.Linear(
                             in_features=hidden_channels,
                             out_features=out_channels
-                            )
+                        )
 
         self.use_for_prediction = use_for_prediction
         self.log_codebook_utilization = log_codebook_utilization
@@ -286,9 +279,11 @@ class VQGraph(BaseModel):
                         'target_attr': h_pre_vq_conv[:batch_size],
                         'pred_adj': h_edge[:batch_size],
                         'batch_edge_index': train_batch.edge_index,
-                        'pred_commit': h_pre_vq_conv[:batch_size],
-                        'target_commit': h_vq[:batch_size],
-                        'codebook_embeddings': codebook_embeddings[:batch_size],
+                        'quantizer_input': h_pre_vq_conv[:batch_size],
+                        'quantized_output': h_vq[:batch_size],
+                        'node_embeddings': h_pre_vq_conv[:batch_size],
+                        'codebook_embeddings': codebook_embeddings[0],
+                        'code_indices': indices[:batch_size],
                         'batch_input_id': train_batch.input_id,
                         'batch_nid': train_batch.n_id,
                         }
@@ -300,17 +295,17 @@ class VQGraph(BaseModel):
                         mode='train',
                     )
 
-        # compute the predicted class probabilities (normalized logits)
-        preds_batch = unnormalized_logits_batch.softmax(dim=-1)
+        # compute train accuracy
+        train_acc = metrics.accuracy_score(
+                        unnormalized_logits=unnormalized_logits_batch[:batch_size],
+                        one_hot_labels=train_batch.y[:batch_size],
+                    )
 
-        # compute the training accuracy
-        self.train_acc(preds_batch[:batch_size], train_batch.y[:batch_size])
-
-        # log the training loss and accuracy
+        # log training loss and accuracy
         self.log_metrics(
                 mode='train',
                 loss_value=train_loss,
-                acc_value=self.train_acc.compute(),
+                acc_value=train_acc,
                 curr_batch_size=batch_size,
             )
 
@@ -319,7 +314,8 @@ class VQGraph(BaseModel):
 
     def validation_step(
             self,
-            val_batch: torch_geometric.data.Data
+            val_batch: torch_geometric.data.Data,
+            batch_idx: int
         ) -> torch.Tensor:
         """
         Definition of a single validation step of the GraphSAGE model on the current batch of nodes received from the validation dataloader at the current training epoch.
@@ -362,9 +358,11 @@ class VQGraph(BaseModel):
                         'target_attr': h_pre_vq_conv[:batch_size],
                         'pred_adj': h_edge[:batch_size],
                         'batch_edge_index': val_batch.edge_index,
-                        'pred_commit': h_pre_vq_conv[:batch_size],
-                        'target_commit': h_vq[:batch_size],
-                        'codebook_embeddings': codebook_embeddings[:batch_size],
+                        'quantizer_input': h_pre_vq_conv[:batch_size],
+                        'quantized_output': h_vq[:batch_size],
+                        'node_embeddings': h_pre_vq_conv[:batch_size],
+                        'codebook_embeddings': codebook_embeddings[0],
+                        'code_indices': indices[:batch_size],
                         'batch_input_id': val_batch.input_id,
                         'batch_nid': val_batch.n_id,
                         }
@@ -374,19 +372,19 @@ class VQGraph(BaseModel):
                         loss_data=val_loss_data,
                         curr_batch_size=batch_size,
                         mode='val',
-                        )
+                    )
 
-        # compute the predicted class probabilities (normalized logits)
-        preds_batch = unnormalized_logits_batch.softmax(dim=-1)
+        # compute validation accuracy
+        val_acc = metrics.accuracy_score(
+                        unnormalized_logits=unnormalized_logits_batch[:batch_size],
+                        one_hot_labels=val_batch.y[:batch_size],
+                    )
 
-        # compute the validation accuracy
-        self.val_acc(preds_batch[:batch_size], val_batch.y[:batch_size])
-
-        # log the validation loss and accuracy
+        # log validation loss and accuracy
         self.log_metrics(
                 mode='val',
                 loss_value=val_loss,
-                acc_value=self.val_acc.compute(),
+                acc_value=val_acc,
                 curr_batch_size=batch_size,
             )
 
@@ -416,7 +414,7 @@ class VQGraph(BaseModel):
             # execute the forward of the GraphSAGE model
             _, \
             _, \
-            indices, \
+            _, \
             _, \
             _, \
             _, \
@@ -431,24 +429,21 @@ class VQGraph(BaseModel):
         elif self.inference_mode == 'layer-wise':
             raise NotImplementedError("Layer-wise inference is not supported for test step.")
 
-        # compute the predicted class probabilities (normalized logits)
-        preds_batch = unnormalized_logits_batch.softmax(dim=-1)
+        # compute test accuracy
+        test_acc = metrics.accuracy_score(
+                        unnormalized_logits=unnormalized_logits_batch[:batch_size],
+                        one_hot_labels=test_batch.y[:batch_size],
+                    )
 
-        # compute the test accuracy
-        self.test_acc(preds_batch[:batch_size], test_batch.y[:batch_size])
-
-        # log the test loss and accuracy
+        # log test accuracy
         self.log_metrics(
                 mode='test',
                 loss_value=None,
-                acc_value=self.test_acc.compute(),
+                acc_value=test_acc,
                 curr_batch_size=batch_size,
             )
 
-        # Update unique codes with the current batch's indices
-        self.unique_codes.update(indices.tolist())
-
-        return self.test_acc
+        return test_acc
 
 
     def on_train_epoch_end(self) -> None:
@@ -460,5 +455,6 @@ class VQGraph(BaseModel):
                 prog_bar=False,
                 on_step=False,
                 on_epoch=True,
+                sync_dist=True,
             )
         return super().on_train_epoch_end()

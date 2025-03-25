@@ -1,12 +1,11 @@
-import pandas as pd
 from pathlib import Path
+from typing import List, Tuple, Callable, Optional, Literal
+
+import pandas as pd
 
 import torch
 import torch_geometric
 import pytorch_lightning as pl
-import torchmetrics
-from torchmetrics import Accuracy
-from typing import List, Tuple, Callable, Optional, Literal
 
 from ..utils.loss import *
 
@@ -24,8 +23,6 @@ class BaseModel(pl.LightningModule):
             weight_decay: float = 0.0,
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'mean'},
-            task_name: str = 'multiclass',
-            task_kwargs: dict = {},
             inference_mode: Literal['batch-wise', 'layer-wise'] = 'batch-wise',
         ) -> None:
         """
@@ -57,11 +54,6 @@ class BaseModel(pl.LightningModule):
         - loss_kwargs: dict
             The loss function keyword arguments.
 
-        - task_name: str
-            The task name.
-        - task_kwargs: dict
-            The task keyword arguments.
-
         - inference_mode: Literal['batch-wise', 'layer-wise']
             The inference mode. Choose from 'batch-wise' or 'layer-wise'.
         """
@@ -83,25 +75,6 @@ class BaseModel(pl.LightningModule):
         # Loss parameters
         self.loss_kwargs = loss_kwargs
         self.loss_fn_tuples = self.set_loss_fn_tuples(loss_names, loss_kwargs)
-
-        # Accuracy metrics parameters
-        self.task_name = task_name
-        self.task_kwargs = task_kwargs
-        self.train_acc = Accuracy(
-                            task=task_name,
-                            num_classes=out_channels,
-                            **task_kwargs
-                            )
-        self.val_acc = Accuracy(
-                            task=task_name,
-                            num_classes=out_channels,
-                            **task_kwargs
-                            )
-        self.test_acc = Accuracy(
-                            task=task_name,
-                            num_classes=out_channels,
-                            **task_kwargs
-                            )
 
         # Option 1 -- batch-wise (default)
         # for epoch in epochs:
@@ -185,7 +158,7 @@ class BaseModel(pl.LightningModule):
             elif loss_fn_name == 'mse_joint_code_commit_loss':
                 loss_fn = mse_joint_code_commit_loss
 
-                loss_fn_data_keys = ['pred_commit', 'target_commit']
+                loss_fn_data_keys = ['quantizer_input', 'quantized_output']
 
                 wt_joint_code_commit = loss_kwargs.get('wt_joint_code_commit')
                 if wt_joint_code_commit is not None:
@@ -295,28 +268,26 @@ class BaseModel(pl.LightningModule):
 
     def log_metrics(
             self,
-            mode: str = 'train',
             loss_value: torch.Tensor = None,
             acc_value: torch.Tensor = None,
             curr_batch_size: int = None,
+            mode: Literal['train', 'val', 'test'] = 'train',
         ) -> None:
         """
         Log total loss (if available) and accuracy for the model during training, validation, and testing.
 
         Parameters
         ----------
-        - mode: str
-            The mode of the model (train, val, test).
         - loss_value: torch.Tensor
             The computed loss.
         - acc_value: torch.Tensor
             The computed accuracy.
         - curr_batch_size: int
             The number of samples in the current batch.
+        - mode: Literal['train', 'val', 'test']
+            The mode of the model (train, val, test).
         """
         assert acc_value is not None, 'Accuracy value is None'
-        if isinstance(acc_value, torchmetrics.Metric):
-            raise ValueError(f"Accuracy value is a torchmetrics.Metric object: {acc_value}.")
 
         if loss_value is not None:
             self.log(

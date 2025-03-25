@@ -63,6 +63,7 @@ from torch_geometric.nn import GraphSAGE as SAGE_Encoder
 from typing import List, Union, Callable, Literal
 
 from .base_model import BaseModel
+from ..utils import metrics
 
 
 class GraphSAGE(BaseModel):
@@ -84,8 +85,6 @@ class GraphSAGE(BaseModel):
             weight_decay: float = 0.0,
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'none'},
-            task_name: str = 'multiclass',
-            task_kwargs: dict = {},
             inference_mode: Literal['batch-wise', 'layer-wise'] = 'layer-wise',
         ):
         """
@@ -130,11 +129,6 @@ class GraphSAGE(BaseModel):
         - loss_kwargs: dict
             Keyword arguments for the loss functions.
 
-        - task_name: str
-            The task type.
-        - task_kwargs: dict
-            Keyword arguments for the task.
-
         - inference_mode: str
             The inference mode. Choose from 'batch-wise' or 'layer-wise'.
         """
@@ -150,8 +144,6 @@ class GraphSAGE(BaseModel):
             weight_decay=weight_decay,
             loss_names=loss_names,
             loss_kwargs=loss_kwargs,
-            task_name=task_name,
-            task_kwargs=task_kwargs,
             inference_mode=inference_mode,
         )
 
@@ -283,17 +275,17 @@ class GraphSAGE(BaseModel):
                         curr_batch_size=batch_size
                         )
 
-        # compute the predicted class probabilities (normalized logits)
-        preds_batch = unnormalized_logits_batch.softmax(dim=-1)
+        # compute train accuracy
+        train_acc = metrics.accuracy_score(
+                        unnormalized_logits=unnormalized_logits_batch[:batch_size],
+                        one_hot_labels=train_batch.y[:batch_size],
+                    )
 
-        # compute the training accuracy
-        self.train_acc(preds_batch, train_batch.y[:batch_size])
-
-        # log the training loss and accuracy
+        # log training loss and accuracy
         self.log_metrics(
                 mode='train',
                 loss_value=train_loss,
-                acc_value=self.train_acc,
+                acc_value=train_acc,
                 curr_batch_size=batch_size,
             )
 
@@ -341,17 +333,17 @@ class GraphSAGE(BaseModel):
                         curr_batch_size=batch_size
                         )
 
-        # compute the predicted class probabilities (normalized logits)
-        preds_batch = unnormalized_logits_batch.softmax(dim=-1)
+        # compute validation accuracy
+        val_acc = metrics.accuracy_score(
+                        unnormalized_logits=unnormalized_logits_batch[:batch_size],
+                        one_hot_labels=val_batch.y[:batch_size],
+                    )
 
-        # compute the validation accuracy
-        self.val_acc(preds_batch, val_batch.y[:batch_size])
-
-        # log the validation loss and accuracy
+        # log validation loss and accuracy
         self.log_metrics(
                 mode='val',
                 loss_value=val_loss,
-                acc_value=self.val_acc,
+                acc_value=val_acc,
                 curr_batch_size=batch_size,
             )
 
@@ -387,18 +379,18 @@ class GraphSAGE(BaseModel):
         elif self.inference_mode == 'layer-wise':
             unnormalized_logits_batch = self.test_logits[test_batch.n_id[:batch_size]]
 
-        # compute the predicted class probabilities (normalized logits)
-        preds_batch = unnormalized_logits_batch.softmax(dim=-1)
+        # compute test accuracy
+        test_acc = metrics.accuracy_score(
+                        unnormalized_logits=unnormalized_logits_batch[:batch_size],
+                        one_hot_labels=test_batch.y[:batch_size],
+                    )
 
-        # compute the test accuracy
-        self.test_acc(preds_batch, test_batch.y[:batch_size])
-
-        # log the test loss and accuracy
+        # log test accuracy
         self.log_metrics(
                 mode='test',
                 loss_value=None,
-                acc_value=self.test_acc,
+                acc_value=test_acc,
                 curr_batch_size=batch_size,
             )
 
-        return self.test_acc
+        return test_acc

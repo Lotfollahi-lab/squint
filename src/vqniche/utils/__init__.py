@@ -4,4 +4,5 @@ from . import (
     config_parsers,
     type_conversions,
     vqgraph_helpers,
+    metrics,
 )
