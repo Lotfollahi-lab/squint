@@ -182,14 +182,32 @@ class BaseModel(pl.LightningModule):
                 if wt_adj_reconstr is not None:
                     loss_fn_params['wt_adj_reconstr'] = wt_adj_reconstr
 
-            elif loss_fn_name == 'mse_total_codebook_loss':
-                loss_fn = mse_total_codebook_loss
+            elif loss_fn_name == 'mse_joint_code_commit_loss':
+                loss_fn = mse_joint_code_commit_loss
 
                 loss_fn_data_keys = ['pred_commit', 'target_commit']
 
-                wt_total_codebook = loss_kwargs.get('wt_total_codebook')
-                if wt_total_codebook is not None:
-                    loss_fn_params['wt_total_codebook'] = wt_total_codebook
+                wt_joint_code_commit = loss_kwargs.get('wt_joint_code_commit')
+                if wt_joint_code_commit is not None:
+                    loss_fn_params['wt_joint_code_commit'] = wt_joint_code_commit
+
+            elif loss_fn_name == 'mse_commit_loss':
+                loss_fn = mse_commit_loss
+
+                loss_fn_data_keys = ['node_embeddings', 'codebook_embeddings', 'code_indices']
+
+                wt_commit = loss_kwargs.get('wt_commit')
+                if wt_commit is not None:
+                    loss_fn_params['wt_commit'] = wt_commit
+
+            elif loss_fn_name == 'mse_code_loss':
+                loss_fn = mse_code_loss
+
+                loss_fn_data_keys = ['node_embeddings', 'codebook_embeddings', 'code_indices']
+
+                wt_code = loss_kwargs.get('wt_code')
+                if wt_code is not None:
+                    loss_fn_params['wt_code'] = wt_code
 
             elif loss_fn_name == 'l2_codebook_orthogonal_regularization_loss':
                 loss_fn = l2_codebook_orthogonal_regularization_loss

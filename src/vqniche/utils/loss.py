@@ -141,42 +141,121 @@ def mse_adjacency_reconstruction(
     return mse_adj_reconstr_loss * wt_adj_reconstr
 
 
-def mse_total_codebook_loss(
-        pred_commit: torch.Tensor,
-        target_commit: torch.Tensor,
-        wt_total_codebook: float = 0.25
+def mse_joint_code_commit_loss(
+        quantizer_input: torch.Tensor,
+        quantized_output: torch.Tensor,
+        wt_joint_code_commit: float = 0.25
     ) -> torch.Tensor:
     """
     Computes the total codebook loss defined as the sum of the commit loss and code loss for the VQGraph encoder as in the original VQGraph implementation.
 
     Parameters
     ----------
-    pred_commit: torch.Tensor
+    quantizer_input: torch.Tensor
         The latent node embedding obtained from the pre-VQ graph convolution layer(s).
         Dimensions: (batch_size, num_genes)
-    target_commit: torch.Tensor
+    quantized_output: torch.Tensor
         The quantized node embedding obtained from a Linear Decoder layer on the output of the VQ layer.
         Dimensions: (batch_size, num_genes)
-    wt_total_codebook: float
+    wt_joint_code_commit: float
         The scaling factor for the total codebook loss.
 
     Returns
     -------
-    total_codebook_loss: torch.Tensor
+    joint_code_commit_loss: torch.Tensor
         The computed total codebook loss.
 
     Notes
     -----
-    - The pred_commit for VQGraph is the output from the pre-VQ graph convolution layer(s).
-    - The target_commit for VQGraph is the output from the VQ layer (i.e. the quantized node embedding obtained from the codebook).
+    - The quantizer_input for VQGraph is the output from the pre-VQ graph convolution layer(s).
+    - The quantized_output for VQGraph is the output from the VQ layer (i.e. the quantized node embedding obtained from the codebook).
     """
-    detached_target = target_commit.detach()
-    mse_total_codebook_loss = F.mse_loss(
-                        input=pred_commit,
-                        target=detached_target,
+    mse_joint_code_commit_loss = F.mse_loss(
+                        input=quantizer_input,
+                        target=quantized_output.detach(),
                         reduction='mean',
                     )
-    return mse_total_codebook_loss * wt_total_codebook
+    return mse_joint_code_commit_loss * wt_joint_code_commit
+
+
+def mse_commit_loss(
+        node_embeddings: torch.Tensor,
+        codebook_embeddings: torch.Tensor,
+        code_indices: torch.Tensor,
+        wt_commit: float = 0.25
+    ) -> torch.Tensor:
+    """
+    Compute the commit loss for VQGraph. This freezes the codebook embeddings and updates the node embeddings.
+
+    Parameters
+    ----------
+    node_embeddings: torch.Tensor
+        The node embeddings.
+        Dimensions: (batch_size, num_genes)
+    codebook_embeddings: torch.Tensor
+        The codebook embeddings.
+        Dimensions: (codebook_size, num_genes)
+    code_indices: torch.Tensor
+        The indices of the nearest code for each node.
+        Dimensions: (batch_size,)
+    wt_commit: float
+        The scaling factor for the commitment loss.
+
+    Returns
+    -------
+    commit_loss: torch.Tensor
+        The computed commit loss.
+
+    Notes:
+    -----
+    - Source --> Equation (3) from https://arxiv.org/abs/2112.00384
+    """
+    commit_loss = F.mse_loss(
+                        input=node_embeddings,
+                        target=codebook_embeddings[code_indices].detach(),
+                        reduction='mean',
+                    )
+    return commit_loss * wt_commit
+
+
+def mse_code_loss(
+        node_embeddings: torch.Tensor,
+        codebook_embeddings: torch.Tensor,
+        code_indices: torch.Tensor,
+        wt_code: float = 0.25
+    ) -> torch.Tensor:
+    """
+    Compute the code loss for VQGraph. This freezes the node embeddings and updates the codebook embeddings.
+
+    Parameters
+    ----------
+    node_embeddings: torch.Tensor
+        The node embeddings.
+        Dimensions: (batch_size, num_genes)
+    codebook_embeddings: torch.Tensor
+        The codebook embeddings.
+        Dimensions: (codebook_size, num_genes)
+    code_indices: torch.Tensor
+        The indices of the nearest code for each node.
+        Dimensions: (batch_size,)
+    wt_code: float
+        The scaling factor for the code loss.
+
+    Returns
+    -------
+    code_loss: torch.Tensor
+        The computed code loss.
+
+    Notes:
+    -----
+    - Source --> Equation (3) from https://arxiv.org/abs/2112.00384
+    """
+    code_loss = F.mse_loss(
+                        input=codebook_embeddings[code_indices],
+                        target=node_embeddings.detach(),
+                        reduction='mean',
+                    )
+    return code_loss * wt_code
 
 
 def l2_codebook_orthogonal_regularization_loss(
@@ -205,9 +284,6 @@ def l2_codebook_orthogonal_regularization_loss(
     codebook_orthogonal_regularization_loss: torch.Tensor
         The computed codebook orthogonal regularization loss.
 
-    Notes:
-    -----
-    - Source --> Equation (3) from https://arxiv.org/abs/2112.00384
     """
     if codebook_reg_active_codes_only:
         raise NotImplementedError("Codebook orthogonal regularization loss for active codes only is not implemented.")

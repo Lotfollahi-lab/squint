@@ -254,6 +254,7 @@ class VQGraph_Encoder(pl.LightningModule):
         dist, \
         codebook_embeddings \
             = self._codebook(h_pre_vq_conv)
+        # if we use gumble-softmax, turn this off
         h_vq = h_pre_vq_conv + (h_vq - h_pre_vq_conv).detach()
 
         # decode the VQ-encoded node embeddings to recover the node attributes
