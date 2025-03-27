@@ -405,25 +405,6 @@ class BaseModel(pl.LightningModule):
         return super().on_train_epoch_end()
 
 
-    def on_validation_epoch_start(self) -> None:
-        """
-        Callback function to be executed at the start of each validation epoch.
-
-        Notes:
-        ------
-        - We use this hook to obtain the unnormalized logits for the validation set if the inference mode is 'layer-wise'. Otherwise, we do nothing.
-        """
-        if self.inference_mode == 'batch-wise':
-            pass
-
-        elif self.inference_mode == 'layer-wise':
-            self.val_logits = self.inference(
-                                self.trainer.datamodule.val_dataloader()
-                                )
-
-        return super().on_validation_epoch_start()
-
-
     def validation_step(
             self,
             val_batch: torch_geometric.data.Data,
@@ -456,25 +437,6 @@ class BaseModel(pl.LightningModule):
         - We use this hook to print the total validation loss at the end of each epoch to monitor the validation progress.
         """
         super().on_validation_epoch_end()
-
-
-    def on_test_epoch_start(self) -> None:
-        """
-        Callback function to be executed at the start of each test epoch.
-
-        Notes:
-        ------
-        - We use this hook to obtain the unnormalized logits for the test set if the inference mode is 'layer-wise'. Otherwise, we do nothing.
-        """
-        if self.inference_mode == 'batch-wise':
-            pass
-
-        elif self.inference_mode == 'layer-wise':
-            self.test_logits = self.inference(
-                                self.trainer.datamodule.test_dataloader()
-                                )
-
-        return super().on_test_epoch_start()
 
 
     def test_step(

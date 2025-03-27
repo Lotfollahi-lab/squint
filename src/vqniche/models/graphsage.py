@@ -350,6 +350,26 @@ class GraphSAGE(BaseModel):
         return val_loss
 
 
+    def on_validation_epoch_start(self) -> None:
+        """
+        Callback function to be executed at the start of each validation epoch.
+
+        Notes:
+        ------
+        - We use this hook to obtain the unnormalized logits for the validation set if the inference mode is 'layer-wise'. Otherwise, we do nothing.
+        """
+        if self.inference_mode == 'batch-wise':
+            pass
+
+        elif self.inference_mode == 'layer-wise':
+            self.val_logits = self.inference(
+                                self.trainer.datamodule.infer_dataloader()
+                                )
+
+        return super().on_validation_epoch_start()
+
+
+
     def test_step(
             self,
             test_batch: torch_geometric.data.Data
@@ -394,3 +414,24 @@ class GraphSAGE(BaseModel):
             )
 
         return test_acc
+
+
+    def on_test_epoch_start(self) -> None:
+        """
+        Callback function to be executed at the start of each test epoch.
+
+        Notes:
+        ------
+        - We use this hook to obtain the unnormalized logits for the test set if the inference mode is 'layer-wise'. Otherwise, we do nothing.
+        """
+        if self.inference_mode == 'batch-wise':
+            pass
+
+        elif self.inference_mode == 'layer-wise':
+            # infer_dataloader() batches the entire dataset so that the entire dataset is processed in one go
+            # in the test_step, only nodes in the test set are processed.
+            self.test_logits = self.inference(
+                                self.trainer.datamodule.infer_dataloader()
+                                )
+
+        return super().on_test_epoch_start()
