@@ -5,12 +5,10 @@ The VQGraph model is a graph neural network model that uses vector quantization 
 """
 from typing import List, Union, Callable, Literal
 
-import numpy as np
-
 import torch
 import torch.nn as nn
 import torch_geometric
-
+import torch.nn.functional as F
 from .base_model import BaseModel
 from ..encoders.vqgraph_encoder import VQGraph_Encoder
 from ..utils import metrics
@@ -20,7 +18,7 @@ class VQGraph(BaseModel):
     def __init__(
             self,
             model_name: str = 'VQGraph',
-            encoder_name: str = 'VQGraph_InputSpace_Encoder',
+            encoder_name: str = 'VQGraph_Encoder',
             predictor_name: str = 'Linear',
             in_channels: int = None,
             out_channels: int = None,
@@ -209,31 +207,90 @@ class VQGraph(BaseModel):
     # @torch.no_grad()
     # def embed(
 
-    @torch.no_grad()
-    def get_sorted_indices(self) -> List[int]:
+    @staticmethod
+    def get_similarity_stats(
+            embeddings: torch.Tensor,
+            prefix: str
+        ) -> dict:
         """
-        Get the codebook indices sorted by the node ids. `infer_dataloader` is used to get loop over all nodes in the graph.
+        Compute pairwise cosine similarity statistics for embeddings efficiently.
+        Only computes upper triangle elements without materializing full matrix.
+
+        Parameters
+        ----------
+        - embeddings : torch.Tensor
+            Tensor of shape (N, D) containing N embeddings of dimension D
+        - prefix : str
+            Prefix for the keys in returned dictionary
 
         Returns
         -------
-        - sorted_indices: List[int]
-            List of sorted codebook indices.
+        - similarity_stats : dict
+            Dictionary containing mean and std of pairwise cosine similarities
         """
-        sorted_indices = []
-        node_ids = []
+        N = embeddings.size(0)
+        # Normalize embeddings for cosine similarity
+        normalized = F.normalize(embeddings, p=2, dim=1)
+
+        # Initialize storage for upper triangle similarities
+        n_pairs = (N * (N - 1)) // 2
+        similarities = torch.empty(n_pairs, device=embeddings.device)
+
+        # Compute only upper triangle elements
+        idx = 0
+        for i in range(N-1):
+            # Compute similarity between embedding i and all j > i
+            sims = torch.matmul(normalized[i:i+1], normalized[i+1:].t())
+            similarities[idx:idx+N-i-1] = sims[0]
+            idx += N-i-1
+
+        return {
+            f'{prefix}_mean': similarities.mean().item(),
+        }
+
+
+    @torch.no_grad()
+    def compute_train_epoch_stats(self) -> List[int]:
+        """
+        Compute pairwise similarity statistics for all embeddings and codebook utilization.
+
+        Returns
+        -------
+        - code_indices: List[int]
+            List of sorted codebook indices.
+        - similarity_stats: dict
+            Dictionary containing mean and std of pairwise cosine similarities for different embeddings
+        """
+        code_indices = []
+        h_pre_vq_conv_list = []
+        h_post_vq_conv_list = []
+        logits_list = []
 
         # Iterate through inference dataloader
         for batch in self.trainer.datamodule.infer_dataloader():
-            # Move batch to same device as model
             batch = batch.to(self.device)
-            # Get indices from forward pass
-            _, _, indices, _, _, _, _, _, _ = self(batch.x, batch.edge_index)
-            sorted_indices.extend(indices[:batch.batch_size].tolist())
-            node_ids.extend(batch.n_id[:batch.batch_size].tolist())
+            batch_size = batch.batch_size
 
-        sorted_indices = [sorted_indices[i] for i in np.argsort(node_ids)]
+            h_pre_vq_conv, _, indices, _, _, _, _, h_post_vq_conv, logits = self(batch.x, batch.edge_index)
 
-        return sorted_indices
+            h_pre_vq_conv_list.append(h_pre_vq_conv[:batch_size])
+            h_post_vq_conv_list.append(h_post_vq_conv[:batch_size])
+            logits_list.append(logits[:batch_size])
+            code_indices.extend(indices[:batch_size].tolist())
+
+        # Concatenate all embeddings
+        h_pre_vq_conv = torch.cat(h_pre_vq_conv_list, dim=0)
+        h_post_vq_conv = torch.cat(h_post_vq_conv_list, dim=0)
+        logits = torch.cat(logits_list, dim=0)
+
+        # Compute statistics for all embeddings
+        similarity_stats = {}
+        similarity_stats.update(self.get_similarity_stats(h_pre_vq_conv, 'h_pre_vq_conv'))
+        similarity_stats.update(self.get_similarity_stats(h_post_vq_conv, 'h_post_vq_conv'))
+        similarity_stats.update(self.get_similarity_stats(logits, 'logits'))
+        similarity_stats.update(self.get_similarity_stats(self.encoder.codebook, 'codebook'))
+
+        return code_indices, similarity_stats
 
 
     def training_step(
@@ -448,13 +505,22 @@ class VQGraph(BaseModel):
 
     def on_train_epoch_end(self) -> None:
         if self.log_codebook_utilization:
-            sorted_indices = self.get_sorted_indices()
+            code_indices, similarity_stats = self.compute_train_epoch_stats()
             self.log(
                 name="codebook_utilization",
-                value=len(set(sorted_indices)),
+                value=len(set(code_indices)),
                 prog_bar=False,
                 on_step=False,
                 on_epoch=True,
                 sync_dist=True,
             )
+            for key, value in similarity_stats.items():
+                self.log(
+                    name=key,
+                    value=value,
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
         return super().on_train_epoch_end()
