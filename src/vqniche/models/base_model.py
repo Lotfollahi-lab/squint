@@ -394,8 +394,10 @@ class BaseModel(pl.LightningModule):
         # log the metrics at the end of each epoch
         metric_names = ['epoch'] + list(self.trainer.callback_metrics.keys())
         metrics_values = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
+        print("--------------------------------")
         for metric_name, metric_value in zip(metric_names, metrics_values):
             print(f"{metric_name}: {metric_value}")
+        print("--------------------------------\n")
 
         self.train_val_epoch_metrics = pd.concat(
             [self.train_val_epoch_metrics, pd.DataFrame([metrics_values], columns=metric_names)],
