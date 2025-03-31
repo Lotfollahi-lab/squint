@@ -8,7 +8,7 @@ from typing import List, Union, Callable, Literal
 import torch
 import torch.nn as nn
 import torch_geometric
-import torch.nn.functional as F
+
 from .base_model import BaseModel
 from ..encoders.vqgraph_encoder import VQGraph_Encoder
 from ..utils import metrics
@@ -212,47 +212,6 @@ class VQGraph(BaseModel):
     # @torch.no_grad()
     # def embed(
 
-    @staticmethod
-    def get_similarity_stats(
-            embeddings: torch.Tensor,
-            prefix: str
-        ) -> dict:
-        """
-        Compute pairwise cosine similarity statistics for embeddings efficiently.
-        Only computes upper triangle elements without materializing full matrix.
-
-        Parameters
-        ----------
-        - embeddings : torch.Tensor
-            Tensor of shape (N, D) containing N embeddings of dimension D
-        - prefix : str
-            Prefix for the keys in returned dictionary
-
-        Returns
-        -------
-        - similarity_stats : dict
-            Dictionary containing mean and std of pairwise cosine similarities
-        """
-        N = embeddings.size(0)
-        # Normalize embeddings for cosine similarity
-        normalized = F.normalize(embeddings, p=2, dim=1)
-
-        # Initialize storage for upper triangle similarities
-        n_pairs = (N * (N - 1)) // 2
-        similarities = torch.empty(n_pairs, device=embeddings.device)
-
-        # Compute only upper triangle elements
-        idx = 0
-        for i in range(N-1):
-            # Compute similarity between embedding i and all j > i
-            sims = torch.matmul(normalized[i:i+1], normalized[i+1:].t())
-            similarities[idx:idx+N-i-1] = sims[0]
-            idx += N-i-1
-
-        return {
-            f'{prefix}_mean': similarities.mean().item(),
-        }
-
 
     @torch.no_grad()
     def compute_train_epoch_stats(self) -> List[int]:
@@ -290,10 +249,18 @@ class VQGraph(BaseModel):
 
         # Compute statistics for all embeddings
         similarity_stats = {}
-        similarity_stats.update(self.get_similarity_stats(h_pre_vq_conv, 'h_pre_vq_conv'))
-        similarity_stats.update(self.get_similarity_stats(h_post_vq_conv, 'h_post_vq_conv'))
-        similarity_stats.update(self.get_similarity_stats(logits, 'logits'))
-        similarity_stats.update(self.get_similarity_stats(self.encoder.codebook, 'codebook'))
+        similarity_stats.update(
+            metrics.get_similarity_stats(h_pre_vq_conv, 'h_pre_vq_conv')
+        )
+        similarity_stats.update(
+            metrics.get_similarity_stats(h_post_vq_conv, 'h_post_vq_conv')
+        )
+        similarity_stats.update(
+            metrics.get_similarity_stats(logits, 'logits')
+        )
+        similarity_stats.update(
+            metrics.get_similarity_stats(self.encoder.codebook, 'codebook')
+        )
 
         return code_indices, similarity_stats
 

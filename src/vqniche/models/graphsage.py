@@ -54,7 +54,7 @@ What has changed is:
 
 Because P_3 and P_4 are both learnable parameters of the model, they will be updated during training. In matrix form, P_3 * P_4 will have the same dimensions as P_1 which is the linear transformation in the last layer of the Pytorch Geometric's GraphSAGE model. Mathematically, this is the same as applying the linear transformation P_1 in the last layer of the Pytorch Geometric's GraphSAGE model. The only downside is that we need to maintain an extra matrix of trainable parameters which impacts the memory usage of the model.
 """
-from typing import List, Union, Callable, Literal
+from typing import List, Union, Callable, Literal, Dict
 
 import torch
 import torch.nn as nn
@@ -168,6 +168,28 @@ class GraphSAGE(BaseModel):
                             in_features=hidden_channels,
                             out_features=out_channels
                         )
+
+
+    @torch.no_grad()
+    def compute_train_epoch_stats(self) -> Dict:
+        """
+        Compute pairwise similarity statistics for all embeddings.
+
+        Returns
+        -------
+        - similarity_stats: dict
+            Dictionary containing mean and std of pairwise cosine similarities for different embeddings
+        """
+        similarity_stats = {}
+
+        h_embeddings = self.embed(self.trainer.datamodule.infer_dataloader())
+
+        # Compute statistics for all embeddings
+        similarity_stats.update(
+            metrics.get_similarity_stats(h_embeddings, 'h_embeddings')
+        )
+
+        return similarity_stats
 
 
     @torch.no_grad()
@@ -294,6 +316,20 @@ class GraphSAGE(BaseModel):
             )
 
         return train_loss
+
+
+    def on_train_epoch_end(self) -> None:
+        similarity_stats = self.compute_train_epoch_stats()
+        for key, value in similarity_stats.items():
+            self.log(
+                name=key,
+                value=value,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+        return super().on_train_epoch_end()
 
 
     def validation_step(
