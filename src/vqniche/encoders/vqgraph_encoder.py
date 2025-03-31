@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
-from torch_geometric.nn import GraphSAGE as SAGE_Encoder
 
-from typing import Callable, Union
+from typing import Callable, Union, Literal
 from einops import rearrange, pack, repeat, unpack
 
 from vqniche.codebooks.cosine_codebook import CosineSimCodebook
+from ..modules.sage_conv import SAGEConv_Module
 
 
 class VQGraph_Encoder(pl.LightningModule):
@@ -22,6 +22,7 @@ class VQGraph_Encoder(pl.LightningModule):
         activation: Union[str, Callable, None] = "relu",
         dropout: float = 0.5,
         norm: Union[str, Callable, None] = None,
+        init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform',
         learnable_codebook: bool = True,
         num_codebooks: int = 1,
         codebook_size: int = 256,
@@ -56,7 +57,8 @@ class VQGraph_Encoder(pl.LightningModule):
             act_first=act_first,
             activation=activation,
             dropout=dropout,
-            norm=norm
+            norm=norm,
+            init_method=init_method
         )
 
         # initialize codebook class
@@ -98,7 +100,8 @@ class VQGraph_Encoder(pl.LightningModule):
             act_first=act_first,
             activation=activation,
             dropout=0.0,
-            norm=None
+            norm=None,
+            init_method=init_method
         )
 
 
@@ -110,8 +113,9 @@ class VQGraph_Encoder(pl.LightningModule):
             act_first: bool,
             activation: Union[str, Callable, None],
             dropout: float,
-            norm: Union[str, Callable, None]
-        ) -> SAGE_Encoder:
+            norm: Union[str, Callable, None],
+            init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform'
+        ) -> SAGEConv_Module:
         """
         Initialize the Graph Convolution module(s).
 
@@ -144,14 +148,15 @@ class VQGraph_Encoder(pl.LightningModule):
         if self.graphconv_layer_name == 'SAGEConv':
             print(f"Graph Convolution applied from {in_channels} to {hidden_channels} across {num_layers} layer(s).")
             # initialize and return the graph convolution module
-            return SAGE_Encoder(
+            return SAGEConv_Module(
                             in_channels=in_channels,
                             hidden_channels=hidden_channels,
                             num_layers=num_layers,
                             act_first=act_first,
                             act=activation,
                             dropout=dropout,
-                            norm=norm
+                            norm=norm,
+                            init_method=init_method
                         )
         else:
             raise ValueError(f"Graph convolution layer {self.graphconv_layer_name} not supported.")

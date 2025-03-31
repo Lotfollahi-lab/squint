@@ -32,6 +32,7 @@ class VQGraph(BaseModel):
             activation: Union[str, Callable, None] = "relu",
             norm: Union[str, Callable, None] = None,
             dropout: float = 0.5,
+            init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform',
             codebook_params: dict = {},
             optimizer_name: str = 'adam',
             lr: float = 0.01,
@@ -77,6 +78,9 @@ class VQGraph(BaseModel):
             The normalization function to use.
         - dropout: float
             The dropout probability.
+        - init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None]
+            The initialization method to use for the linear transformations in the SAGEConv layers.
+            If None, the initialization method is 'kaiming_uniform'.
         - codebook_params: dict
             Keyword arguments for the codebook.
 
@@ -122,6 +126,7 @@ class VQGraph(BaseModel):
                             activation=activation,
                             dropout=dropout,
                             norm=norm,
+                            init_method=init_method,
                             **codebook_params
                         )
 
