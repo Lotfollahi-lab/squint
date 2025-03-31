@@ -54,13 +54,12 @@ What has changed is:
 
 Because P_3 and P_4 are both learnable parameters of the model, they will be updated during training. In matrix form, P_3 * P_4 will have the same dimensions as P_1 which is the linear transformation in the last layer of the Pytorch Geometric's GraphSAGE model. Mathematically, this is the same as applying the linear transformation P_1 in the last layer of the Pytorch Geometric's GraphSAGE model. The only downside is that we need to maintain an extra matrix of trainable parameters which impacts the memory usage of the model.
 """
-
+from typing import List, Union, Callable, Literal
 
 import torch
 import torch.nn as nn
 import torch_geometric
-from torch_geometric.nn import GraphSAGE as SAGE_Encoder
-from typing import List, Union, Callable, Literal
+from ..modules.sage_conv import SAGEConv_Module as GraphSAGE_Encoder
 
 from .base_model import BaseModel
 from ..utils import metrics
@@ -80,6 +79,7 @@ class GraphSAGE(BaseModel):
             activation: Union[str, Callable, None] = "relu",
             norm: Union[str, Callable, None] = None,
             dropout: float = 0.5,
+            init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform',
             optimizer_name: str = 'adam',
             lr: float = 0.01,
             weight_decay: float = 0.0,
@@ -116,6 +116,9 @@ class GraphSAGE(BaseModel):
             The normalization function to use.
         - dropout: float
             The dropout probability.
+        - init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None]
+            The initialization method to use for the linear transformations in the SAGEConv layers.
+            If None, the initialization method is 'kaiming_uniform'.
 
         - optimizer_name: str
             The optimizer name.
@@ -149,21 +152,22 @@ class GraphSAGE(BaseModel):
 
         # Initialize GraphSAGE model from Pytorch Geometric as the encoder
         # The out_channels parameter is not passed to the SAGE_Encoder (i.e. it is set to None) so that we can separate the encoder from the predictor.
-        self.encoder = SAGE_Encoder(
+        self.encoder = GraphSAGE_Encoder(
                             in_channels=in_channels,
                             hidden_channels=hidden_channels,
                             num_layers=num_layers,
                             act_first=act_first,
-                            act=activation,
+                            activation=activation,
+                            norm=norm,
                             dropout=dropout,
-                            norm=norm
+                            init_method=init_method
                         )
 
         # Instead, we apply this final linear transformation in the predictor module manually to have access to the internal node embeddings via the `embed` function.
         self.predictor = nn.Linear(
                             in_features=hidden_channels,
                             out_features=out_channels
-                            )
+                        )
 
 
     @torch.no_grad()
@@ -367,7 +371,6 @@ class GraphSAGE(BaseModel):
                                 )
 
         return super().on_validation_epoch_start()
-
 
 
     def test_step(
