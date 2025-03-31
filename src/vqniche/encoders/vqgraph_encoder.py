@@ -153,7 +153,7 @@ class VQGraph_Encoder(pl.LightningModule):
                             hidden_channels=hidden_channels,
                             num_layers=num_layers,
                             act_first=act_first,
-                            act=activation,
+                            activation=activation,
                             dropout=dropout,
                             norm=norm,
                             init_method=init_method
