@@ -1,7 +1,7 @@
 """
-Our implementation of VQGraph is built off of the code published by the authors of the VQGraph paper (source: https://github.com/YangLing0818/VQGraph/). We adapt it to work within our setup of Pytorch Geometric, Dataset-Blob, Pytorch Lightning, and Encoder-Predictor setup.
+This file implements the VQGraph Model. It comprises of an Encoder and a Linear Predictor. The Encoder jointly trains a node embedding using a graph-convolution module and a codebook using a vector quantization module. The Predictor is a Linear layer that uses the quantized node embeddings and outputs the predicted labels.
 
-The VQGraph model is a graph neural network model that uses vector quantization (VQ) to encode node embeddings. The VQGraph model consists of a VQGraph_Encoder module and a Linear predictor module. The VQGraph_Encoder module is responsible for encoding the input node embeddings using a graph-convolution module followed by vector quantization, while the Linear predictor module is responsible for predicting the output node embeddings. We use the Euclidean distance as the distance metric for vector quantization (i.e. Euclidean Codebook).
+The implementation is based on the paper: VQGraph: Rethinking Graph Representation Space for Bridging GNNs and MLPs.
 """
 from typing import List, Union, Callable, Literal
 
@@ -243,7 +243,8 @@ class VQGraph(BaseModel):
             metrics.get_similarity_stats(self.encoder.codebook, 'codebook')
         )
 
-        return code_indices, similarity_stats
+        codebook_utilization = 1.0* len(set(code_indices)) / self.encoder.codebook.shape[0]
+        return codebook_utilization, similarity_stats
 
 
     def training_step(
@@ -269,7 +270,7 @@ class VQGraph(BaseModel):
         h_pre_vq_conv, \
         h_vq, \
         indices, \
-        dist, \
+        _, \
         codebook_embeddings, \
         h_node, \
         h_edge, \
@@ -345,7 +346,7 @@ class VQGraph(BaseModel):
             h_pre_vq_conv, \
             h_vq, \
             indices, \
-            dist, \
+            _, \
             codebook_embeddings, \
             h_node, \
             h_edge, \
@@ -455,10 +456,10 @@ class VQGraph(BaseModel):
 
     def on_train_epoch_end(self) -> None:
         if self.log_codebook_utilization:
-            code_indices, similarity_stats = self.compute_train_epoch_stats()
+            codebook_utilization, similarity_stats = self.compute_train_epoch_stats()
             self.log(
                 name="codebook_utilization",
-                value=len(set(code_indices)),
+                value=codebook_utilization,
                 prog_bar=False,
                 on_step=False,
                 on_epoch=True,
