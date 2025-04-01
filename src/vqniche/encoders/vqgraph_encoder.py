@@ -91,19 +91,6 @@ class VQGraph_Encoder(pl.LightningModule):
                                 out_features=vq_dim
                             )
 
-        # initialize the post-VQ Graph Convolution module
-        print("Initializing the post-VQ Graph Convolution module.")
-        self.post_vq_conv_module = self._init_graph_conv_module(
-            in_channels=vq_dim,
-            hidden_channels=hidden_channels,
-            num_layers=1,
-            act_first=act_first,
-            activation=activation,
-            dropout=0.0,
-            norm=None,
-            init_method=init_method
-        )
-
 
     def _init_graph_conv_module(
             self,
@@ -244,8 +231,6 @@ class VQGraph_Encoder(pl.LightningModule):
             The decoded node attributes.
         - h_edge: torch.Tensor
             The decoded adjacency embeddings.
-        - h_post_vq_conv: torch.Tensor
-            Forward (output) of the post-VQ Graph Convolution module.
         """
         # pre-VQ Graph Convolution
         h_pre_vq_conv = self.pre_vq_conv_module(
@@ -270,17 +255,10 @@ class VQGraph_Encoder(pl.LightningModule):
         # decode the VQ-encoded edge embeddings to recover the adjacency matrix
         h_edge = self.decoder_edge(h_vq)
 
-        # post-VQ Graph Convolution
-        h_post_vq_conv = self.post_vq_conv_module(
-                            h_vq,
-                            batch_edge_index
-                        )
-
         return h_pre_vq_conv, \
             h_vq, \
             indices, \
             dist, \
             codebook_embeddings, \
             h_node, \
-            h_edge, \
-            h_post_vq_conv
+            h_edge

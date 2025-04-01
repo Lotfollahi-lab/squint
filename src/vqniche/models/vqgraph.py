@@ -167,8 +167,6 @@ class VQGraph(BaseModel):
             The decoded node attributes.
         - h_edge: torch.Tensor
             The decoded adjacency embeddings.
-        - h_post_vq_conv: torch.Tensor
-            Forward (output) of the post-VQ Graph Convolution module.
         - unnormalized_logits_batch: torch.Tensor
             The unnormalized logits for the batch of nodes (output of the predictor module).
         """
@@ -180,7 +178,6 @@ class VQGraph(BaseModel):
         codebook_embeddings, \
         h_node, \
         h_edge, \
-        h_post_vq_conv \
             = self.encoder(
                             batch_x,
                             batch_edge_index
@@ -195,7 +192,6 @@ class VQGraph(BaseModel):
             codebook_embeddings, \
             h_node, \
             h_edge, \
-            h_post_vq_conv, \
             unnormalized_logits_batch
 
 
@@ -218,7 +214,6 @@ class VQGraph(BaseModel):
         """
         code_indices = []
         h_pre_vq_conv_list = []
-        h_post_vq_conv_list = []
         logits_list = []
 
         # Iterate through inference dataloader
@@ -226,25 +221,20 @@ class VQGraph(BaseModel):
             batch = batch.to(self.device)
             batch_size = batch.batch_size
 
-            h_pre_vq_conv, _, indices, _, _, _, _, h_post_vq_conv, logits = self(batch.x, batch.edge_index)
+            h_pre_vq_conv, _, indices, _, _, _, _, logits = self(batch.x, batch.edge_index)
 
             h_pre_vq_conv_list.append(h_pre_vq_conv[:batch_size])
-            h_post_vq_conv_list.append(h_post_vq_conv[:batch_size])
             logits_list.append(logits[:batch_size])
             code_indices.extend(indices[:batch_size].tolist())
 
         # Concatenate all embeddings
         h_pre_vq_conv = torch.cat(h_pre_vq_conv_list, dim=0)
-        h_post_vq_conv = torch.cat(h_post_vq_conv_list, dim=0)
         logits = torch.cat(logits_list, dim=0)
 
         # Compute statistics for all embeddings
         similarity_stats = {}
         similarity_stats.update(
             metrics.get_similarity_stats(h_pre_vq_conv, 'h_pre_vq_conv')
-        )
-        similarity_stats.update(
-            metrics.get_similarity_stats(h_post_vq_conv, 'h_post_vq_conv')
         )
         similarity_stats.update(
             metrics.get_similarity_stats(logits, 'logits')
@@ -283,7 +273,6 @@ class VQGraph(BaseModel):
         codebook_embeddings, \
         h_node, \
         h_edge, \
-        h_post_vq_conv, \
         unnormalized_logits_batch \
             = self(
                     train_batch.x,
@@ -360,7 +349,6 @@ class VQGraph(BaseModel):
             codebook_embeddings, \
             h_node, \
             h_edge, \
-            h_post_vq_conv, \
             unnormalized_logits_batch \
                 = self(
                         val_batch.x,
@@ -432,7 +420,6 @@ class VQGraph(BaseModel):
 
         if self.inference_mode == 'batch-wise':
             # execute the forward of the GraphSAGE model
-            _, \
             _, \
             _, \
             _, \
