@@ -67,7 +67,7 @@ def mse_attribute_reconstruction(
 
     Notes
     -----
-    In VQGraph, `pred_attr` is the output from the Linear attribute decoder module (after vector quantization) and `target_attr` is the node embedding from the pre-VQ graph convolution layer(s).
+    In VQGraph, `pred_attr` is the output from the Linear attribute decoder module (after vector quantization) and `target_attr` is the log-transformed gene expression values.
     """
     mse_attr_reconstr_loss = F.mse_loss(
                                 input=pred_attr,

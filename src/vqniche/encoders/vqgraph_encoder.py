@@ -1,9 +1,9 @@
+from typing import Callable, Union, Literal
+from einops import rearrange
+
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
-
-from typing import Callable, Union, Literal
-from einops import rearrange, pack, repeat, unpack
 
 from vqniche.codebooks.cosine_codebook import CosineSimCodebook
 from ..modules.sage_conv import SAGEConv_Module
@@ -15,7 +15,6 @@ class VQGraph_Encoder(pl.LightningModule):
         self,
         in_channels: int = None,
         hidden_channels: int = 256,
-        apply_vq_on_latent_space: bool = True,
         graphconv_layer_name: str = 'SAGEConv',
         num_layers: int = 2,
         act_first: bool = True,
@@ -37,22 +36,14 @@ class VQGraph_Encoder(pl.LightningModule):
     ):
         super().__init__()
 
-        if apply_vq_on_latent_space:
-            print("Applying VQ on the latent space.")
-            vq_dim = hidden_channels
-        else:
-            print("Applying VQ on the input space.")
-            vq_dim = in_channels
-
         # graph convolution
         self.graphconv_layer_name = graphconv_layer_name
 
         # initialize the pre-VQ Graph Convolution module
-        print("Initializing the pre-VQ Graph Convolution module.")
-
+        print(f"Initializing the pre-VQ {self.graphconv_layer_name} module from {in_channels} to {hidden_channels} across {num_layers - 1} layer(s).")
         self.pre_vq_conv_module = self._init_graph_conv_module(
             in_channels=in_channels,
-            hidden_channels=vq_dim,
+            hidden_channels=hidden_channels,
             num_layers=num_layers - 1,
             act_first=act_first,
             activation=activation,
@@ -62,33 +53,35 @@ class VQGraph_Encoder(pl.LightningModule):
         )
 
         # initialize codebook class
+        print(f"Initializing {num_codebooks} Cosine codebook(s) with {codebook_size} codes of dimension {hidden_channels}.")
         self._codebook = CosineSimCodebook(
-            dim=vq_dim,
-            learnable_codebook=learnable_codebook, # True
-            num_codebooks=num_codebooks, # 1
+            dim=hidden_channels,
+            learnable_codebook=learnable_codebook,
+            num_codebooks=num_codebooks,
             codebook_size=codebook_size,
             decay=decay,
-            eps=eps, # 1e-5
-            kmeans_init=kmeans_init, # False
+            eps=eps,
+            kmeans_init=kmeans_init,
             kmeans_iters=kmeans_iters, # 10
             sync_kmeans=sync_kmeans, # True
             threshold_ema_dead_code=threshold_ema_dead_code, # 0
             use_ddp=use_ddp, # False
-            sample_codebook_temp=sample_codebook_temp, # 1.0
+            sample_codebook_temp=sample_codebook_temp, # 0.0
         )
 
         # initialize the decoder module for the node attributes
-        print("Initializing the decoder module for node attributes.")
+        # attribute reconstruction error is measured on the gene expression values and so the decoder output dimension is the same as the input dimension (i.e. number of genes)
+        print(f"Initializing the decoder module for the node attributes with {hidden_channels} input dimension and {in_channels} output dimension.")
         self.decoder_node = nn.Linear(
-                                in_features=vq_dim,
-                                out_features=vq_dim
+                                in_features=hidden_channels,
+                                out_features=in_channels
                             )
 
         # initialize the decoder module for the adjacency matrix
-        print("Initializing the decoder module for the adjacency matrix.")
+        print(f"Initializing the decoder module for the adjacency matrix with {hidden_channels} input dimension and {hidden_channels} output dimension.")
         self.decoder_edge = nn.Linear(
-                                in_features=vq_dim,
-                                out_features=vq_dim
+                                in_features=hidden_channels,
+                                out_features=hidden_channels
                             )
 
 

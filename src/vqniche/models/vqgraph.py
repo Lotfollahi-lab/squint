@@ -22,7 +22,6 @@ class VQGraph(BaseModel):
             predictor_name: str = 'Linear',
             in_channels: int = None,
             out_channels: int = None,
-            apply_vq_on_latent_space: bool = True,
             log_codebook_utilization: bool = False,
             graphconv_layer_name: str = 'SAGEConv',
             hidden_channels: int = 64,
@@ -116,7 +115,6 @@ class VQGraph(BaseModel):
         self.encoder = VQGraph_Encoder(
                             in_channels=in_channels,
                             hidden_channels=hidden_channels,
-                            apply_vq_on_latent_space=apply_vq_on_latent_space,
                             graphconv_layer_name=graphconv_layer_name,
                             num_layers=num_layers,
                             act_first=act_first,
