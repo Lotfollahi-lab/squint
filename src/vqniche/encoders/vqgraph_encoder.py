@@ -272,7 +272,7 @@ class VQGraph_Encoder(pl.LightningModule):
 
         # post-VQ Graph Convolution
         h_post_vq_conv = self.post_vq_conv_module(
-                            h_edge,
+                            h_vq,
                             batch_edge_index
                         )
 
