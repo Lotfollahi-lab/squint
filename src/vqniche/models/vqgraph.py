@@ -23,7 +23,6 @@ class VQGraph(BaseModel):
             in_channels: int = None,
             out_channels: int = None,
             apply_vq_on_latent_space: bool = True,
-            use_for_prediction: Literal['node-embeddings', 'codebook-embeddings'] = 'node-embeddings',
             log_codebook_utilization: bool = False,
             graphconv_layer_name: str = 'SAGEConv',
             hidden_channels: int = 64,
@@ -59,8 +58,6 @@ class VQGraph(BaseModel):
             The number of output features.
         - apply_vq_on_latent_space: bool
             Whether to apply vector quantization on the latent space or the input space.
-        - use_for_prediction: Literal['node-embeddings', 'codebook-embeddings']
-            Whether to use the node embeddings or the codebook embeddings for prediction.
         - log_codebook_utilization: bool
             Whether to log the codebook utilization.
 
@@ -136,8 +133,8 @@ class VQGraph(BaseModel):
                             out_features=out_channels
                         )
 
-        self.use_for_prediction = use_for_prediction
         self.log_codebook_utilization = log_codebook_utilization
+
 
     def forward(
             self,
@@ -189,13 +186,7 @@ class VQGraph(BaseModel):
                             batch_edge_index
                         )
 
-        if self.use_for_prediction == 'node-embeddings':
-            # Apply the predictor to the VQ-encoded node embeddings.
-            unnormalized_logits_batch = self.predictor(h_post_vq_conv)
-        elif self.use_for_prediction == 'codebook-embeddings':
-            # Apply the predictor to the codebook embeddings.
-            codes = self.encoder.get_codes_from_indices(indices)
-            unnormalized_logits_batch = self.predictor(codes)
+        unnormalized_logits_batch = self.predictor(h_vq)
 
         return h_pre_vq_conv, \
             h_vq, \
