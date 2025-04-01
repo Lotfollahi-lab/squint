@@ -152,52 +152,15 @@ class VQGraph_Encoder(pl.LightningModule):
     @property
     def codebook(self) -> torch.Tensor:
         """
-        Retrieves the codebook embeddingsfrom the codebook class.
+        Retrieves the codebook embeddings from the codebook class.
 
         Returns
         -------
         - codebook_embeddings: torch.Tensor
             The codebook embeddings retrieved from the codebook class.
         """
-        # NOTE: This function is not used in the forward pass.
         codebook_embeddings = self._codebook.embed
         return rearrange(codebook_embeddings, "1 ... -> ...")
-
-
-    def get_codes_from_indices(
-            self,
-            indices: torch.Tensor
-        ) -> torch.Tensor:
-        """
-        Retrieves the codes from the codebook class based on the provided indices.
-
-        Parameters
-        ----------
-        - indices: torch.Tensor
-            The indices of the codes to retrieve.
-
-        Returns
-        -------
-        - codes: torch.Tensor
-            The codes retrieved from the codebook class.
-        """
-        # NOTE: This function is not used in the forward pass.
-        codebook = self.codebook
-        is_multiheaded = codebook.ndim > 2
-
-        if not is_multiheaded:
-            return codebook[indices]
-
-        indices, ps = pack([indices], "b * h")
-        indices = rearrange(indices, "b n h -> b h n")
-
-        indices = repeat(indices, "b h n -> b h n d", d=codebook.shape[-1])
-        codebook = repeat(codebook, "h n d -> b h n d", b=indices.shape[0])
-
-        codes = codebook.gather(2, indices)
-        codes = rearrange(codes, "b h n d -> b n (h d)")
-        (codes,) = unpack(codes, ps, "b * d")
-        return codes
 
 
     def forward(
