@@ -71,7 +71,7 @@ def mse_attribute_reconstruction(
     """
     mse_attr_reconstr_loss = F.mse_loss(
                                 input=pred_attr,
-                                target=target_attr,
+                                target=torch.log1p(target_attr),
                                 reduction='mean',
                             )
     return mse_attr_reconstr_loss * wt_attr_reconstr
