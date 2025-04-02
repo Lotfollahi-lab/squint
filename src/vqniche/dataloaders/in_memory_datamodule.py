@@ -20,8 +20,8 @@ The `sampler_params` argument is a dictionary that can be used to define the arg
 KEY INFO:
 ---> The Loader + Sampler combination is kept the same across training, validation and testing.
 ---> The input data to this class must be a single PyTorch Geometric Data object. If the experiment requires multiple tissue sections, the data must be concatenated before being passed to this class.
----> The `infer_dataloader` method is provided to allow for inference on the full graph. This is useful for downstream tasks that require the full graph to be used.
----> The `use_full_graph_for_inference` parameter is used to control whether the full graph is used for validation, testing, and inference or not. If set to True, the sampler is configured to return the full neighborhood for each node in the graph.
+---> The `infer_dataloader` method is provided to allow for looping over all the nodes in the graph unlike the training, validation, and testing dataloaders which only loop over the nodes in the training, validation, and test sets respectively.
+---> The `sample_neighbors_for_inference` parameter is used to control whether the neighbors are sampled during inference or not. This parameter is the same for validation and testing and is ignored for training.
 """
 import os
 from typing import Literal, Optional, Callable
@@ -46,7 +46,7 @@ class InMemoryDataModule(LightningNodeData):
             loader_params: Optional[dict] = {},
             sampler_name: Optional[Literal['NeighborSampler']] = 'NeighborSampler',
             sampler_params: Optional[dict] = {},
-            use_full_graph_for_inference: bool = True,
+            sample_neighbors_for_inference: bool = False,
         ) -> None:
         """
         This function initializes the InMemoryDataModule class with the given DataLoader and Sampler classes along with their corresponding parameters.
@@ -63,8 +63,8 @@ class InMemoryDataModule(LightningNodeData):
             Name of the Sampler class that will be used to sample the subgraphs.
         - sampler_params: Optional[dict]
             Dictionary that contains the arguments that will be passed to the Sampler class, e.g. `num_neighbors`.
-        - use_full_graph_for_inference: bool
-            Whether to use the full graph for inference or not. This is implemented by setting the number of neighbors to the maximum number of neighbors for inference.
+        - sample_neighbors_for_inference: bool
+            Whether to sample neighbors for inference or not. This is implemented by setting the number of neighbors to the maximum number of neighbors for inference.
         """
         assert isinstance(data, Data), f"data must be of type torch_geometric.data.Data, but got {type(data)}."
 
@@ -171,9 +171,9 @@ class InMemoryDataModule(LightningNodeData):
         print(f"Sampler Class: {self.sampler_class}")
         print(f"Sampler Params: {self.sampler_params}")
 
-        # set whether to use the full graph for inference
-        self.use_full_graph_for_inference = use_full_graph_for_inference
-        print(f"Use Full Graph for Inference: {self.use_full_graph_for_inference}")
+        # set whether to sample neighbors for inference
+        self.sample_neighbors_for_inference = sample_neighbors_for_inference
+        print(f"Sample Neighbors for Inference: {self.sample_neighbors_for_inference}")
 
         # subset the data to exclude metadata such as cell-ids (strings) which cause errors
         # Nice-To-Have: Add functionality to allow for the inclusion of metadata
@@ -202,8 +202,8 @@ class InMemoryDataModule(LightningNodeData):
 
 
     def set_custom_loader_class(
-        self,
-        custom_loader_name: str
+            self,
+            custom_loader_name: str
         ) -> Callable:
         """
         This function sets the DataLoader class that will be used to load the data when loader_type is `custom`.
@@ -225,8 +225,8 @@ class InMemoryDataModule(LightningNodeData):
 
 
     def set_custom_sampler_class(
-        self,
-        custom_sampler_name: str
+            self,
+            custom_sampler_name: str
         ) -> Callable:
         """
         This function sets the Sampler class that will be used to sample the subgraphs when loader_type is `custom`.
@@ -250,6 +250,10 @@ class InMemoryDataModule(LightningNodeData):
     def train_dataloader(self):
         """
         This function constructs the DataLoader object for training based on the settings defined in the constructor of the InMemoryDataModule class. If the loader_name is set to 'DefaultFullLoader' or 'DefaultNodeLoader', the function will call the parent class' train_dataloader() function. Otherwise, it will instantiate `self.loader_class` with `self.sampler_class`.
+
+        Notes:
+        ------
+        - `sample_neighbors_for_inference` is ignored for training.
         """
         if self.loader_name in ['DefaultFullLoader', 'DefaultNodeLoader']:
             return super().train_dataloader()
@@ -277,7 +281,11 @@ class InMemoryDataModule(LightningNodeData):
         """
         This function constructs the DataLoader object for validation based on the settings defined in the constructor of the InMemoryDataModule class. If the loader_name is set to 'DefaultFullLoader' or 'DefaultNodeLoader', the function will call the parent class' val_dataloader() function. Otherwise, it will instantiate `self.loader_class` with `self.sampler_class`.
 
-        If `use_full_graph_for_inference` is set to True, input_nodes is set to None. That is, all nodes are used.
+        Notes:
+        ------
+        - If `sample_neighbors_for_inference` is set to True, the neighbors are sampled during inference.
+        - If `sample_neighbors_for_inference` is set to False, the neighbors are not sampled during inference.
+        - `val_dataloader` loops over nodes in the validation set.
         """
         if self.loader_name in ['DefaultFullLoader', 'DefaultNodeLoader']:
             return super().val_dataloader()
@@ -286,7 +294,7 @@ class InMemoryDataModule(LightningNodeData):
             # reuse user-defined sampler parameters
             sampler_params = self.sampler_params
 
-            if self.use_full_graph_for_inference:
+            if not self.sample_neighbors_for_inference:
                 # update num_neighbors to -1 so that the neighbors are not sampled.
                 sampler_params['num_neighbors'] = [-1] * len(self.sampler_params['num_neighbors'])
 
@@ -312,7 +320,11 @@ class InMemoryDataModule(LightningNodeData):
         """
         This function constructs the DataLoader object for testing based on the settings defined in the constructor of the InMemoryDataModule class. If the loader_name is set to 'DefaultFullLoader' or 'DefaultNodeLoader', the function will call the parent class' test_dataloader() function. Otherwise, it will instantiate `self.loader_class` with `self.sampler_class`.
 
-        If `use_full_graph_for_inference` is set to True, input_nodes is set to None. That is, all nodes are used.
+        Notes:
+        ------
+        - If `sample_neighbors_for_inference` is set to True, the neighbors are sampled during inference.
+        - If `sample_neighbors_for_inference` is set to False, the neighbors are not sampled during inference.
+        - `test_dataloader` loops over nodes in the test set.
         """
         if self.loader_name in ['DefaultFullLoader', 'DefaultNodeLoader']:
             return super().test_dataloader()
@@ -321,7 +333,7 @@ class InMemoryDataModule(LightningNodeData):
             # reuse user-defined sampler parameters
             sampler_params = self.sampler_params
 
-            if self.use_full_graph_for_inference:
+            if not self.sample_neighbors_for_inference:
                 # update num_neighbors to -1 so that the neighbors are not sampled.
                 sampler_params['num_neighbors'] = [-1] * len(self.sampler_params['num_neighbors'])
 
@@ -345,14 +357,21 @@ class InMemoryDataModule(LightningNodeData):
 
     def infer_dataloader(self):
         """
-        This method returns a DataLoader object for all the nodes in the graph and does not sample neighbors.
-        This is intended to be useful for downstream tasks that require the full graph to be used.
+        This method returns a DataLoader object for all the nodes in the graph.
+        This is required for looping over all the nodes in the graph for inference.
+
+        Notes:
+        ------
+        - If `sample_neighbors_for_inference` is set to True, the neighbors are sampled during inference.
+        - If `sample_neighbors_for_inference` is set to False, the neighbors are not sampled during inference.
+        - `infer_dataloader` loops over all the nodes in the graph.
         """
         # reuse user-defined sampler parameters
         sampler_params = self.sampler_params
 
         # update num_neighbors to -1 so that the neighbors are not sampled.
-        sampler_params['num_neighbors'] = [-1] * len(self.sampler_params['num_neighbors'])
+        if not self.sample_neighbors_for_inference:
+            sampler_params['num_neighbors'] = [-1] * len(self.sampler_params['num_neighbors'])
 
         # instantiate the sampler class to control the behavior of the loader
         infer_sampler = self.sampler_class(

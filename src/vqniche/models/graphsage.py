@@ -54,15 +54,15 @@ What has changed is:
 
 Because P_3 and P_4 are both learnable parameters of the model, they will be updated during training. In matrix form, P_3 * P_4 will have the same dimensions as P_1 which is the linear transformation in the last layer of the Pytorch Geometric's GraphSAGE model. Mathematically, this is the same as applying the linear transformation P_1 in the last layer of the Pytorch Geometric's GraphSAGE model. The only downside is that we need to maintain an extra matrix of trainable parameters which impacts the memory usage of the model.
 """
-
+from typing import List, Union, Callable, Literal, Dict
 
 import torch
 import torch.nn as nn
 import torch_geometric
-from torch_geometric.nn import GraphSAGE as SAGE_Encoder
-from typing import List, Union, Callable, Literal
+from ..modules.sage_conv import SAGEConv_Module as GraphSAGE_Encoder
 
 from .base_model import BaseModel
+from ..utils import metrics
 
 
 class GraphSAGE(BaseModel):
@@ -79,13 +79,12 @@ class GraphSAGE(BaseModel):
             activation: Union[str, Callable, None] = "relu",
             norm: Union[str, Callable, None] = None,
             dropout: float = 0.5,
+            init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform',
             optimizer_name: str = 'adam',
             lr: float = 0.01,
             weight_decay: float = 0.0,
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'none'},
-            task_name: str = 'multiclass',
-            task_kwargs: dict = {},
             inference_mode: Literal['batch-wise', 'layer-wise'] = 'layer-wise',
         ):
         """
@@ -117,6 +116,9 @@ class GraphSAGE(BaseModel):
             The normalization function to use.
         - dropout: float
             The dropout probability.
+        - init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None]
+            The initialization method to use for the linear transformations in the SAGEConv layers.
+            If None, the initialization method is 'kaiming_uniform'.
 
         - optimizer_name: str
             The optimizer name.
@@ -129,11 +131,6 @@ class GraphSAGE(BaseModel):
             The loss function names.
         - loss_kwargs: dict
             Keyword arguments for the loss functions.
-
-        - task_name: str
-            The task type.
-        - task_kwargs: dict
-            Keyword arguments for the task.
 
         - inference_mode: str
             The inference mode. Choose from 'batch-wise' or 'layer-wise'.
@@ -150,28 +147,49 @@ class GraphSAGE(BaseModel):
             weight_decay=weight_decay,
             loss_names=loss_names,
             loss_kwargs=loss_kwargs,
-            task_name=task_name,
-            task_kwargs=task_kwargs,
             inference_mode=inference_mode,
         )
 
         # Initialize GraphSAGE model from Pytorch Geometric as the encoder
         # The out_channels parameter is not passed to the SAGE_Encoder (i.e. it is set to None) so that we can separate the encoder from the predictor.
-        self.encoder = SAGE_Encoder(
+        self.encoder = GraphSAGE_Encoder(
                             in_channels=in_channels,
                             hidden_channels=hidden_channels,
                             num_layers=num_layers,
                             act_first=act_first,
-                            act=activation,
+                            activation=activation,
+                            norm=norm,
                             dropout=dropout,
-                            norm=norm
+                            init_method=init_method
                         )
 
         # Instead, we apply this final linear transformation in the predictor module manually to have access to the internal node embeddings via the `embed` function.
         self.predictor = nn.Linear(
                             in_features=hidden_channels,
                             out_features=out_channels
-                            )
+                        )
+
+
+    @torch.no_grad()
+    def compute_train_epoch_stats(self) -> Dict:
+        """
+        Compute pairwise similarity statistics for all embeddings.
+
+        Returns
+        -------
+        - similarity_stats: dict
+            Dictionary containing mean and std of pairwise cosine similarities for different embeddings
+        """
+        similarity_stats = {}
+
+        h_embeddings = self.embed(self.trainer.datamodule.infer_dataloader())
+
+        # Compute statistics for all embeddings
+        similarity_stats.update(
+            metrics.get_similarity_stats(h_embeddings, 'h_embeddings')
+        )
+
+        return similarity_stats
 
 
     @torch.no_grad()
@@ -283,21 +301,35 @@ class GraphSAGE(BaseModel):
                         curr_batch_size=batch_size
                         )
 
-        # compute the predicted class probabilities (normalized logits)
-        preds_batch = unnormalized_logits_batch.softmax(dim=-1)
+        # compute train accuracy
+        train_acc = metrics.accuracy_score(
+                        unnormalized_logits=unnormalized_logits_batch[:batch_size],
+                        one_hot_labels=train_batch.y[:batch_size],
+                    )
 
-        # compute the training accuracy
-        self.train_acc(preds_batch, train_batch.y[:batch_size])
-
-        # log the training loss and accuracy
+        # log training loss and accuracy
         self.log_metrics(
                 mode='train',
                 loss_value=train_loss,
-                acc_value=self.train_acc,
+                acc_value=train_acc,
                 curr_batch_size=batch_size,
             )
 
         return train_loss
+
+
+    def on_train_epoch_end(self) -> None:
+        similarity_stats = self.compute_train_epoch_stats()
+        for key, value in similarity_stats.items():
+            self.log(
+                name=key,
+                value=value,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+        return super().on_train_epoch_end()
 
 
     def validation_step(
@@ -341,21 +373,40 @@ class GraphSAGE(BaseModel):
                         curr_batch_size=batch_size
                         )
 
-        # compute the predicted class probabilities (normalized logits)
-        preds_batch = unnormalized_logits_batch.softmax(dim=-1)
+        # compute validation accuracy
+        val_acc = metrics.accuracy_score(
+                        unnormalized_logits=unnormalized_logits_batch[:batch_size],
+                        one_hot_labels=val_batch.y[:batch_size],
+                    )
 
-        # compute the validation accuracy
-        self.val_acc(preds_batch, val_batch.y[:batch_size])
-
-        # log the validation loss and accuracy
+        # log validation loss and accuracy
         self.log_metrics(
                 mode='val',
                 loss_value=val_loss,
-                acc_value=self.val_acc,
+                acc_value=val_acc,
                 curr_batch_size=batch_size,
             )
 
         return val_loss
+
+
+    def on_validation_epoch_start(self) -> None:
+        """
+        Callback function to be executed at the start of each validation epoch.
+
+        Notes:
+        ------
+        - We use this hook to obtain the unnormalized logits for the validation set if the inference mode is 'layer-wise'. Otherwise, we do nothing.
+        """
+        if self.inference_mode == 'batch-wise':
+            pass
+
+        elif self.inference_mode == 'layer-wise':
+            self.val_logits = self.inference(
+                                self.trainer.datamodule.infer_dataloader()
+                                )
+
+        return super().on_validation_epoch_start()
 
 
     def test_step(
@@ -387,18 +438,39 @@ class GraphSAGE(BaseModel):
         elif self.inference_mode == 'layer-wise':
             unnormalized_logits_batch = self.test_logits[test_batch.n_id[:batch_size]]
 
-        # compute the predicted class probabilities (normalized logits)
-        preds_batch = unnormalized_logits_batch.softmax(dim=-1)
+        # compute test accuracy
+        test_acc = metrics.accuracy_score(
+                        unnormalized_logits=unnormalized_logits_batch[:batch_size],
+                        one_hot_labels=test_batch.y[:batch_size],
+                    )
 
-        # compute the test accuracy
-        self.test_acc(preds_batch, test_batch.y[:batch_size])
-
-        # log the test loss and accuracy
+        # log test accuracy
         self.log_metrics(
                 mode='test',
                 loss_value=None,
-                acc_value=self.test_acc,
+                acc_value=test_acc,
                 curr_batch_size=batch_size,
             )
 
-        return self.test_acc
+        return test_acc
+
+
+    def on_test_epoch_start(self) -> None:
+        """
+        Callback function to be executed at the start of each test epoch.
+
+        Notes:
+        ------
+        - We use this hook to obtain the unnormalized logits for the test set if the inference mode is 'layer-wise'. Otherwise, we do nothing.
+        """
+        if self.inference_mode == 'batch-wise':
+            pass
+
+        elif self.inference_mode == 'layer-wise':
+            # infer_dataloader() batches the entire dataset so that the entire dataset is processed in one go
+            # in the test_step, only nodes in the test set are processed.
+            self.test_logits = self.inference(
+                                self.trainer.datamodule.infer_dataloader()
+                                )
+
+        return super().on_test_epoch_start()

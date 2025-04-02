@@ -1,12 +1,11 @@
-import wandb
-import pandas as pd
 from pathlib import Path
+from typing import List, Tuple, Callable, Optional, Literal
+
+import pandas as pd
 
 import torch
 import torch_geometric
 import pytorch_lightning as pl
-from torchmetrics import Accuracy
-from typing import List, Tuple, Callable, Optional, Literal
 
 from ..utils.loss import *
 
@@ -24,8 +23,6 @@ class BaseModel(pl.LightningModule):
             weight_decay: float = 0.0,
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'mean'},
-            task_name: str = 'multiclass',
-            task_kwargs: dict = {},
             inference_mode: Literal['batch-wise', 'layer-wise'] = 'batch-wise',
         ) -> None:
         """
@@ -57,11 +54,6 @@ class BaseModel(pl.LightningModule):
         - loss_kwargs: dict
             The loss function keyword arguments.
 
-        - task_name: str
-            The task name.
-        - task_kwargs: dict
-            The task keyword arguments.
-
         - inference_mode: Literal['batch-wise', 'layer-wise']
             The inference mode. Choose from 'batch-wise' or 'layer-wise'.
         """
@@ -83,25 +75,6 @@ class BaseModel(pl.LightningModule):
         # Loss parameters
         self.loss_kwargs = loss_kwargs
         self.loss_fn_tuples = self.set_loss_fn_tuples(loss_names, loss_kwargs)
-
-        # Accuracy metrics parameters
-        self.task_name = task_name
-        self.task_kwargs = task_kwargs
-        self.train_acc = Accuracy(
-                            task=task_name,
-                            num_classes=out_channels,
-                            **task_kwargs
-                            )
-        self.val_acc = Accuracy(
-                            task=task_name,
-                            num_classes=out_channels,
-                            **task_kwargs
-                            )
-        self.test_acc = Accuracy(
-                            task=task_name,
-                            num_classes=out_channels,
-                            **task_kwargs
-                            )
 
         # Option 1 -- batch-wise (default)
         # for epoch in epochs:
@@ -173,23 +146,6 @@ class BaseModel(pl.LightningModule):
                 if wt_attr_reconstr is not None:
                     loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
 
-            elif loss_fn_name == 'nb_attribute_reconstruction':
-                loss_fn = nb_attribute_reconstruction
-
-                loss_fn_data_keys = ['pred_attr', 'target_attr']
-
-                distribution = loss_kwargs.get('distribution')
-                if 'distribution' is not None:
-                    loss_fn_params['distribution'] = distribution
-
-                dispersion_theta = loss_kwargs.get('dispersion_theta')
-                if dispersion_theta is not None:
-                    loss_fn_params['dispersion_theta'] = dispersion_theta
-
-                wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
-                if wt_attr_reconstr is not None:
-                    loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
-
             elif loss_fn_name == 'mse_adjacency_reconstruction':
                 loss_fn = mse_adjacency_reconstruction
 
@@ -199,23 +155,41 @@ class BaseModel(pl.LightningModule):
                 if wt_adj_reconstr is not None:
                     loss_fn_params['wt_adj_reconstr'] = wt_adj_reconstr
 
-            elif loss_fn_name == 'mse_commitment_loss':
-                loss_fn = mse_commitment_loss
+            elif loss_fn_name == 'mse_joint_code_commit_loss':
+                loss_fn = mse_joint_code_commit_loss
 
-                loss_fn_data_keys = ['pred_commit', 'target_commit']
+                loss_fn_data_keys = ['quantizer_input', 'quantized_output']
+
+                wt_joint_code_commit = loss_kwargs.get('wt_joint_code_commit')
+                if wt_joint_code_commit is not None:
+                    loss_fn_params['wt_joint_code_commit'] = wt_joint_code_commit
+
+            elif loss_fn_name == 'mse_commit_loss':
+                loss_fn = mse_commit_loss
+
+                loss_fn_data_keys = ['node_embeddings', 'codebook_embeddings', 'code_indices']
 
                 wt_commit = loss_kwargs.get('wt_commit')
                 if wt_commit is not None:
                     loss_fn_params['wt_commit'] = wt_commit
 
-            elif loss_fn_name == 'l2_codebook_loss':
-                loss_fn = l2_codebook_loss
+            elif loss_fn_name == 'mse_code_loss':
+                loss_fn = mse_code_loss
+
+                loss_fn_data_keys = ['node_embeddings', 'codebook_embeddings', 'code_indices']
+
+                wt_code = loss_kwargs.get('wt_code')
+                if wt_code is not None:
+                    loss_fn_params['wt_code'] = wt_code
+
+            elif loss_fn_name == 'l2_codebook_orthogonal_regularization_loss':
+                loss_fn = l2_codebook_orthogonal_regularization_loss
 
                 loss_fn_data_keys = ['codebook_embeddings']
 
-                wt_codebook = loss_kwargs.get('wt_codebook')
-                if wt_codebook is not None:
-                    loss_fn_params['wt_codebook'] = wt_codebook
+                wt_codebook_orthogonal_regularization = loss_kwargs.get('wt_codebook_orthogonal_regularization')
+                if wt_codebook_orthogonal_regularization is not None:
+                    loss_fn_params['wt_codebook_orthogonal_regularization'] = wt_codebook_orthogonal_regularization
 
                 codebook_reg_active_codes_only = loss_kwargs.get('codebook_reg_active_codes_only')
                 if codebook_reg_active_codes_only is not None:
@@ -293,26 +267,28 @@ class BaseModel(pl.LightningModule):
 
 
     def log_metrics(
-        self,
-        mode: str = 'train',
-        loss_value: torch.Tensor = None,
-        acc_value: torch.Tensor = None,
-        curr_batch_size: int = None,
+            self,
+            loss_value: torch.Tensor = None,
+            acc_value: torch.Tensor = None,
+            curr_batch_size: int = None,
+            mode: Literal['train', 'val', 'test'] = 'train',
         ) -> None:
         """
         Log total loss (if available) and accuracy for the model during training, validation, and testing.
 
         Parameters
         ----------
-        - mode: str
-            The mode of the model (train, val, test).
         - loss_value: torch.Tensor
             The computed loss.
         - acc_value: torch.Tensor
             The computed accuracy.
         - curr_batch_size: int
             The number of samples in the current batch.
+        - mode: Literal['train', 'val', 'test']
+            The mode of the model (train, val, test).
         """
+        assert acc_value is not None, 'Accuracy value is None'
+
         if loss_value is not None:
             self.log(
                 name=f'{mode}_loss',
@@ -416,38 +392,19 @@ class BaseModel(pl.LightningModule):
         - We use this hook to log the train and validation loss terms and accuracies in the training loop.
         """
         # log the metrics at the end of each epoch
-        columns = ['epoch'] + list(self.trainer.callback_metrics.keys())
-        metrics_data = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
+        metric_names = ['epoch'] + list(self.trainer.callback_metrics.keys())
+        metrics_values = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
+        print("--------------------------------")
+        for metric_name, metric_value in zip(metric_names, metrics_values):
+            print(f"{metric_name}: {metric_value}")
+        print("--------------------------------\n")
 
         self.train_val_epoch_metrics = pd.concat(
-            [self.train_val_epoch_metrics, pd.DataFrame([metrics_data], columns=columns)],
+            [self.train_val_epoch_metrics, pd.DataFrame([metrics_values], columns=metric_names)],
             ignore_index=True
         )
-        self.logger.log_table(
-            key='train_val_epoch_metrics',
-            columns=columns,
-            data=[metrics_data],
-        )
+
         return super().on_train_epoch_end()
-
-
-    def on_validation_epoch_start(self) -> None:
-        """
-        Callback function to be executed at the start of each validation epoch.
-
-        Notes:
-        ------
-        - We use this hook to obtain the unnormalized logits for the validation set if the inference mode is 'layer-wise'. Otherwise, we do nothing.
-        """
-        if self.inference_mode == 'batch-wise':
-            pass
-
-        elif self.inference_mode == 'layer-wise':
-            self.val_logits = self.inference(
-                                self.trainer.datamodule.val_dataloader()
-                                )
-
-        return super().on_validation_epoch_start()
 
 
     def validation_step(
@@ -482,25 +439,6 @@ class BaseModel(pl.LightningModule):
         - We use this hook to print the total validation loss at the end of each epoch to monitor the validation progress.
         """
         super().on_validation_epoch_end()
-
-
-    def on_test_epoch_start(self) -> None:
-        """
-        Callback function to be executed at the start of each test epoch.
-
-        Notes:
-        ------
-        - We use this hook to obtain the unnormalized logits for the test set if the inference mode is 'layer-wise'. Otherwise, we do nothing.
-        """
-        if self.inference_mode == 'batch-wise':
-            pass
-
-        elif self.inference_mode == 'layer-wise':
-            self.test_logits = self.inference(
-                                self.trainer.datamodule.test_dataloader()
-                                )
-
-        return super().on_test_epoch_start()
 
 
     def test_step(

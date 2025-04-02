@@ -1,11 +1,8 @@
 import torch
 import torch.nn.functional as F
-from typing import Literal, Optional
 
 from ..utils.type_conversions import edge_index_to_adjacency_tensor
 from ..utils.vqgraph_helpers import l2norm
-from ..utils.loss_utils import compute_dispersion
-from scvi.distributions import NegativeBinomial, ZeroInflatedNegativeBinomial
 
 
 def cross_entropy(
@@ -70,88 +67,14 @@ def mse_attribute_reconstruction(
 
     Notes
     -----
-    In VQGraph, `pred_attr` is the output from the Linear attribute decoder module (after vector quantization) and `target_attr` is the node embedding from the pre-VQ graph convolution layer(s).
+    In VQGraph, `pred_attr` is the output from the Linear attribute decoder module (after vector quantization) and `target_attr` is the log-transformed gene expression values.
     """
     mse_attr_reconstr_loss = F.mse_loss(
                                 input=pred_attr,
-                                target=target_attr,
+                                target=torch.log1p(target_attr),
                                 reduction='mean',
                             )
     return mse_attr_reconstr_loss * wt_attr_reconstr
-
-
-def nb_attribute_reconstruction(
-        pred_attr: torch.Tensor,
-        target_attr: torch.Tensor,
-        dispersion: Optional[torch.Tensor] = None,
-        distribution: Literal['zinb', 'nb'] = 'nb',
-        dispersion_theta: float = 1.0,
-        wt_attr_reconstr: float = 0.1,
-    ) -> torch.Tensor:
-    """
-    Compute the negative binomial loss.
-
-    Parameters
-    ----------
-    pred_attr: torch.Tensor
-        The output from the attribute decoder module.
-        Dimensions: (batch_size, num_genes)
-    target_attr: torch.Tensor
-        The target attributes.
-        Dimensions: (batch_size, num_genes)
-    dispersion: torch.Tensor
-        The dispersion parameter for the negative binomial distribution. Can be `None` if not provided.
-    distribution: str
-        The distribution to use for the negative binomial loss. Can be 'nb' or 'zinb'.
-    dispersion_theta: float
-        The `theta` parameter to compute dispersion of batch-ids for the negative binomial distribution.
-    wt_attr_reconstr: float
-        The scaling factor for the node attribute reconstruction loss.
-
-    Returns
-    -------
-    nb_loss: torch.Tensor
-        The computed node attribute reconstruction loss.
-
-    Notes
-    -----
-    - If we set `target_attr` to be the raw count data, we could repurpose this to be used for a Count Decoder in the future.
-    - Otherwise, with real-valued tensors, this returns NaNs.
-    """
-    if dispersion is None:
-        # TODO: Replace with batch_ids from the dataloader
-        batch_ids = torch.ones(
-                        pred_attr.shape[0], # batch_size
-                        dtype=torch.long,
-                        device=pred_attr.device
-                    )
-
-        dispersion = compute_dispersion(
-            input=batch_ids,
-            num_out_features=pred_attr.shape[1], # num_genes
-            theta=dispersion_theta,
-            device=pred_attr.device
-        )
-    else:
-        dispersion = dispersion.expand(
-                        pred_attr.shape[0], -1
-                    ).to(pred_attr.device) # (batch_size, num_genes)
-
-    if distribution == 'zinb':
-        nb_distribution = ZeroInflatedNegativeBinomial(
-                            mu=pred_attr,
-                            theta=dispersion
-                            )
-    elif distribution == 'nb':
-        nb_distribution = NegativeBinomial(
-                            mu=pred_attr,
-                            theta=dispersion
-                            )
-    nb_loss = -nb_distribution.log_prob(
-                                target_attr
-                            ).sum(dim=-1).mean()
-
-    return nb_loss * wt_attr_reconstr
 
 
 def mse_adjacency_reconstruction(
@@ -203,7 +126,7 @@ def mse_adjacency_reconstruction(
     # quantize the predicted adjacency matrix coming from the decoder
     # then, subset the quantized adjacency matrix to only include the nodes in the current batch
     adj_quantized = torch.matmul(pred_adj.detach(), pred_adj.detach().t())
-    adj_quantized = (adj_quantized - adj_quantized.min()) / (adj_quantized.max() - adj_quantized.min())
+    adj_quantized = (adj_quantized - adj_quantized.min()) / (adj_quantized.max() - adj_quantized.min() + 1e-8)
     adj_quantized = adj_quantized.to(global_batch_adj.device)
 
     # compute the mean root squared error between the quantized adjacency matrix and the original adjacency matrix
@@ -218,76 +141,155 @@ def mse_adjacency_reconstruction(
     return mse_adj_reconstr_loss * wt_adj_reconstr
 
 
-def mse_commitment_loss(
-        pred_commit: torch.Tensor,
-        target_commit: torch.Tensor,
-        wt_commit: float = 0.25
+def mse_joint_code_commit_loss(
+        quantizer_input: torch.Tensor,
+        quantized_output: torch.Tensor,
+        wt_joint_code_commit: float = 0.25
     ) -> torch.Tensor:
     """
-    Compute the commitment loss for the VQ layer using a straight-through estimator.
+    Computes the total codebook loss defined as the sum of the commit loss and code loss for the VQGraph encoder as in the original VQGraph implementation.
 
     Parameters
     ----------
-    pred_commit: torch.Tensor
+    quantizer_input: torch.Tensor
         The latent node embedding obtained from the pre-VQ graph convolution layer(s).
         Dimensions: (batch_size, num_genes)
-    target_commit: torch.Tensor
+    quantized_output: torch.Tensor
         The quantized node embedding obtained from a Linear Decoder layer on the output of the VQ layer.
         Dimensions: (batch_size, num_genes)
+    wt_joint_code_commit: float
+        The scaling factor for the total codebook loss.
+
+    Returns
+    -------
+    joint_code_commit_loss: torch.Tensor
+        The computed total codebook loss.
+
+    Notes
+    -----
+    - The quantizer_input for VQGraph is the output from the pre-VQ graph convolution layer(s).
+    - The quantized_output for VQGraph is the output from the VQ layer (i.e. the quantized node embedding obtained from the codebook).
+    """
+    mse_joint_code_commit_loss = F.mse_loss(
+                        input=quantizer_input,
+                        target=quantized_output.detach(),
+                        reduction='mean',
+                    )
+    return mse_joint_code_commit_loss * wt_joint_code_commit
+
+
+def mse_commit_loss(
+        node_embeddings: torch.Tensor,
+        codebook_embeddings: torch.Tensor,
+        code_indices: torch.Tensor,
+        wt_commit: float = 0.25
+    ) -> torch.Tensor:
+    """
+    Compute the commit loss for VQGraph. This freezes the codebook embeddings and updates the node embeddings.
+
+    Parameters
+    ----------
+    node_embeddings: torch.Tensor
+        The node embeddings.
+        Dimensions: (batch_size, num_genes)
+    codebook_embeddings: torch.Tensor
+        The codebook embeddings.
+        Dimensions: (codebook_size, num_genes)
+    code_indices: torch.Tensor
+        The indices of the nearest code for each node.
+        Dimensions: (batch_size,)
     wt_commit: float
         The scaling factor for the commitment loss.
 
     Returns
     -------
-    mse_commit_loss: torch.Tensor
-        The computed commitment loss.
-    """
-    target_commit = pred_commit + (target_commit - pred_commit).detach()
-    detached_target = target_commit.detach()
+    commit_loss: torch.Tensor
+        The computed commit loss.
 
-    mse_commit_loss = F.mse_loss(
-                        input=pred_commit,
-                        target=detached_target,
+    Notes:
+    -----
+    - Source --> Equation (3) from https://arxiv.org/abs/2112.00384
+    """
+    commit_loss = F.mse_loss(
+                        input=node_embeddings,
+                        target=codebook_embeddings[code_indices].detach(),
                         reduction='mean',
                     )
-    return mse_commit_loss * wt_commit
+    return commit_loss * wt_commit
 
 
-def l2_codebook_loss(
+def mse_code_loss(
+        node_embeddings: torch.Tensor,
         codebook_embeddings: torch.Tensor,
-        wt_codebook: float = 0.2,
+        code_indices: torch.Tensor,
+        wt_code: float = 0.25
+    ) -> torch.Tensor:
+    """
+    Compute the code loss for VQGraph. This freezes the node embeddings and updates the codebook embeddings.
+
+    Parameters
+    ----------
+    node_embeddings: torch.Tensor
+        The node embeddings.
+        Dimensions: (batch_size, num_genes)
+    codebook_embeddings: torch.Tensor
+        The codebook embeddings.
+        Dimensions: (codebook_size, num_genes)
+    code_indices: torch.Tensor
+        The indices of the nearest code for each node.
+        Dimensions: (batch_size,)
+    wt_code: float
+        The scaling factor for the code loss.
+
+    Returns
+    -------
+    code_loss: torch.Tensor
+        The computed code loss.
+
+    Notes:
+    -----
+    - Source --> Equation (3) from https://arxiv.org/abs/2112.00384
+    """
+    code_loss = F.mse_loss(
+                        input=codebook_embeddings[code_indices],
+                        target=node_embeddings.detach(),
+                        reduction='mean',
+                    )
+    return code_loss * wt_code
+
+
+def l2_codebook_orthogonal_regularization_loss(
+        codebook_embeddings: torch.Tensor,
+        wt_codebook_orthogonal_regularization: float = 0.2,
         codebook_reg_active_codes_only: bool = False,
         codebook_reg_max_codes: int = None
     ) -> torch.Tensor:
     """
-    Compute the codebook loss for VQGraph.
+    Compute the codebook orthogonal regularization loss for VQGraph.
 
     Parameters
     ----------
     codebook_embeddings: torch.Tensor
         The codebook embeddings.
         Dimensions: (codebook_size, num_genes)
-    codebook_reg_weight: float
-        The scaling factor for the codebook loss.
+    wt_codebook_orthogonal_regularization: float
+        The scaling factor for the codebook orthogonal regularization loss.
     codebook_reg_active_codes_only: bool
-        Whether to only calculate the codebook loss for the active codes.
+        Whether to only calculate the codebook orthogonal regularization loss for the active codes.
     codebook_reg_max_codes: int
-        The maximum number of codes to use for the codebook loss.
+        The maximum number of codes to use for the codebook orthogonal regularization loss.
 
     Returns
     -------
-    codebook_loss: torch.Tensor
-        The computed codebook loss.
+    codebook_orthogonal_regularization_loss: torch.Tensor
+        The computed codebook orthogonal regularization loss.
 
-    Notes:
-    -----
-    - Source --> Equation (3) from https://arxiv.org/abs/2112.00384
     """
     if codebook_reg_active_codes_only:
-        raise NotImplementedError("Codebook loss for active codes only is not implemented.")
+        raise NotImplementedError("Codebook orthogonal regularization loss for active codes only is not implemented.")
 
     if codebook_reg_max_codes is not None:
-        raise NotImplementedError("Codebook loss for max codes is not implemented.")
+        raise NotImplementedError("Codebook orthogonal regularization loss for max codes is not implemented.")
 
     h, n = codebook_embeddings.shape[:2]
     normed_codes = l2norm(codebook_embeddings)
@@ -297,6 +299,6 @@ def l2_codebook_loss(
         normed_codes
         )
 
-    codebook_loss = (cosine_sim**2).sum() / (h * n**2) - (1 / n)
+    codebook_orthogonal_regularization_loss = (cosine_sim**2).sum() / (h * n**2) - (1 / n)
 
-    return codebook_loss * wt_codebook
+    return codebook_orthogonal_regularization_loss * wt_codebook_orthogonal_regularization

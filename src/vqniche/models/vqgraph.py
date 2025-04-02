@@ -1,16 +1,17 @@
 """
-Our implementation of VQGraph is built off of the code published by the authors of the VQGraph paper (source: https://github.com/YangLing0818/VQGraph/). We adapt it to work within our setup of Pytorch Geometric, Dataset-Blob, Pytorch Lightning, and Encoder-Predictor setup.
+This file implements the VQGraph Model. It comprises of an Encoder and a Linear Predictor. The Encoder jointly trains a node embedding using a graph-convolution module and a codebook using a vector quantization module. The Predictor is a Linear layer that uses the quantized node embeddings and outputs the predicted labels.
 
-The VQGraph model is a graph neural network model that uses vector quantization (VQ) to encode node embeddings. The VQGraph model consists of a VQGraph_Encoder module and a Linear predictor module. The VQGraph_Encoder module is responsible for encoding the input node embeddings using a graph-convolution module followed by vector quantization, while the Linear predictor module is responsible for predicting the output node embeddings. We use the Euclidean distance as the distance metric for vector quantization (i.e. Euclidean Codebook).
+The implementation is based on the paper: VQGraph: Rethinking Graph Representation Space for Bridging GNNs and MLPs.
 """
+from typing import List, Union, Callable, Literal
 
 import torch
 import torch.nn as nn
 import torch_geometric
-from typing import List, Union, Callable, Literal
 
 from .base_model import BaseModel
 from ..encoders.vqgraph_encoder import VQGraph_Encoder
+from ..utils import metrics
 
 
 class VQGraph(BaseModel):
@@ -21,6 +22,7 @@ class VQGraph(BaseModel):
             predictor_name: str = 'Linear',
             in_channels: int = None,
             out_channels: int = None,
+            log_codebook_utilization: bool = False,
             graphconv_layer_name: str = 'SAGEConv',
             hidden_channels: int = 64,
             num_layers: int = 2,
@@ -28,14 +30,13 @@ class VQGraph(BaseModel):
             activation: Union[str, Callable, None] = "relu",
             norm: Union[str, Callable, None] = None,
             dropout: float = 0.5,
+            init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform',
             codebook_params: dict = {},
             optimizer_name: str = 'adam',
             lr: float = 0.01,
             weight_decay: float = 0.0,
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'none'},
-            task_name: str = 'multiclass',
-            task_kwargs: dict = {},
             inference_mode: Literal['batch-wise', 'layer-wise'] = 'batch-wise',
         ):
         """
@@ -54,6 +55,10 @@ class VQGraph(BaseModel):
             The number of input features.
         - out_channels: int
             The number of output features.
+        - apply_vq_on_latent_space: bool
+            Whether to apply vector quantization on the latent space or the input space.
+        - log_codebook_utilization: bool
+            Whether to log the codebook utilization.
 
         - graphconv_layer_name: str
             The name of the graph convolutional layer.
@@ -69,6 +74,9 @@ class VQGraph(BaseModel):
             The normalization function to use.
         - dropout: float
             The dropout probability.
+        - init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None]
+            The initialization method to use for the linear transformations in the SAGEConv layers.
+            If None, the initialization method is 'kaiming_uniform'.
         - codebook_params: dict
             Keyword arguments for the codebook.
 
@@ -83,11 +91,6 @@ class VQGraph(BaseModel):
             The loss function names.
         - loss_kwargs: dict
             Keyword arguments for the loss functions.
-
-        - task_name: str
-            The task type.
-        - task_kwargs: dict
-            Keyword arguments for the task.
 
         - inference_mode: str
             The inference mode. Choose from 'batch-wise' or 'layer-wise'.
@@ -104,8 +107,6 @@ class VQGraph(BaseModel):
             weight_decay=weight_decay,
             loss_names=loss_names,
             loss_kwargs=loss_kwargs,
-            task_name=task_name,
-            task_kwargs=task_kwargs,
             inference_mode=inference_mode,
         )
 
@@ -120,6 +121,7 @@ class VQGraph(BaseModel):
                             activation=activation,
                             dropout=dropout,
                             norm=norm,
+                            init_method=init_method,
                             **codebook_params
                         )
 
@@ -127,13 +129,15 @@ class VQGraph(BaseModel):
         self.predictor = nn.Linear(
                             in_features=hidden_channels,
                             out_features=out_channels
-                            )
+                        )
+
+        self.log_codebook_utilization = log_codebook_utilization
 
 
     def forward(
-        self,
-        batch_x: torch.Tensor,
-        batch_edge_index: torch.Tensor
+            self,
+            batch_x: torch.Tensor,
+            batch_edge_index: torch.Tensor
         ) -> torch.Tensor:
         """
         Forward pass of the VQGraph model.
@@ -161,8 +165,6 @@ class VQGraph(BaseModel):
             The decoded node attributes.
         - h_edge: torch.Tensor
             The decoded adjacency embeddings.
-        - h_post_vq_conv: torch.Tensor
-            Forward (output) of the post-VQ Graph Convolution module.
         - unnormalized_logits_batch: torch.Tensor
             The unnormalized logits for the batch of nodes (output of the predictor module).
         """
@@ -174,14 +176,12 @@ class VQGraph(BaseModel):
         codebook_embeddings, \
         h_node, \
         h_edge, \
-        h_post_vq_conv \
             = self.encoder(
                             batch_x,
                             batch_edge_index
                         )
 
-        # Apply the predictor to the VQ-encoded node embeddings.
-        unnormalized_logits_batch = self.predictor(h_post_vq_conv)
+        unnormalized_logits_batch = self.predictor(h_vq)
 
         return h_pre_vq_conv, \
             h_vq, \
@@ -190,7 +190,6 @@ class VQGraph(BaseModel):
             codebook_embeddings, \
             h_node, \
             h_edge, \
-            h_post_vq_conv, \
             unnormalized_logits_batch
 
 
@@ -198,10 +197,57 @@ class VQGraph(BaseModel):
     # @torch.no_grad()
     # def embed(
 
+
+    @torch.no_grad()
+    def compute_train_epoch_stats(self) -> List[int]:
+        """
+        Compute pairwise similarity statistics for all embeddings and codebook utilization.
+
+        Returns
+        -------
+        - code_indices: List[int]
+            List of sorted codebook indices.
+        - similarity_stats: dict
+            Dictionary containing mean and std of pairwise cosine similarities for different embeddings
+        """
+        code_indices = []
+        h_pre_vq_conv_list = []
+        logits_list = []
+
+        # Iterate through inference dataloader
+        for batch in self.trainer.datamodule.infer_dataloader():
+            batch = batch.to(self.device)
+            batch_size = batch.batch_size
+
+            h_pre_vq_conv, _, indices, _, _, _, _, logits = self(batch.x, batch.edge_index)
+
+            h_pre_vq_conv_list.append(h_pre_vq_conv[:batch_size])
+            logits_list.append(logits[:batch_size])
+            code_indices.extend(indices[:batch_size].tolist())
+
+        # Concatenate all embeddings
+        h_pre_vq_conv = torch.cat(h_pre_vq_conv_list, dim=0)
+        logits = torch.cat(logits_list, dim=0)
+
+        # Compute statistics for all embeddings
+        similarity_stats = {}
+        similarity_stats.update(
+            metrics.get_similarity_stats(h_pre_vq_conv, 'h_pre_vq_conv')
+        )
+        similarity_stats.update(
+            metrics.get_similarity_stats(logits, 'logits')
+        )
+        similarity_stats.update(
+            metrics.get_similarity_stats(self.encoder.codebook, 'codebook')
+        )
+
+        codebook_utilization = 1.0* len(set(code_indices)) / self.encoder.codebook.shape[0]
+        return codebook_utilization, similarity_stats
+
+
     def training_step(
             self,
             train_batch: torch_geometric.data.Data,
-            batch_idx: int,
         ) -> torch.Tensor:
         """
         Definition of a single training step of the GraphSAGE model on the current batch of nodes received from the training dataloader at the current training epoch.
@@ -210,8 +256,6 @@ class VQGraph(BaseModel):
         ----------
         - batch: torch_geometric.data.Data
             The input train data (batch of nodes).
-        - batch_idx: int
-            The index of the current batch of data.
 
         Returns
         -------
@@ -224,11 +268,10 @@ class VQGraph(BaseModel):
         h_pre_vq_conv, \
         h_vq, \
         indices, \
-        dist, \
+        _, \
         codebook_embeddings, \
         h_node, \
         h_edge, \
-        h_post_vq_conv, \
         unnormalized_logits_batch \
             = self(
                     train_batch.x,
@@ -241,12 +284,14 @@ class VQGraph(BaseModel):
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': train_batch.y[:batch_size],
                         'pred_attr': h_node[:batch_size],
-                        'target_attr': h_pre_vq_conv[:batch_size],
+                        'target_attr': train_batch.x[:batch_size],
                         'pred_adj': h_edge[:batch_size],
                         'batch_edge_index': train_batch.edge_index,
-                        'pred_commit': h_pre_vq_conv[:batch_size],
-                        'target_commit': h_vq[:batch_size],
-                        'codebook_embeddings': codebook_embeddings[:batch_size],
+                        'quantizer_input': h_pre_vq_conv[:batch_size],
+                        'quantized_output': h_vq[:batch_size],
+                        'node_embeddings': h_pre_vq_conv[:batch_size],
+                        'codebook_embeddings': codebook_embeddings[0],
+                        'code_indices': indices[:batch_size],
                         'batch_input_id': train_batch.input_id,
                         'batch_nid': train_batch.n_id,
                         }
@@ -256,19 +301,19 @@ class VQGraph(BaseModel):
                         loss_data=train_loss_data,
                         curr_batch_size=batch_size,
                         mode='train',
-                        )
+                    )
 
-        # compute the predicted class probabilities (normalized logits)
-        preds_batch = unnormalized_logits_batch.softmax(dim=-1)
+        # compute train accuracy
+        train_acc = metrics.accuracy_score(
+                        unnormalized_logits=unnormalized_logits_batch[:batch_size],
+                        one_hot_labels=train_batch.y[:batch_size],
+                    )
 
-        # compute the training accuracy
-        self.train_acc(preds_batch[:batch_size], train_batch.y[:batch_size])
-
-        # log the training loss and accuracy
+        # log training loss and accuracy
         self.log_metrics(
                 mode='train',
                 loss_value=train_loss,
-                acc_value=self.train_acc,
+                acc_value=train_acc,
                 curr_batch_size=batch_size,
             )
 
@@ -277,7 +322,8 @@ class VQGraph(BaseModel):
 
     def validation_step(
             self,
-            val_batch: torch_geometric.data.Data
+            val_batch: torch_geometric.data.Data,
+            batch_idx: int
         ) -> torch.Tensor:
         """
         Definition of a single validation step of the GraphSAGE model on the current batch of nodes received from the validation dataloader at the current training epoch.
@@ -298,11 +344,10 @@ class VQGraph(BaseModel):
             h_pre_vq_conv, \
             h_vq, \
             indices, \
-            dist, \
+            _, \
             codebook_embeddings, \
             h_node, \
             h_edge, \
-            h_post_vq_conv, \
             unnormalized_logits_batch \
                 = self(
                         val_batch.x,
@@ -317,12 +362,14 @@ class VQGraph(BaseModel):
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': val_batch.y[:batch_size],
                         'pred_attr': h_node[:batch_size],
-                        'target_attr': h_pre_vq_conv[:batch_size],
+                        'target_attr': val_batch.x[:batch_size],
                         'pred_adj': h_edge[:batch_size],
                         'batch_edge_index': val_batch.edge_index,
-                        'pred_commit': h_pre_vq_conv[:batch_size],
-                        'target_commit': h_vq[:batch_size],
-                        'codebook_embeddings': codebook_embeddings[:batch_size],
+                        'quantizer_input': h_pre_vq_conv[:batch_size],
+                        'quantized_output': h_vq[:batch_size],
+                        'node_embeddings': h_pre_vq_conv[:batch_size],
+                        'codebook_embeddings': codebook_embeddings[0],
+                        'code_indices': indices[:batch_size],
                         'batch_input_id': val_batch.input_id,
                         'batch_nid': val_batch.n_id,
                         }
@@ -332,19 +379,19 @@ class VQGraph(BaseModel):
                         loss_data=val_loss_data,
                         curr_batch_size=batch_size,
                         mode='val',
-                        )
+                    )
 
-        # compute the predicted class probabilities (normalized logits)
-        preds_batch = unnormalized_logits_batch.softmax(dim=-1)
+        # compute validation accuracy
+        val_acc = metrics.accuracy_score(
+                        unnormalized_logits=unnormalized_logits_batch[:batch_size],
+                        one_hot_labels=val_batch.y[:batch_size],
+                    )
 
-        # compute the validation accuracy
-        self.val_acc(preds_batch[:batch_size], val_batch.y[:batch_size])
-
-        # log the validation loss and accuracy
+        # log validation loss and accuracy
         self.log_metrics(
                 mode='val',
                 loss_value=val_loss,
-                acc_value=self.val_acc,
+                acc_value=val_acc,
                 curr_batch_size=batch_size,
             )
 
@@ -379,7 +426,6 @@ class VQGraph(BaseModel):
             _, \
             _, \
             _, \
-            _, \
             unnormalized_logits_batch \
                 = self(
                         test_batch.x,
@@ -389,18 +435,41 @@ class VQGraph(BaseModel):
         elif self.inference_mode == 'layer-wise':
             raise NotImplementedError("Layer-wise inference is not supported for test step.")
 
-        # compute the predicted class probabilities (normalized logits)
-        preds_batch = unnormalized_logits_batch.softmax(dim=-1)
+        # compute test accuracy
+        test_acc = metrics.accuracy_score(
+                        unnormalized_logits=unnormalized_logits_batch[:batch_size],
+                        one_hot_labels=test_batch.y[:batch_size],
+                    )
 
-        # compute the test accuracy
-        self.test_acc(preds_batch[:batch_size], test_batch.y[:batch_size])
-
-        # log the test loss and accuracy
+        # log test accuracy
         self.log_metrics(
                 mode='test',
                 loss_value=None,
-                acc_value=self.test_acc,
+                acc_value=test_acc,
                 curr_batch_size=batch_size,
             )
 
-        return self.test_acc
+        return test_acc
+
+
+    def on_train_epoch_end(self) -> None:
+        if self.log_codebook_utilization:
+            codebook_utilization, similarity_stats = self.compute_train_epoch_stats()
+            self.log(
+                name="codebook_utilization",
+                value=codebook_utilization,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+            for key, value in similarity_stats.items():
+                self.log(
+                    name=key,
+                    value=value,
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
+        return super().on_train_epoch_end()

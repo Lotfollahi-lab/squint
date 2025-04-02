@@ -2,8 +2,9 @@ from pathlib import Path
 from typing import Dict
 
 import pytorch_lightning as pl
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch
 import torch_geometric.transforms as T
+from torch_geometric.loader import DataLoader as BatchBuilder
 from pytorch_lightning.loggers import WandbLogger
 
 from ..preprocessors.graph_constructors import set_edge_index_name
@@ -95,6 +96,41 @@ def initialize_dataset_blob(
     return dataset_blob
 
 
+def initialize_databatch(
+        config: Dict,
+        dataset_blob: InMemoryDatasetBlob,
+    ) -> Batch:
+    # load PyG data object(s) corresponding to adata_batch_idx (e.g. 0 -> AnnData batch0)
+    # NOTE: sss2-1b_1p is 1-indexed, while others are 0-indexed
+    adata_batch_idx = config['dataset']['adata_batch_idx']
+
+    # list of Data objects, one for each tissue section
+    if isinstance(adata_batch_idx, int):
+        adata_batch_idx = [adata_batch_idx]
+    data_list = [dataset_blob[idx] for idx in adata_batch_idx]
+
+    # collate the list of Data objects into a single Batch object
+    # i.e. concatenate tissue sections into one big graph with disconnected components
+    data_batch = BatchBuilder(
+                        dataset=data_list,
+                        batch_size=len(data_list),
+                        shuffle=False,
+                        num_workers=0,
+                        pin_memory=True,
+                        drop_last=False,
+                    ).collate_fn(data_list)
+
+    # TODO: fix this hard-coding
+    data_batch.num_features = int(data_batch.num_features)
+    data_batch.num_classes = int(data_batch.num_classes)
+
+    print(f"Batch ID(s): {adata_batch_idx}")
+    print(f"Data Batch: {data_batch}")
+    print(f"Number of Tissue Sections: {len(data_list)}")
+
+    return data_batch
+
+
 def initialize_datamodule(
         config: Dict,
         data: Data,
@@ -131,7 +167,6 @@ def initialize_model(
     encoder_params = config['model']['encoder_params']
     optimizer_params = config['model']['optimizer_params']
     loss_params = config['model']['loss_params']
-    task_params = config['model']['task_params']
     inference_params = config['model']['inference_params']
 
     # initialize model
@@ -150,7 +185,6 @@ def initialize_model(
                 **encoder_params,
                 **optimizer_params,
                 **loss_params,
-                **task_params,
                 **inference_params,
             )
     return model
