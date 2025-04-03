@@ -1,5 +1,7 @@
+import os
+import yaml
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional, Literal
 
 import pytorch_lightning as pl
 from torch_geometric.data import Data, Batch
@@ -18,20 +20,14 @@ from ..models.vqgraph import VQGraph
 def initialize_logger(
         config: Dict,
     ) -> WandbLogger:
-    wandb_tags = [
-                    config['dataset']['dataset_name'],
-                    f"batch={config['dataset']['adata_batch_idx']}",
-                    config['model']['model_name'],
-                ]
 
-    wandb_log_dir = set_wandb_log_dir(config)
     logger = WandbLogger(
-                project="VQNiche",
-                save_dir=wandb_log_dir,
                 log_model=config['logging']['log_model'],
-                offline=config['logging']['offline'],
-                tags=wandb_tags,
             )
+
+    config_path = Path(logger.experiment.dir) / 'config.yaml'
+    with open(config_path, 'w') as config_file:
+        yaml.dump(config, config_file)
 
     return logger
 
@@ -190,28 +186,34 @@ def initialize_model(
     return model
 
 
-def set_wandb_log_dir(
+def set_wandb_experiment_dir(
         config: Dict,
+        experiment_mode: Literal['sweep', 'standalone'] = 'standalone',
+        sweep_id: Optional[str] = None,
     ) -> Path:
+    # set root sweep directory
+    exp_dir = Path(config['logging']['root_log_dir']) / config['dataset']['dataset_name'] / experiment_mode
 
-    wandb_log_dir = Path(config['logging']['root_log_dir']) / config['dataset']['dataset_name'] / config['experiment']['mode']
+    # create batch subdirectory
+    exp_dir = exp_dir / f"batch={config['dataset']['adata_batch_idx']}"
 
-    wandb_log_dir = wandb_log_dir / f"batch={config['dataset']['adata_batch_idx']}"
-
+    # create edge index subdirectory
     edge_index_name = set_edge_index_name(
                         spatial_key=config['dataset']['graph_params']['spatial_key'],
                         delaunay=config['dataset']['graph_params']['delaunay'],
                         n_neighs=config['dataset']['graph_params']['n_neighs'],
                         radius=config['dataset']['graph_params']['radius'],
                     )
-    wandb_log_dir = wandb_log_dir / f"{edge_index_name}_{config['dataset']['label_name']}"
+    exp_dir = exp_dir / edge_index_name
 
-    wandb_log_dir = wandb_log_dir / f"trainratio={1-config['dataset']['transform_params']['val_ratio']-config['dataset']['transform_params']['test_ratio']}"
+    # set experiment run directory
+    if experiment_mode == 'sweep':
+        exp_dir = exp_dir / f"sweep-{sweep_id}"
 
-    wandb_log_dir = wandb_log_dir / f"{config['datamodule']['loader_name']}_batchsize={config['datamodule']['loader_params']['batch_size']}_neighbors={'_'.join([str(i) for i in config['datamodule']['sampler_params']['num_neighbors']])}"
+    # create experiment run directory
+    exp_dir.mkdir(parents=True, exist_ok=True)
 
-    wandb_log_dir = wandb_log_dir / config['model']['model_name']
+    # set environment variable for wandb
+    os.environ["WANDB_DIR"] = str(exp_dir)
 
-    wandb_log_dir.mkdir(parents=True, exist_ok=True)
-
-    return wandb_log_dir
+    return exp_dir
