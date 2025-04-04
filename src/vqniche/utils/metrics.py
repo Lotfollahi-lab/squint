@@ -1,7 +1,7 @@
 import numpy as np
 import networkx as nx
 import scipy.sparse as sp
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Literal
 from sklearn.metrics import accuracy_score as sklearn_accuracy_score
 
 import torch
@@ -199,7 +199,7 @@ def node_clustering_coefficient_distribution(
         G: nx.Graph,
         n_bins: Optional[int] = 100,
         density: Optional[bool] = False,
-        normalize: Optional[bool] = False
+        normalize: Optional[bool] = True
     ) -> np.ndarray:
     """
     Compute the local clustering coefficient distribution for a given networkx graph.
@@ -298,13 +298,14 @@ def compute_spectral_distribution(
     )
 
 
-def compute_distribution_discrepancy(
+def compute_mmd(
         input_distribution: np.ndarray,
         target_distribution: np.ndarray,
-        method: Optional[str] = 'total_variation'
+        method: Literal['gaussian_tv'] = 'gaussian_tv',
+        sigma: Optional[float] = 1.0
     ) -> float:
     """
-    Compute the discrepancy between two distributions.
+    Compute the Maximum Mean Discrepancy (MMD) between two distributions.
 
     Parameters
     ----------
@@ -314,24 +315,48 @@ def compute_distribution_discrepancy(
     - target_distribution: numpy.ndarray
         The target distribution.
         Dimensions: (num_nodes)
-    - method: str
+    - method: Literal['gaussian_tv']
         The method to use to compute the discrepancy.
-        Options: 'total_variation', 'kl_divergence'
+        Options: 'gaussian_tv'
+    - sigma: float
+        The bandwidth of the Gaussian kernel.
 
     Returns
     -------
     - discrepancy: float
         The discrepancy between the two distributions.
+
+    References
+    ----------
+    - https://github.com/KarolisMart/SPECTRE/blob/main/util/dist_helper.py
     """
-    if method == 'total_variation':
-        return np.linalg.norm(
-            x=input_distribution - target_distribution,
-            ord=2
+    assert input_distribution.sum() == 1.0
+    assert target_distribution.sum() == 1.0
+
+    input_support_size = input_distribution.size
+    target_support_size = target_distribution.size
+    support_size = max(input_support_size, target_support_size)
+
+    # pad the input distribution with zeros if it is smaller than the target distribution
+    if input_support_size < support_size:
+        input_distribution = np.pad(
+            array=input_distribution,
+            pad_width=((0, 0), (0, support_size - input_support_size)),
+            mode='constant',
+            constant_values=0.0,
         )
-    elif method == 'kl_divergence':
-        return np.sum(
-            a=input_distribution * np.log(input_distribution / target_distribution),
-            axis=None,
+
+    # pad the target distribution with zeros if it is smaller than the input distribution
+    if target_support_size < support_size:
+        target_distribution = np.pad(
+            array=target_distribution,
+            pad_width=((0, 0), (0, support_size - target_support_size)),
+            mode='constant',
+            constant_values=0.0,
         )
-    else:
-        raise ValueError(f"Invalid method: {method}")
+
+    if method == 'gaussian_tv':
+        distance = np.abs(input_distribution - target_distribution).sum() / 2.0
+        discrepancy = np.exp(-distance / (2.0 * sigma ** 2))
+
+    return discrepancy
