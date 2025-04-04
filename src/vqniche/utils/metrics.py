@@ -1,6 +1,7 @@
 import numpy as np
 import networkx as nx
 import scipy.sparse as sp
+from scipy.stats import pearsonr
 from typing import Optional, Tuple, Literal
 from sklearn.metrics import accuracy_score as sklearn_accuracy_score
 
@@ -392,12 +393,15 @@ def compute_pearson_correlation(
         The mean Pearson correlation
         or the Pearson correlation for each gene/cell.
     """
+    assert X.shape == X_hat.shape
+
     if compare_genes:
-        pearson_correlation = np.corrcoef(X, X_hat)[0, 1]
+        correlations = [pearsonr(X[:, j], X_hat[:, j])[0] for j in range(X.shape[1])]
     else:
-        pearson_correlation = np.corrcoef(X, X_hat)[1, 0]
+        correlations = [pearsonr(X[i, :], X_hat[i, :])[0] for i in range(X.shape[0])]
+    correlations = np.array(correlations)
 
     if mean:
-        return pearson_correlation.mean()
+        return correlations.mean()
     else:
-        return pearson_correlation
+        return correlations
