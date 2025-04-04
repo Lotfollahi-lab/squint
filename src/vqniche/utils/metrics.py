@@ -147,11 +147,11 @@ def compute_node_distributions(
     return node_degree_distribution, clustering_coefficient_distribution, orbit_count_distribution
 
 
-def compute_spectral_density_distribution(
+def compute_spectral_distribution(
         G: nx.Graph,
-        k: Optional[int] = 100,
+        k: Optional[int] = None,
         n_bins: Optional[int] = 50,
-        density: Optional[bool] = True
+        density: Optional[bool] = False
     ) -> np.ndarray:
     """
     Compute the spectral density distribution for a given graph.
@@ -169,33 +169,45 @@ def compute_spectral_density_distribution(
 
     Returns
     -------
-    - spectral_density: numpy.ndarray
-        The spectral density distribution.
+    - spectral_distribution: numpy.ndarray
+        The spectral distribution.
         Dimensions: (n_bins)
+
+    References
+    ----------
+    - Adapted from https://github.com/KarolisMart/SPECTRE/blob/main/util/eval_helper.py
     """
     # compute the normalized Laplacian matrix
     L = nx.normalized_laplacian_matrix(G)
 
     # compute the eigenvalues of the Laplacian matrix
     # note: eigvalsh returns a 1D array of sorted eigenvalues with multiplicity
-    # NOTE: maybe use shift-invert mode for better performance?
-    eigenvalues = sp.eigsh(
-                        A=L,
-                        k=k,
-                        which='SM',
-                        tol=1e-4,
-                        maxiter=1000,
-                        return_eigenvectors=False,
+    if k is None:
+        eigenvalues = np.eigvalsh(L.todense())[1:]
+    else:
+        # NOTE: maybe use shift-invert mode for better performance?
+        eigenvalues = sp.eigsh(
+                            A=L,
+                            k=k,
+                            which='SA',
+                            tol=1e-4,
+                            maxiter=1000,
+                            return_eigenvectors=False,
                     )
 
-    # quantize eigenvalues into a probability density function
-    spectral_density, _ = np.histogram(
+    # quantize eigenvalues into a probability mass function
+    spectral_distribution, _ = np.histogram(
         a=eigenvalues,
         bins=n_bins,
+        range=(-1e-6, 2),
         density=density,
     )
 
-    return spectral_density
+    # normalize into a probability mass distribution if density is False
+    if not density:
+        spectral_distribution = spectral_distribution / spectral_distribution.sum()
+
+    return spectral_distribution
 
 
 def compute_distribution_discrepancy(
