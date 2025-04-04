@@ -360,3 +360,44 @@ def compute_mmd(
         discrepancy = np.exp(-distance / (2.0 * sigma ** 2))
 
     return discrepancy
+
+
+def compute_pearson_correlation(
+        X: np.ndarray,
+        X_hat: np.ndarray,
+        compare_genes: Optional[bool] = False,
+        mean: Optional[bool] = True
+    ) -> float:
+    """
+    Compute the Pearson correlation between original and reconstructed cell-gene matrices.
+
+    Parameters
+    ----------
+    - X: numpy.ndarray
+        The original cell-gene matrix.
+    - X_hat: numpy.ndarray
+        The reconstructed cell-gene matrix.
+    - compare_genes: bool
+        Whether to compare the genes of the two matrices.
+        If True, the Pearson correlation is computed between the genes of the two matrices.
+        If False, the Pearson correlation is computed between the cells of the two matrices.
+    - mean: bool
+        Whether to return the mean Pearson correlation.
+        If True, the mean Pearson correlation is returned.
+        If False, the Pearson correlation is returned for each gene/cell.
+
+    Returns
+    -------
+    - pearson_correlation: float | numpy.ndarray
+        The mean Pearson correlation
+        or the Pearson correlation for each gene/cell.
+    """
+    if compare_genes:
+        pearson_correlation = np.corrcoef(X, X_hat)[0, 1]
+    else:
+        pearson_correlation = np.corrcoef(X, X_hat)[1, 0]
+
+    if mean:
+        return pearson_correlation.mean()
+    else:
+        return pearson_correlation
