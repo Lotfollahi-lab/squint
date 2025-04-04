@@ -1,8 +1,8 @@
 import numpy as np
 import networkx as nx
-from sklearn.metrics import accuracy_score as sklearn_accuracy_score
-from typing import Optional
 import scipy.sparse as sp
+from typing import Optional, Tuple
+from sklearn.metrics import accuracy_score as sklearn_accuracy_score
 
 import torch
 import torch.nn.functional as F
@@ -114,44 +114,135 @@ def build_reconstructed_adjacency_matrix(
     return reconstr_adj
 
 
-def compute_node_distributions(
-        G: nx.Graph
-    ) -> torch.Tensor:
+def compute_distribution(
+        input: np.ndarray,
+        n_bins: Optional[int] = 50,
+        range: Optional[Tuple[float, float]] = None,
+        density: Optional[bool] = False,
+        normalize: Optional[bool] = True
+    ) -> np.ndarray:
     """
-    Compute the local (node) clustering coefficient distribution given an adjacency matrix.
+    Compute the distribution of a given input array.
 
     Parameters
     ----------
-    - adjacency_matrix: torch.Tensor
-        The adjacency matrix.
-        Dimensions: (num_nodes, num_nodes)
+    - input: numpy.ndarray
+        The input array.
+    - n_bins: int
+        The number of bins to use for the histogram.
+    - density: bool
+        Whether to return the density of the histogram.
+    - normalize: bool
+        Whether to normalize the histogram.
+
+    Returns
+    -------
+    - distribution: numpy.ndarray
+        The distribution of the input array.
+        Dimensions: (n_bins)
+    """
+    distribution, _ = np.histogram(
+        a=input,
+        bins=n_bins,
+        range=range,
+        density=density,
+    )
+    if normalize:
+        distribution = distribution / distribution.sum()
+
+    return distribution
+
+
+def node_degree_distribution(
+        G: nx.Graph,
+        n_bins: Optional[int] = 100,
+        density: Optional[bool] = False,
+        normalize: Optional[bool] = True
+    ) -> torch.Tensor:
+    """
+    Compute the local (node) degree distribution given a networkx graph.
+
+    Parameters
+    ----------
+    - G: nx.Graph
+        The networkx graph.
+    - n_bins: int
+        The number of bins to use for the histogram.
+    - density: bool
+        Whether to return the density of the histogram.
+    - normalize: bool
+        Whether to normalize the histogram.
 
     Returns
     -------
     - node_degree_distribution: numpy.ndarray
         The node degree distribution.
         Dimensions: (num_nodes)
-    - clustering_coefficient_distribution: numpy.ndarray
-        The clustering coefficient distribution.
-        Dimensions: (num_nodes)
+
+    References
+    ----------
+    - Adapted from https://github.com/KarolisMart/SPECTRE/blob/main/util/eval_helper.py
     """
     # compute the node degree distribution
-    node_degree_distribution = np.array(list(dict(G.degree()).values()))
+    node_degree_distribution = np.array(nx.degree_histogram(G))
 
+    return compute_distribution(
+        input=node_degree_distribution,
+        n_bins=n_bins,
+        range=(0.0, 1.0),
+        density=density,
+        normalize=normalize,
+    )
+
+
+def node_clustering_coefficient_distribution(
+        G: nx.Graph,
+        n_bins: Optional[int] = 100,
+        density: Optional[bool] = False,
+        normalize: Optional[bool] = False
+    ) -> np.ndarray:
+    """
+    Compute the local clustering coefficient distribution for a given networkx graph.
+
+    Parameters
+    ----------
+    - G: nx.Graph
+        The networkx graph.
+    - n_bins: int
+        The number of bins to use for the histogram.
+    - density: bool
+        Whether to return the density of the histogram.
+    - normalize: bool
+        Whether to normalize the histogram.
+
+    Returns
+    -------
+    - node_cc_distribution: numpy.ndarray
+        The local clustering coefficient distribution.
+        Dimensions: (num_nodes)
+
+    References
+    ----------
+    - Adapted from https://github.com/KarolisMart/SPECTRE/blob/main/util/eval_helper.py
+    """
     # compute the local clustering coefficient for each node
-    clustering_coefficient_distribution = np.array(list(nx.clustering(G).values()))
+    node_cc = np.array(list(nx.clustering(G).values()))
 
-    # compute the 4-orbit count distribution
-    orbit_count_distribution = np.array(list(nx.four_cycles(G).values()))
-
-    return node_degree_distribution, clustering_coefficient_distribution, orbit_count_distribution
+    return compute_distribution(
+        input=node_cc,
+        n_bins=n_bins,
+        range=(0.0, 1.0),
+        density=density,
+        normalize=normalize,
+    )
 
 
 def compute_spectral_distribution(
         G: nx.Graph,
         k: Optional[int] = None,
         n_bins: Optional[int] = 50,
-        density: Optional[bool] = False
+        density: Optional[bool] = False,
+        normalize: Optional[bool] = True
     ) -> np.ndarray:
     """
     Compute the spectral density distribution for a given graph.
@@ -166,6 +257,8 @@ def compute_spectral_distribution(
         The number of bins to use for the histogram.
     - density: bool
         Whether to return the density of the histogram.
+    - normalize: bool
+        Whether to normalize the histogram.
 
     Returns
     -------
@@ -196,18 +289,13 @@ def compute_spectral_distribution(
                     )
 
     # quantize eigenvalues into a probability mass function
-    spectral_distribution, _ = np.histogram(
-        a=eigenvalues,
-        bins=n_bins,
+    return compute_distribution(
+        input=eigenvalues,
+        n_bins=n_bins,
         range=(-1e-6, 2),
         density=density,
+        normalize=normalize,
     )
-
-    # normalize into a probability mass distribution if density is False
-    if not density:
-        spectral_distribution = spectral_distribution / spectral_distribution.sum()
-
-    return spectral_distribution
 
 
 def compute_distribution_discrepancy(
