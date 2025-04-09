@@ -2,7 +2,7 @@ import numpy as np
 import networkx as nx
 import scipy.sparse as sp
 from scipy.stats import pearsonr
-from typing import Optional, Tuple, Literal
+from typing import Optional, Tuple, Literal, List
 from sklearn.metrics import accuracy_score as sklearn_accuracy_score
 
 import torch
@@ -20,7 +20,7 @@ def accuracy_score(
     ----------
     - logits: torch.Tensor
         The unnormalized logits.
-        Dimensions: (batch_size, num_classes)
+        Dimensions: (batch, num_classes)
     - labels: torch.Tensor
         The true labels.
         Dimensions: (batch_size, num_classes)
@@ -154,11 +154,8 @@ def compute_distribution(
     return distribution
 
 
-def node_degree_distribution(
+def compute_node_degree_distribution(
         G: nx.Graph,
-        n_bins: Optional[int] = 100,
-        density: Optional[bool] = False,
-        normalize: Optional[bool] = True
     ) -> torch.Tensor:
     """
     Compute the local (node) degree distribution given a networkx graph.
@@ -167,12 +164,6 @@ def node_degree_distribution(
     ----------
     - G: nx.Graph
         The networkx graph.
-    - n_bins: int
-        The number of bins to use for the histogram.
-    - density: bool
-        Whether to return the density of the histogram.
-    - normalize: bool
-        Whether to normalize the histogram.
 
     Returns
     -------
@@ -186,17 +177,12 @@ def node_degree_distribution(
     """
     # compute the node degree distribution
     node_degree_distribution = np.array(nx.degree_histogram(G))
+    node_degree_distribution = node_degree_distribution / node_degree_distribution.sum()
 
-    return compute_distribution(
-        input=node_degree_distribution,
-        n_bins=n_bins,
-        range=(0.0, 1.0),
-        density=density,
-        normalize=normalize,
-    )
+    return node_degree_distribution
 
 
-def node_clustering_coefficient_distribution(
+def compute_node_clustering_coefficient_distribution(
         G: nx.Graph,
         n_bins: Optional[int] = 100,
         density: Optional[bool] = False,
@@ -277,15 +263,15 @@ def compute_spectral_distribution(
     # compute the eigenvalues of the Laplacian matrix
     # note: eigvalsh returns a 1D array of sorted eigenvalues with multiplicity
     if k is None:
-        eigenvalues = np.eigvalsh(L.todense())[1:]
+        eigenvalues = np.linalg.eigvalsh(L.todense())[1:]
     else:
         # NOTE: maybe use shift-invert mode for better performance?
-        eigenvalues = sp.eigsh(
+        eigenvalues = sp.linalg.eigsh(
                             A=L,
                             k=k,
                             which='SA',
                             tol=1e-4,
-                            maxiter=1000,
+                            maxiter=200,
                             return_eigenvectors=False,
                     )
 
@@ -299,26 +285,24 @@ def compute_spectral_distribution(
     )
 
 
-def compute_mmd(
-        input_distribution: np.ndarray,
-        target_distribution: np.ndarray,
-        method: Literal['gaussian_tv'] = 'gaussian_tv',
+def compute_distribution_discrepancy(
+        x: np.ndarray,
+        y: np.ndarray,
+        method: Literal['l1_gaussian_tv', 'l2_gaussian_tv'] = 'l1_gaussian_tv',
         sigma: Optional[float] = 1.0
     ) -> float:
     """
-    Compute the Maximum Mean Discrepancy (MMD) between two distributions.
+    Compute the discrepancy between two distributions.
 
     Parameters
     ----------
-    - input_distribution: numpy.ndarray
-        The input distribution.
-        Dimensions: (num_nodes)
-    - target_distribution: numpy.ndarray
-        The target distribution.
-        Dimensions: (num_nodes)
-    - method: Literal['gaussian_tv']
+    - x: numpy.ndarray
+        First distribution.
+    - y: numpy.ndarray
+        Second distribution.
+    - method: Literal['l1_gaussian_tv', 'l2_gaussian_tv']
         The method to use to compute the discrepancy.
-        Options: 'gaussian_tv'
+        Options: 'l1_gaussian_tv', 'l2_gaussian_tv'
     - sigma: float
         The bandwidth of the Gaussian kernel.
 
@@ -331,36 +315,120 @@ def compute_mmd(
     ----------
     - https://github.com/KarolisMart/SPECTRE/blob/main/util/dist_helper.py
     """
-    assert input_distribution.sum() == 1.0
-    assert target_distribution.sum() == 1.0
+    assert np.isclose(x.sum(), 1.0)
+    assert np.isclose(y.sum(), 1.0)
 
-    input_support_size = input_distribution.size
-    target_support_size = target_distribution.size
-    support_size = max(input_support_size, target_support_size)
+    x_support = x.size
+    y_support = y.size
+    support = max(x_support, y_support)
 
     # pad the input distribution with zeros if it is smaller than the target distribution
-    if input_support_size < support_size:
-        input_distribution = np.pad(
-            array=input_distribution,
-            pad_width=((0, 0), (0, support_size - input_support_size)),
-            mode='constant',
-            constant_values=0.0,
-        )
+    if x_support < support:
+        x = np.hstack((
+            x,
+            np.zeros(support - x_support),
+        ))
 
     # pad the target distribution with zeros if it is smaller than the input distribution
-    if target_support_size < support_size:
-        target_distribution = np.pad(
-            array=target_distribution,
-            pad_width=((0, 0), (0, support_size - target_support_size)),
-            mode='constant',
-            constant_values=0.0,
-        )
+    if y_support < support:
+        y = np.hstack((
+            y,
+            np.zeros(support - y_support),
+        ))
 
-    if method == 'gaussian_tv':
-        distance = np.abs(input_distribution - target_distribution).sum() / 2.0
+    if method == 'l1_gaussian_tv':
+        distance = np.abs(x - y).sum() / 2.0
+        discrepancy = np.exp(-distance * distance / (2.0 * sigma ** 2))
+    elif method == 'l2_gaussian_tv':
+        distance = np.linalg.norm(x - y, ord=2)
         discrepancy = np.exp(-distance / (2.0 * sigma ** 2))
 
     return discrepancy
+
+
+def compute_total_discrepancy(
+        X: List[np.ndarray],
+        Y: List[np.ndarray],
+        method: Literal['l1_gaussian_tv', 'l2_gaussian_tv'] = 'l1_gaussian_tv',
+        sigma: Optional[float] = 1.0
+    ) -> np.ndarray:
+    """
+    Compute the total discrepancy between two collections of distributions.
+
+    Parameters
+    ----------
+    - X: List[numpy.ndarray]
+        First collection of distributions.
+    - Y: List[numpy.ndarray]
+        Second collection of distributions.
+    - method: Literal['l1_gaussian_tv', 'l2_gaussian_tv']
+        The method to use to compute the discrepancy.
+        Options: 'l1_gaussian_tv', 'l2_gaussian_tv'
+    - sigma: float
+        The bandwidth of the Gaussian kernel.
+    """
+    total_discrepancy = 0.0
+    for x in X:
+        for y in Y:
+            total_discrepancy += compute_distribution_discrepancy(
+                                    input_distribution=x,
+                                    target_distribution=y,
+                                    method=method,
+                                    sigma=sigma,
+                                )
+    total_discrepancy /= len(X) * len(Y)
+    return total_discrepancy
+
+
+def compute_mmd(
+        D: List[np.ndarray],
+        D_hat: List[np.ndarray],
+        method: Literal['l1_gaussian_tv', 'l2_gaussian_tv'] = 'l1_gaussian_tv',
+        sigma: Optional[float] = 1.0
+    ) -> float:
+    """
+    Compute the Maximum Mean Discrepancy (MMD) between two collections of distributions.
+
+    Parameters
+    ----------
+    - D: List[numpy.ndarray]
+        A collection of distributions, one per originalgraph.
+    - D_hat: List[numpy.ndarray]
+        A collection of distributions, one per reconstructed graph.
+    - method: Literal['l1_gaussian_tv', 'l2_gaussian_tv']
+        The method to use to compute the discrepancy.
+        Options: 'l1_gaussian_tv', 'l2_gaussian_tv'
+    - sigma: float
+        The bandwidth of the Gaussian kernel.
+
+    Returns
+    -------
+    - mmd: float
+        The MMD between the two collections of distributions.
+    """
+    assert len(D) == len(D_hat)
+
+    Kxx = compute_total_discrepancy(
+        X=D,
+        Y=D,
+        method=method,
+        sigma=sigma,
+    )
+    Kyy = compute_total_discrepancy(
+        X=D_hat,
+        Y=D_hat,
+        method=method,
+        sigma=sigma,
+    )
+    Kxy = compute_total_discrepancy(
+        X=D,
+        Y=D_hat,
+        method=method,
+        sigma=sigma,
+    )
+    print(f"Kxx: {Kxx}, Kyy: {Kyy}, Kxy: {Kxy}")
+    mmd = Kxx + Kyy - 2 * Kxy
+    return mmd
 
 
 def compute_pearson_correlation(
