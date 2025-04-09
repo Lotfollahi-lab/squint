@@ -81,6 +81,7 @@ def collect_configs(args: argparse.Namespace) -> Dict:
         config = yaml.safe_load(f)
 
     # Set model checkpoint file name
+    config['experiment']['wandb_run_dir'] = args.wandb_run_dir
     if args.model_ckpt:
         config['model']['model_ckpt'] = args.model_ckpt
     else:
