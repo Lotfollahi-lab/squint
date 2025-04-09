@@ -193,9 +193,55 @@ class VQGraph(BaseModel):
             unnormalized_logits_batch
 
 
-    # NOTE: Add the following method to the BaseModel class.
-    # @torch.no_grad()
-    # def embed(
+    @torch.no_grad()
+    def inference(self):
+        X = []
+        H_pre_vq_conv = []
+        H_vq = []
+        Indices = []
+        X_hat = []
+        H_edge = []
+        Labels_cell_type = []
+        Labels_niche_type = []
+
+        for batch in self.trainer.datamodule.infer_dataloader():
+            batch_size = batch.batch_size
+            X.append(batch.x[:batch_size])
+            Labels_cell_type.append(batch.y[:batch_size])
+            Labels_niche_type.append(batch.y_niche_types[:batch_size])
+
+            h_pre_vq_conv, \
+            h_vq, \
+            indices, \
+            _, \
+            _, \
+            h_node, \
+            h_edge, \
+            _ = self(torch.log1p(batch.x), batch.edge_index)
+
+            H_pre_vq_conv.append(h_pre_vq_conv[:batch_size])
+            H_vq.append(h_vq[:batch_size])
+            Indices.append(indices[:batch_size])
+            X_hat.append(torch.expm1(h_node[:batch_size]))
+            H_edge.append(h_edge[:batch_size])
+
+        X = torch.cat(X, dim=0)
+        H_pre_vq_conv = torch.cat(H_pre_vq_conv, dim=0)
+        H_vq = torch.cat(H_vq, dim=0)
+        Indices = torch.cat(Indices, dim=0)
+        X_hat = torch.cat(X_hat, dim=0)
+        H_edge = torch.cat(H_edge, dim=0)
+        Labels_cell_type = torch.cat(Labels_cell_type, dim=0)
+        Labels_niche_type = torch.cat(Labels_niche_type, dim=0)
+
+        return X, \
+            Labels_cell_type, \
+            Labels_niche_type, \
+            H_pre_vq_conv, \
+            H_vq, \
+            Indices, \
+            X_hat, \
+            H_edge
 
 
     @torch.no_grad()
@@ -241,7 +287,7 @@ class VQGraph(BaseModel):
             metrics.get_similarity_stats(self.encoder.codebook, 'codebook')
         )
 
-        codebook_utilization = 1.0* len(set(code_indices)) / self.encoder.codebook.shape[0]
+        codebook_utilization = 1.0 * len(set(code_indices)) / self.encoder.codebook.shape[0]
         return codebook_utilization, similarity_stats
 
 
