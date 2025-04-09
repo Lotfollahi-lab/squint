@@ -38,17 +38,17 @@ def normalize_by_read_depth(
 
 
 def normalize_total_log1p(
-        x: Union[sp.csr_matrix , torch.Tensor],
+        x: torch.Tensor,
         target_size: int=10_000,
         apply_CPM: bool=True,
-    ) -> sp.csr_matrix:
+    ) -> torch.Tensor:
     """
     Normalize counts per cell by total counts over all genes and log1p transform.
 
     Parameters
     ----------
-    x : sp.csr_matrix
-        A sparse matrix where each row represents an observation and each column
+    x : torch.Tensor
+        A tensor where each row represents an observation and each column
         represents a feature.
     target_size : int
         The target read depth per observation (i.e. the sum of features across
@@ -58,15 +58,16 @@ def normalize_total_log1p(
 
     Returns
     -------
-    sp.csr_matrix :
-        A sparse matrix containing the normalized features.
+    torch.Tensor :
+        A tensor containing the normalized features.
     """
     if apply_CPM:
-        adata = ad.AnnData(x.todense().astype(float))
+        adata = ad.AnnData(x.numpy())
         x = sc.pp.normalize_total(
                 adata,
                 target_sum=target_size,
                 inplace=False
             )['X']
-    x = sp.csr_matrix(np.log1p(x))
+        x = torch.from_numpy(x)
+    x = torch.log1p(x)
     return x

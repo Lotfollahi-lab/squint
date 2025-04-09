@@ -225,7 +225,7 @@ class VQGraph(BaseModel):
             _, \
             h_node, \
             h_edge, \
-            _ = self(torch.log1p(batch.x), batch.edge_index)
+            _ = self(batch.x, batch.edge_index)
 
             H_pre_vq_conv.append(h_pre_vq_conv[:batch_size])
             H_vq.append(h_vq[:batch_size])
@@ -275,10 +275,19 @@ class VQGraph(BaseModel):
 
         # Iterate through inference dataloader
         for batch in self.trainer.datamodule.infer_dataloader():
-            batch = batch.to(self.device)
             batch_size = batch.batch_size
-
-            h_pre_vq_conv, _, indices, _, _, h_node, h_edge, logits = self(batch.x, batch.edge_index)
+            h_pre_vq_conv, \
+            _, \
+            indices, \
+            _, \
+            _, \
+            h_node, \
+            h_edge, \
+            logits \
+                = self(
+                    batch.x.to(self.device),
+                    batch.edge_index.to(self.device)
+                )
 
             if self.log_similarity_stats:
                 h_pre_vq_conv_list.append(h_pre_vq_conv[:batch_size])
@@ -315,8 +324,8 @@ class VQGraph(BaseModel):
             X = torch.cat(X, dim=0)
             X_hat = torch.cat(X_hat, dim=0)
             pearson_correlation = compute_pearson_correlation(
-                            X.numpy(),
-                            X_hat.numpy(),
+                            X.cpu().numpy(),
+                            X_hat.cpu().numpy(),
                             compare_genes=False,
                             mean=True,
                         )
