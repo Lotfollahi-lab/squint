@@ -371,8 +371,8 @@ def compute_total_discrepancy(
     for x in X:
         for y in Y:
             total_discrepancy += compute_distribution_discrepancy(
-                                    input_distribution=x,
-                                    target_distribution=y,
+                                    x=x,
+                                    y=y,
                                     method=method,
                                     sigma=sigma,
                                 )
