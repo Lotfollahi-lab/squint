@@ -7,7 +7,7 @@ from pathlib import Path
 
 def parse_test_arguments() -> argparse.Namespace:
     """
-    Parse command line arguments.
+    Parse command line arguments for testing.
 
     Returns:
     ----------
@@ -27,6 +27,35 @@ def parse_test_arguments() -> argparse.Namespace:
                         help='Override parameters in the config file')
 
     return parser.parse_args()
+
+
+def collect_test_configs(args: argparse.Namespace) -> Dict:
+    """
+    Collect configurations from the config file from the wandb run directory and command line arguments for testing.
+
+    Parameters:
+    ----------
+    - args (argparse.Namespace): The command line arguments.
+
+    Returns:
+    ----------
+    - Dict: The configuration dictionary.
+    """
+    # Get the config file name from command line argument
+    config_fname = Path(args.wandb_run_dir) / 'files' / 'config.yaml'
+
+    # Read parameters from config file
+    with open(config_fname, "r") as f:
+        config = yaml.safe_load(f)
+
+    # Set model checkpoint file name
+    config['experiment']['wandb_run_dir'] = args.wandb_run_dir
+    if args.model_ckpt:
+        config['model']['model_ckpt'] = args.model_ckpt
+    else:
+        config['model']['model_ckpt'] = find_best_checkpoint(args.wandb_run_dir)
+
+    return config
 
 
 def find_best_checkpoint(wandb_run_dir):
@@ -59,32 +88,3 @@ def find_best_checkpoint(wandb_run_dir):
     print(f"Best checkpoint found: {best_ckpt}")
 
     return ckpt_dir / best_ckpt
-
-
-def collect_configs(args: argparse.Namespace) -> Dict:
-    """
-    Collect configurations from the config file and command line arguments.
-
-    Parameters:
-    ----------
-    - args (argparse.Namespace): The command line arguments.
-
-    Returns:
-    ----------
-    - Dict: The configuration dictionary.
-    """
-    # Get the config file name from command line argument
-    config_fname = Path(args.wandb_run_dir) / 'files' / 'config.yaml'
-
-    # Read parameters from config file
-    with open(config_fname, "r") as f:
-        config = yaml.safe_load(f)
-
-    # Set model checkpoint file name
-    config['experiment']['wandb_run_dir'] = args.wandb_run_dir
-    if args.model_ckpt:
-        config['model']['model_ckpt'] = args.model_ckpt
-    else:
-        config['model']['model_ckpt'] = find_best_checkpoint(args.wandb_run_dir)
-
-    return config
