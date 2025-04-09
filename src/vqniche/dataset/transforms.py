@@ -1,15 +1,16 @@
 from torch_geometric.data import Data
+from typing import Optional, List
 
 import torch_geometric.transforms as T
-from typing import Any, List
 
-from ..preprocessors.normalizers import normalize_by_read_depth
+from ..preprocessors.normalizers import normalize_by_read_depth, normalize_total_log1p
 
 
 def init_data_transforms(
         data_transform_names: List[str] = ['NormalizeFeatures',
                                             'RandomNodeSplit'],
-        norm_method: str = 'read_depth',
+        norm_method: str = 'total_log1p',
+        apply_CPM: bool = True,
         val_ratio: float = 0.1,
         test_ratio: float = 0.2,
     ) -> List[T.BaseTransform]:
@@ -22,6 +23,8 @@ def init_data_transforms(
         The list of PyG transforms to initialize.
     - norm_method: str
         The method to use for normalization.
+    - apply_CPM: bool
+        If True, apply CPM normalization.
     - val_ratio: float
         The ratio of validation data.
     - test_ratio: float
@@ -37,19 +40,22 @@ def init_data_transforms(
 
     for data_transform_name in data_transform_names:
         if data_transform_name == 'NormalizeFeatures':
-            data_transforms.append(NormalizeFeatures(
-                                        feature_key='x',
-                                        norm_method=norm_method
-                                        )
-                            )
+            data_transforms.append(
+                NormalizeFeatures(
+                    feature_key='x',
+                    norm_method=norm_method,
+                    apply_CPM=apply_CPM
+                )
+            )
 
         elif data_transform_name == 'RandomNodeSplit':
-            data_transforms.append(T.RandomNodeSplit(
-                                        split='train_rest',
-                                        num_val=val_ratio,
-                                        num_test=test_ratio
-                                        )
-                            )
+            data_transforms.append(
+                T.RandomNodeSplit(
+                    split='train_rest',
+                    num_val=val_ratio,
+                    num_test=test_ratio
+                )
+            )
 
         else:
             raise ValueError(f"{data_transform_name} Transform not found.")
@@ -61,7 +67,8 @@ class NormalizeFeatures(T.BaseTransform):
     def __init__(
             self,
             norm_method: str = 'read_depth',
-            feature_key: str = 'x'
+            feature_key: str = 'x',
+            apply_CPM: Optional[bool] = True
         ):
         """
         Normalize the features of the PyG Data object.
@@ -79,6 +86,7 @@ class NormalizeFeatures(T.BaseTransform):
         """
         self.norm_method = norm_method
         self.feature_key = feature_key
+        self.apply_CPM = apply_CPM
 
     def forward(
             self,
@@ -90,6 +98,8 @@ class NormalizeFeatures(T.BaseTransform):
         feature_data = getattr(data, self.feature_key)
         if self.norm_method == 'read_depth':
             feature_data = normalize_by_read_depth(feature_data)
+        elif self.norm_method == 'total_log1p':
+            feature_data = normalize_total_log1p(feature_data, self.apply_CPM)
         else:
             raise ValueError(f"Normalization method {self.norm_method} not found.")
         setattr(data, self.feature_key, feature_data)
