@@ -151,11 +151,26 @@ def initialize_datamodule(
     return datamodule_batch
 
 
+def set_model_class(
+        model_name: str,
+    ) -> pl.LightningModule:
+    if model_name == 'GraphSAGE':
+        Model = GraphSAGE
+    elif model_name == 'VQGraph':
+        Model = VQGraph
+    else:
+        raise ValueError(f"Model {model_name} not found.")
+    return Model
+
+
 def initialize_model(
         config: Dict,
         in_channels: int,
         out_channels: int,
     ) -> pl.LightningModule:
+    # set model class
+    Model = set_model_class(model_name=config['model']['model_name'])
+
     # get model, optimizer, loss, and task parameters
     model_name = config['model']['model_name']
     encoder_name = config['model']['encoder_name']
@@ -166,12 +181,6 @@ def initialize_model(
     inference_params = config['model']['inference_params']
 
     # initialize model
-    if model_name == 'GraphSAGE':
-        Model = GraphSAGE
-    elif model_name == 'VQGraph':
-        Model = VQGraph
-    else:
-        raise ValueError(f"Model {model_name} not found.")
     model = Model(
                 model_name=model_name,
                 encoder_name=encoder_name,

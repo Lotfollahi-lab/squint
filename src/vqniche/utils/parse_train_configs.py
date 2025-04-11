@@ -4,9 +4,9 @@ import argparse
 from typing import Dict, List, Tuple
 
 
-def parse_arguments() -> argparse.Namespace:
+def parse_train_arguments() -> argparse.Namespace:
     """
-    Parse command line arguments.
+    Parse command line arguments for training.
 
     Returns:
     ----------
@@ -27,11 +27,11 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def collect_configs(
+def collect_train_configs(
         args: argparse.Namespace
     ) -> Tuple[Dict, Dict]:
     """
-    Collect configurations from the config file and command line arguments.
+    Collect configurations from the config file and command line arguments for training.
 
     Parameters:
     ----------

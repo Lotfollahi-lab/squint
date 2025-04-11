@@ -92,7 +92,8 @@ class InMemoryDatasetBlob(InMemoryDataset):
         self.name = name
 
         self.feature_names = feature_names
-        self.label_names = label_names
+        self.label_names = [label_name.split('=')[0] for label_name in label_names]
+        self.label_keys = [label_name.split('=')[1] for label_name in label_names]
         self.graph_kwargs = graph_kwargs
 
         # path to the data directory which contains silver and gold data
@@ -131,8 +132,8 @@ class InMemoryDatasetBlob(InMemoryDataset):
 
         for adata_batch_file in self.raw_paths:
             adata_batch = sc.read(adata_batch_file)
-            for label_name in self.label_names:
-                self.label_categories[label_name].update(adata_batch.obs[label_name].unique())
+            for label_name, label_key in zip(self.label_names, self.label_keys):
+                self.label_categories[label_name].update(adata_batch.obs[label_key].unique())
 
         for label_name in self.label_names:
             # sorting the categories for consistency across batches so that the one-hot encoding is consistent. e.g. when the one-hot encoding is [0, 1, 0], the label name is the second name in the sorted list of that label.
@@ -254,9 +255,9 @@ class InMemoryDatasetBlob(InMemoryDataset):
                                                 )
 
         # build for node labels (categorical pandas series to one hot tensor)
-        for label_name in self.label_names:
+        for label_name, label_key in zip(self.label_names, self.label_keys):
             batch_dict[f"y_{label_name}"] = pandas_to_torch_one_hot(
-                                                adata_batch.obs[label_name],
+                                                adata_batch.obs[label_key],
                                                 categories=self.label_categories[label_name]
                                             )
 

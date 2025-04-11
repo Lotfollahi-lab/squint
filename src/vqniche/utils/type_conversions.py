@@ -2,6 +2,8 @@ import torch
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+import networkx as nx
+
 from torch_geometric.utils import to_undirected, to_dense_adj
 
 
@@ -93,3 +95,23 @@ def edge_index_to_adjacency_tensor(
                         to_undirected(edge_index).to(torch.long)
                         )[0]
     return adjacency_matrix
+
+
+def adjacency_tensor_to_networkx(
+        adjacency_matrix: torch.Tensor
+    ) -> nx.Graph:
+    """
+    Convert an adjacency tensor to a networkx graph.
+
+    Parameters
+    ----------
+    - adjacency_matrix: torch.Tensor
+        The adjacency matrix.
+        Dimensions: (num_nodes, num_nodes)
+
+    Returns
+    -------
+    - graph: nx.Graph
+        The networkx graph.
+    """
+    return nx.from_numpy_array(adjacency_matrix.numpy())
