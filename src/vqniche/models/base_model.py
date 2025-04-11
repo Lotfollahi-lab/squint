@@ -74,6 +74,7 @@ class BaseModel(pl.LightningModule):
 
         # Loss parameters
         self.loss_kwargs = loss_kwargs
+        self.dispersion = torch.nn.Parameter(torch.randn(self.in_channels))
         self.loss_fn_tuples = self.set_loss_fn_tuples(loss_names, loss_kwargs)
 
         # Option 1 -- batch-wise (default)
@@ -141,6 +142,15 @@ class BaseModel(pl.LightningModule):
                 loss_fn = mse_attribute_reconstruction
 
                 loss_fn_data_keys = ['pred_attr', 'target_attr']
+
+                wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
+                if wt_attr_reconstr is not None:
+                    loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
+
+            elif loss_fn_name == 'nb_attribute_reconstruction':
+                loss_fn = nb_attribute_reconstruction
+
+                loss_fn_data_keys = ['pred_attr', 'target_attr', 'dispersion']
 
                 wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
                 if wt_attr_reconstr is not None:
