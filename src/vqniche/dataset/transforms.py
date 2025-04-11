@@ -10,6 +10,7 @@ def init_data_transforms(
         data_transform_names: List[str] = ['NormalizeFeatures',
                                             'RandomNodeSplit'],
         norm_method: str = 'total_log1p',
+        target_size: int = 10_000,
         apply_CPM: bool = True,
         val_ratio: float = 0.1,
         test_ratio: float = 0.2,
@@ -23,6 +24,8 @@ def init_data_transforms(
         The list of PyG transforms to initialize.
     - norm_method: str
         The method to use for normalization.
+    - target_size: int
+        The target size for normalization.
     - apply_CPM: bool
         If True, apply CPM normalization.
     - val_ratio: float
@@ -44,6 +47,7 @@ def init_data_transforms(
                 NormalizeFeatures(
                     feature_key='x',
                     norm_method=norm_method,
+                    target_size=target_size,
                     apply_CPM=apply_CPM
                 )
             )
@@ -68,6 +72,7 @@ class NormalizeFeatures(T.BaseTransform):
             self,
             norm_method: str = 'read_depth',
             feature_key: str = 'x',
+            target_size: int = 10_000,
             apply_CPM: Optional[bool] = True
         ):
         """
@@ -79,6 +84,10 @@ class NormalizeFeatures(T.BaseTransform):
             The method to use for normalization.
         - feature_key: str
             The key for the node features that are to be normalized.
+        - target_size: int
+            The target size for normalization.
+        - apply_CPM: bool
+            If True, apply CPM normalization.
 
         Notes:
         -----
@@ -86,6 +95,7 @@ class NormalizeFeatures(T.BaseTransform):
         """
         self.norm_method = norm_method
         self.feature_key = feature_key
+        self.target_size = target_size
         self.apply_CPM = apply_CPM
 
     def forward(
@@ -97,9 +107,16 @@ class NormalizeFeatures(T.BaseTransform):
         """
         feature_data = getattr(data, self.feature_key)
         if self.norm_method == 'read_depth':
-            feature_data = normalize_by_read_depth(feature_data)
+            feature_data = normalize_by_read_depth(
+                            x=feature_data,
+                            target_size=self.target_size
+                        )
         elif self.norm_method == 'total_log1p':
-            feature_data = normalize_total_log1p(feature_data, self.apply_CPM)
+            feature_data = normalize_total_log1p(
+                            x=feature_data,
+                            target_size=self.target_size,
+                            apply_CPM=self.apply_CPM
+                        )
         else:
             raise ValueError(f"Normalization method {self.norm_method} not found.")
         setattr(data, self.feature_key, feature_data)
