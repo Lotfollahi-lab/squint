@@ -214,7 +214,6 @@ class VQGraph(BaseModel):
 
         for batch in self.trainer.datamodule.infer_dataloader():
             batch_size = batch.batch_size
-            X.append(batch.x[:batch_size])
             Labels_cell_type.append(batch.y[:batch_size])
             Labels_niche_type.append(batch.y_niche_types[:batch_size])
 
@@ -227,10 +226,11 @@ class VQGraph(BaseModel):
             h_edge, \
             _ = self(batch.x, batch.edge_index)
 
+            X.append(batch.x[:batch_size])
             H_pre_vq_conv.append(h_pre_vq_conv[:batch_size])
             H_vq.append(h_vq[:batch_size])
             Indices.append(indices[:batch_size])
-            X_hat.append(torch.expm1(h_node[:batch_size]))
+            X_hat.append(h_node[:batch_size])
             H_edge.append(h_edge[:batch_size])
 
         X = torch.cat(X, dim=0)
