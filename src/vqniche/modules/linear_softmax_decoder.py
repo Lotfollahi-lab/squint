@@ -56,7 +56,7 @@ class LinearSoftmax(pl.LightningModule):
             The output tensor after linear transformation and softmax.
         """
         x = self.linear(x)
-        if self.name == 'CountDecoder':
+        if self.name == 'LinearSoftmax':
             x = F.softmax(x, dim=-1)
             x = x * read_depth.unsqueeze(-1)
         return x
