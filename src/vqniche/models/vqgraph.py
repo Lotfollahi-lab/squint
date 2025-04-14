@@ -26,6 +26,7 @@ class VQGraph(BaseModel):
             log_codebook_utilization: bool = True,
             log_pearson_correlation: bool = False,
             graphconv_layer_name: str = 'SAGEConv',
+            attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
             hidden_channels: int = 64,
             num_layers: int = 2,
             act_first: bool = True,
@@ -68,6 +69,8 @@ class VQGraph(BaseModel):
 
         - graphconv_layer_name: str
             The name of the graph convolutional layer.
+        - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
+            The name of the attribute decoder module.
         - hidden_channels: int
             The number of hidden features.
         - num_layers: int
@@ -122,6 +125,7 @@ class VQGraph(BaseModel):
                             in_channels=in_channels,
                             hidden_channels=hidden_channels,
                             graphconv_layer_name=graphconv_layer_name,
+                            attribute_decoder_name=attribute_decoder_name,
                             num_layers=num_layers,
                             act_first=act_first,
                             activation=activation,
@@ -374,6 +378,7 @@ class VQGraph(BaseModel):
                         'labels': train_batch.y[:batch_size],
                         'pred_attr': h_node[:batch_size],
                         'target_attr': train_batch.x[:batch_size],
+                        'dispersion': torch.exp(self.dispersion),
                         'pred_adj': h_edge[:batch_size],
                         'batch_edge_index': train_batch.edge_index,
                         'quantizer_input': h_pre_vq_conv[:batch_size],
@@ -453,6 +458,7 @@ class VQGraph(BaseModel):
                         'pred_attr': h_node[:batch_size],
                         'target_attr': val_batch.x[:batch_size],
                         'pred_adj': h_edge[:batch_size],
+                        'dispersion': torch.exp(self.dispersion),
                         'batch_edge_index': val_batch.edge_index,
                         'quantizer_input': h_pre_vq_conv[:batch_size],
                         'quantized_output': h_vq[:batch_size],

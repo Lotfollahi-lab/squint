@@ -77,6 +77,60 @@ def mse_attribute_reconstruction(
     return mse_attr_reconstr_loss * wt_attr_reconstr
 
 
+def nb_attribute_reconstruction(
+        pred_attr: torch.Tensor,
+        target_attr: torch.Tensor,
+        dispersion: torch.Tensor,
+        wt_attr_reconstr: float = 0.1
+    ) -> torch.Tensor:
+    """
+    Compute the negative binomial (NB) loss between the estimated attributes from the decoder module and the target attributes.
+
+    Parameters
+    ----------
+    pred_attr: torch.Tensor
+        The output from the attribute decoder module.
+        Dimensions: (batch_size, num_genes)
+    target_attr: torch.Tensor
+        The target attributes.
+        Dimensions: (batch_size, num_genes)
+    dispersion: torch.Tensor
+        The dispersion parameter.
+        Dimensions: (num_genes,)
+    wt_attr_reconstr: float
+        The scaling factor for the node attribute reconstruction loss.
+
+    Returns
+    -------
+    nb_loss: torch.Tensor
+        The computed negative binomial loss.
+
+    Notes
+    -----
+    - This implementation sets one dispersion parameter per gene.
+    - mu (mean of the NB distribution) is the predicted attribute.
+    - theta (dispersion parameter) is a learnable parameter.
+    - target_attr is the raw count data.
+    - NB loss seeks to estimate the true counts conditioned on the predicted attributes.
+
+    References:
+    ----------
+    - NicheCompass --> https://github.com/Lotfollahi-lab/nichecompass/blob/main/src/nichecompass/modules/losses.py
+    - scvi-tools --> https://github.com/scverse/scvi-tools/blob/main/src/scvi/module/_vae.py#L205
+    """
+    log_theta_mu_eps = torch.log(dispersion + pred_attr + 1e-8).detach()
+    log_likelihood_nb = (
+        dispersion * (torch.log(dispersion + 1e-8) - log_theta_mu_eps)
+        + target_attr * (torch.log(pred_attr + 1e-8) - log_theta_mu_eps)
+        + torch.lgamma(target_attr + dispersion)
+        - torch.lgamma(dispersion)
+        - torch.lgamma(target_attr + 1))
+
+    nb_loss = torch.mean(-log_likelihood_nb.sum(-1))
+
+    return nb_loss * wt_attr_reconstr
+
+
 def mse_adjacency_reconstruction(
         pred_adj: torch.Tensor,
         batch_edge_index: torch.Tensor,

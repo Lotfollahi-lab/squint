@@ -203,6 +203,9 @@ def set_wandb_experiment_dir(
     # set root sweep directory
     exp_dir = Path(config['logging']['root_log_dir']) / config['dataset']['dataset_name'] / experiment_mode
 
+    # create model subdirectory
+    exp_dir = exp_dir / config['model']['model_name']
+
     # create batch subdirectory
     exp_dir = exp_dir / f"batch={config['dataset']['adata_batch_idx']}"
 
