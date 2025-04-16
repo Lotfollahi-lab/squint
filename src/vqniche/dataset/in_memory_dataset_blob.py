@@ -37,6 +37,7 @@ import numpy as np
 import scanpy as sc
 from typing import Optional, Callable, List, Tuple
 
+from torch import Tensor
 from torch_geometric.data import InMemoryDataset, Data
 from torch_geometric.utils.convert import from_scipy_sparse_matrix
 
@@ -272,8 +273,8 @@ class InMemoryDatasetBlob(InMemoryDataset):
             print(f"{key}: {value.shape=}, {value.dtype=}, {type(value)=}")
 
         # ----------------- Add Metadata -----------------
+        batch_dict['xy_coordinates'] = Tensor(adata_batch.obsm['spatial'])
         batch_dict['cell_id'] = adata_batch.obs['cell_id'].to_list()
-
         batch_dict['dataset_id'] = adata_batch.uns['dataset_id']
         batch_dict['tissue'] = adata_batch.uns['tissue']
         batch_dict['species'] = adata_batch.uns['species']
