@@ -249,11 +249,15 @@ class InMemoryDatasetBlob(InMemoryDataset):
         batch_dict = {}
 
         # build for node features (sparse csr matrix to float tensor)
+        # NOTE: adata_batch.X is assumed to a the raw cell-gene counts matrix.
         assert len(self.feature_names) > 0, "At least one feature name must be provided"
         for feature_name in self.feature_names:
-            batch_dict[f'x_{feature_name}'] = sparse_mx_to_float_tensor(
-                                                    adata_batch.X
-                                                )
+            if feature_name == 'cell_gene_counts':
+                batch_dict[f'x_{feature_name}'] = sparse_mx_to_float_tensor(
+                                                        adata_batch.X
+                                                    )
+            else:
+                raise ValueError(f"Feature name {feature_name} not supported")
 
         # build for node labels (categorical pandas series to one hot tensor)
         for label_name, label_key in zip(self.label_names, self.label_keys):
