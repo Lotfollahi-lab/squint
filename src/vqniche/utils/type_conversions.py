@@ -97,7 +97,7 @@ def edge_index_to_adjacency_tensor(
     # to_dense_adj returns a tensor of shape (1, num_nodes, num_nodes)
     # here, num_nodes = edge_index.max() + 1
     adjacency_matrix = to_dense_adj(
-                        to_undirected(edge_index).to(torch.long)
+                        edge_index.to(torch.long)
                         )[0]
     return adjacency_matrix
 
