@@ -3,8 +3,13 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 import networkx as nx
+import anndata as ad
+from typing import List
 
+from torch_geometric.data import Batch
 from torch_geometric.utils import to_undirected, to_dense_adj
+
+from ..dataset.in_memory_dataset_blob import InMemoryDatasetBlob
 
 
 def sparse_mx_to_float_tensor(
@@ -115,3 +120,100 @@ def adjacency_tensor_to_networkx(
         The networkx graph.
     """
     return nx.from_numpy_array(adjacency_matrix.numpy())
+
+
+def torch_one_hot_to_label_name(
+        one_hot: torch.Tensor,
+        label_categories: list[str]
+    ) -> pd.Series:
+    """
+    Convert a one-hot encoded label tensor to a pandas Series of label names.
+
+    Parameters:
+    ----------
+    one_hot: torch.Tensor
+        The one-hot encoded label tensor.
+    label_categories: list[str]
+        The list of label categories where the index of the one-hot encoded label tensor matches the index of the label name in the list.
+
+    Returns:
+    --------
+    pd.Series
+        The pandas Series of label names.
+    """
+    return pd.Series(label_categories[one_hot.argmax(dim=1)])
+
+
+def data_batch_to_adata_list(
+        dataset_blob: InMemoryDatasetBlob,
+        data_batch: Batch
+    ) -> List[ad.AnnData]:
+    """
+    Convert a PyTorch Geometric Batch object to a list of AnnData objects.
+    Each AnnData object corresponds to a tissue section.
+
+    Parameters:
+    ----------
+    dataset_blob: InMemoryDatasetBlob
+        The dataset blob.
+    data_batch: Batch
+        Combined data batch comprising of multiple tissue sections.
+
+    Returns:
+    --------
+    List[ad.AnnData]
+        A list of AnnData objects, one per tissue section.
+    """
+    adata_list = []
+    for data in data_batch:
+        # ------------------------------------------------------------------------
+        # set features
+        adata = ad.AnnData(X=data.x.cpu().numpy())
+
+        # ------------------------------------------------------------------------
+        # set gene panel
+        adata.var = dataset_blob.gene_panel
+
+        # ------------------------------------------------------------------------
+        # set labels
+        adata.obs['cell_types'] = torch_one_hot_to_label_name(
+                                    data.y_cell_types.cpu(),
+                                    dataset_blob.label_categories['cell_types']
+                                    )
+        adata.obs['niche_types'] = torch_one_hot_to_label_name(
+                                    data.y_niche_types.cpu(),
+                                    dataset_blob.label_categories['niche_types']
+                                    )
+        # ------------------------------------------------------------------------
+        # Convert edge index to dense adjacency matrix
+        adj_matrix = to_dense_adj(data.edge_index)[0]
+        # Convert to scipy sparse matrix
+        sparse_adj = sp.csr_matrix(adj_matrix.cpu().numpy())
+        # Add to adata.obsp
+        adata.obsp['spatial_connectivities'] = sparse_adj
+        # Add metadata
+        adata.uns['spatial_neighbors'] = {
+            'connectivities_key': 'spatial_connectivities',
+            'params': {
+                'n_neighbors': None,
+                'method': 'edge_index',
+                'key_added': 'spatial'
+            }
+        }
+
+        # ------------------------------------------------------------------------
+        # set spatial coordinates
+        adata.obsm['spatial'] = data.xy_coordinates.cpu().numpy()
+
+        # ------------------------------------------------------------------------
+        # set metadata
+        adata.obs['cell_id'] = data.cell_id
+        adata.uns['dataset_id'] = data.dataset_id
+        adata.uns['tissue'] = data.tissue
+        adata.uns['species'] = data.species
+        adata.uns['batch'] = f"batch_{data.batch_idx}"
+
+        # ------------------------------------------------------------------------
+        adata_list.append(adata)
+
+    return adata_list
