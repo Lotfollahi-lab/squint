@@ -63,6 +63,8 @@ from ..modules.sage_conv import SAGEConv_Module as GraphSAGE_Encoder
 
 from .base_model import BaseModel
 from ..utils import metrics
+from ..modules.linear_softmax_decoder import LinearSoftmax
+from ..utils.metrics import compute_pearson_correlation
 
 
 class GraphSAGE(BaseModel):
@@ -73,6 +75,8 @@ class GraphSAGE(BaseModel):
             predictor_name: str = 'Linear',
             in_channels: int = None,
             out_channels: int = None,
+            log_similarity_stats: bool = False,
+            log_pearson_correlation: bool = False,
             hidden_channels: int = 256,
             num_layers: int = 2,
             act_first: bool = True,
@@ -103,6 +107,10 @@ class GraphSAGE(BaseModel):
             The number of input features.
         - out_channels: int
             The number of output features.
+        - log_similarity_stats: bool
+            Whether to log the similarity statistics.
+        - log_pearson_correlation: bool
+            Whether to log the Pearson correlation.
 
         - hidden_channels: int
             The number of hidden features.
@@ -163,11 +171,47 @@ class GraphSAGE(BaseModel):
                             init_method=init_method
                         )
 
+        self.attribute_decoder = LinearSoftmax(
+                name='LinearSoftmax',
+                in_channels=hidden_channels,
+                out_channels=in_channels
+            )
+
         # Instead, we apply this final linear transformation in the predictor module manually to have access to the internal node embeddings via the `embed` function.
         self.predictor = nn.Linear(
                             in_features=hidden_channels,
                             out_features=out_channels
                         )
+
+        self.log_similarity_stats = log_similarity_stats
+        self.log_pearson_correlation = log_pearson_correlation
+
+
+    def forward(
+            self,
+            batch_x: torch.Tensor,
+            batch_edge_index: torch.Tensor
+        ) -> torch.Tensor:
+        """
+        Forward pass of the GraphSAGE model.
+
+        Parameters
+        ----------
+        - batch_x: torch.Tensor
+            The input features.
+        - batch_edge_index: torch.Tensor
+            The edge index.
+        """
+        h_encoder = self.encoder(batch_x, batch_edge_index)
+        # decode the node embeddings to recover the node attributes
+        h_attr_decoded = self.attribute_decoder(
+                            x=h_encoder,
+                            read_depth=batch_x.sum(dim=-1)
+                        )
+
+        unnormalized_logits = self.predictor(h_encoder)
+
+        return h_encoder, h_attr_decoded, unnormalized_logits
 
 
     @torch.no_grad()
@@ -180,16 +224,56 @@ class GraphSAGE(BaseModel):
         - similarity_stats: dict
             Dictionary containing mean and std of pairwise cosine similarities for different embeddings
         """
-        similarity_stats = {}
+        train_epoch_end_stats = {}
 
-        h_embeddings = self.embed(self.trainer.datamodule.infer_dataloader())
+        if self.log_similarity_stats:
+            h_encoder_list = []
+            h_attr_decoded_list = []
+        if self.log_pearson_correlation:
+            X = []
+            X_hat = []
+
+        # Iterate through inference dataloader
+        for batch in self.trainer.datamodule.infer_dataloader():
+            batch_size = batch.batch_size
+            h_encoder, \
+            h_attr_decoded, \
+            _ = self(
+                        batch.x.to(self.device),
+                        batch.edge_index.to(self.device)
+                    )
+
+            if self.log_similarity_stats:
+                h_encoder_list.append(h_encoder[:batch_size])
+                h_attr_decoded_list.append(h_attr_decoded[:batch_size])
+
+            if self.log_pearson_correlation:
+                X.append(batch.x[:batch_size])
+                X_hat.append(h_attr_decoded[:batch_size])
 
         # Compute statistics for all embeddings
-        similarity_stats.update(
-            metrics.get_similarity_stats(h_embeddings, 'h_embeddings')
-        )
+        if self.log_similarity_stats:
+            h_encoder = torch.cat(h_encoder_list, dim=0)
+            h_attr_decoded = torch.cat(h_attr_decoded_list, dim=0)
+            train_epoch_end_stats.update(
+                metrics.get_similarity_stats(h_encoder, 'h_encoder')
+            )
+            train_epoch_end_stats.update(
+                metrics.get_similarity_stats(h_attr_decoded, 'h_attr_decoded')
+            )
 
-        return similarity_stats
+        if self.log_pearson_correlation:
+            X = torch.cat(X, dim=0)
+            X_hat = torch.cat(X_hat, dim=0)
+            pearson_correlation = compute_pearson_correlation(
+                            X.cpu().numpy(),
+                            X_hat.cpu().numpy(),
+                            compare_genes=False,
+                            mean=True,
+                        )
+            train_epoch_end_stats['pearson_correlation'] = pearson_correlation
+
+        return train_epoch_end_stats
 
 
     @torch.no_grad()
@@ -284,15 +368,20 @@ class GraphSAGE(BaseModel):
         # execute the forward of the GraphSAGE model
 
         # This slicing is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the target nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of target nodes is equal to the batch size. The remaining entries of the forward output are the logits for the sampled neighbors of the target nodes.
+        _, \
+        h_attr_decoded, \
         unnormalized_logits_batch = self(
                                         train_batch.x,
                                         train_batch.edge_index,
-                                    )[:batch_size]
+                                    )
 
         # prepare dictionary of data required for computing loss
         train_loss_data = {
-                        'logits': unnormalized_logits_batch,
+                        'logits': unnormalized_logits_batch[:batch_size],
                         'labels': train_batch.y[:batch_size],
+                        'pred_attr': h_attr_decoded[:batch_size],
+                        'target_attr': train_batch.x[:batch_size],
+                        'dispersion': torch.exp(self.dispersion),
                         }
 
         # compute train loss
@@ -319,8 +408,8 @@ class GraphSAGE(BaseModel):
 
 
     def on_train_epoch_end(self) -> None:
-        similarity_stats = self.compute_train_epoch_stats()
-        for key, value in similarity_stats.items():
+        train_epoch_end_stats = self.compute_train_epoch_stats()
+        for key, value in train_epoch_end_stats.items():
             self.log(
                 name=key,
                 value=value,
@@ -353,18 +442,23 @@ class GraphSAGE(BaseModel):
 
         if self.inference_mode == 'batch-wise':
             # execute the forward of the GraphSAGE model
+            _, \
+            h_attr_decoded, \
             unnormalized_logits_batch = self(
                                             val_batch.x,
                                             val_batch.edge_index
-                                        )[:batch_size]
+                                        )
 
         elif self.inference_mode == 'layer-wise':
             unnormalized_logits_batch = self.val_logits[val_batch.n_id[:batch_size]]
 
         # prepare dictionary of data required for computing loss
         val_loss_data = {
-                        'logits': unnormalized_logits_batch,
+                        'logits': unnormalized_logits_batch[:batch_size],
                         'labels': val_batch.y[:batch_size],
+                        'pred_attr': h_attr_decoded[:batch_size],
+                        'target_attr': val_batch.x[:batch_size],
+                        'dispersion': torch.exp(self.dispersion),
                         }
 
         # compute validation loss
@@ -430,10 +524,12 @@ class GraphSAGE(BaseModel):
 
         if self.inference_mode == 'batch-wise':
             # execute the forward of the GraphSAGE model
+            _, \
+            _, \
             unnormalized_logits_batch = self(
                                             test_batch.x,
                                             test_batch.edge_index
-                                        )[:batch_size]
+                                        )
 
         elif self.inference_mode == 'layer-wise':
             unnormalized_logits_batch = self.test_logits[test_batch.n_id[:batch_size]]
