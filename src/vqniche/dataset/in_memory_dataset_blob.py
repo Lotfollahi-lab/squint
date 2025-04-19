@@ -1,12 +1,12 @@
 """
-Define `Data` to refer to a PyG Data object that is constructed from a single batch of AnnData where each batch is a collection of cells originating from the same sample. Each `Data` object will have one or more of each type of the following attribute:
+Define `Data` to refer to a PyG Data object that is constructed from a single batch of AnnData where each batch is a collection of cells originating from the same tissue section. Each `Data` object will have one or more of each type of the following attribute:
 - `x_<feature_name>`: Node features (e.g.,cell-gene counts or neighborhood-gene counts)
 - `y_<label_name>`: Node labels (e.g., cell types or niche types)
 - `edge_index_<edge_index_name>`: Edge index (e.g., spatial neighbors via Delaunay triangulation or radius-based neighbors or k-nearest neighbors)
 - `metadata_<metadata_name>`: Metadata (e.g., cell ids, batch ids, tissue, etc.)
 We construct these attributes from the AnnData object stored as an `.h5ad` file on disk.
 
-Next, define `Dataset` to refer to a PyG InMemoryDataset object comprising of collection of AnnData batches, i.e. `Data` objects. From an implementation perspective, we consider the Dataset to be a "blob" because we collate (combine) the individual Data objects (built previously from AnnData batches) into a single file called `dataset_blob.pt` before saving to disk.
+Next, define `Dataset` to refer to a PyG InMemoryDataset object comprising of collection of AnnData batches, i.e. `Data` objects. From an implementation perspective, we consider the Dataset to be a "blob" because we collate (combine) the individual Data objects (built previously from AnnData batches) into a single file called `dataset_blob.pt` before saving to disk. Currently, all Data objects in the Dataset have the same gene panel, meaning that the input feature dimensions are the same across all tissue sections.
 
 For example, consider creating a DatasetBlob for `xhs1000-39b_1p` (Xenium Human Skin | id = 1000 | 39 batches | 1 gene panel). When we first process this data, we create 39 Data objects, each an attributed graph representation of the corresponding batch of cells, and save them all into `dataset_blob.pt`. When we load the DatasetBlob, we load the `dataset_blob.pt` file and then access the individual Data objects as needed.
 
@@ -20,8 +20,8 @@ Usage:
 
 Tradeoffs:
 -------
-- One dataset_blob.pt across all batches of cells in the experiment folder vs one data.pt per batch of cells in the experiment folder.
-- One dataset_blob.pt is easier to manage and load than multiple data.pt files. During training, we can load the entire dataset in one go and use one or more batches per model as needed. This is useful because the subsequent subgraph sampling and batching can be done on the fly.
+- One dataset_blob.pt across all tissue sections in the experiment folder vs one data.pt per tissue section in the experiment folder.
+- One dataset_blob.pt is easier to manage and load than multiple data.pt files. During training, we can load the entire dataset in one go and use one or more tissue sections per model as needed. This is useful because the subsequent subgraph sampling and batching can be done on the fly.
 - For each epoch, we subset the dataset_blob by batch(es) and then sample subgraphs from the batch(es) for training. This is more time efficient than sampling subgraphs from each batch separately, but requires more memory.
 - Memory usage is a concern because the entire dataset is loaded into memory at once. This is not a problem for small datasets but can be a bottleneck for large datasets.
 - For larger datasets, we have two options:
@@ -33,11 +33,12 @@ import copy
 from pathlib import Path
 import concurrent.futures
 
-import numpy as np
 import scanpy as sc
 from typing import Optional, Callable, List, Tuple
 
+from torch import Tensor
 from torch_geometric.data import InMemoryDataset, Data
+from torch_geometric.utils import is_undirected
 from torch_geometric.utils.convert import from_scipy_sparse_matrix
 
 from ..preprocessors.graph_constructors import set_edge_index_name, spatial_neighbors
@@ -122,9 +123,12 @@ class InMemoryDatasetBlob(InMemoryDataset):
         Process the raw (silver) data and save it to the processed (gold) directory as a PyG InMemoryDataset. This method is called either when specifically `data.pt` is not found or when overwrite (force_reload) is set to True. Otherwise, `dataset_blob.pt` is loaded directly without calling this function.
         """
         # ----------------- First Pass over AnnData Batches -----------------
-        # This pass is used to collect the unique categories for each label name across all batches.
-        # NOTE: So far, this only does this for labels. This needs to be extended to features in the future when we have multiple gene panels across dataset-ids.
-        # QUESTION: Can we parallelize this across batches?
+        # This pass is used to collect gene panels and the unique categories for each label name across all batches.
+        # All batches must have the same gene panel. Multiple gene panels across tissue sections are not supported.
+
+        self.gene_panel = None
+
+        # Collect the unique categories for each label name across all batches.
         self.label_categories = {
             label_name: set()
             for label_name in self.label_names
@@ -132,8 +136,21 @@ class InMemoryDatasetBlob(InMemoryDataset):
 
         for adata_batch_file in self.raw_paths:
             adata_batch = sc.read(adata_batch_file)
+
+            if self.gene_panel is None:
+                # adata_batch.var is a pandas dataframe
+                # index is the gene name
+                # columns are the ensemble ids
+                self.gene_panel = adata_batch.var
+            else:
+                # check if the gene panel is the same across all batches
+                if not self.gene_panel.equals(adata_batch.var):
+                    raise ValueError("All batches must have the same gene panel")
+
             for label_name, label_key in zip(self.label_names, self.label_keys):
                 self.label_categories[label_name].update(adata_batch.obs[label_key].unique())
+
+        print("All batches have the same gene panel.")
 
         for label_name in self.label_names:
             # sorting the categories for consistency across batches so that the one-hot encoding is consistent. e.g. when the one-hot encoding is [0, 1, 0], the label name is the second name in the sorted list of that label.
@@ -150,7 +167,7 @@ class InMemoryDatasetBlob(InMemoryDataset):
         num_cores = int(os.environ.get("LSB_DJOB_NUMPROC", 1))
         num_files = len(self.raw_paths)
         max_workers = min(num_cores, num_files)
-        print(f"Number of Cores: {num_cores} | Number of Batches: {num_files}")
+        print(f"Number of Cores: {num_cores} | Number of Tissue Sections: {num_files}")
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             for adata_batch_file in self.raw_paths:
@@ -248,11 +265,15 @@ class InMemoryDatasetBlob(InMemoryDataset):
         batch_dict = {}
 
         # build for node features (sparse csr matrix to float tensor)
+        # NOTE: adata_batch.X is assumed to a the raw cell-gene counts matrix.
         assert len(self.feature_names) > 0, "At least one feature name must be provided"
         for feature_name in self.feature_names:
-            batch_dict[f'x_{feature_name}'] = sparse_mx_to_float_tensor(
-                                                    adata_batch.X
-                                                )
+            if feature_name == 'cell_gene_counts':
+                batch_dict[f'x_{feature_name}'] = sparse_mx_to_float_tensor(
+                                                        adata_batch.X
+                                                    )
+            else:
+                raise ValueError(f"Feature name {feature_name} not supported")
 
         # build for node labels (categorical pandas series to one hot tensor)
         for label_name, label_key in zip(self.label_names, self.label_keys):
@@ -261,19 +282,36 @@ class InMemoryDatasetBlob(InMemoryDataset):
                                                 categories=self.label_categories[label_name]
                                             )
 
-        # build for edge index (sparse csr matrix to edge index style tensor)
+        # build one edge index for each edge index name (as defined by above)
         assert len(self.edge_index_names) > 0, "At least one edge index name must be provided"
         for edge_index_name in self.edge_index_names:
+            # adata_batch.obsp[f"{edge_index_name}_connectivities"] is a symmetric matrix for an undirected, unweighted graph
+            # the second element of the tuple returned by from_scipy_sparse_matrix is the edge weights which we don't need
+            # undirected graphs are represented by including both i->j and j->i in the edge_index tensor
+            # Check if the connectivity matrix is symmetric
+            connectivity_matrix = adata_batch.obsp[f"{edge_index_name}_connectivities"]
+            count_nnz = (connectivity_matrix != connectivity_matrix.T).nnz
+            if count_nnz > 0:
+                print(f"{edge_index_name} is not symmetric. Making it symmetric...")
+                adata_batch.obsp[f"{edge_index_name}_connectivities"] = (
+                    adata_batch.obsp[f"{edge_index_name}_connectivities"].maximum(
+                        adata_batch.obsp[f"{edge_index_name}_connectivities"].T
+                    )
+                )
+
             batch_dict[f"edge_index_{edge_index_name}"] = from_scipy_sparse_matrix(
                                                         adata_batch.obsp[f"{edge_index_name}_connectivities"]
                                                         )[0]
+            # check if the edge index is undirected
+            if not is_undirected(batch_dict[f"edge_index_{edge_index_name}"]):
+                raise ValueError(f"Edge index {edge_index_name} is not undirected")
 
         for key, value in batch_dict.items():
             print(f"{key}: {value.shape=}, {value.dtype=}, {type(value)=}")
 
         # ----------------- Add Metadata -----------------
+        batch_dict['xy_coordinates'] = Tensor(adata_batch.obsm['spatial'])
         batch_dict['cell_id'] = adata_batch.obs['cell_id'].to_list()
-
         batch_dict['dataset_id'] = adata_batch.uns['dataset_id']
         batch_dict['tissue'] = adata_batch.uns['tissue']
         batch_dict['species'] = adata_batch.uns['species']
