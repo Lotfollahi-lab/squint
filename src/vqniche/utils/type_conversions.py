@@ -7,9 +7,8 @@ import anndata as ad
 from typing import List
 
 from torch_geometric.data import Batch
-from torch_geometric.utils import to_undirected, to_dense_adj
-
-from ..dataset.in_memory_dataset_blob import InMemoryDatasetBlob
+from torch_geometric.utils import to_dense_adj
+from torch_geometric.data import InMemoryDataset
 
 
 def sparse_mx_to_float_tensor(
@@ -145,7 +144,7 @@ def torch_one_hot_to_label_name(
 
 
 def data_batch_to_adata_list(
-        dataset_blob: InMemoryDatasetBlob,
+        dataset_blob: InMemoryDataset,
         data_batch: Batch
     ) -> List[ad.AnnData]:
     """
@@ -186,9 +185,9 @@ def data_batch_to_adata_list(
                                     )
         # ------------------------------------------------------------------------
         # Convert edge index to dense adjacency matrix
-        adj_matrix = to_dense_adj(data.edge_index)[0]
+        adj_matrix: torch.Tensor = to_dense_adj(data.edge_index)[0]
         # Convert to scipy sparse matrix
-        sparse_adj = sp.csr_matrix(adj_matrix.cpu().numpy())
+        sparse_adj: sp.csr_matrix = sp.csr_matrix(adj_matrix.cpu().numpy())
         # Add to adata.obsp
         adata.obsp['spatial_connectivities'] = sparse_adj
         # Add metadata

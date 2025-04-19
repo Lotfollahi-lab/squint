@@ -33,12 +33,12 @@ import copy
 from pathlib import Path
 import concurrent.futures
 
-import numpy as np
 import scanpy as sc
 from typing import Optional, Callable, List, Tuple
 
 from torch import Tensor
 from torch_geometric.data import InMemoryDataset, Data
+from torch_geometric.utils import is_undirected
 from torch_geometric.utils.convert import from_scipy_sparse_matrix
 
 from ..preprocessors.graph_constructors import set_edge_index_name, spatial_neighbors
@@ -150,6 +150,8 @@ class InMemoryDatasetBlob(InMemoryDataset):
             for label_name, label_key in zip(self.label_names, self.label_keys):
                 self.label_categories[label_name].update(adata_batch.obs[label_key].unique())
 
+        print("All batches have the same gene panel.")
+
         for label_name in self.label_names:
             # sorting the categories for consistency across batches so that the one-hot encoding is consistent. e.g. when the one-hot encoding is [0, 1, 0], the label name is the second name in the sorted list of that label.
             self.label_categories[label_name] = sorted(list(self.label_categories[label_name]))
@@ -165,7 +167,7 @@ class InMemoryDatasetBlob(InMemoryDataset):
         num_cores = int(os.environ.get("LSB_DJOB_NUMPROC", 1))
         num_files = len(self.raw_paths)
         max_workers = min(num_cores, num_files)
-        print(f"Number of Cores: {num_cores} | Number of Batches: {num_files}")
+        print(f"Number of Cores: {num_cores} | Number of Tissue Sections: {num_files}")
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             for adata_batch_file in self.raw_paths:
@@ -280,12 +282,29 @@ class InMemoryDatasetBlob(InMemoryDataset):
                                                 categories=self.label_categories[label_name]
                                             )
 
-        # build for edge index (sparse csr matrix to edge index style tensor)
+        # build one edge index for each edge index name (as defined by above)
         assert len(self.edge_index_names) > 0, "At least one edge index name must be provided"
         for edge_index_name in self.edge_index_names:
+            # adata_batch.obsp[f"{edge_index_name}_connectivities"] is a symmetric matrix for an undirected, unweighted graph
+            # the second element of the tuple returned by from_scipy_sparse_matrix is the edge weights which we don't need
+            # undirected graphs are represented by including both i->j and j->i in the edge_index tensor
+            # Check if the connectivity matrix is symmetric
+            connectivity_matrix = adata_batch.obsp[f"{edge_index_name}_connectivities"]
+            count_nnz = (connectivity_matrix != connectivity_matrix.T).nnz
+            if count_nnz > 0:
+                print(f"{edge_index_name} is not symmetric. Making it symmetric...")
+                adata_batch.obsp[f"{edge_index_name}_connectivities"] = (
+                    adata_batch.obsp[f"{edge_index_name}_connectivities"].maximum(
+                        adata_batch.obsp[f"{edge_index_name}_connectivities"].T
+                    )
+                )
+
             batch_dict[f"edge_index_{edge_index_name}"] = from_scipy_sparse_matrix(
                                                         adata_batch.obsp[f"{edge_index_name}_connectivities"]
                                                         )[0]
+            # check if the edge index is undirected
+            if not is_undirected(batch_dict[f"edge_index_{edge_index_name}"]):
+                raise ValueError(f"Edge index {edge_index_name} is not undirected")
 
         for key, value in batch_dict.items():
             print(f"{key}: {value.shape=}, {value.dtype=}, {type(value)=}")

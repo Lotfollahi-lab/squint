@@ -79,7 +79,8 @@ def spatial_neighbors(adata: ad.AnnData,
     - ad.AnnData:
         AnnData object with spatial connectivities available in `adata.obsp[f'{key_added}_connectivities']`.
     """
-
+    # we separate the construction of the spatial neighbors into two cases:
+    # 1. if delaunay is true, radius is used if provided. squidpy ignores n_neighs. so we leave it as default which is 6.
     if delaunay:
         sq.gr.spatial_neighbors(
             adata=adata,
@@ -90,6 +91,7 @@ def spatial_neighbors(adata: ad.AnnData,
             set_diag=include_self_loop,
             key_added=key_added,
         )
+    # 2. if delaunay is false, n_neighs is used if provided. graph is then pruned by radius if provided.
     else:
         sq.gr.spatial_neighbors(
             adata=adata,
