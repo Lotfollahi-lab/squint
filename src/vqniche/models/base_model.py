@@ -8,6 +8,7 @@ import torch_geometric
 import pytorch_lightning as pl
 
 from ..utils.loss import *
+from ..modules.linear_softmax_decoder import LinearSoftmax
 
 
 class BaseModel(pl.LightningModule):
@@ -274,6 +275,43 @@ class BaseModel(pl.LightningModule):
             del _loss_fn_data
 
         return total_loss
+
+
+    def _init_attribute_decoder(
+            self,
+            attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
+            in_channels: int = None,
+            out_channels: int = None
+        ) -> pl.LightningModule:
+        """
+        Initialize the attribute decoder module.
+
+        Parameters
+        ----------
+        - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
+            The name of the attribute decoder module.
+        - in_channels: int
+            The input dimension of the attribute decoder module. This is the same as the hidden dimension of the Graph Convolution module.
+        - out_channels: int
+            The output dimension of the attribute decoder module. This is the same as the number of genes.
+
+        Returns
+        -------
+        - attribute_decoder: pl.LightningModule
+            The attribute decoder module.
+        """
+        if attribute_decoder_name == 'Linear':
+            return LinearSoftmax(
+                name='Linear',
+                in_channels=in_channels,
+                out_channels=out_channels
+            )
+        elif attribute_decoder_name == 'LinearSoftmax':
+            return LinearSoftmax(
+                name='LinearSoftmax',
+                in_channels=in_channels,
+                out_channels=out_channels
+            )
 
 
     def log_metrics(
