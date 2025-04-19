@@ -47,7 +47,7 @@ class VQGraph_Encoder(pl.LightningModule):
         self.pre_vq_conv_module = self._init_graph_conv_module(
             in_channels=in_channels,
             hidden_channels=hidden_channels,
-            num_layers=num_layers - 1,
+            num_layers=num_layers,
             act_first=act_first,
             activation=activation,
             dropout=dropout,
@@ -247,7 +247,8 @@ class VQGraph_Encoder(pl.LightningModule):
 
         # decode the VQ-encoded node embeddings to recover the node attributes
         h_node = self.attribute_decoder(
-                    h_vq,
+                    x=h_vq,
+                    # x=h_pre_vq_conv,
                     read_depth=batch_x.sum(dim=-1)
                 )
 
