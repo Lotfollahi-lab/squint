@@ -124,7 +124,6 @@ class VQGraph(BaseModel):
                             in_channels=in_channels,
                             hidden_channels=hidden_channels,
                             graphconv_layer_name=graphconv_layer_name,
-                            attribute_decoder_name=attribute_decoder_name,
                             num_layers=num_layers,
                             act_first=act_first,
                             activation=activation,
@@ -133,6 +132,22 @@ class VQGraph(BaseModel):
                             init_method=init_method,
                             **codebook_params
                         )
+
+        # Initialize the attribute decoder.
+        print(f"Initializing the {attribute_decoder_name} attribute decoder module that takes as input latent node embeddings of dimension {hidden_channels} and outputs an estimate of {in_channels} original features.")
+        self.attribute_decoder = self._init_attribute_decoder(
+                                attribute_decoder_name=attribute_decoder_name,
+                                in_channels=hidden_channels,
+                                out_channels=in_channels
+                            )
+
+        # Initialize the decoder module for the adjacency matrix
+        # Currently, the decoder is hard-coded to be a simple linear layer.
+        print(f"Initializing the decoder module for the adjacency matrix with {hidden_channels} input dimension and {hidden_channels} output dimension.")
+        self.decoder_edge = nn.Linear(
+                                in_features=hidden_channels,
+                                out_features=hidden_channels
+                            )
 
         # Instead, we apply this final linear transformation in the predictor module manually to have access to the internal node embeddings via the `embed` function.
         self.predictor = nn.Linear(
@@ -181,12 +196,19 @@ class VQGraph(BaseModel):
         indices, \
         dist, \
         codebook_embeddings, \
-        h_node, \
-        h_edge, \
             = self.encoder(
                             batch_x,
                             batch_edge_index
                         )
+
+        h_node = self.attribute_decoder(
+                    x=h_vq,
+                    # x=h_pre_vq_conv,
+                    read_depth=batch_x.sum(dim=-1)
+                )
+
+        # decode the VQ-encoded edge embeddings to recover the adjacency matrix
+        h_edge = self.decoder_edge(h_vq)
 
         unnormalized_logits_batch = self.predictor(h_vq)
 

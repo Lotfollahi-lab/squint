@@ -17,7 +17,6 @@ class VQGraph_Encoder(pl.LightningModule):
         in_channels: int = None,
         hidden_channels: int = 256,
         graphconv_layer_name: str = 'SAGEConv',
-        attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
         num_layers: int = 2,
         act_first: bool = True,
         activation: Union[str, Callable, None] = "relu",
@@ -40,7 +39,6 @@ class VQGraph_Encoder(pl.LightningModule):
 
         # graph convolution
         self.graphconv_layer_name = graphconv_layer_name
-        self.attribute_decoder_name = attribute_decoder_name
 
         # initialize the pre-VQ Graph Convolution module
         print(f"Initializing the pre-VQ {self.graphconv_layer_name} module from {in_channels} to {hidden_channels} across {num_layers - 1} layer(s).")
@@ -71,22 +69,6 @@ class VQGraph_Encoder(pl.LightningModule):
             use_ddp=use_ddp, # False
             sample_codebook_temp=sample_codebook_temp, # 0.0
         )
-
-        # initialize the decoder module for the node attributes
-        # attribute reconstruction error is measured on the gene expression values and so the decoder output dimension is the same as the input dimension (i.e. number of genes)
-        print(f"Initializing the decoder module for the node attributes with {hidden_channels} input dimension and {in_channels} output dimension.")
-        self.attribute_decoder = self._init_attribute_decoder(
-                                attribute_decoder_name=attribute_decoder_name,
-                                in_channels=hidden_channels,
-                                out_channels=in_channels
-                            )
-
-        # initialize the decoder module for the adjacency matrix
-        print(f"Initializing the decoder module for the adjacency matrix with {hidden_channels} input dimension and {hidden_channels} output dimension.")
-        self.decoder_edge = nn.Linear(
-                                in_features=hidden_channels,
-                                out_features=hidden_channels
-                            )
 
 
     def _init_graph_conv_module(
@@ -146,42 +128,6 @@ class VQGraph_Encoder(pl.LightningModule):
             raise ValueError(f"Graph convolution layer {self.graphconv_layer_name} not supported.")
 
 
-    def _init_attribute_decoder(
-            self,
-            attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
-            in_channels: int = None,
-            out_channels: int = None
-        ) -> nn.Module:
-        """
-        Initialize the attribute decoder module.
-
-        Parameters
-        ----------
-        - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
-            The name of the attribute decoder module.
-        - in_channels: int
-            The input dimension of the attribute decoder module. This is the same as the hidden dimension of the Graph Convolution module.
-        - out_channels: int
-            The output dimension of the attribute decoder module. This is the same as the number of genes.
-
-        Returns
-        -------
-        - attribute_decoder: nn.Module
-            The attribute decoder module.
-        """
-        if attribute_decoder_name == 'Linear':
-            return LinearSoftmax(
-                name='Linear',
-                in_channels=in_channels,
-                out_channels=out_channels
-            )
-        elif attribute_decoder_name == 'LinearSoftmax':
-            return LinearSoftmax(
-                name='LinearSoftmax',
-                in_channels=in_channels,
-                out_channels=out_channels
-            )
-
     @property
     def codebook(self) -> torch.Tensor:
         """
@@ -223,10 +169,6 @@ class VQGraph_Encoder(pl.LightningModule):
             The distances between the node embeddings and the codebook embeddings.
         - codebook_embeddings: torch.Tensor
             The codebook embeddings.
-        - h_node: torch.Tensor
-            The decoded node attributes.
-        - h_edge: torch.Tensor
-            The decoded adjacency embeddings.
         """
         # pre-VQ Graph Convolution
         h_pre_vq_conv = self.pre_vq_conv_module(
@@ -245,20 +187,8 @@ class VQGraph_Encoder(pl.LightningModule):
         if self._codebook.sample_codebook_temp == 0.0:
             h_vq = h_pre_vq_conv + (h_vq - h_pre_vq_conv).detach()
 
-        # decode the VQ-encoded node embeddings to recover the node attributes
-        h_node = self.attribute_decoder(
-                    x=h_vq,
-                    # x=h_pre_vq_conv,
-                    read_depth=batch_x.sum(dim=-1)
-                )
-
-        # decode the VQ-encoded edge embeddings to recover the adjacency matrix
-        h_edge = self.decoder_edge(h_vq)
-
         return h_pre_vq_conv, \
             h_vq, \
             indices, \
             dist, \
-            codebook_embeddings, \
-            h_node, \
-            h_edge
+            codebook_embeddings
