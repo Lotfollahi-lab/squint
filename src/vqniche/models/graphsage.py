@@ -49,8 +49,9 @@ Predictor:
 - Linear transformation (P_4): hidden_channels -> out_channels
 
 What has changed is:
-- The forward of the encoder now returns the internal node embeddings which are first convolved by the SAGEConv Layer 2 and translated by the linear transformation P_3.
-- The forward of the predictor then applies the final linear transformation P_4 to the internal node embeddings to get the unnormalized logits of the model.
+- The forward of the encoder now returns the latent node embeddings which are first convolved by the SAGEConv Layer 2 and translated by the linear transformation P_3.
+- The attribute decoder takes the latent node embeddings as input and outputs an estimate of the original node attributes.
+- The forward of the predictor applies the final linear transformation P_4 to the latent node embeddings to get the unnormalized logits of the model.
 
 Because P_3 and P_4 are both learnable parameters of the model, they will be updated during training. In matrix form, P_3 * P_4 will have the same dimensions as P_1 which is the linear transformation in the last layer of the Pytorch Geometric's GraphSAGE model. Mathematically, this is the same as applying the linear transformation P_1 in the last layer of the Pytorch Geometric's GraphSAGE model. The only downside is that we need to maintain an extra matrix of trainable parameters which impacts the memory usage of the model.
 """
@@ -63,7 +64,6 @@ from ..modules.sage_conv import SAGEConv_Module as GraphSAGE_Encoder
 
 from .base_model import BaseModel
 from ..utils import metrics
-from ..modules.linear_softmax_decoder import LinearSoftmax
 
 
 class GraphSAGE(BaseModel):
@@ -103,15 +103,15 @@ class GraphSAGE(BaseModel):
             The name of the attribute decoder module.
         - predictor_name: str
             The name of the predictor module.
+        - log_similarity_stats: bool
+            Whether to log the similarity statistics.
+        - log_pearson_correlation: bool
+            Whether to log the Pearson correlation.
 
         - in_channels: int
             The number of input features.
         - out_channels: int
             The number of output features.
-        - log_similarity_stats: bool
-            Whether to log the similarity statistics.
-        - log_pearson_correlation: bool
-            Whether to log the Pearson correlation.
 
         - hidden_channels: int
             The number of hidden features.
@@ -147,6 +147,8 @@ class GraphSAGE(BaseModel):
             encoder_name=encoder_name,
             attribute_decoder_name=attribute_decoder_name,
             predictor_name=predictor_name,
+            log_similarity_stats=log_similarity_stats,
+            log_pearson_correlation=log_pearson_correlation,
             in_channels=in_channels,
             out_channels=out_channels,
             optimizer_name=optimizer_name,
@@ -156,8 +158,8 @@ class GraphSAGE(BaseModel):
             loss_kwargs=loss_kwargs,
         )
 
-        # Initialize GraphSAGE model from Pytorch Geometric as the encoder
-        # The out_channels parameter is not passed to the SAGE_Encoder (i.e. it is set to None) so that we can separate the encoder from the predictor.
+        # Initialize SAGEConv_Module as the encoder.
+        # The out_channels parameter is not passed to the SAGEConv_Module (i.e. it is set to None) so that we can separate the encoder from the predictor.
         self.encoder = GraphSAGE_Encoder(
                             in_channels=in_channels,
                             hidden_channels=hidden_channels,
@@ -169,21 +171,19 @@ class GraphSAGE(BaseModel):
                             init_method=init_method
                         )
 
+        # Initialize the attribute decoder.
         self.attribute_decoder = self._init_attribute_decoder(
             attribute_decoder_name=attribute_decoder_name,
             in_channels=hidden_channels,
-            out_channels=out_channels
+            out_channels=in_channels
         )
 
-        # Instead, we apply this final linear transformation in the predictor module manually to have access to the internal node embeddings via the `embed` function.
+        # Initialize the predictor.
+        # Currently, the predictor hardcoded to be a simple linear layer.
         self.predictor = nn.Linear(
                             in_features=hidden_channels,
                             out_features=out_channels
                         )
-
-        self.log_similarity_stats = log_similarity_stats
-        self.log_pearson_correlation = log_pearson_correlation
-
 
     def forward(
             self,
@@ -202,71 +202,67 @@ class GraphSAGE(BaseModel):
 
         Returns
         -------
-        - h_encoder: torch.Tensor
-            The internal node embeddings.
-        - h_attr_decoded: torch.Tensor
+        - h_latent: torch.Tensor
+            The latent node embeddings from the SAGEConv layers.
+        - xhat: torch.Tensor
             The decoded node attributes.
         - unnormalized_logits: torch.Tensor
             The unnormalized logits.
         """
         # forward pass through the graph encoder
-        h_encoder = self.encoder(
+        h_latent = self.encoder(
                         batch_x,
                         batch_edge_index
                     )
 
-        # decode the node embeddings to recover the node attributes
-        h_attr_decoded = self.attribute_decoder(
-                            x=h_encoder,
+        # decode the latent node embeddings to recover the node attributes
+        xhat = self.attribute_decoder(
+                            x=h_latent,
                             read_depth=batch_x.sum(dim=-1)
                         )
 
         # forward pass through the predictor
-        unnormalized_logits = self.predictor(h_encoder)
+        unnormalized_logits = self.predictor(h_latent)
 
-        return h_encoder, \
-                h_attr_decoded, \
+        return h_latent, \
+                xhat, \
                 unnormalized_logits
 
 
     def training_step(
             self,
             train_batch: torch_geometric.data.Data,
-            batch_idx: int,
         ) -> torch.Tensor:
         """
         Definition of a single training step of the GraphSAGE model on the current batch of nodes received from the training dataloader at the current training epoch.
 
         Parameters
         ----------
-        - batch: torch_geometric.data.Data
+        - train_batch: torch_geometric.data.Data
             The input train data (batch of nodes).
-        - batch_idx: int
-            The index of the current batch of data.
-
 
         Returns
         -------
         - train_loss: torch.Tensor
             The computed loss for this batch.
         """
-        batch_size = train_batch.batch_size
-
         # execute the forward of the GraphSAGE model
-
-        # This slicing is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the target nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of target nodes is equal to the batch size. The remaining entries of the forward output are the logits for the sampled neighbors of the target nodes.
         _, \
-        h_attr_decoded, \
+        xhat_batch, \
         unnormalized_logits_batch = self(
                                         train_batch.x,
                                         train_batch.edge_index,
                                     )
 
         # prepare dictionary of data required for computing loss
+        # Slicing via batch_size is necessary because the Loader places the target nodes, i.e. nodes in the current batch, at the start of the batch.
+        # IDs of the target nodes are accessible via train_batch.input_id or train_batch.n_id[:batch_size].
+        # train_batch.n_id contains the IDs of all the target nodes and their sampled neighbors.
+        batch_size = train_batch.batch_size
         train_loss_data = {
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': train_batch.y[:batch_size],
-                        'pred_attr': h_attr_decoded[:batch_size],
+                        'pred_attr': xhat_batch[:batch_size],
                         'target_attr': train_batch.x[:batch_size],
                         'dispersion': torch.exp(self.dispersion),
                         }
@@ -297,20 +293,20 @@ class GraphSAGE(BaseModel):
         - val_loss: torch.Tensor
             The computed loss for this batch.
         """
-        batch_size = val_batch.batch_size
-
+        # execute the forward of the GraphSAGE model
         _, \
-        h_attr_decoded, \
+        xhat_batch, \
         unnormalized_logits_batch = self(
                                         val_batch.x,
                                         val_batch.edge_index
                                     )
 
         # prepare dictionary of data required for computing loss
+        batch_size = val_batch.batch_size
         val_loss_data = {
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': val_batch.y[:batch_size],
-                        'pred_attr': h_attr_decoded[:batch_size],
+                        'pred_attr': xhat_batch[:batch_size],
                         'target_attr': val_batch.x[:batch_size],
                         'dispersion': torch.exp(self.dispersion),
                         }
@@ -341,8 +337,7 @@ class GraphSAGE(BaseModel):
         - test_loss: torch.Tensor
             The computed loss for this batch.
         """
-        batch_size = test_batch.batch_size
-
+        # execute the forward of the GraphSAGE model
         _, \
         _, \
         unnormalized_logits_batch = self(
@@ -351,6 +346,7 @@ class GraphSAGE(BaseModel):
                                     )
 
         # prepare dictionary of data required for computing accuracy
+        batch_size = test_batch.batch_size
         test_acc_data = {
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': test_batch.y[:batch_size],
@@ -366,62 +362,79 @@ class GraphSAGE(BaseModel):
 
 
     @torch.no_grad()
-    def compute_train_epoch_stats(self) -> Dict:
-        """
-        Compute pairwise similarity statistics for all embeddings.
+    def inference(self):
+        X = []
+        Y_cell_type = []
+        Y_niche_type = []
+        H_latent = []
+        X_hat = []
 
-        Returns
-        -------
-        - similarity_stats: dict
-            Dictionary containing mean and std of pairwise cosine similarities for different embeddings
-        """
-        train_epoch_end_stats = {}
-
-        if self.log_similarity_stats:
-            h_encoder_list = []
-            h_attr_decoded_list = []
-        if self.log_pearson_correlation:
-            X = []
-            X_hat = []
-
-        # Iterate through inference dataloader
         for batch in self.trainer.datamodule.infer_dataloader():
             batch_size = batch.batch_size
-            h_encoder, \
-            h_attr_decoded, \
+
+            X.append(batch.x[:batch_size])
+            Y_cell_type.append(batch.y[:batch_size])
+            Y_niche_type.append(batch.y_niche_types[:batch_size])
+
+            h_latent, \
+            xhat_batch, \
             _ = self(
                         batch.x.to(self.device),
                         batch.edge_index.to(self.device)
                     )
 
-            if self.log_similarity_stats:
-                h_encoder_list.append(h_encoder[:batch_size])
-                h_attr_decoded_list.append(h_attr_decoded[:batch_size])
+            H_latent.append(h_latent[:batch_size])
+            X_hat.append(xhat_batch[:batch_size])
 
-            if self.log_pearson_correlation:
-                X.append(batch.x[:batch_size])
-                X_hat.append(h_attr_decoded[:batch_size])
+        X = torch.cat(X, dim=0)
+        Y_cell_type = torch.cat(Y_cell_type, dim=0)
+        Y_niche_type = torch.cat(Y_niche_type, dim=0)
+        H_latent = torch.cat(H_latent, dim=0)
+        X_hat = torch.cat(X_hat, dim=0)
 
-        # Compute statistics for all embeddings
+        return X, \
+                Y_cell_type, \
+                Y_niche_type, \
+                H_latent, \
+                X_hat
+
+
+    @torch.no_grad()
+    def compute_train_epoch_stats(self) -> Dict:
+        """
+        If the log_similarity_stats flag is set to True, compute statistics for original and decoded node attributes, and latent node embeddings at the end of each training epoch.
+        If the log_pearson_correlation flag is set to True, compute the Pearson correlation between original and decoded attributes at the end of each training epoch.
+
+        Returns
+        -------
+        - train_epoch_end_stats: dict
+            Dictionary containing the computed statistics.
+        """
+        X, \
+        _, \
+        _, \
+        H_latent, \
+        X_hat = self.inference()
+
+        train_epoch_end_stats = {}
+
         if self.log_similarity_stats:
-            h_encoder = torch.cat(h_encoder_list, dim=0)
-            h_attr_decoded = torch.cat(h_attr_decoded_list, dim=0)
             train_epoch_end_stats.update(
-                metrics.get_similarity_stats(h_encoder, 'h_encoder')
+                metrics.cosine_similarity(X, 'X')
             )
             train_epoch_end_stats.update(
-                metrics.get_similarity_stats(h_attr_decoded, 'h_attr_decoded')
+                metrics.cosine_similarity(H_latent, 'H_latent')
+            )
+            train_epoch_end_stats.update(
+                metrics.cosine_similarity(X_hat, 'X_hat')
             )
 
         if self.log_pearson_correlation:
-            X = torch.cat(X, dim=0)
-            X_hat = torch.cat(X_hat, dim=0)
-            pearson_correlation = metrics.compute_pearson_correlation(
-                                        X.cpu().numpy(),
-                                        X_hat.cpu().numpy(),
-                                        compare_genes=False,
-                                        mean=True,
-                                    )
-            train_epoch_end_stats['pearson_correlation'] = pearson_correlation
+            train_epoch_end_stats['pearson_correlation'] = metrics.pearson_correlation(
+                                                            X.cpu().numpy(),
+                                                            X_hat.cpu().numpy(),
+                                                            compare_genes=False,
+                                                            mean=True,
+                                                        )
 
         return train_epoch_end_stats

@@ -12,7 +12,6 @@ import torch_geometric
 from .base_model import BaseModel
 from ..encoders.vqgraph_encoder import VQGraph_Encoder
 from ..utils import metrics
-from ..utils.metrics import compute_pearson_correlation
 
 
 class VQGraph(BaseModel):
@@ -22,11 +21,11 @@ class VQGraph(BaseModel):
             encoder_name: str = 'VQGraph_Encoder',
             attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
             predictor_name: str = 'Linear',
+            log_similarity_stats: bool = False,
+            log_pearson_correlation: bool = False,
+            log_codebook_utilization: bool = True,
             in_channels: int = None,
             out_channels: int = None,
-            log_similarity_stats: bool = False,
-            log_codebook_utilization: bool = True,
-            log_pearson_correlation: bool = False,
             graphconv_layer_name: str = 'SAGEConv',
             hidden_channels: int = 64,
             num_layers: int = 2,
@@ -55,19 +54,17 @@ class VQGraph(BaseModel):
             The name of the attribute decoder module.
         - predictor_name: str
             The name of the predictor module.
+        - log_similarity_stats: bool
+            Whether to log the pairwise similarity statistics for all embeddings.
+        - log_pearson_correlation: bool
+            Whether to log the Pearson correlation between original and reconstructed cell-gene matrices.
+        - log_codebook_utilization: bool
+            Whether to log the codebook utilization.
 
         - in_channels: int
             The number of input features.
         - out_channels: int
             The number of output features.
-        - apply_vq_on_latent_space: bool
-            Whether to apply vector quantization on the latent space or the input space.
-        - log_similarity_stats: bool
-            Whether to log the pairwise similarity statistics for all embeddings.
-        - log_codebook_utilization: bool
-            Whether to log the codebook utilization.
-        - log_pearson_correlation: bool
-            Whether to log the Pearson correlation between original and reconstructed cell-gene matrices.
 
         - graphconv_layer_name: str
             The name of the graph convolutional layer.
@@ -109,6 +106,9 @@ class VQGraph(BaseModel):
             encoder_name=encoder_name,
             attribute_decoder_name=attribute_decoder_name,
             predictor_name=predictor_name,
+            log_similarity_stats=log_similarity_stats,
+            log_codebook_utilization=log_codebook_utilization,
+            log_pearson_correlation=log_pearson_correlation,
             in_channels=in_channels,
             out_channels=out_channels,
             optimizer_name=optimizer_name,
@@ -139,10 +139,6 @@ class VQGraph(BaseModel):
                             in_features=hidden_channels,
                             out_features=out_channels
                         )
-
-        self.log_similarity_stats = log_similarity_stats
-        self.log_codebook_utilization = log_codebook_utilization
-        self.log_pearson_correlation = log_pearson_correlation
 
 
     def forward(
@@ -202,57 +198,6 @@ class VQGraph(BaseModel):
             h_node, \
             h_edge, \
             unnormalized_logits_batch
-
-
-    @torch.no_grad()
-    def inference(self):
-        X = []
-        H_pre_vq_conv = []
-        H_vq = []
-        Indices = []
-        X_hat = []
-        H_edge = []
-        Labels_cell_type = []
-        Labels_niche_type = []
-
-        for batch in self.trainer.datamodule.infer_dataloader():
-            batch_size = batch.batch_size
-            Labels_cell_type.append(batch.y[:batch_size])
-            Labels_niche_type.append(batch.y_niche_types[:batch_size])
-
-            h_pre_vq_conv, \
-            h_vq, \
-            indices, \
-            _, \
-            _, \
-            h_node, \
-            h_edge, \
-            _ = self(batch.x, batch.edge_index)
-
-            X.append(batch.x[:batch_size])
-            H_pre_vq_conv.append(h_pre_vq_conv[:batch_size])
-            H_vq.append(h_vq[:batch_size])
-            Indices.append(indices[:batch_size])
-            X_hat.append(h_node[:batch_size])
-            H_edge.append(h_edge[:batch_size])
-
-        X = torch.cat(X, dim=0)
-        H_pre_vq_conv = torch.cat(H_pre_vq_conv, dim=0)
-        H_vq = torch.cat(H_vq, dim=0)
-        Indices = torch.cat(Indices, dim=0)
-        X_hat = torch.cat(X_hat, dim=0)
-        H_edge = torch.cat(H_edge, dim=0)
-        Labels_cell_type = torch.cat(Labels_cell_type, dim=0)
-        Labels_niche_type = torch.cat(Labels_niche_type, dim=0)
-
-        return X, \
-            Labels_cell_type, \
-            Labels_niche_type, \
-            H_pre_vq_conv, \
-            H_vq, \
-            Indices, \
-            X_hat, \
-            H_edge
 
 
     def training_step(
@@ -425,82 +370,104 @@ class VQGraph(BaseModel):
 
 
     @torch.no_grad()
-    def compute_train_epoch_stats(self) -> List[int]:
-        """
-        Compute train epoch end statistics: pairwise similarity statistics for all embeddings, codebook utilization, Pearson correlation between original and reconstructed cell-gene matrices, and MMD for node degree distribution.
+    def inference(self):
+        X = []
+        Y_cell_type = []
+        Y_niche_type = []
+        H_pre_vq_conv = []
+        H_vq = []
+        Indices = []
+        X_hat = []
+        H_edge = []
 
-        Returns
-        -------
-        - train_epoch_end_stats: dict
-            Dictionary containing pairwise similarity statistics for all embeddings, codebook utilization, Pearson correlation between original and reconstructed cell-gene matrices, and MMD for node degree distribution.
-        """
-        train_epoch_end_stats = {}
-
-        if self.log_similarity_stats:
-            h_pre_vq_conv_list = []
-            logits_list = []
-        if self.log_codebook_utilization:
-            code_indices = []
-        if self.log_pearson_correlation:
-            X = []
-            X_hat = []
-
-        # Iterate through inference dataloader
         for batch in self.trainer.datamodule.infer_dataloader():
             batch_size = batch.batch_size
+
+            X.append(batch.x[:batch_size])
+            Y_cell_type.append(batch.y[:batch_size])
+            Y_niche_type.append(batch.y_niche_types[:batch_size])
+
             h_pre_vq_conv, \
-            _, \
+            h_vq, \
             indices, \
             _, \
             _, \
             h_node, \
             h_edge, \
-            logits \
-                = self(
-                    batch.x.to(self.device),
-                    batch.edge_index.to(self.device)
-                )
+            _ = self(batch.x, batch.edge_index)
 
-            if self.log_similarity_stats:
-                h_pre_vq_conv_list.append(h_pre_vq_conv[:batch_size])
-                logits_list.append(logits[:batch_size])
+            H_pre_vq_conv.append(h_pre_vq_conv[:batch_size])
+            H_vq.append(h_vq[:batch_size])
+            Indices.append(indices[:batch_size])
+            X_hat.append(h_node[:batch_size])
+            H_edge.append(h_edge[:batch_size])
 
-            if self.log_codebook_utilization:
-                code_indices.extend(indices[:batch_size].tolist())
+        X = torch.cat(X, dim=0)
+        Y_cell_type = torch.cat(Y_cell_type, dim=0)
+        Y_niche_type = torch.cat(Y_niche_type, dim=0)
+        H_pre_vq_conv = torch.cat(H_pre_vq_conv, dim=0)
+        H_vq = torch.cat(H_vq, dim=0)
+        Indices = torch.cat(Indices, dim=0)
+        X_hat = torch.cat(X_hat, dim=0)
+        H_edge = torch.cat(H_edge, dim=0)
 
-            if self.log_pearson_correlation:
-                X.append(batch.x[:batch_size])
-                X_hat.append(h_node[:batch_size])
+        return X, \
+            Y_cell_type, \
+            Y_niche_type, \
+            H_pre_vq_conv, \
+            H_vq, \
+            Indices, \
+            X_hat, \
+            H_edge
+
+
+    @torch.no_grad()
+    def compute_train_epoch_stats(self) -> List[int]:
+        """
+        If the log_similarity_stats flag is set to True, compute statistics for original and decoded node attributes, and latent and quantized node embeddings at the end of each training epoch.
+        If the log_pearson_correlation flag is set to True, compute the Pearson correlation between original and decoded attributes at the end of each training epoch.
+        If the log_codebook_utilization flag is set to True, compute the codebook utilization at the end of each training epoch.
+
+        Returns
+        -------
+        - train_epoch_end_stats: dict
+            Dictionary containing the computed statistics.
+        """
+        X, \
+        _, \
+        _, \
+        H_pre_vq_conv, \
+        H_vq, \
+        Indices, \
+        X_hat, \
+        H_edge = self.inference()
+
+        train_epoch_end_stats = {}
 
         # Concatenate all embeddings
         if self.log_similarity_stats:
-            h_pre_vq_conv = torch.cat(h_pre_vq_conv_list, dim=0)
-            logits = torch.cat(logits_list, dim=0)
-
-            # Compute statistics for all embeddings
             train_epoch_end_stats.update(
-                metrics.get_similarity_stats(h_pre_vq_conv, 'h_pre_vq_conv')
+                metrics.cosine_similarity(X, 'X')
             )
             train_epoch_end_stats.update(
-                metrics.get_similarity_stats(logits, 'logits')
+                metrics.cosine_similarity(H_pre_vq_conv, 'H_pre_vq_conv')
             )
             train_epoch_end_stats.update(
-                metrics.get_similarity_stats(self.encoder.codebook, 'codebook')
+                metrics.cosine_similarity(H_vq, 'H_vq')
             )
-
-        if self.log_codebook_utilization:
-            codebook_utilization = 1.0 * len(set(code_indices)) / self.encoder.codebook.shape[0]
-            train_epoch_end_stats['codebook_utilization'] = codebook_utilization
+            train_epoch_end_stats.update(
+                metrics.cosine_similarity(X_hat, 'X_hat')
+            )
 
         if self.log_pearson_correlation:
-            X = torch.cat(X, dim=0)
-            X_hat = torch.cat(X_hat, dim=0)
-            pearson_correlation = compute_pearson_correlation(
+            train_epoch_end_stats['pearson_correlation'] = metrics.pearson_correlation(
                             X.cpu().numpy(),
                             X_hat.cpu().numpy(),
                             compare_genes=False,
                             mean=True,
                         )
-            train_epoch_end_stats['pearson_correlation'] = pearson_correlation
+
+        if self.log_codebook_utilization:
+            train_epoch_end_stats['codebook_utilization'] = 1.0 * len(set(Indices.cpu().numpy())) / self.encoder.codebook.shape[0]
 
         return train_epoch_end_stats

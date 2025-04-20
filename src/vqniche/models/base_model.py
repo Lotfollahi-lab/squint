@@ -19,6 +19,9 @@ class BaseModel(pl.LightningModule):
             encoder_name: str = 'GraphSAGE',
             attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
             predictor_name: str = 'Linear',
+            log_similarity_stats: bool = False,
+            log_pearson_correlation: bool = False,
+            log_codebook_utilization: Optional[bool] = None,
             in_channels: int = None,
             out_channels: int = None,
             optimizer_name: str = 'adam',
@@ -40,6 +43,12 @@ class BaseModel(pl.LightningModule):
             The name of the attribute decoder module.
         - predictor_name: str
             The predictor name.
+        - log_similarity_stats: bool
+            Whether to log the similarity statistics.
+        - log_pearson_correlation: bool
+            Whether to log the Pearson correlation.
+        - log_codebook_utilization: bool
+            Whether to log the codebook utilization.
 
         - in_channels: int
             The number of input channels.
@@ -63,6 +72,10 @@ class BaseModel(pl.LightningModule):
         self.encoder_name = encoder_name
         self.attribute_decoder_name = attribute_decoder_name
         self.predictor_name = predictor_name
+        self.log_similarity_stats = log_similarity_stats
+        self.log_pearson_correlation = log_pearson_correlation
+        if log_codebook_utilization is not None:
+            self.log_codebook_utilization = log_codebook_utilization
 
         super().__init__()
 
