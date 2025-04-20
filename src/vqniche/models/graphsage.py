@@ -60,7 +60,7 @@ from typing import List, Union, Callable, Literal, Dict
 import torch
 import torch.nn as nn
 import torch_geometric
-from ..modules.sage_conv import SAGEConv_Module as GraphSAGE_Encoder
+from ..gnn_modules.sage_conv import SAGEConv_Module as GraphSAGE_Encoder
 
 from .base_model import BaseModel
 from ..utils import metrics

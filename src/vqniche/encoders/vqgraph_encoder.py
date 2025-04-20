@@ -6,7 +6,7 @@ import torch.nn as nn
 import pytorch_lightning as pl
 
 from vqniche.codebooks.cosine_codebook import CosineSimCodebook
-from ..modules.sage_conv import SAGEConv_Module
+from ..gnn_modules.sage_conv import SAGEConv_Module
 from ..modules.linear_softmax_decoder import LinearSoftmax
 
 
