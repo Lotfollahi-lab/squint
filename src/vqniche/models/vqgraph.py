@@ -252,88 +252,6 @@ class VQGraph(BaseModel):
             H_edge
 
 
-    @torch.no_grad()
-    def compute_train_epoch_stats(self) -> List[int]:
-        """
-        Compute train epoch end statistics: pairwise similarity statistics for all embeddings, codebook utilization, Pearson correlation between original and reconstructed cell-gene matrices, and MMD for node degree distribution.
-
-        Returns
-        -------
-        - train_epoch_end_stats: dict
-            Dictionary containing pairwise similarity statistics for all embeddings, codebook utilization, Pearson correlation between original and reconstructed cell-gene matrices, and MMD for node degree distribution.
-        """
-        train_epoch_end_stats = {}
-
-        if self.log_similarity_stats:
-            h_pre_vq_conv_list = []
-            logits_list = []
-        if self.log_codebook_utilization:
-            code_indices = []
-        if self.log_pearson_correlation:
-            X = []
-            X_hat = []
-
-        # Iterate through inference dataloader
-        for batch in self.trainer.datamodule.infer_dataloader():
-            batch_size = batch.batch_size
-            h_pre_vq_conv, \
-            _, \
-            indices, \
-            _, \
-            _, \
-            h_node, \
-            h_edge, \
-            logits \
-                = self(
-                    batch.x.to(self.device),
-                    batch.edge_index.to(self.device)
-                )
-
-            if self.log_similarity_stats:
-                h_pre_vq_conv_list.append(h_pre_vq_conv[:batch_size])
-                logits_list.append(logits[:batch_size])
-
-            if self.log_codebook_utilization:
-                code_indices.extend(indices[:batch_size].tolist())
-
-            if self.log_pearson_correlation:
-                X.append(batch.x[:batch_size])
-                X_hat.append(h_node[:batch_size])
-
-        # Concatenate all embeddings
-        if self.log_similarity_stats:
-            h_pre_vq_conv = torch.cat(h_pre_vq_conv_list, dim=0)
-            logits = torch.cat(logits_list, dim=0)
-
-            # Compute statistics for all embeddings
-            train_epoch_end_stats.update(
-                metrics.get_similarity_stats(h_pre_vq_conv, 'h_pre_vq_conv')
-            )
-            train_epoch_end_stats.update(
-                metrics.get_similarity_stats(logits, 'logits')
-            )
-            train_epoch_end_stats.update(
-                metrics.get_similarity_stats(self.encoder.codebook, 'codebook')
-            )
-
-        if self.log_codebook_utilization:
-            codebook_utilization = 1.0 * len(set(code_indices)) / self.encoder.codebook.shape[0]
-            train_epoch_end_stats['codebook_utilization'] = codebook_utilization
-
-        if self.log_pearson_correlation:
-            X = torch.cat(X, dim=0)
-            X_hat = torch.cat(X_hat, dim=0)
-            pearson_correlation = compute_pearson_correlation(
-                            X.cpu().numpy(),
-                            X_hat.cpu().numpy(),
-                            compare_genes=False,
-                            mean=True,
-                        )
-            train_epoch_end_stats['pearson_correlation'] = pearson_correlation
-
-        return train_epoch_end_stats
-
-
     def training_step(
             self,
             train_batch: torch_geometric.data.Data,
@@ -535,15 +453,83 @@ class VQGraph(BaseModel):
         return test_acc
 
 
-    def on_train_epoch_end(self) -> None:
-        train_epoch_end_stats = self.compute_train_epoch_stats()
-        for key, value in train_epoch_end_stats.items():
-            self.log(
-                name=key,
-                value=value,
-                prog_bar=False,
-                on_step=False,
-                on_epoch=True,
-                    sync_dist=True,
+    @torch.no_grad()
+    def compute_train_epoch_stats(self) -> List[int]:
+        """
+        Compute train epoch end statistics: pairwise similarity statistics for all embeddings, codebook utilization, Pearson correlation between original and reconstructed cell-gene matrices, and MMD for node degree distribution.
+
+        Returns
+        -------
+        - train_epoch_end_stats: dict
+            Dictionary containing pairwise similarity statistics for all embeddings, codebook utilization, Pearson correlation between original and reconstructed cell-gene matrices, and MMD for node degree distribution.
+        """
+        train_epoch_end_stats = {}
+
+        if self.log_similarity_stats:
+            h_pre_vq_conv_list = []
+            logits_list = []
+        if self.log_codebook_utilization:
+            code_indices = []
+        if self.log_pearson_correlation:
+            X = []
+            X_hat = []
+
+        # Iterate through inference dataloader
+        for batch in self.trainer.datamodule.infer_dataloader():
+            batch_size = batch.batch_size
+            h_pre_vq_conv, \
+            _, \
+            indices, \
+            _, \
+            _, \
+            h_node, \
+            h_edge, \
+            logits \
+                = self(
+                    batch.x.to(self.device),
+                    batch.edge_index.to(self.device)
                 )
-        return super().on_train_epoch_end()
+
+            if self.log_similarity_stats:
+                h_pre_vq_conv_list.append(h_pre_vq_conv[:batch_size])
+                logits_list.append(logits[:batch_size])
+
+            if self.log_codebook_utilization:
+                code_indices.extend(indices[:batch_size].tolist())
+
+            if self.log_pearson_correlation:
+                X.append(batch.x[:batch_size])
+                X_hat.append(h_node[:batch_size])
+
+        # Concatenate all embeddings
+        if self.log_similarity_stats:
+            h_pre_vq_conv = torch.cat(h_pre_vq_conv_list, dim=0)
+            logits = torch.cat(logits_list, dim=0)
+
+            # Compute statistics for all embeddings
+            train_epoch_end_stats.update(
+                metrics.get_similarity_stats(h_pre_vq_conv, 'h_pre_vq_conv')
+            )
+            train_epoch_end_stats.update(
+                metrics.get_similarity_stats(logits, 'logits')
+            )
+            train_epoch_end_stats.update(
+                metrics.get_similarity_stats(self.encoder.codebook, 'codebook')
+            )
+
+        if self.log_codebook_utilization:
+            codebook_utilization = 1.0 * len(set(code_indices)) / self.encoder.codebook.shape[0]
+            train_epoch_end_stats['codebook_utilization'] = codebook_utilization
+
+        if self.log_pearson_correlation:
+            X = torch.cat(X, dim=0)
+            X_hat = torch.cat(X_hat, dim=0)
+            pearson_correlation = compute_pearson_correlation(
+                            X.cpu().numpy(),
+                            X_hat.cpu().numpy(),
+                            compare_genes=False,
+                            mean=True,
+                        )
+            train_epoch_end_stats['pearson_correlation'] = pearson_correlation
+
+        return train_epoch_end_stats

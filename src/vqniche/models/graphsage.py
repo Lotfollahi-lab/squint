@@ -226,68 +226,6 @@ class GraphSAGE(BaseModel):
                 unnormalized_logits
 
 
-    @torch.no_grad()
-    def compute_train_epoch_stats(self) -> Dict:
-        """
-        Compute pairwise similarity statistics for all embeddings.
-
-        Returns
-        -------
-        - similarity_stats: dict
-            Dictionary containing mean and std of pairwise cosine similarities for different embeddings
-        """
-        train_epoch_end_stats = {}
-
-        if self.log_similarity_stats:
-            h_encoder_list = []
-            h_attr_decoded_list = []
-        if self.log_pearson_correlation:
-            X = []
-            X_hat = []
-
-        # Iterate through inference dataloader
-        for batch in self.trainer.datamodule.infer_dataloader():
-            batch_size = batch.batch_size
-            h_encoder, \
-            h_attr_decoded, \
-            _ = self(
-                        batch.x.to(self.device),
-                        batch.edge_index.to(self.device)
-                    )
-
-            if self.log_similarity_stats:
-                h_encoder_list.append(h_encoder[:batch_size])
-                h_attr_decoded_list.append(h_attr_decoded[:batch_size])
-
-            if self.log_pearson_correlation:
-                X.append(batch.x[:batch_size])
-                X_hat.append(h_attr_decoded[:batch_size])
-
-        # Compute statistics for all embeddings
-        if self.log_similarity_stats:
-            h_encoder = torch.cat(h_encoder_list, dim=0)
-            h_attr_decoded = torch.cat(h_attr_decoded_list, dim=0)
-            train_epoch_end_stats.update(
-                metrics.get_similarity_stats(h_encoder, 'h_encoder')
-            )
-            train_epoch_end_stats.update(
-                metrics.get_similarity_stats(h_attr_decoded, 'h_attr_decoded')
-            )
-
-        if self.log_pearson_correlation:
-            X = torch.cat(X, dim=0)
-            X_hat = torch.cat(X_hat, dim=0)
-            pearson_correlation = compute_pearson_correlation(
-                            X.cpu().numpy(),
-                            X_hat.cpu().numpy(),
-                            compare_genes=False,
-                            mean=True,
-                        )
-            train_epoch_end_stats['pearson_correlation'] = pearson_correlation
-
-        return train_epoch_end_stats
-
-
     def training_step(
             self,
             train_batch: torch_geometric.data.Data,
@@ -351,20 +289,6 @@ class GraphSAGE(BaseModel):
             )
 
         return train_loss
-
-
-    def on_train_epoch_end(self) -> None:
-        train_epoch_end_stats = self.compute_train_epoch_stats()
-        for key, value in train_epoch_end_stats.items():
-            self.log(
-                name=key,
-                value=value,
-                prog_bar=False,
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-            )
-        return super().on_train_epoch_end()
 
 
     def validation_step(
@@ -466,3 +390,65 @@ class GraphSAGE(BaseModel):
             )
 
         return test_acc
+
+
+    @torch.no_grad()
+    def compute_train_epoch_stats(self) -> Dict:
+        """
+        Compute pairwise similarity statistics for all embeddings.
+
+        Returns
+        -------
+        - similarity_stats: dict
+            Dictionary containing mean and std of pairwise cosine similarities for different embeddings
+        """
+        train_epoch_end_stats = {}
+
+        if self.log_similarity_stats:
+            h_encoder_list = []
+            h_attr_decoded_list = []
+        if self.log_pearson_correlation:
+            X = []
+            X_hat = []
+
+        # Iterate through inference dataloader
+        for batch in self.trainer.datamodule.infer_dataloader():
+            batch_size = batch.batch_size
+            h_encoder, \
+            h_attr_decoded, \
+            _ = self(
+                        batch.x.to(self.device),
+                        batch.edge_index.to(self.device)
+                    )
+
+            if self.log_similarity_stats:
+                h_encoder_list.append(h_encoder[:batch_size])
+                h_attr_decoded_list.append(h_attr_decoded[:batch_size])
+
+            if self.log_pearson_correlation:
+                X.append(batch.x[:batch_size])
+                X_hat.append(h_attr_decoded[:batch_size])
+
+        # Compute statistics for all embeddings
+        if self.log_similarity_stats:
+            h_encoder = torch.cat(h_encoder_list, dim=0)
+            h_attr_decoded = torch.cat(h_attr_decoded_list, dim=0)
+            train_epoch_end_stats.update(
+                metrics.get_similarity_stats(h_encoder, 'h_encoder')
+            )
+            train_epoch_end_stats.update(
+                metrics.get_similarity_stats(h_attr_decoded, 'h_attr_decoded')
+            )
+
+        if self.log_pearson_correlation:
+            X = torch.cat(X, dim=0)
+            X_hat = torch.cat(X_hat, dim=0)
+            pearson_correlation = compute_pearson_correlation(
+                            X.cpu().numpy(),
+                            X_hat.cpu().numpy(),
+                            compare_genes=False,
+                            mean=True,
+                        )
+            train_epoch_end_stats['pearson_correlation'] = pearson_correlation
+
+        return train_epoch_end_stats

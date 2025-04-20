@@ -422,6 +422,18 @@ class BaseModel(pl.LightningModule):
         raise NotImplementedError('Training step not implemented')
 
 
+    def compute_train_epoch_stats(self) -> dict:
+        """
+        Compute the training epoch end stats such as embedding similarity, pearson correlation, codebook utilization, etc.
+
+        Returns
+        -------
+        - dict
+            The training epoch end stats.
+        """
+        raise NotImplementedError('Training epoch end stats not implemented')
+
+
     def on_train_epoch_end(self) -> None:
         """
         Callback function to be executed at the end of each training epoch.
@@ -430,6 +442,18 @@ class BaseModel(pl.LightningModule):
         -----
         - We use this hook to log the train and validation loss terms and accuracies in the training loop.
         """
+        # compute the training epoch end stats such as embedding similarity, pearson correlation, codebook utilization, etc.
+        train_epoch_end_stats = self.compute_train_epoch_stats()
+        for key, value in train_epoch_end_stats.items():
+            self.log(
+                name=key,
+                value=value,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
         # log the metrics at the end of each epoch
         metric_names = ['epoch'] + list(self.trainer.callback_metrics.keys())
         metrics_values = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
