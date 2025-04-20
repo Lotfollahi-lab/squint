@@ -12,7 +12,8 @@ import torch_geometric
 from .base_model import BaseModel
 from ..encoders.vqgraph_encoder import VQGraph_Encoder
 from ..utils import metrics
-from ..utils.metrics import compute_pearson_correlation, compute_mmd
+from ..utils.metrics import compute_pearson_correlation
+
 
 class VQGraph(BaseModel):
     def __init__(
@@ -40,7 +41,6 @@ class VQGraph(BaseModel):
             weight_decay: float = 0.0,
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'none'},
-            inference_mode: Literal['batch-wise', 'layer-wise'] = 'batch-wise',
         ):
         """
         Initializes the VQGraph model.
@@ -100,9 +100,6 @@ class VQGraph(BaseModel):
             The loss function names.
         - loss_kwargs: dict
             Keyword arguments for the loss functions.
-
-        - inference_mode: str
-            The inference mode. Choose from 'batch-wise' or 'layer-wise'.
         """
         # Initialize the BaseModel class
         super().__init__(
@@ -116,7 +113,6 @@ class VQGraph(BaseModel):
             weight_decay=weight_decay,
             loss_names=loss_names,
             loss_kwargs=loss_kwargs,
-            inference_mode=inference_mode,
         )
 
         # Initialize VQGraph encoder module.
@@ -434,22 +430,18 @@ class VQGraph(BaseModel):
         """
         batch_size = val_batch.batch_size
 
-        if self.inference_mode == 'batch-wise':
-            h_pre_vq_conv, \
-            h_vq, \
-            indices, \
-            _, \
-            codebook_embeddings, \
-            h_node, \
-            h_edge, \
-            unnormalized_logits_batch \
-                = self(
-                        val_batch.x,
-                        val_batch.edge_index,
-                    )
-
-        elif self.inference_mode == 'layer-wise':
-            raise NotImplementedError("Layer-wise inference is not supported for validation step.")
+        h_pre_vq_conv, \
+        h_vq, \
+        indices, \
+        _, \
+        codebook_embeddings, \
+        h_node, \
+        h_edge, \
+        unnormalized_logits_batch \
+            = self(
+                    val_batch.x,
+                    val_batch.edge_index,
+                )
 
         # prepare dictionary of data required for computing loss
         val_loss_data = {
@@ -512,23 +504,19 @@ class VQGraph(BaseModel):
         """
         batch_size = test_batch.batch_size
 
-        if self.inference_mode == 'batch-wise':
-            # execute the forward of the GraphSAGE model
-            _, \
-            _, \
-            _, \
-            _, \
-            _, \
-            _, \
-            _, \
-            unnormalized_logits_batch \
-                = self(
-                        test_batch.x,
-                        test_batch.edge_index
-                    )
-
-        elif self.inference_mode == 'layer-wise':
-            raise NotImplementedError("Layer-wise inference is not supported for test step.")
+        # execute the forward of the GraphSAGE model
+        _, \
+        _, \
+        _, \
+        _, \
+        _, \
+        _, \
+        _, \
+        unnormalized_logits_batch \
+            = self(
+                    test_batch.x,
+                    test_batch.edge_index
+                )
 
         # compute test accuracy
         test_acc = metrics.accuracy_score(

@@ -178,7 +178,6 @@ def initialize_model(
     encoder_params = config['model']['encoder_params']
     optimizer_params = config['model']['optimizer_params']
     loss_params = config['model']['loss_params']
-    inference_params = config['model']['inference_params']
 
     # initialize model
     model = Model(
@@ -190,7 +189,6 @@ def initialize_model(
                 **encoder_params,
                 **optimizer_params,
                 **loss_params,
-                **inference_params,
             )
     return model
 

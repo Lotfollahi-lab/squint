@@ -24,7 +24,6 @@ class BaseModel(pl.LightningModule):
             weight_decay: float = 0.0,
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'mean'},
-            inference_mode: Literal['batch-wise', 'layer-wise'] = 'batch-wise',
         ) -> None:
         """
         Initialize the BaseModel class.
@@ -55,8 +54,6 @@ class BaseModel(pl.LightningModule):
         - loss_kwargs: dict
             The loss function keyword arguments.
 
-        - inference_mode: Literal['batch-wise', 'layer-wise']
-            The inference mode. Choose from 'batch-wise' or 'layer-wise'.
         """
         self.model_name = model_name
         self.encoder_name = encoder_name
@@ -78,17 +75,11 @@ class BaseModel(pl.LightningModule):
         self.dispersion = torch.nn.Parameter(torch.randn(self.in_channels))
         self.loss_fn_tuples = self.set_loss_fn_tuples(loss_names, loss_kwargs)
 
-        # Option 1 -- batch-wise (default)
+        # Inference mode: Batch-wise
         # for epoch in epochs:
         #    for batch in loader:
         #       for layer in model.layers:
         #         layer.forward(batch)
-        # Option 2 -- layer-wise
-        # for epoch in epochs:
-        #    for layer in model.layers:
-        #       for batch in loader:
-        #         layer.forward(batch)
-        self.inference_mode = inference_mode
 
         self.train_val_epoch_metrics = pd.DataFrame()
 

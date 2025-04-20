@@ -89,7 +89,6 @@ class GraphSAGE(BaseModel):
             weight_decay: float = 0.0,
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'none'},
-            inference_mode: Literal['batch-wise', 'layer-wise'] = 'layer-wise',
         ):
         """
         Initializes the GraphSAGE model.
@@ -139,9 +138,6 @@ class GraphSAGE(BaseModel):
             The loss function names.
         - loss_kwargs: dict
             Keyword arguments for the loss functions.
-
-        - inference_mode: str
-            The inference mode. Choose from 'batch-wise' or 'layer-wise'.
         """
         # Initialize the BaseModel class
         super().__init__(
@@ -155,7 +151,6 @@ class GraphSAGE(BaseModel):
             weight_decay=weight_decay,
             loss_names=loss_names,
             loss_kwargs=loss_kwargs,
-            inference_mode=inference_mode,
         )
 
         # Initialize GraphSAGE model from Pytorch Geometric as the encoder
@@ -201,17 +196,34 @@ class GraphSAGE(BaseModel):
             The input features.
         - batch_edge_index: torch.Tensor
             The edge index.
+
+        Returns
+        -------
+        - h_encoder: torch.Tensor
+            The internal node embeddings.
+        - h_attr_decoded: torch.Tensor
+            The decoded node attributes.
+        - unnormalized_logits: torch.Tensor
+            The unnormalized logits.
         """
-        h_encoder = self.encoder(batch_x, batch_edge_index)
+        # forward pass through the graph encoder
+        h_encoder = self.encoder(
+                        batch_x,
+                        batch_edge_index
+                    )
+
         # decode the node embeddings to recover the node attributes
         h_attr_decoded = self.attribute_decoder(
                             x=h_encoder,
                             read_depth=batch_x.sum(dim=-1)
                         )
 
+        # forward pass through the predictor
         unnormalized_logits = self.predictor(h_encoder)
 
-        return h_encoder, h_attr_decoded, unnormalized_logits
+        return h_encoder, \
+                h_attr_decoded, \
+                unnormalized_logits
 
 
     @torch.no_grad()
@@ -274,72 +286,6 @@ class GraphSAGE(BaseModel):
             train_epoch_end_stats['pearson_correlation'] = pearson_correlation
 
         return train_epoch_end_stats
-
-
-    @torch.no_grad()
-    def embed(
-            self,
-            subgraph_loader: torch_geometric.data.DataLoader
-        ) -> torch.Tensor:
-        """
-        Computes the internal node embeddings of the GraphSAGE model. These embeddings are of dimension hidden_channels. subgraph_loader is a torch_geometric.data.DataLoader object that may contain the entire graph or a subgraph induced by a batch of nodes.
-
-        Parameters
-        ----------
-        - subgraph_loader: torch_geometric.data.DataLoader
-            The graph data loader. This maybe the full graph or a batch of nodes.
-
-        Returns
-        -------
-        - node_embeddings: torch.Tensor
-            The internal node embeddings.
-
-        Notes
-        -----
-        The input to this method is named `graph_loader` and not `batch_loader` because it may be used to obtain an encoding for any subset of nodes.
-        """
-        node_embeddings = subgraph_loader.data.x.to(self.device)
-        for i in range(self.encoder.num_layers):
-            hs = []
-            for batch in subgraph_loader:
-                h = node_embeddings[batch.n_id].to(self.device)
-                h = self.encoder.inference_per_layer(
-                        i,
-                        h,
-                        batch.edge_index.to(self.device),
-                        batch.batch_size
-                    )
-                hs.append(h.to(self.device))
-
-            node_embeddings = torch.cat(hs, dim=0)
-        return node_embeddings
-
-
-    @torch.no_grad()
-    def inference(
-            self,
-            graph_loader: torch_geometric.data.DataLoader
-        ) -> torch.Tensor:
-        """
-        Computes the unnormalized logits of the GraphSAGE model. These logits are of dimension output_channels. This method is used for inference on the full graph.
-
-        Parameters
-        ----------
-        - graph_loader: torch_geometric.data.DataLoader
-            The graph data loader.
-
-        Returns
-        -------
-        - torch.Tensor
-            The unnormalized logits.
-        """
-        # Compute the internal node embeddings without gradients
-        node_embeddings = self.embed(graph_loader)
-
-        # forward pass through the predictor
-        unnormalized_logits = self.predictor(node_embeddings)
-
-        return unnormalized_logits
 
 
     def training_step(
@@ -440,17 +386,12 @@ class GraphSAGE(BaseModel):
         """
         batch_size = val_batch.batch_size
 
-        if self.inference_mode == 'batch-wise':
-            # execute the forward of the GraphSAGE model
-            _, \
-            h_attr_decoded, \
-            unnormalized_logits_batch = self(
-                                            val_batch.x,
-                                            val_batch.edge_index
-                                        )
-
-        elif self.inference_mode == 'layer-wise':
-            unnormalized_logits_batch = self.val_logits[val_batch.n_id[:batch_size]]
+        _, \
+        h_attr_decoded, \
+        unnormalized_logits_batch = self(
+                                        val_batch.x,
+                                        val_batch.edge_index
+                                    )
 
         # prepare dictionary of data required for computing loss
         val_loss_data = {
@@ -484,25 +425,6 @@ class GraphSAGE(BaseModel):
         return val_loss
 
 
-    def on_validation_epoch_start(self) -> None:
-        """
-        Callback function to be executed at the start of each validation epoch.
-
-        Notes:
-        ------
-        - We use this hook to obtain the unnormalized logits for the validation set if the inference mode is 'layer-wise'. Otherwise, we do nothing.
-        """
-        if self.inference_mode == 'batch-wise':
-            pass
-
-        elif self.inference_mode == 'layer-wise':
-            self.val_logits = self.inference(
-                                self.trainer.datamodule.infer_dataloader()
-                                )
-
-        return super().on_validation_epoch_start()
-
-
     def test_step(
             self,
             test_batch: torch_geometric.data.Data
@@ -522,17 +444,12 @@ class GraphSAGE(BaseModel):
         """
         batch_size = test_batch.batch_size
 
-        if self.inference_mode == 'batch-wise':
-            # execute the forward of the GraphSAGE model
-            _, \
-            _, \
-            unnormalized_logits_batch = self(
-                                            test_batch.x,
-                                            test_batch.edge_index
-                                        )
-
-        elif self.inference_mode == 'layer-wise':
-            unnormalized_logits_batch = self.test_logits[test_batch.n_id[:batch_size]]
+        _, \
+        _, \
+        unnormalized_logits_batch = self(
+                                        test_batch.x,
+                                        test_batch.edge_index
+                                    )
 
         # compute test accuracy
         test_acc = metrics.accuracy_score(
@@ -549,24 +466,3 @@ class GraphSAGE(BaseModel):
             )
 
         return test_acc
-
-
-    def on_test_epoch_start(self) -> None:
-        """
-        Callback function to be executed at the start of each test epoch.
-
-        Notes:
-        ------
-        - We use this hook to obtain the unnormalized logits for the test set if the inference mode is 'layer-wise'. Otherwise, we do nothing.
-        """
-        if self.inference_mode == 'batch-wise':
-            pass
-
-        elif self.inference_mode == 'layer-wise':
-            # infer_dataloader() batches the entire dataset so that the entire dataset is processed in one go
-            # in the test_step, only nodes in the test set are processed.
-            self.test_logits = self.inference(
-                                self.trainer.datamodule.infer_dataloader()
-                                )
-
-        return super().on_test_epoch_start()
