@@ -7,7 +7,7 @@ import pytorch_lightning as pl
 
 from vqniche.codebooks.cosine_codebook import CosineSimCodebook
 from ..gnn_modules.sage_conv import SAGEConv_Module
-from ..modules.linear_softmax_decoder import LinearSoftmax
+from ..attribute_decoders.linear_softmax import LinearSoftmax
 
 
 class VQGraph_Encoder(pl.LightningModule):

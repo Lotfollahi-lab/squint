@@ -9,7 +9,7 @@ import pytorch_lightning as pl
 
 from ..utils.loss import *
 from ..utils import metrics
-from ..modules.linear_softmax_decoder import LinearSoftmax
+from ..attribute_decoders.linear_softmax import LinearSoftmax
 
 
 class BaseModel(pl.LightningModule):
