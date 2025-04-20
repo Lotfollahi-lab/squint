@@ -71,6 +71,7 @@ class GraphSAGE(BaseModel):
             self,
             model_name: str = 'GraphSAGE',
             encoder_name: str = 'SAGE_Encoder',
+            attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
             predictor_name: str = 'Linear',
             in_channels: int = None,
             out_channels: int = None,
@@ -98,6 +99,8 @@ class GraphSAGE(BaseModel):
             The name of the model.
         - encoder_name: str
             The name of the encoder module.
+        - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
+            The name of the attribute decoder module.
         - predictor_name: str
             The name of the predictor module.
 
@@ -142,6 +145,7 @@ class GraphSAGE(BaseModel):
         super().__init__(
             model_name=model_name,
             encoder_name=encoder_name,
+            attribute_decoder_name=attribute_decoder_name,
             predictor_name=predictor_name,
             in_channels=in_channels,
             out_channels=out_channels,
@@ -165,11 +169,11 @@ class GraphSAGE(BaseModel):
                             init_method=init_method
                         )
 
-        self.attribute_decoder = LinearSoftmax(
-                name='LinearSoftmax',
-                in_channels=hidden_channels,
-                out_channels=in_channels
-            )
+        self.attribute_decoder = self._init_attribute_decoder(
+            attribute_decoder_name=attribute_decoder_name,
+            in_channels=hidden_channels,
+            out_channels=out_channels
+        )
 
         # Instead, we apply this final linear transformation in the predictor module manually to have access to the internal node embeddings via the `embed` function.
         self.predictor = nn.Linear(

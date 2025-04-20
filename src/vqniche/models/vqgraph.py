@@ -20,6 +20,7 @@ class VQGraph(BaseModel):
             self,
             model_name: str = 'VQGraph',
             encoder_name: str = 'VQGraph_Encoder',
+            attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
             predictor_name: str = 'Linear',
             in_channels: int = None,
             out_channels: int = None,
@@ -27,7 +28,6 @@ class VQGraph(BaseModel):
             log_codebook_utilization: bool = True,
             log_pearson_correlation: bool = False,
             graphconv_layer_name: str = 'SAGEConv',
-            attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
             hidden_channels: int = 64,
             num_layers: int = 2,
             act_first: bool = True,
@@ -51,6 +51,8 @@ class VQGraph(BaseModel):
             The name of the model.
         - encoder_name: str
             The name of the encoder module.
+        - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
+            The name of the attribute decoder module.
         - predictor_name: str
             The name of the predictor module.
 
@@ -105,6 +107,7 @@ class VQGraph(BaseModel):
         super().__init__(
             model_name=model_name,
             encoder_name=encoder_name,
+            attribute_decoder_name=attribute_decoder_name,
             predictor_name=predictor_name,
             in_channels=in_channels,
             out_channels=out_channels,

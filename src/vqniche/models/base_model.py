@@ -17,6 +17,7 @@ class BaseModel(pl.LightningModule):
             self,
             model_name: str = 'BaseModel',
             encoder_name: str = 'GraphSAGE',
+            attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
             predictor_name: str = 'Linear',
             in_channels: int = None,
             out_channels: int = None,
@@ -35,6 +36,8 @@ class BaseModel(pl.LightningModule):
             The name of the model.
         - encoder_name: str
             The encoder name.
+        - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
+            The name of the attribute decoder module.
         - predictor_name: str
             The predictor name.
 
@@ -58,6 +61,7 @@ class BaseModel(pl.LightningModule):
         """
         self.model_name = model_name
         self.encoder_name = encoder_name
+        self.attribute_decoder_name = attribute_decoder_name
         self.predictor_name = predictor_name
 
         super().__init__()
@@ -292,18 +296,14 @@ class BaseModel(pl.LightningModule):
         - attribute_decoder: pl.LightningModule
             The attribute decoder module.
         """
-        if attribute_decoder_name == 'Linear':
+        if attribute_decoder_name in ['Linear', 'LinearSoftmax']:
             return LinearSoftmax(
-                name='Linear',
+                name=attribute_decoder_name,
                 in_channels=in_channels,
                 out_channels=out_channels
             )
-        elif attribute_decoder_name == 'LinearSoftmax':
-            return LinearSoftmax(
-                name='LinearSoftmax',
-                in_channels=in_channels,
-                out_channels=out_channels
-            )
+        else:
+            raise NotImplementedError(f'Attribute decoder {attribute_decoder_name} not implemented')
 
 
     def configure_optimizers(self) -> torch.optim.Optimizer:

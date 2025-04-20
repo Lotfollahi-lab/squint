@@ -174,6 +174,7 @@ def initialize_model(
     # get model, optimizer, loss, and task parameters
     model_name = config['model']['model_name']
     encoder_name = config['model']['encoder_name']
+    attribute_decoder_name = config['model']['attribute_decoder_name']
     predictor_name = config['model']['predictor_name']
     encoder_params = config['model']['encoder_params']
     optimizer_params = config['model']['optimizer_params']
@@ -183,6 +184,7 @@ def initialize_model(
     model = Model(
                 model_name=model_name,
                 encoder_name=encoder_name,
+                attribute_decoder_name=attribute_decoder_name,
                 predictor_name=predictor_name,
                 in_channels=in_channels,
                 out_channels=out_channels,
