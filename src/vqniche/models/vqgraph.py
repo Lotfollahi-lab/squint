@@ -304,26 +304,11 @@ class VQGraph(BaseModel):
                         'batch_nid': train_batch.n_id,
                         }
 
-        # compute train loss
-        train_loss = self.criterion(
-                        loss_data=train_loss_data,
-                        curr_batch_size=batch_size,
-                        mode='train',
-                    )
-
-        # compute train accuracy
-        train_acc = metrics.accuracy_score(
-                        unnormalized_logits=unnormalized_logits_batch[:batch_size],
-                        one_hot_labels=train_batch.y[:batch_size],
-                    )
-
-        # log training loss and accuracy
-        self.log_metrics(
-                mode='train',
-                loss_value=train_loss,
-                acc_value=train_acc,
-                curr_batch_size=batch_size,
-            )
+        train_loss = self.common_step(
+            batch_loss_data=train_loss_data,
+            batch_size=batch_size,
+            mode='train',
+        )
 
         return train_loss
 
@@ -379,26 +364,11 @@ class VQGraph(BaseModel):
                         'batch_nid': val_batch.n_id,
                         }
 
-        # compute validation loss
-        val_loss = self.criterion(
-                        loss_data=val_loss_data,
-                        curr_batch_size=batch_size,
-                        mode='val',
-                    )
-
-        # compute validation accuracy
-        val_acc = metrics.accuracy_score(
-                        unnormalized_logits=unnormalized_logits_batch[:batch_size],
-                        one_hot_labels=val_batch.y[:batch_size],
-                    )
-
-        # log validation loss and accuracy
-        self.log_metrics(
-                mode='val',
-                loss_value=val_loss,
-                acc_value=val_acc,
-                curr_batch_size=batch_size,
-            )
+        val_loss = self.common_step(
+            batch_loss_data=val_loss_data,
+            batch_size=batch_size,
+            mode='val',
+        )
 
         return val_loss
 
@@ -436,19 +406,17 @@ class VQGraph(BaseModel):
                     test_batch.edge_index
                 )
 
-        # compute test accuracy
-        test_acc = metrics.accuracy_score(
-                        unnormalized_logits=unnormalized_logits_batch[:batch_size],
-                        one_hot_labels=test_batch.y[:batch_size],
-                    )
+        # prepare dictionary of data required for computing accuracy
+        test_acc_data = {
+                        'logits': unnormalized_logits_batch[:batch_size],
+                        'labels': test_batch.y[:batch_size],
+                        }
 
-        # log test accuracy
-        self.log_metrics(
-                mode='test',
-                loss_value=None,
-                acc_value=test_acc,
-                curr_batch_size=batch_size,
-            )
+        test_acc = self.common_step(
+            batch_loss_data=test_acc_data,
+            batch_size=batch_size,
+            mode='test',
+        )
 
         return test_acc
 

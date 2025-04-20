@@ -8,6 +8,7 @@ import torch_geometric
 import pytorch_lightning as pl
 
 from ..utils.loss import *
+from ..utils import metrics
 from ..modules.linear_softmax_decoder import LinearSoftmax
 
 
@@ -323,6 +324,56 @@ class BaseModel(pl.LightningModule):
             )
         else:
             raise NotImplementedError(f'Optimizer {self.optimizer_name} not implemented')
+
+
+    def common_step(
+        self,
+        batch_loss_data: dict,
+        batch_size: int,
+        mode: Literal['train', 'val', 'test'] = 'train',
+    ) -> torch.Tensor:
+        """
+        Compute the loss for a model for a given batch if mode is 'train' or 'val', but not if mode is 'test'.
+        Log the loss (if available) and accuracy for the current batch.
+
+        Parameters
+        ----------
+        - batch_loss_data: dict
+            The data required to compute the loss.
+        - batch_size: int
+            The size of the batch.
+        - mode: Literal['train', 'val', 'test']
+            The mode of the model (train, val, test).
+
+        Returns
+        -------
+        - torch.Tensor
+            The computed loss for the current batch if mode is 'train' or 'val'. The computed accuracy for the current batch if mode is 'test'.
+        """
+        if mode in ['train', 'val']:
+            loss_value = self.criterion(
+                loss_data=batch_loss_data,
+                curr_batch_size=batch_size,
+            )
+        elif mode == 'test':
+            loss_value = None
+
+        acc_value = metrics.accuracy_score(
+            unnormalized_logits=batch_loss_data['logits'],
+            one_hot_labels=batch_loss_data['labels'],
+        )
+
+        self.log_metrics(
+            loss_value=loss_value,
+            acc_value=acc_value,
+            curr_batch_size=batch_size,
+            mode=mode,
+        )
+
+        if mode in ['train', 'val']:
+            return loss_value
+        elif mode == 'test':
+            return acc_value
 
 
     def log_metrics(
