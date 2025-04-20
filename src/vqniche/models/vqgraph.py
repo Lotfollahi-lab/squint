@@ -394,7 +394,10 @@ class VQGraph(BaseModel):
             _, \
             h_node, \
             h_edge, \
-            _ = self(batch.x, batch.edge_index)
+            _ = self(
+                    batch.x.to(self.device),
+                    batch.edge_index.to(self.device)
+                )
 
             H_pre_vq_conv.append(h_pre_vq_conv[:batch_size])
             H_vq.append(h_vq[:batch_size])
