@@ -305,6 +305,26 @@ class BaseModel(pl.LightningModule):
             )
 
 
+    def configure_optimizers(self) -> torch.optim.Optimizer:
+        """
+        Configure the optimizer for the model.
+
+        Returns
+        -------
+        - torch.optim.Optimizer
+            The configured optimizer.
+        """
+        # TODO: Add support for multiple optimizers
+        if self.optimizer_name == 'adam':
+            return torch.optim.Adam(
+                params=self.parameters(),
+                lr=self.lr,
+                weight_decay=self.weight_decay
+            )
+        else:
+            raise NotImplementedError(f'Optimizer {self.optimizer_name} not implemented')
+
+
     def log_metrics(
             self,
             loss_value: torch.Tensor = None,
@@ -350,13 +370,60 @@ class BaseModel(pl.LightningModule):
         )
 
 
+    def on_train_epoch_end(self) -> None:
+        """
+        Callback function to be executed at the end of each training epoch.
+
+        Notes
+        -----
+        - We use this hook to log the train and validation loss terms and accuracies in the training loop.
+        """
+        # compute the training epoch end stats such as embedding similarity, pearson correlation, codebook utilization, etc.
+        train_epoch_end_stats = self.compute_train_epoch_stats()
+        for key, value in train_epoch_end_stats.items():
+            self.log(
+                name=key,
+                value=value,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
+        # log the metrics at the end of each epoch
+        metric_names = ['epoch'] + list(self.trainer.callback_metrics.keys())
+        metrics_values = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
+        print("--------------------------------")
+        for metric_name, metric_value in zip(metric_names, metrics_values):
+            print(f"{metric_name}: {metric_value}")
+        print("--------------------------------\n")
+
+        self.train_val_epoch_metrics = pd.concat(
+            [self.train_val_epoch_metrics, pd.DataFrame([metrics_values], columns=metric_names)],
+            ignore_index=True
+        )
+
+        return super().on_train_epoch_end()
+
+
+    def on_fit_end(self):
+        epoch_metrics_fname = Path(self.logger.experiment.dir) / 'train_val_epoch_metrics.csv'
+        self.train_val_epoch_metrics.to_csv(
+            path_or_buf=epoch_metrics_fname,
+            sep=',',
+            index=False
+        )
+
+        return super().on_fit_end()
+
+
     def forward(
             self,
             batch_x: torch.Tensor,
             batch_edge_index: torch.Tensor
         ) -> torch.Tensor:
         """
-        Forward pass of a standard GNN model. This is a composition of the forward pass of the encoder and the predictor. The batch of nodes may be the entire set of nodes in the graph or a subset of nodes.
+        Forward pass of the model. The batch of nodes may be the entire set of nodes in the graph or a subset of nodes.
 
         Parameters
         ----------
@@ -370,33 +437,7 @@ class BaseModel(pl.LightningModule):
         - unnormalized_logits: torch.Tensor
             The unnormalized logits of the model.
         """
-        # calls the forward method of the Model's encoder
-        batch_node_embeddings = self.encoder(batch_x, batch_edge_index)
-
-        # calls the forward method of the Model's predictor
-        unnormalized_logits = self.predictor(batch_node_embeddings)
-
-        return unnormalized_logits
-
-
-    def configure_optimizers(self) -> torch.optim.Optimizer:
-        """
-        Configure the optimizer for the model.
-
-        Returns
-        -------
-        - torch.optim.Optimizer
-            The configured optimizer.
-        """
-        # TODO: Add support for multiple optimizers
-        if self.optimizer_name == 'adam':
-            return torch.optim.Adam(
-                params=self.parameters(),
-                lr=self.lr,
-                weight_decay=self.weight_decay
-            )
-        else:
-            raise NotImplementedError(f'Optimizer {self.optimizer_name} not implemented')
+        raise NotImplementedError('Forward pass should be implemented by the subclass')
 
 
     def training_step(
@@ -434,42 +475,6 @@ class BaseModel(pl.LightningModule):
         raise NotImplementedError('Training epoch end stats not implemented')
 
 
-    def on_train_epoch_end(self) -> None:
-        """
-        Callback function to be executed at the end of each training epoch.
-
-        Notes
-        -----
-        - We use this hook to log the train and validation loss terms and accuracies in the training loop.
-        """
-        # compute the training epoch end stats such as embedding similarity, pearson correlation, codebook utilization, etc.
-        train_epoch_end_stats = self.compute_train_epoch_stats()
-        for key, value in train_epoch_end_stats.items():
-            self.log(
-                name=key,
-                value=value,
-                prog_bar=False,
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-            )
-
-        # log the metrics at the end of each epoch
-        metric_names = ['epoch'] + list(self.trainer.callback_metrics.keys())
-        metrics_values = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
-        print("--------------------------------")
-        for metric_name, metric_value in zip(metric_names, metrics_values):
-            print(f"{metric_name}: {metric_value}")
-        print("--------------------------------\n")
-
-        self.train_val_epoch_metrics = pd.concat(
-            [self.train_val_epoch_metrics, pd.DataFrame([metrics_values], columns=metric_names)],
-            ignore_index=True
-        )
-
-        return super().on_train_epoch_end()
-
-
     def validation_step(
             self,
             val_batch: torch_geometric.data.Data,
@@ -493,17 +498,6 @@ class BaseModel(pl.LightningModule):
         raise NotImplementedError('Validation step not implemented')
 
 
-    def on_validation_epoch_end(self) -> None:
-        """
-        Callback function to be executed at the end of each validation epoch.
-
-        Notes:
-        ------
-        - We use this hook to print the total validation loss at the end of each epoch to monitor the validation progress.
-        """
-        super().on_validation_epoch_end()
-
-
     def test_step(
             self,
             test_batch: torch_geometric.data.Data,
@@ -525,13 +519,3 @@ class BaseModel(pl.LightningModule):
             The computed test accuracy.
         """
         raise NotImplementedError('Test step not implemented')
-
-    def on_fit_end(self):
-        epoch_metrics_fname = Path(self.logger.experiment.dir) / 'train_val_epoch_metrics.csv'
-        self.train_val_epoch_metrics.to_csv(
-            path_or_buf=epoch_metrics_fname,
-            sep=',',
-            index=False
-        )
-
-        return super().on_fit_end()
