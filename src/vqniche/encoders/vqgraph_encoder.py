@@ -2,12 +2,10 @@ from typing import Callable, Union, Literal
 from einops import rearrange
 
 import torch
-import torch.nn as nn
 import pytorch_lightning as pl
 
 from vqniche.codebooks.cosine_codebook import CosineSimCodebook
 from ..gnn_modules.sage_conv import SAGEConv_Module
-from ..attribute_decoders.linear_softmax import LinearSoftmax
 
 
 class VQGraph_Encoder(pl.LightningModule):
@@ -16,7 +14,7 @@ class VQGraph_Encoder(pl.LightningModule):
         self,
         in_channels: int = None,
         hidden_channels: int = 256,
-        graphconv_layer_name: str = 'SAGEConv',
+        gnn_layer_name: str = 'SAGEConv',
         num_layers: int = 2,
         act_first: bool = True,
         activation: Union[str, Callable, None] = "relu",
@@ -37,12 +35,9 @@ class VQGraph_Encoder(pl.LightningModule):
     ):
         super().__init__()
 
-        # graph convolution
-        self.graphconv_layer_name = graphconv_layer_name
-
         # initialize the pre-VQ Graph Convolution module
-        print(f"Initializing the pre-VQ {self.graphconv_layer_name} module from {in_channels} to {hidden_channels} across {num_layers - 1} layer(s).")
-        self.pre_vq_conv_module = self._init_graph_conv_module(
+        self.gnn_module = self._init_gnn_module(
+            gnn_layer_name=gnn_layer_name,
             in_channels=in_channels,
             hidden_channels=hidden_channels,
             num_layers=num_layers,
@@ -71,8 +66,9 @@ class VQGraph_Encoder(pl.LightningModule):
         )
 
 
-    def _init_graph_conv_module(
+    def _init_gnn_module(
             self,
+            gnn_layer_name: str,
             in_channels: int,
             hidden_channels: int,
             num_layers: int,
@@ -81,22 +77,20 @@ class VQGraph_Encoder(pl.LightningModule):
             dropout: float,
             norm: Union[str, Callable, None],
             init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform'
-        ) -> SAGEConv_Module:
+        ) -> torch.nn.Module:
         """
-        Initialize the Graph Convolution module(s).
-
-        This function sets the hidden channels and the number of layers for the Graph Convolution module(s). Then it initializes and returns the graph convolution module. Currently, only GraphSAGE is supported.
-
-        If the vq_location is 'feature-space', the hidden channels are set to the in_channels and the number of layers is set to num_layers - 1. If the vq_location is 'latent-space', the hidden channels are set to the hidden_channels and the number of layers is set to num_layers.
+        Initialize the Graph Neural Network (GNN) module with `num_layers` layers transforming the input features of dimension `in_channels` to dimension `hidden_channels`.
 
         Parameters
         ----------
+        - gnn_layer_name: str
+            The name of the GNN layer to use.
         - in_channels: int
-            The input dimension of the Graph Convolution module.
+            The input dimension of the GNN module.
         - hidden_channels: int
-            The hidden dimension of the Graph Convolution module.
+            The hidden dimension of the GNN module.
         - num_layers: int
-            The number of layers in the pre-VQ Graph Convolution module.
+            The number of layers in the GNN module.
         - act_first: bool
             Whether to apply the activation function before the normalization layer.
         - activation: Union[str, Callable, None]
@@ -108,12 +102,12 @@ class VQGraph_Encoder(pl.LightningModule):
 
         Returns
         -------
-        - SAGE_Encoder: torch.nn.Module
-            The Graph Convolution module.
+        - torch.nn.Module
+            The GNN module.
         """
-        if self.graphconv_layer_name == 'SAGEConv':
-            print(f"Graph Convolution applied from {in_channels} to {hidden_channels} across {num_layers} layer(s).")
-            # initialize and return the graph convolution module
+        self.gnn_layer_name = gnn_layer_name
+        if self.gnn_layer_name == 'SAGEConv':
+            print(f"Initializing the GNN module with {num_layers} {gnn_layer_name} layer(s) to transform the input features of dimension {in_channels} to {hidden_channels} latent dimensions.")
             return SAGEConv_Module(
                             in_channels=in_channels,
                             hidden_channels=hidden_channels,
@@ -125,7 +119,7 @@ class VQGraph_Encoder(pl.LightningModule):
                             init_method=init_method
                         )
         else:
-            raise ValueError(f"Graph convolution layer {self.graphconv_layer_name} not supported.")
+            raise ValueError(f"GNN layer {self.gnn_layer_name} not supported.")
 
 
     @property
@@ -159,10 +153,10 @@ class VQGraph_Encoder(pl.LightningModule):
 
         Returns
         -------
-        - h_pre_vq_conv: torch.Tensor
-            Forward (output) of the pre-VQ Graph Convolution module.
+        - h_gnn: torch.Tensor
+            Forward (output) of the GNN module.
         - h_vq: torch.Tensor
-            VQ-encoded node embeddings.
+            Quantized node embeddings.
         - indices: torch.Tensor
             The indices of the node embeddings mapped to codebook embeddings.
         - dist: torch.Tensor
@@ -170,8 +164,8 @@ class VQGraph_Encoder(pl.LightningModule):
         - codebook_embeddings: torch.Tensor
             The codebook embeddings.
         """
-        # pre-VQ Graph Convolution
-        h_pre_vq_conv = self.pre_vq_conv_module(
+        # forward pass of the GNN module
+        h_gnn = self.gnn_module(
             batch_x,
             batch_edge_index
         )
@@ -181,13 +175,13 @@ class VQGraph_Encoder(pl.LightningModule):
         indices, \
         dist, \
         codebook_embeddings \
-            = self._codebook(h_pre_vq_conv)
+            = self._codebook(h_gnn)
 
         # if gumble sampling is used, straight-through estimator is turned off
         if self._codebook.sample_codebook_temp == 0.0:
-            h_vq = h_pre_vq_conv + (h_vq - h_pre_vq_conv).detach()
+            h_vq = h_gnn + (h_vq - h_gnn).detach()
 
-        return h_pre_vq_conv, \
+        return h_gnn, \
             h_vq, \
             indices, \
             dist, \

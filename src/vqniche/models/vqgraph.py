@@ -26,7 +26,7 @@ class VQGraph(BaseModel):
             log_codebook_utilization: bool = True,
             in_channels: int = None,
             out_channels: int = None,
-            graphconv_layer_name: str = 'SAGEConv',
+            gnn_layer_name: str = 'SAGEConv',
             hidden_channels: int = 64,
             num_layers: int = 2,
             act_first: bool = True,
@@ -66,8 +66,8 @@ class VQGraph(BaseModel):
         - out_channels: int
             The number of output features.
 
-        - graphconv_layer_name: str
-            The name of the graph convolutional layer.
+        - gnn_layer_name: str
+            The name of the GNN layer.
         - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
             The name of the attribute decoder module.
         - hidden_channels: int
@@ -123,7 +123,7 @@ class VQGraph(BaseModel):
         self.encoder = VQGraph_Encoder(
                             in_channels=in_channels,
                             hidden_channels=hidden_channels,
-                            graphconv_layer_name=graphconv_layer_name,
+                            gnn_layer_name=gnn_layer_name,
                             num_layers=num_layers,
                             act_first=act_first,
                             activation=activation,
@@ -191,7 +191,7 @@ class VQGraph(BaseModel):
             The unnormalized logits for the batch of nodes (output of the predictor module).
         """
         # execute the forward of the VQGraph_Encoder model
-        h_pre_vq_conv, \
+        h_gnn, \
         h_vq, \
         indices, \
         dist, \
@@ -203,7 +203,6 @@ class VQGraph(BaseModel):
 
         h_node = self.attribute_decoder(
                     x=h_vq,
-                    # x=h_pre_vq_conv,
                     read_depth=batch_x.sum(dim=-1)
                 )
 
@@ -212,7 +211,7 @@ class VQGraph(BaseModel):
 
         unnormalized_logits_batch = self.predictor(h_vq)
 
-        return h_pre_vq_conv, \
+        return h_gnn, \
             h_vq, \
             indices, \
             dist, \
@@ -242,7 +241,7 @@ class VQGraph(BaseModel):
         batch_size = train_batch.batch_size
 
         # execute the forward of the VQGraph model
-        h_pre_vq_conv, \
+        h_gnn, \
         h_vq, \
         indices, \
         _, \
@@ -265,9 +264,9 @@ class VQGraph(BaseModel):
                         'dispersion': torch.exp(self.dispersion),
                         'pred_adj': h_edge[:batch_size],
                         'batch_edge_index': train_batch.edge_index,
-                        'quantizer_input': h_pre_vq_conv[:batch_size],
+                        'quantizer_input': h_gnn[:batch_size],
                         'quantized_output': h_vq[:batch_size],
-                        'node_embeddings': h_pre_vq_conv[:batch_size],
+                        'node_embeddings': h_gnn[:batch_size],
                         'codebook_embeddings': codebook_embeddings[0],
                         'code_indices': indices[:batch_size],
                         'batch_input_id': train_batch.input_id,
@@ -286,7 +285,6 @@ class VQGraph(BaseModel):
     def validation_step(
             self,
             val_batch: torch_geometric.data.Data,
-            batch_idx: int
         ) -> torch.Tensor:
         """
         Definition of a single validation step of the GraphSAGE model on the current batch of nodes received from the validation dataloader at the current training epoch.
@@ -303,7 +301,7 @@ class VQGraph(BaseModel):
         """
         batch_size = val_batch.batch_size
 
-        h_pre_vq_conv, \
+        h_gnn, \
         h_vq, \
         indices, \
         _, \
@@ -325,9 +323,9 @@ class VQGraph(BaseModel):
                         'pred_adj': h_edge[:batch_size],
                         'dispersion': torch.exp(self.dispersion),
                         'batch_edge_index': val_batch.edge_index,
-                        'quantizer_input': h_pre_vq_conv[:batch_size],
+                        'quantizer_input': h_gnn[:batch_size],
                         'quantized_output': h_vq[:batch_size],
-                        'node_embeddings': h_pre_vq_conv[:batch_size],
+                        'node_embeddings': h_gnn[:batch_size],
                         'codebook_embeddings': codebook_embeddings[0],
                         'code_indices': indices[:batch_size],
                         'batch_input_id': val_batch.input_id,
@@ -396,7 +394,7 @@ class VQGraph(BaseModel):
         X = []
         Y_cell_type = []
         Y_niche_type = []
-        H_pre_vq_conv = []
+        H_gnn = []
         H_vq = []
         Indices = []
         X_hat = []
@@ -409,7 +407,7 @@ class VQGraph(BaseModel):
             Y_cell_type.append(batch.y[:batch_size])
             Y_niche_type.append(batch.y_niche_types[:batch_size])
 
-            h_pre_vq_conv, \
+            h_gnn, \
             h_vq, \
             indices, \
             _, \
@@ -421,7 +419,7 @@ class VQGraph(BaseModel):
                     batch.edge_index.to(self.device)
                 )
 
-            H_pre_vq_conv.append(h_pre_vq_conv[:batch_size])
+            H_gnn.append(h_gnn[:batch_size])
             H_vq.append(h_vq[:batch_size])
             Indices.append(indices[:batch_size])
             X_hat.append(h_node[:batch_size])
@@ -430,7 +428,7 @@ class VQGraph(BaseModel):
         X = torch.cat(X, dim=0)
         Y_cell_type = torch.cat(Y_cell_type, dim=0)
         Y_niche_type = torch.cat(Y_niche_type, dim=0)
-        H_pre_vq_conv = torch.cat(H_pre_vq_conv, dim=0)
+        H_gnn = torch.cat(H_gnn, dim=0)
         H_vq = torch.cat(H_vq, dim=0)
         Indices = torch.cat(Indices, dim=0)
         X_hat = torch.cat(X_hat, dim=0)
@@ -439,7 +437,7 @@ class VQGraph(BaseModel):
         return X, \
             Y_cell_type, \
             Y_niche_type, \
-            H_pre_vq_conv, \
+            H_gnn, \
             H_vq, \
             Indices, \
             X_hat, \
@@ -461,7 +459,7 @@ class VQGraph(BaseModel):
         X, \
         _, \
         _, \
-        H_pre_vq_conv, \
+        H_gnn, \
         H_vq, \
         Indices, \
         X_hat, \
@@ -475,7 +473,7 @@ class VQGraph(BaseModel):
                 metrics.cosine_similarity(X, 'X')
             )
             train_epoch_end_stats.update(
-                metrics.cosine_similarity(H_pre_vq_conv, 'H_pre_vq_conv')
+                metrics.cosine_similarity(H_gnn, 'H_gnn')
             )
             train_epoch_end_stats.update(
                 metrics.cosine_similarity(H_vq, 'H_vq')
