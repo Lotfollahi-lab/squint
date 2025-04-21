@@ -77,8 +77,9 @@ class GraphSAGE(BaseModel):
             out_channels: int = None,
             log_similarity_stats: bool = False,
             log_pearson_correlation: bool = False,
-            hidden_channels: int = 256,
-            num_layers: int = 2,
+            num_linear_layers: int = 1,
+            hidden_channels: List[int] | int = 500,
+            num_gnn_layers: int = 2,
             act_first: bool = True,
             activation: Union[str, Callable, None] = "relu",
             norm: Union[str, Callable, None] = None,
@@ -113,9 +114,11 @@ class GraphSAGE(BaseModel):
         - out_channels: int
             The number of output features.
 
-        - hidden_channels: int
+        - num_linear_layers: int
+            The number of linear layers to use before the GraphSAGE encoder layers.
+        - hidden_channels: List[int] | int
             The number of hidden features.
-        - num_layers: int
+        - num_gnn_layers: int
             The number of GraphSAGE encoder layers.
         - act_first: bool
             Whether to apply the activation function before normalization.
@@ -161,9 +164,10 @@ class GraphSAGE(BaseModel):
         # Initialize SAGEConv_Module as the encoder.
         # The out_channels parameter is not passed to the SAGEConv_Module (i.e. it is set to None) so that we can separate the encoder from the predictor.
         self.encoder = GraphSAGE_Encoder(
+                            num_linear_layers=num_linear_layers,
                             in_channels=in_channels,
                             hidden_channels=hidden_channels,
-                            num_layers=num_layers,
+                            num_gnn_layers=num_gnn_layers,
                             act_first=act_first,
                             activation=activation,
                             norm=norm,
@@ -174,14 +178,14 @@ class GraphSAGE(BaseModel):
         # Initialize the attribute decoder.
         self.attribute_decoder = self._init_attribute_decoder(
             attribute_decoder_name=attribute_decoder_name,
-            in_channels=hidden_channels,
+            in_channels=self.encoder.hidden_channels,
             out_channels=in_channels
         )
 
         # Initialize the predictor.
         # Currently, the predictor hardcoded to be a simple linear layer.
         self.predictor = nn.Linear(
-                            in_features=hidden_channels,
+                            in_features=self.encoder.hidden_channels,
                             out_features=out_channels
                         )
 
@@ -202,7 +206,7 @@ class GraphSAGE(BaseModel):
 
         Returns
         -------
-        - h_latent: torch.Tensor
+        - h_gnn: torch.Tensor
             The latent node embeddings from the SAGEConv layers.
         - xhat: torch.Tensor
             The decoded node attributes.
@@ -210,21 +214,21 @@ class GraphSAGE(BaseModel):
             The unnormalized logits.
         """
         # forward pass through the graph encoder
-        h_latent = self.encoder(
+        h_gnn = self.encoder(
                         batch_x,
                         batch_edge_index
                     )
 
         # decode the latent node embeddings to recover the node attributes
         xhat = self.attribute_decoder(
-                            x=h_latent,
+                            x=h_gnn,
                             read_depth=batch_x.sum(dim=-1)
                         )
 
         # forward pass through the predictor
-        unnormalized_logits = self.predictor(h_latent)
+        unnormalized_logits = self.predictor(h_gnn)
 
-        return h_latent, \
+        return h_gnn, \
                 xhat, \
                 unnormalized_logits
 
@@ -366,7 +370,7 @@ class GraphSAGE(BaseModel):
         X = []
         Y_cell_type = []
         Y_niche_type = []
-        H_latent = []
+        H_gnn = []
         X_hat = []
 
         for batch in self.trainer.datamodule.infer_dataloader():
@@ -376,26 +380,26 @@ class GraphSAGE(BaseModel):
             Y_cell_type.append(batch.y[:batch_size])
             Y_niche_type.append(batch.y_niche_types[:batch_size])
 
-            h_latent, \
+            h_gnn, \
             xhat_batch, \
             _ = self(
                         batch.x.to(self.device),
                         batch.edge_index.to(self.device)
                     )
 
-            H_latent.append(h_latent[:batch_size])
+            H_gnn.append(h_gnn[:batch_size])
             X_hat.append(xhat_batch[:batch_size])
 
         X = torch.cat(X, dim=0)
         Y_cell_type = torch.cat(Y_cell_type, dim=0)
         Y_niche_type = torch.cat(Y_niche_type, dim=0)
-        H_latent = torch.cat(H_latent, dim=0)
+        H_gnn = torch.cat(H_gnn, dim=0)
         X_hat = torch.cat(X_hat, dim=0)
 
         return X, \
                 Y_cell_type, \
                 Y_niche_type, \
-                H_latent, \
+                H_gnn, \
                 X_hat
 
 
@@ -413,7 +417,7 @@ class GraphSAGE(BaseModel):
         X, \
         _, \
         _, \
-        H_latent, \
+        H_gnn, \
         X_hat = self.inference()
 
         train_epoch_end_stats = {}
@@ -423,7 +427,7 @@ class GraphSAGE(BaseModel):
                 metrics.cosine_similarity(X, 'X')
             )
             train_epoch_end_stats.update(
-                metrics.cosine_similarity(H_latent, 'H_latent')
+                metrics.cosine_similarity(H_gnn, 'H_gnn')
             )
             train_epoch_end_stats.update(
                 metrics.cosine_similarity(X_hat, 'X_hat')

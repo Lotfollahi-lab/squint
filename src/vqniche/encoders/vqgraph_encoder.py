@@ -1,4 +1,4 @@
-from typing import Callable, Union, Literal
+from typing import Callable, Union, Literal, List
 from einops import rearrange
 
 import torch
@@ -11,36 +11,86 @@ from ..gnn_modules.sage_conv import SAGEConv_Module
 class VQGraph_Encoder(pl.LightningModule):
 
     def __init__(
-        self,
-        in_channels: int = None,
-        hidden_channels: int = 256,
-        gnn_layer_name: str = 'SAGEConv',
-        num_layers: int = 2,
-        act_first: bool = True,
-        activation: Union[str, Callable, None] = "relu",
-        dropout: float = 0.5,
-        norm: Union[str, Callable, None] = None,
-        init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform',
-        learnable_codebook: bool = True,
-        num_codebooks: int = 1,
-        codebook_size: int = 256,
-        decay: float = 0.8,
-        eps: float = 1e-5,
-        kmeans_init: bool = False,
-        kmeans_iters: int = 10,
-        sync_kmeans: bool = True,
-        threshold_ema_dead_code: int = 0,
-        use_ddp: bool = False,
-        sample_codebook_temp: float = 0.0,
-    ):
+            self,
+            num_linear_layers: int = 1,
+            gnn_layer_name: str = 'SAGEConv',
+            in_channels: int = None,
+            hidden_channels: List[int] | int = 500,
+            num_gnn_layers: int = 2,
+            act_first: bool = True,
+            activation: Union[str, Callable, None] = "relu",
+            dropout: float = 0.5,
+            norm: Union[str, Callable, None] = None,
+            init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform',
+            learnable_codebook: bool = True,
+            num_codebooks: int = 1,
+            codebook_size: int = 256,
+            decay: float = 0.8,
+            eps: float = 1e-5,
+            kmeans_init: bool = False,
+            kmeans_iters: int = 10,
+            sync_kmeans: bool = True,
+            threshold_ema_dead_code: int = 0,
+            use_ddp: bool = False,
+            sample_codebook_temp: float = 0.0,
+        ):
+        """
+        Initialize the VQGraph_Encoder model.
+
+        Parameters
+        ----------
+        - num_linear_layers: int
+            The number of linear layers to use before the GNN module.
+        - gnn_layer_name: str
+            The name of the GNN layer to use.
+        - in_channels: int
+            The input dimension of the GNN module.
+        - hidden_channels: List[int] | int
+            The hidden dimension of the GNN module.
+        - num_gnn_layers: int
+            The number of layers in the GNN module.
+        - act_first: bool
+            Whether to apply the activation function before the normalization layer.
+        - activation: Union[str, Callable, None]
+            The activation function to apply.
+        - dropout: float
+            The dropout rate.
+        - norm: Union[str, Callable, None]
+            The normalization layer to apply.
+        - init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None]
+            The initialization method to use.
+        - learnable_codebook: bool
+            Whether to learn the codebook.
+        - num_codebooks: int
+            The number of codebooks to use.
+        - codebook_size: int
+            The size of the codebook.
+        - decay: float
+            The decay rate for the codebook.
+        - eps: float
+            The epsilon value for the codebook.
+        - kmeans_init: bool
+            Whether to use kmeans initialization for the codebook.
+        - kmeans_iters: int
+            The number of kmeans iterations to use.
+        - sync_kmeans: bool
+            Whether to synchronize the kmeans initialization across all processes.
+        - threshold_ema_dead_code: int
+            The threshold for the ema dead code.
+        - use_ddp: bool
+            Whether to use distributed data parallel training.
+        - sample_codebook_temp: float
+            The temperature for the codebook sampling.
+        """
         super().__init__()
 
         # initialize the pre-VQ Graph Convolution module
         self.gnn_module = self._init_gnn_module(
+            num_linear_layers=num_linear_layers,
             gnn_layer_name=gnn_layer_name,
             in_channels=in_channels,
             hidden_channels=hidden_channels,
-            num_layers=num_layers,
+            num_gnn_layers=num_gnn_layers,
             act_first=act_first,
             activation=activation,
             dropout=dropout,
@@ -49,9 +99,9 @@ class VQGraph_Encoder(pl.LightningModule):
         )
 
         # initialize codebook class
-        print(f"Initializing {num_codebooks} Cosine codebook(s) with {codebook_size} codes of dimension {hidden_channels}.")
+        print(f"Initializing {num_codebooks} Cosine codebook(s) with {codebook_size} codes of dimension {self.gnn_module.hidden_channels}.")
         self._codebook = CosineSimCodebook(
-            dim=hidden_channels,
+            dim=self.gnn_module.hidden_channels,
             learnable_codebook=learnable_codebook,
             num_codebooks=num_codebooks,
             codebook_size=codebook_size,
@@ -68,14 +118,15 @@ class VQGraph_Encoder(pl.LightningModule):
 
     def _init_gnn_module(
             self,
-            gnn_layer_name: str,
-            in_channels: int,
-            hidden_channels: int,
-            num_layers: int,
-            act_first: bool,
-            activation: Union[str, Callable, None],
-            dropout: float,
-            norm: Union[str, Callable, None],
+            num_linear_layers: int = 1,
+            gnn_layer_name: str = 'SAGEConv',
+            in_channels: int = None,
+            hidden_channels: List[int] | int = 500,
+            num_gnn_layers: int = 2,
+            act_first: bool = True,
+            activation: Union[str, Callable, None] = "relu",
+            dropout: float = 0.1,
+            norm: Union[str, Callable, None] = None,
             init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform'
         ) -> torch.nn.Module:
         """
@@ -83,13 +134,15 @@ class VQGraph_Encoder(pl.LightningModule):
 
         Parameters
         ----------
+        - num_linear_layers: int
+            The number of linear layers to use before the GNN module.
         - gnn_layer_name: str
             The name of the GNN layer to use.
         - in_channels: int
             The input dimension of the GNN module.
-        - hidden_channels: int
+        - hidden_channels: List[int] | int
             The hidden dimension of the GNN module.
-        - num_layers: int
+        - num_gnn_layers: int
             The number of layers in the GNN module.
         - act_first: bool
             Whether to apply the activation function before the normalization layer.
@@ -107,11 +160,12 @@ class VQGraph_Encoder(pl.LightningModule):
         """
         self.gnn_layer_name = gnn_layer_name
         if self.gnn_layer_name == 'SAGEConv':
-            print(f"Initializing the GNN module with {num_layers} {gnn_layer_name} layer(s) to transform the input features of dimension {in_channels} to {hidden_channels} latent dimensions.")
+            print(f"Initializing the GNN module with {num_linear_layers} linear layer(s) followed by {num_gnn_layers} {gnn_layer_name} layer(s) to transform the input features of dimension {in_channels} to {hidden_channels} latent dimensions.")
             return SAGEConv_Module(
+                            num_linear_layers=num_linear_layers,
                             in_channels=in_channels,
                             hidden_channels=hidden_channels,
-                            num_layers=num_layers,
+                            num_gnn_layers=num_gnn_layers,
                             act_first=act_first,
                             activation=activation,
                             dropout=dropout,

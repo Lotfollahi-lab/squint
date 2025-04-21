@@ -27,8 +27,9 @@ class VQGraph(BaseModel):
             in_channels: int = None,
             out_channels: int = None,
             gnn_layer_name: str = 'SAGEConv',
-            hidden_channels: int = 64,
-            num_layers: int = 2,
+            num_linear_layers: int = 1,
+            hidden_channels: List[int] | int = 500,
+            num_gnn_layers: int = 2,
             act_first: bool = True,
             activation: Union[str, Callable, None] = "relu",
             norm: Union[str, Callable, None] = None,
@@ -68,12 +69,14 @@ class VQGraph(BaseModel):
 
         - gnn_layer_name: str
             The name of the GNN layer.
+        - num_linear_layers: int
+            The number of linear layers to use before the VQGraph encoder layers.
+        - hidden_channels: List[int] | int
+            The number of hidden features.
+        - num_gnn_layers: int
+            The number of VQGraph encoder layers.
         - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
             The name of the attribute decoder module.
-        - hidden_channels: int
-            The number of hidden features.
-        - num_layers: int
-            The number of VQGraph encoder layers.
         - act_first: bool
             Whether to apply the activation function before normalization.
         - activation: str or callable or None
@@ -121,10 +124,11 @@ class VQGraph(BaseModel):
         # Initialize VQGraph encoder module.
         # The out_channels parameter is not passed to the VQGraph_Encoder (i.e. it is set to None) so that we can separate the encoder from the predictor.
         self.encoder = VQGraph_Encoder(
+                            num_linear_layers=num_linear_layers,
+                            gnn_layer_name=gnn_layer_name,
                             in_channels=in_channels,
                             hidden_channels=hidden_channels,
-                            gnn_layer_name=gnn_layer_name,
-                            num_layers=num_layers,
+                            num_gnn_layers=num_gnn_layers,
                             act_first=act_first,
                             activation=activation,
                             dropout=dropout,
@@ -137,21 +141,21 @@ class VQGraph(BaseModel):
         print(f"Initializing the {attribute_decoder_name} attribute decoder module that takes as input latent node embeddings of dimension {hidden_channels} and outputs an estimate of {in_channels} original features.")
         self.attribute_decoder = self._init_attribute_decoder(
                                 attribute_decoder_name=attribute_decoder_name,
-                                in_channels=hidden_channels,
+                                in_channels=self.encoder.gnn_module.hidden_channels,
                                 out_channels=in_channels
                             )
 
         # Initialize the decoder module for the adjacency matrix
         # Currently, the decoder is hard-coded to be a simple linear layer.
-        print(f"Initializing the decoder module for the adjacency matrix with {hidden_channels} input dimension and {hidden_channels} output dimension.")
+        print(f"Initializing the decoder module for the adjacency matrix with {self.encoder.gnn_module.hidden_channels} input dimension and {self.encoder.gnn_module.hidden_channels} output dimension.")
         self.decoder_edge = nn.Linear(
-                                in_features=hidden_channels,
-                                out_features=hidden_channels
+                                in_features=self.encoder.gnn_module.hidden_channels,
+                                out_features=self.encoder.gnn_module.hidden_channels
                             )
 
         # Instead, we apply this final linear transformation in the predictor module manually to have access to the internal node embeddings via the `embed` function.
         self.predictor = nn.Linear(
-                            in_features=hidden_channels,
+                            in_features=self.encoder.gnn_module.hidden_channels,
                             out_features=out_channels
                         )
 

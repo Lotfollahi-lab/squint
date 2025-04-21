@@ -8,8 +8,10 @@ This is now usable as either:
 In the init method of BasicGNN, init_conv is set to torch_geometric.nn.conv.SAGEConv (in the case of torch_geometric.nn.GraphSAGE) which is the actual GraphSAGE convolution layer. SAGEConv inherits from torch_geometric.nn.conv.MessagePassing which is a base class for message passing layers. Within it's init method, SAGEConv builds lin_l and lin_r as torch.nn.Linear layers with the kaiming_uniform initialization method by default. We re-initialize with glorot or uniform initialization method if specified and do nothing if init_method is None or kaiming_uniform.
 """
 
-from typing import Literal, Union, Callable
+from typing import Literal, Union, Callable, List
 
+import torch
+import torch.nn as nn
 from torch_geometric.nn.dense.linear import Linear
 from torch_geometric.nn import GraphSAGE as BaseSAGEConv_Module
 from torch_geometric.nn.aggr import MultiAggregation
@@ -18,9 +20,10 @@ from torch_geometric.nn.aggr import MultiAggregation
 class SAGEConv_Module(BaseSAGEConv_Module):
     def __init__(
             self,
+            num_linear_layers: int = 2,
             in_channels: int = None,
-            hidden_channels: int = 256,
-            num_layers: int = 2,
+            hidden_channels: List[int] | int = 500,
+            num_gnn_layers: int = 2,
             act_first: bool = True,
             activation: Union[str, Callable, None] = "relu",
             norm: Union[str, Callable, None] = None,
@@ -32,11 +35,13 @@ class SAGEConv_Module(BaseSAGEConv_Module):
 
         Parameters
         ----------
+        - num_linear_layers: int
+            The number of linear layers to use before the GraphSAGE encoder layers.
         - in_channels: int
             The number of input features.
-        - hidden_channels: int
+        - hidden_channels: List[int] | int
             The number of hidden features.
-        - num_layers: int
+        - num_gnn_layers: int
             The number of GraphSAGE encoder layers.
         - act_first: bool
             Whether to apply the activation function before normalization.
@@ -50,10 +55,28 @@ class SAGEConv_Module(BaseSAGEConv_Module):
             The initialization method to use for the linear transformations in the SAGEConv layers.
             If None, the initialization method is 'kaiming_uniform'.
         """
+        self.num_linear_layers = num_linear_layers
+        if num_linear_layers > 0:
+            if isinstance(hidden_channels, int):
+                hidden_channels = [in_channels] + [hidden_channels] * num_linear_layers
+            elif isinstance(hidden_channels, list):
+                assert len(hidden_channels) == num_linear_layers, f"The number of hidden channels must be equal to the number of linear layers. Got {len(hidden_channels)} hidden channels for {num_linear_layers} linear layers."
+                hidden_channels = [in_channels] + hidden_channels
+
+            print(f"{num_linear_layers=} | {hidden_channels=}")
+
+            # if Linear layers are used, SAGEConv is applied from the last hidden channel to the last hidden channel
+            sageconv_in_channels = hidden_channels[-1]
+            sageconv_hidden_channels = hidden_channels[-1]
+        else:
+            # if no Linear layers are used, SAGEConv is applied from the input channels to hidden channels
+            sageconv_in_channels = in_channels
+            sageconv_hidden_channels = hidden_channels
+
         super().__init__(
-            in_channels=in_channels,
-            hidden_channels=hidden_channels,
-            num_layers=num_layers,
+            in_channels=sageconv_in_channels,
+            hidden_channels=sageconv_hidden_channels,
+            num_layers=num_gnn_layers,
             act_first=act_first,
             act=activation,
             dropout=dropout,
@@ -64,6 +87,20 @@ class SAGEConv_Module(BaseSAGEConv_Module):
             init_method = 'kaiming_uniform'
         self.init_method = init_method
         self.initialize_linear_layers()
+
+        if num_linear_layers > 0:
+            # Create sequential model of linear layers
+            layers = []
+            for i in range(num_linear_layers):
+                layers.append(Linear(
+                    in_channels=hidden_channels[i],
+                    out_channels=hidden_channels[i+1],
+                    bias=True,
+                    weight_initializer=init_method,
+                    bias_initializer=None,
+                ))
+
+            self.input_transform = nn.Sequential(*layers)
 
 
     def initialize_linear_layers(self):
@@ -100,3 +137,32 @@ class SAGEConv_Module(BaseSAGEConv_Module):
                     )
         else:
             raise ValueError(f"Invalid initialization method: {self.init_method}")
+
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            edge_index: torch.Tensor
+        ) -> torch.Tensor:
+        """
+        Forward pass of the SAGEConv module.
+
+        Parameters
+        ----------
+        - x: torch.Tensor
+            The input features.
+        - edge_index: torch.Tensor
+            The edge index.
+
+        Returns
+        -------
+        - torch.Tensor
+            The output features.
+        """
+        if self.num_linear_layers > 0:
+            x = self.input_transform(x)
+
+        return super().forward(
+            x,
+            edge_index
+        )
