@@ -1,12 +1,12 @@
 """
-This file implements the Vanilla GNN Model.
+This file implements a single-layer MLP model.
 
-The Vanilla GNN Model is a simple GNN model that comprises of the following components:
-- Encoder: A series of Linear layers followed by a GraphSAGE, GATv2, or GIN module.
+The MLP Model comprises of the following components:
+- Encoder: A Linear layer.
 - Attribute Decoder: A Linear or LinearSoftmax decoder.
 - Predictor: A Linear predictor.
 
-In addition, this provides the option to log the mean pairwise cosine similarity between the original attributes, decoded attributes, and GNN embeddings, and the Pearson correlation between the original and decoded node attributes at the end of each training epoch.
+In addition, this provides the option to log the mean pairwise cosine similarity between the original attributes, decoded attributes, and MLP embeddings, and the Pearson correlation between the original and decoded node attributes at the end of each training epoch.
 """
 from typing import List, Union, Callable, Literal, Dict
 
