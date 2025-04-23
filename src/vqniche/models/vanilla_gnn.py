@@ -11,9 +11,8 @@ In addition, this provides the option to log the mean pairwise cosine similarity
 from typing import List, Union, Callable, Literal, Dict
 
 import torch
-import torch.nn as nn
 import torch_geometric
-
+from torch_geometric.nn.dense.linear import Linear
 from .base_model import BaseModel
 from ..modules.gnn import init_gnn_module
 from ..utils import metrics
@@ -137,15 +136,17 @@ class VanillaGNN(BaseModel):
         self.attribute_decoder = self._init_attribute_decoder(
             attribute_decoder_name=attribute_decoder_name,
             in_channels=self.encoder.hidden_channels,
-            out_channels=in_channels
+            out_channels=in_channels,
+            init_method=init_method
         )
         print(f"2. Attribute Decoder: {attribute_decoder_name} that reconstructs {self.encoder.hidden_channels} latent features to {in_channels} input features.")
 
         # Initialize the predictor.
         # Currently, the predictor is hardcoded to be a simple linear layer.
-        self.predictor = nn.Linear(
-                            in_features=self.encoder.hidden_channels,
-                            out_features=out_channels
+        self.predictor = Linear(
+                            in_channels=self.encoder.hidden_channels,
+                            out_channels=out_channels,
+                            weight_initializer=init_method
                         )
         print(f"3. Predictor: Linear layer that transforms {self.encoder.hidden_channels} hidden features to {out_channels} output features.")
 

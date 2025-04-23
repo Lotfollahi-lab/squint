@@ -7,12 +7,13 @@ import pytorch_lightning as pl
 from ..modules.cosine_codebook import CosineSimCodebook
 from ..modules.gnn import init_gnn_module
 
+
 class VQGraph_Encoder(pl.LightningModule):
 
     def __init__(
             self,
             num_linear_layers: int = 1,
-            gnn_layer_name: str = 'SAGE',
+            gnn_layer_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv'] = 'SAGEConv',
             in_channels: int = None,
             hidden_channels: List[int] | int = 500,
             num_gnn_layers: int = 2,

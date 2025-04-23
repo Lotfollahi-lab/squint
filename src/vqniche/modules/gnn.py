@@ -64,7 +64,7 @@ from torch_geometric.nn.aggr import MultiAggregation
 
 
 def init_gnn_module(
-        gnn_name: Literal['SAGE', 'GATv2', 'GIN'] = 'SAGE',
+        gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv'] = 'SAGEConv',
         num_linear_layers: int = 1,
         in_channels: int = None,
         hidden_channels: List[int] | int = 500,
@@ -122,14 +122,14 @@ def init_gnn_module(
 
 
 def create_dynamic_gnn_module_class(
-        gnn_name: Literal['SAGE', 'GATv2', 'GIN'] = 'SAGE'
+        gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv'] = 'SAGEConv'
     ) -> torch.nn.Module:
     """
     Create a GNN Module class dynamically based on the name.
 
     Parameters
     ----------
-    gnn_name: Literal['SAGE', 'GATv2', 'GIN']
+    gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv']
         The name of the GNN module.
 
     Returns
@@ -138,11 +138,11 @@ def create_dynamic_gnn_module_class(
         The GNN module.
     """
     # set the base GNN module class from Pytorch Geometric
-    if gnn_name == 'SAGE':
+    if gnn_name == 'SAGEConv':
         BaseGNN_Module = BaseSAGEConv_Module
-    elif gnn_name == 'GATv2':
+    elif gnn_name == 'GATv2Conv':
         BaseGNN_Module = BaseGATv2_Module
-    elif gnn_name == 'GIN':
+    elif gnn_name == 'GINConv':
         BaseGNN_Module = BaseGIN_Module
 
     # define the VanillaGNN_Module class that inherits from the base GNN module
@@ -208,9 +208,7 @@ def create_dynamic_gnn_module_class(
                         Linear(
                             in_channels=hidden_channels[i],
                             out_channels=hidden_channels[i+1],
-                            bias=True,
                             weight_initializer=init_method,
-                            bias_initializer=None,
                         )
                     )
 

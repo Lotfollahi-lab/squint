@@ -290,7 +290,8 @@ class BaseModel(pl.LightningModule):
             self,
             attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
             in_channels: int = None,
-            out_channels: int = None
+            out_channels: int = None,
+            init_method: str = 'kaiming_uniform'
         ) -> pl.LightningModule:
         """
         Initialize the attribute decoder module.
@@ -303,6 +304,8 @@ class BaseModel(pl.LightningModule):
             The input dimension of the attribute decoder module. This is the same as the hidden dimension of the Graph Convolution module.
         - out_channels: int
             The output dimension of the attribute decoder module. This is the same as the number of genes.
+        - init_method: str
+            The initialization method for the attribute decoder module.
 
         Returns
         -------
@@ -313,7 +316,8 @@ class BaseModel(pl.LightningModule):
             return LinearSoftmax(
                 name=attribute_decoder_name,
                 in_channels=in_channels,
-                out_channels=out_channels
+                out_channels=out_channels,
+                init_method=init_method
             )
         else:
             raise NotImplementedError(f'Attribute decoder {attribute_decoder_name} not implemented')

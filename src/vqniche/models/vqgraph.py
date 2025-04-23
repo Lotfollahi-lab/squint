@@ -14,9 +14,8 @@ The implementation is based on the paper: VQGraph: Rethinking Graph Representati
 from typing import List, Union, Callable, Literal
 
 import torch
-import torch.nn as nn
 import torch_geometric
-
+from torch_geometric.nn.dense.linear import Linear
 from .base_model import BaseModel
 from ..encoders.vqgraph_encoder import VQGraph_Encoder
 from ..utils import metrics
@@ -152,22 +151,25 @@ class VQGraph(BaseModel):
         self.attribute_decoder = self._init_attribute_decoder(
                                 attribute_decoder_name=attribute_decoder_name,
                                 in_channels=self.encoder.gnn_module.hidden_channels,
-                                out_channels=in_channels
+                                out_channels=in_channels,
+                                init_method=init_method
                             )
         print(f"2. Attribute Decoder: {attribute_decoder_name} that reconstructs {self.encoder.hidden_channels} latent features to {in_channels} input features.")
 
         # Initialize the decoder module for the adjacency matrix
         # Currently, the decoder is hard-coded to be a simple linear layer.
-        self.decoder_edge = nn.Linear(
-                                in_features=self.encoder.gnn_module.hidden_channels,
-                                out_features=self.encoder.gnn_module.hidden_channels
+        self.decoder_edge = Linear(
+                                in_channels=self.encoder.gnn_module.hidden_channels,
+                                out_channels=self.encoder.gnn_module.hidden_channels,
+                                weight_initializer=init_method
                             )
         print(f"3. Adjacency Decoder: A linear layer that reconstructs the adjacency matrix from the latent node embeddings of dimension {self.encoder.hidden_channels}.")
 
         # Instead, we apply this final linear transformation in the predictor module manually to have access to the internal node embeddings via the `embed` function.
-        self.predictor = nn.Linear(
-                            in_features=self.encoder.gnn_module.hidden_channels,
-                            out_features=out_channels
+        self.predictor = Linear(
+                            in_channels=self.encoder.gnn_module.hidden_channels,
+                            out_channels=out_channels,
+                            weight_initializer=init_method
                         )
         print(f"4. Predictor: Linear layer that transforms {self.encoder.hidden_channels} hidden features to {out_channels} output features.")
 
