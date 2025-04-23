@@ -1,78 +1,31 @@
 """
-Consider a GraphSAGE model with 2 layers. The forward method of the model returns h_v^1 as the output of the first layer and h_v^2. From Step 5 (Algorithm 1) of the paper, the output of the first layer is computed as follows:
-`h_v^1 = ReLU(W_0 * CONCAT(x_v, sum_{u \in N(v)} x_u))`
+This file implements the Vanilla GNN Model.
 
-The output of the second layer is computed as follows:
-`h_v^2 = W_1 * CONCAT(h_v^1, sum_{u \in N(v)} h_u^1)`
+The Vanilla GNN Model is a simple GNN model that comprises of the following components:
+- Encoder: A series of Linear layers followed by a GraphSAGE, GATv2, or GIN module.
+- Attribute Decoder: A Linear or LinearSoftmax decoder.
+- Predictor: A Linear predictor.
 
-Setting number of features = in_channels, internal dimension = hidden_channels, and number of classes = out_channels, Pytorch Geometric implements a 2-layer GraphSAGE model by using 2 SAGEConv modules.
-
-If we set the layers as follows (and Jumping Knowledge is not used):
-Layer 1 = SAGEConv(in_channels, hidden_channels)
-Layer 2 = SAGEConv(hidden_channels, out_channels)
-Then, internally, the forward of GraphSAGE applies the following operations:
-Layer 1:
-    - Forward of SAGEConv Layer 1:
-        - Message passing step: in_channels -> in_channels
-        - Linear transformation (P_0): in_channels -> hidden_channels
-    - RELU activation
-    - Dropout
-Layer 2:
-    - Forward of SAGEConv Layer 2:
-        - Message passing step: hidden_channels -> hidden_channels
-        - Linear transformation (P_1): hidden_channels -> out_channels
-    (No activation function is applied in the last layer)
-Unfortunately, this means we cannot access the internal node embeddings of the GraphSAGE model. To access the internal node embeddings, we need to separate the encoder from the predictor. We can do this by using the GraphSAGE encoder from Pytorch Geometric and applying the final linear transformation in the predictor layer manually.
-
-Our GraphSAGE model will have the following components:
-- GraphSAGE encoder: Pytorch Geometric's SAGEConv module
-- Predictor: A linear layer that applies the final linear transformation
-
-More specifically, we do the following:
-GraphSAGE encoder:
-Layer 1 = SAGEConv(in_channels, hidden_channels)
-Layer 2 = SAGEConv(hidden_channels, hidden_channels)
-Internally, this applies the following operations:
-Layer 1:
-    - Forward of SAGEConv Layer 1:
-        - Message passing step: in_channels -> in_channels
-        - Linear transformation (P_0): in_channels -> hidden_channels
-    - RELU activation
-    - Dropout
-Layer 2:
-    - Forward of SAGEConv Layer 2:
-        - Message passing step: hidden_channels -> hidden_channels
-        - Linear transformation (P_3): hidden_channels -> hidden_channels
-    (No activation function is applied in the last layer)
-
-Predictor:
-- Linear transformation (P_4): hidden_channels -> out_channels
-
-What has changed is:
-- The forward of the encoder now returns the latent node embeddings which are first convolved by the SAGEConv Layer 2 and translated by the linear transformation P_3.
-- The attribute decoder takes the latent node embeddings as input and outputs an estimate of the original node attributes.
-- The forward of the predictor applies the final linear transformation P_4 to the latent node embeddings to get the unnormalized logits of the model.
-
-Because P_3 and P_4 are both learnable parameters of the model, they will be updated during training. In matrix form, P_3 * P_4 will have the same dimensions as P_1 which is the linear transformation in the last layer of the Pytorch Geometric's GraphSAGE model. Mathematically, this is the same as applying the linear transformation P_1 in the last layer of the Pytorch Geometric's GraphSAGE model. The only downside is that we need to maintain an extra matrix of trainable parameters which impacts the memory usage of the model.
+In addition, this provides the option to log the mean pairwise cosine similarity between the original attributes, decoded attributes, and GNN embeddings, and the Pearson correlation between the original and decoded node attributes at the end of each training epoch.
 """
 from typing import List, Union, Callable, Literal, Dict
 
 import torch
 import torch.nn as nn
 import torch_geometric
-from ..gnn_modules.sage_conv import SAGEConv_Module as GraphSAGE_Encoder
 
 from .base_model import BaseModel
+from ..modules.gnn import init_gnn_module
 from ..utils import metrics
 
 
-class GraphSAGE(BaseModel):
+class VanillaGNN(BaseModel):
     def __init__(
             self,
-            model_name: str = 'GraphSAGE',
-            encoder_name: str = 'SAGE_Encoder',
+            model_name: Literal['GraphSAGE', 'GATv2', 'GIN'] = 'GraphSAGE',
+            encoder_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv'] = 'SAGEConv',
             attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
-            predictor_name: str = 'Linear',
+            predictor_name: Literal['Linear'] = 'Linear',
             in_channels: int = None,
             out_channels: int = None,
             log_similarity_stats: bool = False,
@@ -92,17 +45,17 @@ class GraphSAGE(BaseModel):
             loss_kwargs: dict = {'reduction': 'none'},
         ):
         """
-        Initializes the GraphSAGE model.
+        Initializes a Vanilla GNN model. Currently, this class supports GraphSAGE, GATv2, and GIN encoders.
 
         Parameters
         ----------
-        - model_name: str
+        - model_name: Literal['GraphSAGE', 'GATv2', 'GIN']
             The name of the model.
-        - encoder_name: str
+        - encoder_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv']
             The name of the encoder module.
         - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
             The name of the attribute decoder module.
-        - predictor_name: str
+        - predictor_name: Literal['Linear']
             The name of the predictor module.
         - log_similarity_stats: bool
             Whether to log the similarity statistics.
@@ -144,6 +97,8 @@ class GraphSAGE(BaseModel):
         - loss_kwargs: dict
             Keyword arguments for the loss functions.
         """
+        print(f"Initializing a {model_name} Model with the following components:")
+
         # Initialize the BaseModel class
         super().__init__(
             model_name=model_name,
@@ -161,9 +116,11 @@ class GraphSAGE(BaseModel):
             loss_kwargs=loss_kwargs,
         )
 
-        # Initialize SAGEConv_Module as the encoder.
-        # The out_channels parameter is not passed to the SAGEConv_Module (i.e. it is set to None) so that we can separate the encoder from the predictor.
-        self.encoder = GraphSAGE_Encoder(
+        # Initialize a GraphSAGE | GATv2 | GIN module as the encoder.
+        # This module applies a series of Linear layers followed by a series of GNN layers.
+        # The out_channels parameter is not passed to the GNN_Module (i.e. it is set to None) to separate the encoder from the predictor.
+        self.encoder = init_gnn_module(
+                            gnn_name=encoder_name,
                             num_linear_layers=num_linear_layers,
                             in_channels=in_channels,
                             hidden_channels=hidden_channels,
@@ -172,8 +129,9 @@ class GraphSAGE(BaseModel):
                             activation=activation,
                             norm=norm,
                             dropout=dropout,
-                            init_method=init_method
+                            init_method=init_method,
                         )
+        print(f"1. Encoder: {num_linear_layers} Linear layers followed by {num_gnn_layers} {encoder_name} layers that transforms {in_channels} input features to {self.encoder.hidden_channels} hidden features.")
 
         # Initialize the attribute decoder.
         self.attribute_decoder = self._init_attribute_decoder(
@@ -181,13 +139,16 @@ class GraphSAGE(BaseModel):
             in_channels=self.encoder.hidden_channels,
             out_channels=in_channels
         )
+        print(f"2. Attribute Decoder: {attribute_decoder_name} that reconstructs {self.encoder.hidden_channels} latent features to {in_channels} input features.")
 
         # Initialize the predictor.
-        # Currently, the predictor hardcoded to be a simple linear layer.
+        # Currently, the predictor is hardcoded to be a simple linear layer.
         self.predictor = nn.Linear(
                             in_features=self.encoder.hidden_channels,
                             out_features=out_channels
                         )
+        print(f"3. Predictor: Linear layer that transforms {self.encoder.hidden_channels} hidden features to {out_channels} output features.")
+
 
     def forward(
             self,
@@ -434,11 +395,11 @@ class GraphSAGE(BaseModel):
             )
 
         if self.log_pearson_correlation:
-            train_epoch_end_stats['pearson_correlation'] = metrics.pearson_correlation(
-                                                            X.cpu().numpy(),
-                                                            X_hat.cpu().numpy(),
-                                                            compare_genes=False,
-                                                            mean=True,
-                                                        )
-
+            pearson = metrics.pearson_correlation(
+                            X.cpu().numpy(),
+                            X_hat.cpu().numpy(),
+                            compare_genes=False,
+                            mean=True,
+                        )
+            train_epoch_end_stats['pearson_correlation'] = pearson
         return train_epoch_end_stats

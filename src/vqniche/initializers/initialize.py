@@ -13,7 +13,7 @@ from ..preprocessors.graph_constructors import set_edge_index_name
 from ..dataset.transforms import SetExperimentDataKeys, init_data_transforms
 from ..dataset.in_memory_dataset_blob import InMemoryDatasetBlob
 from ..dataloaders.in_memory_datamodule import InMemoryDataModule
-from ..models.graphsage import GraphSAGE
+from ..models.vanilla_gnn import VanillaGNN
 from ..models.vqgraph import VQGraph
 
 
@@ -154,8 +154,8 @@ def initialize_datamodule(
 def set_model_class(
         model_name: str,
     ) -> pl.LightningModule:
-    if model_name == 'GraphSAGE':
-        Model = GraphSAGE
+    if model_name == 'VanillaGNN':
+        Model = VanillaGNN
     elif model_name == 'VQGraph':
         Model = VQGraph
     else:

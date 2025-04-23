@@ -1,5 +1,13 @@
 """
-This file implements the VQGraph Model. It comprises of an Encoder and a Linear Predictor. The Encoder jointly trains a node embedding using a graph-convolution module and a codebook using a vector quantization module. The Predictor is a Linear layer that uses the quantized node embeddings and outputs the predicted labels.
+This file implements the VQGraph Model. It comprises of a VQGraph Encoder, Attribute Decoder, Adjacency Decoder,and a Linear Predictor.
+
+The VQGraph Encoder builds latent node embeddings using a vanilla GNN module (GraphSAGE, GATv2, or GIN) and quantized representations from the latent embeddings using vector quantization module.
+
+The Attribute Decoder is a Linear layer that uses the quantized node embeddings and outputs the predicted attributes. When the attribute reconstruction loss is set to Negative Binomial Loss, the Attribute Decoder is a LinearSoftmax layer which applies a softmax function to the output of the Linear layer and then multiplies the result by the empirical read depth of the target nodes.
+
+The Adjacency Decoder is a Linear layer that uses the quantized node embeddings and outputs the predicted adjacency matrix. The Predictor is a Linear layer that uses the quantized node embeddings and outputs a reconstructed adjacency matrix.
+
+The Predictor builds the logits for the label prediction task using the quantized node embeddings.
 
 The implementation is based on the paper: VQGraph: Rethinking Graph Representation Space for Bridging GNNs and MLPs.
 """
@@ -26,7 +34,7 @@ class VQGraph(BaseModel):
             log_codebook_utilization: bool = True,
             in_channels: int = None,
             out_channels: int = None,
-            gnn_layer_name: str = 'SAGEConv',
+            gnn_layer_name: str = 'SAGE',
             num_linear_layers: int = 1,
             hidden_channels: List[int] | int = 500,
             num_gnn_layers: int = 2,
@@ -122,7 +130,9 @@ class VQGraph(BaseModel):
         )
 
         # Initialize VQGraph encoder module.
-        # The out_channels parameter is not passed to the VQGraph_Encoder (i.e. it is set to None) so that we can separate the encoder from the predictor.
+        # This module applies a series of Linear layers followed by a series of GNN layers to build latent node embeddings.
+        # Then, it applies a vector quantization module to quantize the latent node embeddings.
+        # The out_channels parameter is not passed to the VQGraph_Encoder to separate the encoder from the predictor.
         self.encoder = VQGraph_Encoder(
                             num_linear_layers=num_linear_layers,
                             gnn_layer_name=gnn_layer_name,
@@ -136,28 +146,30 @@ class VQGraph(BaseModel):
                             init_method=init_method,
                             **codebook_params
                         )
+        print(f"1. Encoder: (a) {num_linear_layers} Linear layers followed by {num_gnn_layers} {encoder_name} layers that transforms {in_channels} input features to {self.encoder.hidden_channels} hidden features.\n(b) A vector quantization module that quantizes the latent node embeddings to {self.encoder.codebook.shape[0]} codebook embeddings of dimension {self.encoder.hidden_channels}.")
 
         # Initialize the attribute decoder.
-        print(f"Initializing the {attribute_decoder_name} attribute decoder module that takes as input latent node embeddings of dimension {hidden_channels} and outputs an estimate of {in_channels} original features.")
         self.attribute_decoder = self._init_attribute_decoder(
                                 attribute_decoder_name=attribute_decoder_name,
                                 in_channels=self.encoder.gnn_module.hidden_channels,
                                 out_channels=in_channels
                             )
+        print(f"2. Attribute Decoder: {attribute_decoder_name} that reconstructs {self.encoder.hidden_channels} latent features to {in_channels} input features.")
 
         # Initialize the decoder module for the adjacency matrix
         # Currently, the decoder is hard-coded to be a simple linear layer.
-        print(f"Initializing the decoder module for the adjacency matrix with {self.encoder.gnn_module.hidden_channels} input dimension and {self.encoder.gnn_module.hidden_channels} output dimension.")
         self.decoder_edge = nn.Linear(
                                 in_features=self.encoder.gnn_module.hidden_channels,
                                 out_features=self.encoder.gnn_module.hidden_channels
                             )
+        print(f"3. Adjacency Decoder: A linear layer that reconstructs the adjacency matrix from the latent node embeddings of dimension {self.encoder.hidden_channels}.")
 
         # Instead, we apply this final linear transformation in the predictor module manually to have access to the internal node embeddings via the `embed` function.
         self.predictor = nn.Linear(
                             in_features=self.encoder.gnn_module.hidden_channels,
                             out_features=out_channels
                         )
+        print(f"4. Predictor: Linear layer that transforms {self.encoder.hidden_channels} hidden features to {out_channels} output features.")
 
 
     def forward(

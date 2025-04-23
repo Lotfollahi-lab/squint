@@ -9,7 +9,7 @@ import pytorch_lightning as pl
 
 from ..utils.loss import *
 from ..utils import metrics
-from ..attribute_decoders.linear_softmax import LinearSoftmax
+from ..decoders.linear_softmax import LinearSoftmax
 
 
 class BaseModel(pl.LightningModule):
@@ -340,11 +340,11 @@ class BaseModel(pl.LightningModule):
 
 
     def common_step(
-        self,
-        batch_loss_data: dict,
-        batch_size: int,
-        mode: Literal['train', 'val', 'test'] = 'train',
-    ) -> torch.Tensor:
+            self,
+            batch_loss_data: dict,
+            batch_size: int,
+            mode: Literal['train', 'val', 'test'] = 'train',
+        ) -> torch.Tensor:
         """
         Compute the loss for a model for a given batch if mode is 'train' or 'val', but not if mode is 'test'.
         Log the loss (if available) and accuracy for the current batch.

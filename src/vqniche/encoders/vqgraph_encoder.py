@@ -4,16 +4,15 @@ from einops import rearrange
 import torch
 import pytorch_lightning as pl
 
-from vqniche.codebooks.cosine_codebook import CosineSimCodebook
-from ..gnn_modules.sage_conv import SAGEConv_Module
-
+from ..modules.cosine_codebook import CosineSimCodebook
+from ..modules.gnn import init_gnn_module
 
 class VQGraph_Encoder(pl.LightningModule):
 
     def __init__(
             self,
             num_linear_layers: int = 1,
-            gnn_layer_name: str = 'SAGEConv',
+            gnn_layer_name: str = 'SAGE',
             in_channels: int = None,
             hidden_channels: List[int] | int = 500,
             num_gnn_layers: int = 2,
@@ -35,7 +34,7 @@ class VQGraph_Encoder(pl.LightningModule):
             sample_codebook_temp: float = 0.0,
         ):
         """
-        Initialize the VQGraph_Encoder model.
+        Initialize the VQGraph_Encoder.
 
         Parameters
         ----------
@@ -85,9 +84,9 @@ class VQGraph_Encoder(pl.LightningModule):
         super().__init__()
 
         # initialize the pre-VQ Graph Convolution module
-        self.gnn_module = self._init_gnn_module(
+        self.gnn_module = init_gnn_module(
+            gnn_name=gnn_layer_name,
             num_linear_layers=num_linear_layers,
-            gnn_layer_name=gnn_layer_name,
             in_channels=in_channels,
             hidden_channels=hidden_channels,
             num_gnn_layers=num_gnn_layers,
@@ -114,66 +113,7 @@ class VQGraph_Encoder(pl.LightningModule):
             use_ddp=use_ddp, # False
             sample_codebook_temp=sample_codebook_temp, # 0.0
         )
-
-
-    def _init_gnn_module(
-            self,
-            num_linear_layers: int = 1,
-            gnn_layer_name: str = 'SAGEConv',
-            in_channels: int = None,
-            hidden_channels: List[int] | int = 500,
-            num_gnn_layers: int = 2,
-            act_first: bool = True,
-            activation: Union[str, Callable, None] = "relu",
-            dropout: float = 0.1,
-            norm: Union[str, Callable, None] = None,
-            init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform'
-        ) -> torch.nn.Module:
-        """
-        Initialize the Graph Neural Network (GNN) module with `num_layers` layers transforming the input features of dimension `in_channels` to dimension `hidden_channels`.
-
-        Parameters
-        ----------
-        - num_linear_layers: int
-            The number of linear layers to use before the GNN module.
-        - gnn_layer_name: str
-            The name of the GNN layer to use.
-        - in_channels: int
-            The input dimension of the GNN module.
-        - hidden_channels: List[int] | int
-            The hidden dimension of the GNN module.
-        - num_gnn_layers: int
-            The number of layers in the GNN module.
-        - act_first: bool
-            Whether to apply the activation function before the normalization layer.
-        - activation: Union[str, Callable, None]
-            The activation function to apply.
-        - dropout: float
-            The dropout rate.
-        - norm: Union[str, Callable, None]
-            The normalization layer to apply.
-
-        Returns
-        -------
-        - torch.nn.Module
-            The GNN module.
-        """
-        self.gnn_layer_name = gnn_layer_name
-        if self.gnn_layer_name == 'SAGEConv':
-            print(f"Initializing the GNN module with {num_linear_layers} linear layer(s) followed by {num_gnn_layers} {gnn_layer_name} layer(s) to transform the input features of dimension {in_channels} to {hidden_channels} latent dimensions.")
-            return SAGEConv_Module(
-                            num_linear_layers=num_linear_layers,
-                            in_channels=in_channels,
-                            hidden_channels=hidden_channels,
-                            num_gnn_layers=num_gnn_layers,
-                            act_first=act_first,
-                            activation=activation,
-                            dropout=dropout,
-                            norm=norm,
-                            init_method=init_method
-                        )
-        else:
-            raise ValueError(f"GNN layer {self.gnn_layer_name} not supported.")
+        self.hidden_channels = self.gnn_module.hidden_channels
 
 
     @property
