@@ -1,8 +1,8 @@
 from typing import Optional
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.nn.dense.linear import Linear
 import pytorch_lightning as pl
 
 
@@ -11,7 +11,8 @@ class LinearSoftmax(pl.LightningModule):
             self,
             name: str,
             in_channels: int,
-            out_channels: int
+            out_channels: int,
+            init_method: str = 'kaiming_uniform'
         ):
         """
         Initialize the LinearSoftmax decoder.
@@ -24,13 +25,19 @@ class LinearSoftmax(pl.LightningModule):
             The number of input channels.
         - out_channels: int
             The number of output channels.
+        - init_method: str
+            The initialization method for the linear layer.
         """
         super().__init__()
         self.name = name
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        self.linear = nn.Linear(in_channels, out_channels)
+        self.linear = Linear(
+                        in_channels=in_channels,
+                        out_channels=out_channels,
+                        weight_initializer=init_method,
+                    )
 
 
     def forward(

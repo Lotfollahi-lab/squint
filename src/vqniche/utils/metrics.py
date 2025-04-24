@@ -55,7 +55,7 @@ def accuracy_score(
 
 
 @staticmethod
-def get_similarity_stats(
+def cosine_similarity(
         embeddings: torch.Tensor,
         prefix: str
     ) -> dict:
@@ -431,7 +431,7 @@ def compute_mmd(
     return mmd
 
 
-def compute_pearson_correlation(
+def pearson_correlation(
         X: np.ndarray,
         X_hat: np.ndarray,
         compare_genes: Optional[bool] = False,

@@ -13,7 +13,8 @@ from ..preprocessors.graph_constructors import set_edge_index_name
 from ..dataset.transforms import SetExperimentDataKeys, init_data_transforms
 from ..dataset.in_memory_dataset_blob import InMemoryDatasetBlob
 from ..dataloaders.in_memory_datamodule import InMemoryDataModule
-from ..models.graphsage import GraphSAGE
+from ..models.vanilla_mlp import VanillaMLP
+from ..models.vanilla_gnn import VanillaGNN
 from ..models.vqgraph import VQGraph
 
 
@@ -154,8 +155,10 @@ def initialize_datamodule(
 def set_model_class(
         model_name: str,
     ) -> pl.LightningModule:
-    if model_name == 'GraphSAGE':
-        Model = GraphSAGE
+    if model_name == 'MLP':
+        Model = VanillaMLP
+    elif model_name in ['GraphSAGE', 'GATv2', 'GIN']:
+        Model = VanillaGNN
     elif model_name == 'VQGraph':
         Model = VQGraph
     else:
@@ -174,23 +177,25 @@ def initialize_model(
     # get model, optimizer, loss, and task parameters
     model_name = config['model']['model_name']
     encoder_name = config['model']['encoder_name']
+    attribute_decoder_name = config['model']['attribute_decoder_name']
     predictor_name = config['model']['predictor_name']
+    train_log_flags = config['model']['train_log_flags']
     encoder_params = config['model']['encoder_params']
     optimizer_params = config['model']['optimizer_params']
     loss_params = config['model']['loss_params']
-    inference_params = config['model']['inference_params']
 
     # initialize model
     model = Model(
                 model_name=model_name,
                 encoder_name=encoder_name,
+                attribute_decoder_name=attribute_decoder_name,
                 predictor_name=predictor_name,
+                **train_log_flags,
                 in_channels=in_channels,
                 out_channels=out_channels,
                 **encoder_params,
                 **optimizer_params,
                 **loss_params,
-                **inference_params,
             )
     return model
 

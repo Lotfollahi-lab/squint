@@ -6,8 +6,11 @@ import pandas as pd
 import torch
 import torch_geometric
 import pytorch_lightning as pl
+from torch_geometric.nn.dense.linear import Linear
 
 from ..utils.loss import *
+from ..utils import metrics
+from ..decoders.linear_softmax import LinearSoftmax
 
 
 class BaseModel(pl.LightningModule):
@@ -15,7 +18,11 @@ class BaseModel(pl.LightningModule):
             self,
             model_name: str = 'BaseModel',
             encoder_name: str = 'GraphSAGE',
+            attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
             predictor_name: str = 'Linear',
+            log_similarity_stats: bool = False,
+            log_pearson_correlation: bool = False,
+            log_codebook_utilization: Optional[bool] = None,
             in_channels: int = None,
             out_channels: int = None,
             optimizer_name: str = 'adam',
@@ -23,7 +30,6 @@ class BaseModel(pl.LightningModule):
             weight_decay: float = 0.0,
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'mean'},
-            inference_mode: Literal['batch-wise', 'layer-wise'] = 'batch-wise',
         ) -> None:
         """
         Initialize the BaseModel class.
@@ -34,8 +40,16 @@ class BaseModel(pl.LightningModule):
             The name of the model.
         - encoder_name: str
             The encoder name.
+        - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
+            The name of the attribute decoder module.
         - predictor_name: str
             The predictor name.
+        - log_similarity_stats: bool
+            Whether to log the similarity statistics.
+        - log_pearson_correlation: bool
+            Whether to log the Pearson correlation.
+        - log_codebook_utilization: bool
+            Whether to log the codebook utilization.
 
         - in_channels: int
             The number of input channels.
@@ -54,12 +68,15 @@ class BaseModel(pl.LightningModule):
         - loss_kwargs: dict
             The loss function keyword arguments.
 
-        - inference_mode: Literal['batch-wise', 'layer-wise']
-            The inference mode. Choose from 'batch-wise' or 'layer-wise'.
         """
         self.model_name = model_name
         self.encoder_name = encoder_name
+        self.attribute_decoder_name = attribute_decoder_name
         self.predictor_name = predictor_name
+        self.log_similarity_stats = log_similarity_stats
+        self.log_pearson_correlation = log_pearson_correlation
+        if log_codebook_utilization is not None:
+            self.log_codebook_utilization = log_codebook_utilization
 
         super().__init__()
 
@@ -77,17 +94,11 @@ class BaseModel(pl.LightningModule):
         self.dispersion = torch.nn.Parameter(torch.randn(self.in_channels))
         self.loss_fn_tuples = self.set_loss_fn_tuples(loss_names, loss_kwargs)
 
-        # Option 1 -- batch-wise (default)
+        # Inference mode: Batch-wise
         # for epoch in epochs:
         #    for batch in loader:
         #       for layer in model.layers:
         #         layer.forward(batch)
-        # Option 2 -- layer-wise
-        # for epoch in epochs:
-        #    for layer in model.layers:
-        #       for batch in loader:
-        #         layer.forward(batch)
-        self.inference_mode = inference_mode
 
         self.train_val_epoch_metrics = pd.DataFrame()
 
@@ -168,7 +179,7 @@ class BaseModel(pl.LightningModule):
             elif loss_fn_name == 'mse_joint_code_commit_loss':
                 loss_fn = mse_joint_code_commit_loss
 
-                loss_fn_data_keys = ['quantizer_input', 'quantized_output']
+                loss_fn_data_keys = ['quantizer_input', 'quantizer_output']
 
                 wt_joint_code_commit = loss_kwargs.get('wt_joint_code_commit')
                 if wt_joint_code_commit is not None:
@@ -177,7 +188,7 @@ class BaseModel(pl.LightningModule):
             elif loss_fn_name == 'mse_commit_loss':
                 loss_fn = mse_commit_loss
 
-                loss_fn_data_keys = ['node_embeddings', 'codebook_embeddings', 'code_indices']
+                loss_fn_data_keys = ['quantizer_input', 'quantizer_output']
 
                 wt_commit = loss_kwargs.get('wt_commit')
                 if wt_commit is not None:
@@ -186,7 +197,7 @@ class BaseModel(pl.LightningModule):
             elif loss_fn_name == 'mse_code_loss':
                 loss_fn = mse_code_loss
 
-                loss_fn_data_keys = ['node_embeddings', 'codebook_embeddings', 'code_indices']
+                loss_fn_data_keys = ['quantizer_input', 'quantizer_output']
 
                 wt_code = loss_kwargs.get('wt_code')
                 if wt_code is not None:
@@ -276,6 +287,145 @@ class BaseModel(pl.LightningModule):
         return total_loss
 
 
+    def _init_attribute_decoder(
+            self,
+            attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
+            in_channels: int = None,
+            out_channels: int = None,
+            init_method: str = 'kaiming_uniform'
+        ) -> pl.LightningModule:
+        """
+        Initialize the attribute decoder module.
+
+        Parameters
+        ----------
+        - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
+            The name of the attribute decoder module.
+        - in_channels: int
+            The input dimension of the attribute decoder module. This is the same as the hidden dimension of the Graph Convolution module.
+        - out_channels: int
+            The output dimension of the attribute decoder module. This is the same as the number of genes.
+        - init_method: str
+            The initialization method for the attribute decoder module.
+
+        Returns
+        -------
+        - attribute_decoder: pl.LightningModule
+            The attribute decoder module.
+        """
+        if attribute_decoder_name in ['Linear', 'LinearSoftmax']:
+            return LinearSoftmax(
+                name=attribute_decoder_name,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                init_method=init_method
+            )
+
+
+    def _init_predictor(
+            self,
+            predictor_name: Literal['Linear'] = 'Linear',
+            in_channels: int = None,
+            out_channels: int = None,
+            init_method: str = 'kaiming_uniform'
+        ) -> pl.LightningModule:
+        """
+        Initialize the predictor module.
+
+        Parameters
+        ----------
+        - predictor_name: str
+            The name of the predictor module.
+        - in_channels: int
+            The input dimension of the predictor module.
+        - out_channels: int
+            The output dimension of the predictor module.
+        - init_method: str
+            The initialization method for the predictor module.
+
+        Returns
+        -------
+        - predictor: pl.LightningModule
+            The predictor module.
+        """
+        if predictor_name == 'Linear':
+            return Linear(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                weight_initializer=init_method
+            )
+
+
+    def configure_optimizers(self) -> torch.optim.Optimizer:
+        """
+        Configure the optimizer for the model.
+
+        Returns
+        -------
+        - torch.optim.Optimizer
+            The configured optimizer.
+        """
+        # TODO: Add support for multiple optimizers
+        if self.optimizer_name == 'adam':
+            return torch.optim.Adam(
+                params=self.parameters(),
+                lr=self.lr,
+                weight_decay=self.weight_decay
+            )
+        else:
+            raise NotImplementedError(f'Optimizer {self.optimizer_name} not implemented')
+
+
+    def common_step(
+            self,
+            batch_loss_data: dict,
+            batch_size: int,
+            mode: Literal['train', 'val', 'test'] = 'train',
+        ) -> torch.Tensor:
+        """
+        Compute the loss for a model for a given batch if mode is 'train' or 'val', but not if mode is 'test'.
+        Log the loss (if available) and accuracy for the current batch.
+
+        Parameters
+        ----------
+        - batch_loss_data: dict
+            The data required to compute the loss.
+        - batch_size: int
+            The size of the batch.
+        - mode: Literal['train', 'val', 'test']
+            The mode of the model (train, val, test).
+
+        Returns
+        -------
+        - torch.Tensor
+            The computed loss for the current batch if mode is 'train' or 'val'. The computed accuracy for the current batch if mode is 'test'.
+        """
+        if mode in ['train', 'val']:
+            loss_value = self.criterion(
+                loss_data=batch_loss_data,
+                curr_batch_size=batch_size,
+            )
+        elif mode == 'test':
+            loss_value = None
+
+        acc_value = metrics.accuracy_score(
+            unnormalized_logits=batch_loss_data['logits'],
+            one_hot_labels=batch_loss_data['labels'],
+        )
+
+        self.log_metrics(
+            loss_value=loss_value,
+            acc_value=acc_value,
+            curr_batch_size=batch_size,
+            mode=mode,
+        )
+
+        if mode in ['train', 'val']:
+            return loss_value
+        elif mode == 'test':
+            return acc_value
+
+
     def log_metrics(
             self,
             loss_value: torch.Tensor = None,
@@ -321,13 +471,60 @@ class BaseModel(pl.LightningModule):
         )
 
 
+    def on_train_epoch_end(self) -> None:
+        """
+        Callback function to be executed at the end of each training epoch.
+
+        Notes
+        -----
+        - We use this hook to log the train and validation loss terms and accuracies in the training loop.
+        """
+        # compute the training epoch end stats such as embedding similarity, pearson correlation, codebook utilization, etc.
+        train_epoch_end_stats = self.compute_train_epoch_stats()
+        for key, value in train_epoch_end_stats.items():
+            self.log(
+                name=key,
+                value=value,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
+        # log the metrics at the end of each epoch
+        metric_names = ['epoch'] + list(self.trainer.callback_metrics.keys())
+        metrics_values = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
+        print("--------------------------------")
+        for metric_name, metric_value in zip(metric_names, metrics_values):
+            print(f"{metric_name}: {metric_value}")
+        print("--------------------------------\n")
+
+        self.train_val_epoch_metrics = pd.concat(
+            [self.train_val_epoch_metrics, pd.DataFrame([metrics_values], columns=metric_names)],
+            ignore_index=True
+        )
+
+        return super().on_train_epoch_end()
+
+
+    def on_fit_end(self):
+        epoch_metrics_fname = Path(self.logger.experiment.dir) / 'train_val_epoch_metrics.csv'
+        self.train_val_epoch_metrics.to_csv(
+            path_or_buf=epoch_metrics_fname,
+            sep=',',
+            index=False
+        )
+
+        return super().on_fit_end()
+
+
     def forward(
             self,
             batch_x: torch.Tensor,
             batch_edge_index: torch.Tensor
         ) -> torch.Tensor:
         """
-        Forward pass of a standard GNN model. This is a composition of the forward pass of the encoder and the predictor. The batch of nodes may be the entire set of nodes in the graph or a subset of nodes.
+        Forward pass of the model. The batch of nodes may be the entire set of nodes in the graph or a subset of nodes.
 
         Parameters
         ----------
@@ -341,33 +538,7 @@ class BaseModel(pl.LightningModule):
         - unnormalized_logits: torch.Tensor
             The unnormalized logits of the model.
         """
-        # calls the forward method of the Model's encoder
-        batch_node_embeddings = self.encoder(batch_x, batch_edge_index)
-
-        # calls the forward method of the Model's predictor
-        unnormalized_logits = self.predictor(batch_node_embeddings)
-
-        return unnormalized_logits
-
-
-    def configure_optimizers(self) -> torch.optim.Optimizer:
-        """
-        Configure the optimizer for the model.
-
-        Returns
-        -------
-        - torch.optim.Optimizer
-            The configured optimizer.
-        """
-        # TODO: Add support for multiple optimizers
-        if self.optimizer_name == 'adam':
-            return torch.optim.Adam(
-                params=self.parameters(),
-                lr=self.lr,
-                weight_decay=self.weight_decay
-            )
-        else:
-            raise NotImplementedError(f'Optimizer {self.optimizer_name} not implemented')
+        raise NotImplementedError('Forward pass should be implemented by the subclass')
 
 
     def training_step(
@@ -393,28 +564,16 @@ class BaseModel(pl.LightningModule):
         raise NotImplementedError('Training step not implemented')
 
 
-    def on_train_epoch_end(self) -> None:
+    def compute_train_epoch_stats(self) -> dict:
         """
-        Callback function to be executed at the end of each training epoch.
+        Compute the training epoch end stats such as embedding similarity, pearson correlation, codebook utilization, etc.
 
-        Notes
-        -----
-        - We use this hook to log the train and validation loss terms and accuracies in the training loop.
+        Returns
+        -------
+        - dict
+            The training epoch end stats.
         """
-        # log the metrics at the end of each epoch
-        metric_names = ['epoch'] + list(self.trainer.callback_metrics.keys())
-        metrics_values = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
-        print("--------------------------------")
-        for metric_name, metric_value in zip(metric_names, metrics_values):
-            print(f"{metric_name}: {metric_value}")
-        print("--------------------------------\n")
-
-        self.train_val_epoch_metrics = pd.concat(
-            [self.train_val_epoch_metrics, pd.DataFrame([metrics_values], columns=metric_names)],
-            ignore_index=True
-        )
-
-        return super().on_train_epoch_end()
+        raise NotImplementedError('Training epoch end stats not implemented')
 
 
     def validation_step(
@@ -440,17 +599,6 @@ class BaseModel(pl.LightningModule):
         raise NotImplementedError('Validation step not implemented')
 
 
-    def on_validation_epoch_end(self) -> None:
-        """
-        Callback function to be executed at the end of each validation epoch.
-
-        Notes:
-        ------
-        - We use this hook to print the total validation loss at the end of each epoch to monitor the validation progress.
-        """
-        super().on_validation_epoch_end()
-
-
     def test_step(
             self,
             test_batch: torch_geometric.data.Data,
@@ -472,13 +620,3 @@ class BaseModel(pl.LightningModule):
             The computed test accuracy.
         """
         raise NotImplementedError('Test step not implemented')
-
-    def on_fit_end(self):
-        epoch_metrics_fname = Path(self.logger.experiment.dir) / 'train_val_epoch_metrics.csv'
-        self.train_val_epoch_metrics.to_csv(
-            path_or_buf=epoch_metrics_fname,
-            sep=',',
-            index=False
-        )
-
-        return super().on_fit_end()
