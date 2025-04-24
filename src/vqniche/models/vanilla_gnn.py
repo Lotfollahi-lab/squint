@@ -143,10 +143,11 @@ class VanillaGNN(BaseModel):
 
         # Initialize the predictor.
         # Currently, the predictor is hardcoded to be a simple linear layer.
-        self.predictor = Linear(
+        self.predictor = self._init_predictor(
+                            predictor_name=predictor_name,
                             in_channels=self.encoder.hidden_channels,
                             out_channels=out_channels,
-                            weight_initializer=init_method
+                            init_method=init_method
                         )
         print(f"3. Predictor: Linear layer that transforms {self.encoder.hidden_channels} hidden features to {out_channels} output features.")
 

@@ -6,6 +6,7 @@ import pandas as pd
 import torch
 import torch_geometric
 import pytorch_lightning as pl
+from torch_geometric.nn.dense.linear import Linear
 
 from ..utils.loss import *
 from ..utils import metrics
@@ -321,6 +322,40 @@ class BaseModel(pl.LightningModule):
             )
         else:
             raise NotImplementedError(f'Attribute decoder {attribute_decoder_name} not implemented')
+
+
+    def _init_predictor(
+            self,
+            predictor_name: str = 'Linear',
+            in_channels: int = None,
+            out_channels: int = None,
+            init_method: str = 'kaiming_uniform'
+        ) -> pl.LightningModule:
+        """
+        Initialize the predictor module.
+
+        Parameters
+        ----------
+        - predictor_name: str
+            The name of the predictor module.
+        - in_channels: int
+            The input dimension of the predictor module.
+        - out_channels: int
+            The output dimension of the predictor module.
+        - init_method: str
+            The initialization method for the predictor module.
+
+        Returns
+        -------
+        - predictor: pl.LightningModule
+            The predictor module.
+        """
+        if predictor_name == 'Linear':
+            return Linear(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                init_method=init_method
+            )
 
 
     def configure_optimizers(self) -> torch.optim.Optimizer:

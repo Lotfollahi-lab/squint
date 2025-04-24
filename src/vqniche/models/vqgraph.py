@@ -166,10 +166,11 @@ class VQGraph(BaseModel):
         print(f"3. Adjacency Decoder: A linear layer that reconstructs the adjacency matrix from the latent node embeddings of dimension {self.encoder.hidden_channels}.")
 
         # Instead, we apply this final linear transformation in the predictor module manually to have access to the internal node embeddings via the `embed` function.
-        self.predictor = Linear(
+        self.predictor = self._init_predictor(
+                            predictor_name=predictor_name,
                             in_channels=self.encoder.gnn_module.hidden_channels,
                             out_channels=out_channels,
-                            weight_initializer=init_method
+                            init_method=init_method
                         )
         print(f"4. Predictor: Linear layer that transforms {self.encoder.hidden_channels} hidden features to {out_channels} output features.")
 
