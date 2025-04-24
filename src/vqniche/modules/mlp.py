@@ -39,9 +39,6 @@ class MLP_Module(pl.LightningModule):
         - init_method : Literal['kaiming_uniform', 'glorot', 'uniform', None], optional
             Initialization method to use. Default: 'kaiming_uniform'
         """
-        if num_layers == 0:
-            return None
-
         super().__init__()
 
         # Validate parameters

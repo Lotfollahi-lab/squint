@@ -11,7 +11,7 @@ The Predictor builds the logits for the label prediction task using the quantize
 
 The implementation is based on the paper: VQGraph: Rethinking Graph Representation Space for Bridging GNNs and MLPs.
 """
-from typing import List, Union, Callable, Literal
+from typing import List, Literal
 
 import torch
 import torch_geometric
@@ -33,6 +33,7 @@ class VQGraph(BaseModel):
             log_codebook_utilization: bool = True,
             in_channels: int = None,
             out_channels: int = None,
+            gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv'] = 'SAGEConv',
             mlp_params: dict = {},
             gnn_params: dict = {},
             init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform',
@@ -68,6 +69,8 @@ class VQGraph(BaseModel):
         - out_channels: int
             The number of output features.
 
+        - gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv']
+            The name of the GNN module.
         - mlp_params: dict
             The parameters for the MLP module.
         - gnn_params: dict
@@ -114,12 +117,13 @@ class VQGraph(BaseModel):
         # The out_channels parameter is not passed to the VQGraph_Encoder to separate the encoder from the predictor.
         self.encoder = VQGraph_Encoder(
                             in_channels=in_channels,
+                            gnn_name=gnn_name,
                             mlp_params=mlp_params,
                             gnn_params=gnn_params,
                             init_method=init_method,
                             codebook_params=codebook_params
                         )
-        print(f"1. Encoder: (a) {self.encoder.mlp_module.num_layers} Linear layers followed by {self.encoder.gnn_module.num_layers} {self.encoder.gnn_module.gnn_layer_name} layers that transforms {in_channels} input features to {self.encoder.dim} hidden features.\n(b) A vector quantization module that quantizes the latent node embeddings to {self.encoder.codebook.shape[0]} codebook embeddings of dimension {self.encoder.dim}.")
+        print(f"1. Encoder: (a) {mlp_params['num_layers']} Linear layers followed by {gnn_params['num_gnn_layers']} {encoder_name} layers that transform {in_channels} input features to {self.encoder.dim} hidden features.\n(b) A vector quantization module that quantizes the latent node embeddings to {self.encoder.codebook.shape[0]} codebook embeddings of dimension {self.encoder.dim}.")
 
         # Initialize the attribute decoder.
         self.attribute_decoder = self._init_attribute_decoder(

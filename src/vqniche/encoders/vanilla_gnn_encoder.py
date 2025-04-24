@@ -12,6 +12,7 @@ class VanillaGNN_Encoder(pl.LightningModule):
     def __init__(
             self,
             in_channels: int,
+            gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv'] = 'SAGEConv',
             mlp_params: dict = {},
             gnn_params: dict = {},
             init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform',
@@ -23,6 +24,8 @@ class VanillaGNN_Encoder(pl.LightningModule):
         ----------
         - in_channels: int
             The number of input channels.
+        - gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv']
+            The name of the GNN module.
         - mlp_params: dict
             Keyword arguments for the MLP module.
         - gnn_params: dict
@@ -33,19 +36,21 @@ class VanillaGNN_Encoder(pl.LightningModule):
         super().__init__()
 
         # initialize the MLP module if num_layers > 0
-        self.mlp_module = MLP_Module(
-            in_channels=in_channels,
-            **mlp_params,
-            init_method=init_method,
-        )
-        if self.mlp_module is not None:
-            gnn_in_channels = self.mlp_module.dim
-        else:
+        if mlp_params['num_layers'] == 0:
+            self.mlp_module = None
             gnn_in_channels = in_channels
+        else:
+            self.mlp_module = MLP_Module(
+                in_channels=in_channels,
+                **mlp_params,
+                init_method=init_method,
+            )
+            gnn_in_channels = self.mlp_module.dim
 
         # initialize the Vanilla GNN module
         self.gnn_module = init_gnn_module(
             in_channels=gnn_in_channels,
+            gnn_name=gnn_name,
             **gnn_params,
             init_method=init_method
         )

@@ -102,6 +102,7 @@ def init_gnn_module(
     - GNN_Module: torch.nn.Module
         The GNN module.
     """
+    print(f"gnn_name: {gnn_name}")
     GNN_Module = create_dynamic_gnn_module_class(gnn_name=gnn_name)
 
     return GNN_Module(

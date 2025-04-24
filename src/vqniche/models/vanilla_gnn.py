@@ -103,12 +103,13 @@ class VanillaGNN(BaseModel):
         # This module applies a series of Linear layers followed by a series of GNN layers.
         # The out_channels parameter is not passed to the GNN_Module (i.e. it is set to None) to separate the encoder from the predictor.
         self.encoder = VanillaGNN_Encoder(
+                            gnn_name=encoder_name,
                             in_channels=in_channels,
                             mlp_params=mlp_params,
                             gnn_params=gnn_params,
                             init_method=init_method,
                         )
-        print(f"1. Encoder: {self.encoder.mlp_module.num_layers} Linear layers followed by {self.encoder.gnn_module.num_layers} {self.encoder.gnn_module.gnn_layer_name} layers that transforms {in_channels} input features to {self.encoder.dim} hidden features.")
+        print(f"1. Encoder: {mlp_params['num_layers']} Linear layers followed by {gnn_params['num_gnn_layers']} {encoder_name} layers that transform {in_channels} input features to {self.encoder.dim} hidden features.")
 
         # Initialize the attribute decoder.
         self.attribute_decoder = self._init_attribute_decoder(
