@@ -55,7 +55,6 @@ Further, this module adds two customization functionalities:
 from typing import Literal, Union, Callable, List
 
 import torch
-import torch.nn as nn
 from torch_geometric.nn.dense.linear import Linear
 from torch_geometric.nn import GraphSAGE as BaseSAGEConv_Module
 from torch_geometric.nn import GAT as BaseGATv2_Module
@@ -64,9 +63,8 @@ from torch_geometric.nn.aggr import MultiAggregation
 
 
 def init_gnn_module(
-        gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv'] = 'SAGEConv',
-        num_linear_layers: int = 1,
         in_channels: int = None,
+        gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv'] = 'SAGEConv',
         hidden_channels: List[int] | int = 500,
         num_gnn_layers: int = 2,
         act_first: bool = True,
@@ -80,12 +78,10 @@ def init_gnn_module(
 
     Parameters
     ----------
-    - gnn_name: str
-        The name of the GNN module.
-    - num_linear_layers: int
-        The number of linear layers.
     - in_channels: int
         The number of input channels.
+    - gnn_name: str
+        The name of the GNN module.
     - hidden_channels: List[int] | int
         The number of hidden channels.
     - num_gnn_layers: int
@@ -109,7 +105,6 @@ def init_gnn_module(
     GNN_Module = create_dynamic_gnn_module_class(gnn_name=gnn_name)
 
     return GNN_Module(
-        num_linear_layers=num_linear_layers,
         in_channels=in_channels,
         hidden_channels=hidden_channels,
         num_gnn_layers=num_gnn_layers,
@@ -153,7 +148,6 @@ def create_dynamic_gnn_module_class(
 
         def __init__(
             self,
-            num_linear_layers: int = 2,
             in_channels: int = None,
             hidden_channels: List[int] | int = 500,
             num_gnn_layers: int = 2,
@@ -163,27 +157,33 @@ def create_dynamic_gnn_module_class(
             dropout: float = 0.5,
             init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform',
         ):
-            self.num_linear_layers = num_linear_layers
-            if num_linear_layers > 0:
-                if isinstance(hidden_channels, int):
-                    hidden_channels = [in_channels] + [hidden_channels] * num_linear_layers
-                elif isinstance(hidden_channels, list):
-                    assert len(hidden_channels) == num_linear_layers, f"The number of hidden channels must be equal to the number of linear layers. Got {len(hidden_channels)} hidden channels for {num_linear_layers} linear layers."
-                    hidden_channels = [in_channels] + hidden_channels
+            """
+            Initialize the GNN module.
 
-                print(f"{num_linear_layers=} | {hidden_channels=}")
-
-                # if Linear layers are used, SAGEConv is applied from the last hidden channel to the last hidden channel
-                sageconv_in_channels = hidden_channels[-1]
-                sageconv_hidden_channels = hidden_channels[-1]
-            else:
-                # if no Linear layers are used, SAGEConv is applied from the input channels to hidden channels
-                sageconv_in_channels = in_channels
-                sageconv_hidden_channels = hidden_channels
+            Parameters
+            ----------
+            - in_channels: int
+                The number of input channels.
+            - hidden_channels: List[int] | int
+                The number of hidden channels.
+            - num_gnn_layers: int
+                The number of GNN layers.
+            - act_first: bool
+                Whether to apply the activation function before the GNN layer.
+            - activation: Union[str, Callable, None]
+                The activation function.
+            - norm: Union[str, Callable, None]
+                The normalization function.
+            - dropout: float
+                The dropout rate.
+            - init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None]
+                The initialization method.
+            """
+            self.num_layers = num_gnn_layers
 
             kwargs = {
-                'in_channels': sageconv_in_channels,
-                'hidden_channels': sageconv_hidden_channels,
+                'in_channels': in_channels,
+                'hidden_channels': hidden_channels,
                 'num_layers': num_gnn_layers,
                 'act_first': act_first,
                 'act': activation,
@@ -200,19 +200,8 @@ def create_dynamic_gnn_module_class(
             self.init_method = init_method
             self.initialize_linear_layers()
 
-            if num_linear_layers > 0:
-                # Create sequential model of linear layers
-                layers = []
-                for i in range(num_linear_layers):
-                    layers.append(
-                        Linear(
-                            in_channels=hidden_channels[i],
-                            out_channels=hidden_channels[i+1],
-                            weight_initializer=init_method,
-                        )
-                    )
-
-                self.input_transform = nn.Sequential(*layers)
+            self.gnn_layer_name = gnn_name
+            self.dim = hidden_channels
 
 
         def initialize_linear_layers(self):
@@ -249,34 +238,5 @@ def create_dynamic_gnn_module_class(
                         )
             else:
                 raise ValueError(f"Invalid initialization method: {self.init_method}")
-
-
-        def forward(
-                self,
-                x: torch.Tensor,
-                edge_index: torch.Tensor
-            ) -> torch.Tensor:
-            """
-            Forward pass of the SAGEConv module.
-
-            Parameters
-            ----------
-            - x: torch.Tensor
-                The input features.
-            - edge_index: torch.Tensor
-                The edge index.
-
-            Returns
-            -------
-            - torch.Tensor
-                The output features.
-            """
-            if self.num_linear_layers > 0:
-                x = self.input_transform(x)
-
-            return super().forward(
-                x,
-                edge_index
-            )
 
     return VanillaGNN_Module

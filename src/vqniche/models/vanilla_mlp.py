@@ -8,20 +8,20 @@ The MLP Model comprises of the following components:
 
 In addition, this provides the option to log the mean pairwise cosine similarity between the original attributes, decoded attributes, and MLP embeddings, and the Pearson correlation between the original and decoded node attributes at the end of each training epoch.
 """
-from typing import List, Union, Callable, Literal, Dict
+from typing import List, Literal, Dict
 
 import torch
 import torch_geometric
-from torch_geometric.nn.dense.linear import Linear
 
 from .base_model import BaseModel
+from ..modules.mlp import MLP_Module as MLP_Encoder
 from ..utils import metrics
 
 
-class MLP(BaseModel):
+class VanillaMLP(BaseModel):
     def __init__(
             self,
-            model_name: Literal['MLP'] = 'MLP',
+            model_name: Literal['VanillaMLP'] = 'VanillaMLP',
             encoder_name: Literal['Linear'] = 'Linear',
             attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
             predictor_name: Literal['Linear'] = 'Linear',
@@ -29,10 +29,7 @@ class MLP(BaseModel):
             out_channels: int = None,
             log_similarity_stats: bool = False,
             log_pearson_correlation: bool = False,
-            num_linear_layers: int = 1,
-            hidden_channels: List[int] | int = 500,
-            norm: Union[str, Callable, None] = None,
-            dropout: float = 0.5,
+            mlp_params: dict = {},
             init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform',
             optimizer_name: str = 'adam',
             lr: float = 0.01,
@@ -63,15 +60,10 @@ class MLP(BaseModel):
         - out_channels: int
             The number of output features.
 
-        - num_linear_layers: int
-            The number of linear layers to use before the GraphSAGE encoder layers.
-        - hidden_channels: List[int] | int
-            The number of hidden features.
-        - dropout: float
-            The dropout probability.
+        - mlp_params: dict
+            The parameters for the MLP module.
         - init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None]
-            The initialization method to use for the linear transformations in the SAGEConv layers.
-            If None, the initialization method is 'kaiming_uniform'.
+            The initialization method to use for all Linear layers in the model.
 
         - optimizer_name: str
             The optimizer name.
@@ -105,30 +97,31 @@ class MLP(BaseModel):
         )
 
         # Initialize a MLP module as the encoder.
-        self.encoder = Linear(
+        self.encoder = MLP_Encoder(
             in_channels=in_channels,
-            out_channels=hidden_channels,
-            weight_initializer=init_method,
+            **mlp_params,
+            init_method=init_method,
         )
+        assert self.encoder is not None, "Number of MLP layers is 0. Please set num_layers to a positive integer."
 
         # Initialize the attribute decoder.
         self.attribute_decoder = self._init_attribute_decoder(
             attribute_decoder_name=attribute_decoder_name,
-            in_channels=hidden_channels,
+            in_channels=self.encoder.dim,
             out_channels=in_channels,
             init_method=init_method,
         )
-        print(f"2. Attribute Decoder: {attribute_decoder_name} that reconstructs {hidden_channels} latent features to {in_channels} input features.")
+        print(f"2. Attribute Decoder: {attribute_decoder_name} that reconstructs {self.encoder.dim} latent features to {in_channels} input features.")
 
         # Initialize the predictor.
         # Currently, the predictor is hardcoded to be a simple linear layer.
         self.predictor = self._init_predictor(
             predictor_name=predictor_name,
-            in_channels=hidden_channels,
+            in_channels=self.encoder.dim,
             out_channels=out_channels,
             init_method=init_method,
         )
-        print(f"3. Predictor: Linear layer that transforms {hidden_channels} hidden features to {out_channels} output features.")
+        print(f"3. Predictor: Linear layer that transforms {self.encoder.dim} hidden features to {out_channels} output features.")
 
 
     def forward(

@@ -352,7 +352,7 @@ class BaseModel(pl.LightningModule):
             return Linear(
                 in_channels=in_channels,
                 out_channels=out_channels,
-                init_method=init_method
+                weight_initializer=init_method
             )
 
 

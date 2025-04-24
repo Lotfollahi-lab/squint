@@ -33,14 +33,8 @@ class VQGraph(BaseModel):
             log_codebook_utilization: bool = True,
             in_channels: int = None,
             out_channels: int = None,
-            gnn_layer_name: str = 'SAGE',
-            num_linear_layers: int = 1,
-            hidden_channels: List[int] | int = 500,
-            num_gnn_layers: int = 2,
-            act_first: bool = True,
-            activation: Union[str, Callable, None] = "relu",
-            norm: Union[str, Callable, None] = None,
-            dropout: float = 0.5,
+            mlp_params: dict = {},
+            gnn_params: dict = {},
             init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform',
             codebook_params: dict = {},
             optimizer_name: str = 'adam',
@@ -74,24 +68,10 @@ class VQGraph(BaseModel):
         - out_channels: int
             The number of output features.
 
-        - gnn_layer_name: str
-            The name of the GNN layer.
-        - num_linear_layers: int
-            The number of linear layers to use before the VQGraph encoder layers.
-        - hidden_channels: List[int] | int
-            The number of hidden features.
-        - num_gnn_layers: int
-            The number of VQGraph encoder layers.
-        - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
-            The name of the attribute decoder module.
-        - act_first: bool
-            Whether to apply the activation function before normalization.
-        - activation: str or callable or None
-            The activation function to use.
-        - norm: str or callable or None
-            The normalization function to use.
-        - dropout: float
-            The dropout probability.
+        - mlp_params: dict
+            The parameters for the MLP module.
+        - gnn_params: dict
+            The parameters for the GNN module.
         - init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None]
             The initialization method to use for the linear transformations in the SAGEConv layers.
             If None, the initialization method is 'kaiming_uniform'.
@@ -133,46 +113,40 @@ class VQGraph(BaseModel):
         # Then, it applies a vector quantization module to quantize the latent node embeddings.
         # The out_channels parameter is not passed to the VQGraph_Encoder to separate the encoder from the predictor.
         self.encoder = VQGraph_Encoder(
-                            num_linear_layers=num_linear_layers,
-                            gnn_layer_name=gnn_layer_name,
                             in_channels=in_channels,
-                            hidden_channels=hidden_channels,
-                            num_gnn_layers=num_gnn_layers,
-                            act_first=act_first,
-                            activation=activation,
-                            dropout=dropout,
-                            norm=norm,
+                            mlp_params=mlp_params,
+                            gnn_params=gnn_params,
                             init_method=init_method,
-                            **codebook_params
+                            codebook_params=codebook_params
                         )
-        print(f"1. Encoder: (a) {num_linear_layers} Linear layers followed by {num_gnn_layers} {encoder_name} layers that transforms {in_channels} input features to {self.encoder.hidden_channels} hidden features.\n(b) A vector quantization module that quantizes the latent node embeddings to {self.encoder.codebook.shape[0]} codebook embeddings of dimension {self.encoder.hidden_channels}.")
+        print(f"1. Encoder: (a) {self.encoder.mlp_module.num_layers} Linear layers followed by {self.encoder.gnn_module.num_layers} {self.encoder.gnn_module.gnn_layer_name} layers that transforms {in_channels} input features to {self.encoder.dim} hidden features.\n(b) A vector quantization module that quantizes the latent node embeddings to {self.encoder.codebook.shape[0]} codebook embeddings of dimension {self.encoder.dim}.")
 
         # Initialize the attribute decoder.
         self.attribute_decoder = self._init_attribute_decoder(
                                 attribute_decoder_name=attribute_decoder_name,
-                                in_channels=self.encoder.gnn_module.hidden_channels,
+                                in_channels=self.encoder.dim,
                                 out_channels=in_channels,
                                 init_method=init_method
                             )
-        print(f"2. Attribute Decoder: {attribute_decoder_name} that reconstructs {self.encoder.hidden_channels} latent features to {in_channels} input features.")
+        print(f"2. Attribute Decoder: {attribute_decoder_name} that reconstructs {self.encoder.dim} latent features to {in_channels} input features.")
 
         # Initialize the decoder module for the adjacency matrix
         # Currently, the decoder is hard-coded to be a simple linear layer.
         self.decoder_edge = Linear(
-                                in_channels=self.encoder.gnn_module.hidden_channels,
-                                out_channels=self.encoder.gnn_module.hidden_channels,
+                                in_channels=self.encoder.dim,
+                                out_channels=self.encoder.dim,
                                 weight_initializer=init_method
                             )
-        print(f"3. Adjacency Decoder: A linear layer that reconstructs the adjacency matrix from the latent node embeddings of dimension {self.encoder.hidden_channels}.")
+        print(f"3. Adjacency Decoder: A linear layer that reconstructs the adjacency matrix from the latent node embeddings of dimension {self.encoder.dim}.")
 
         # Instead, we apply this final linear transformation in the predictor module manually to have access to the internal node embeddings via the `embed` function.
         self.predictor = self._init_predictor(
                             predictor_name=predictor_name,
-                            in_channels=self.encoder.gnn_module.hidden_channels,
+                            in_channels=self.encoder.dim,
                             out_channels=out_channels,
                             init_method=init_method
                         )
-        print(f"4. Predictor: Linear layer that transforms {self.encoder.hidden_channels} hidden features to {out_channels} output features.")
+        print(f"4. Predictor: Linear layer that transforms {self.encoder.dim} hidden features to {out_channels} output features.")
 
 
     def forward(
@@ -221,8 +195,8 @@ class VQGraph(BaseModel):
                         )
 
         h_node = self.attribute_decoder(
-                    # x=h_vq,
-                    x=h_gnn,
+                    x=h_vq,
+                    # x=h_gnn,
                     read_depth=batch_x.sum(dim=-1)
                 )
 
