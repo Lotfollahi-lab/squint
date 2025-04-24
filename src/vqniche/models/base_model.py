@@ -178,7 +178,7 @@ class BaseModel(pl.LightningModule):
             elif loss_fn_name == 'mse_joint_code_commit_loss':
                 loss_fn = mse_joint_code_commit_loss
 
-                loss_fn_data_keys = ['quantizer_input', 'quantized_output']
+                loss_fn_data_keys = ['quantizer_input', 'quantizer_output']
 
                 wt_joint_code_commit = loss_kwargs.get('wt_joint_code_commit')
                 if wt_joint_code_commit is not None:
@@ -187,7 +187,7 @@ class BaseModel(pl.LightningModule):
             elif loss_fn_name == 'mse_commit_loss':
                 loss_fn = mse_commit_loss
 
-                loss_fn_data_keys = ['node_embeddings', 'codebook_embeddings', 'code_indices']
+                loss_fn_data_keys = ['quantizer_input', 'quantizer_output']
 
                 wt_commit = loss_kwargs.get('wt_commit')
                 if wt_commit is not None:
@@ -196,7 +196,7 @@ class BaseModel(pl.LightningModule):
             elif loss_fn_name == 'mse_code_loss':
                 loss_fn = mse_code_loss
 
-                loss_fn_data_keys = ['node_embeddings', 'codebook_embeddings', 'code_indices']
+                loss_fn_data_keys = ['quantizer_input', 'quantizer_output']
 
                 wt_code = loss_kwargs.get('wt_code')
                 if wt_code is not None:

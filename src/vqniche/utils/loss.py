@@ -197,20 +197,20 @@ def mse_adjacency_reconstruction(
 
 def mse_joint_code_commit_loss(
         quantizer_input: torch.Tensor,
-        quantized_output: torch.Tensor,
+        quantizer_output: torch.Tensor,
         wt_joint_code_commit: float = 0.25
     ) -> torch.Tensor:
     """
-    Computes the total codebook loss defined as the sum of the commit loss and code loss for the VQGraph encoder as in the original VQGraph implementation.
+    Computes the total codebook loss defined as the sum of the commit loss and code loss.
 
     Parameters
     ----------
     quantizer_input: torch.Tensor
-        The latent node embedding obtained from the pre-VQ graph convolution layer(s).
-        Dimensions: (batch_size, num_genes)
-    quantized_output: torch.Tensor
-        The quantized node embedding obtained from a Linear Decoder layer on the output of the VQ layer.
-        Dimensions: (batch_size, num_genes)
+        Input to the VQ module.
+        Dimensions: (batch_size, hidden_channels)
+    quantizer_output: torch.Tensor
+        Output from the VQ module.
+        Dimensions: (batch_size, hidden_channels)
     wt_joint_code_commit: float
         The scaling factor for the total codebook loss.
 
@@ -221,37 +221,34 @@ def mse_joint_code_commit_loss(
 
     Notes
     -----
-    - The quantizer_input for VQGraph is the output from the pre-VQ graph convolution layer(s).
-    - The quantized_output for VQGraph is the output from the VQ layer (i.e. the quantized node embedding obtained from the codebook).
+    - The quantizer_input is latent node embeddings from the GNN module.
+    - The quantizer_output is quantized node embeddings, i.e. the nearest codebook embedding for each node.
+    - Reference: vqgraph --> https://github.com/YangLing0818/VQGraph/blob/main/vq.py
     """
     mse_joint_code_commit_loss = F.mse_loss(
-                        input=quantizer_input,
-                        target=quantized_output.detach(),
-                        reduction='mean',
-                    )
+                                    input=quantizer_output.detach(),
+                                    target=quantizer_input,
+                                    reduction='mean',
+                                )
     return mse_joint_code_commit_loss * wt_joint_code_commit
 
 
 def mse_commit_loss(
-        node_embeddings: torch.Tensor,
-        codebook_embeddings: torch.Tensor,
-        code_indices: torch.Tensor,
+        quantizer_input: torch.Tensor,
+        quantizer_output: torch.Tensor,
         wt_commit: float = 0.25
     ) -> torch.Tensor:
     """
-    Compute the commit loss for VQGraph. This freezes the codebook embeddings and updates the node embeddings.
+    Compute the commit loss.
 
     Parameters
     ----------
-    node_embeddings: torch.Tensor
-        The node embeddings.
-        Dimensions: (batch_size, num_genes)
-    codebook_embeddings: torch.Tensor
-        The codebook embeddings.
-        Dimensions: (codebook_size, num_genes)
-    code_indices: torch.Tensor
-        The indices of the nearest code for each node.
-        Dimensions: (batch_size,)
+    quantizer_input: torch.Tensor
+        Input to the VQ module.
+        Dimensions: (batch_size, hidden_channels)
+    quantizer_output: torch.Tensor
+        Output from the VQ module.
+        Dimensions: (batch_size, hidden_channels)
     wt_commit: float
         The scaling factor for the commitment loss.
 
@@ -262,36 +259,35 @@ def mse_commit_loss(
 
     Notes:
     -----
-    - Source --> Equation (3) from https://arxiv.org/abs/2112.00384
+    - The quantizer_input is latent node embeddings from the GNN module.
+    - The quantizer_output is quantized node embeddings, i.e. the nearest codebook embedding for each node.
+    - This loss function freezes the codebook embeddings and updates the node embeddings.
+    - Reference --> Equation (3) from https://arxiv.org/abs/2112.00384
     """
     commit_loss = F.mse_loss(
-                        input=node_embeddings,
-                        target=codebook_embeddings[code_indices].detach(),
+                        input=quantizer_input,
+                        target=quantizer_output.detach(),
                         reduction='mean',
                     )
     return commit_loss * wt_commit
 
 
 def mse_code_loss(
-        node_embeddings: torch.Tensor,
-        codebook_embeddings: torch.Tensor,
-        code_indices: torch.Tensor,
+        quantizer_input: torch.Tensor,
+        quantizer_output: torch.Tensor,
         wt_code: float = 0.25
     ) -> torch.Tensor:
     """
-    Compute the code loss for VQGraph. This freezes the node embeddings and updates the codebook embeddings.
+    Compute the code loss.
 
     Parameters
     ----------
-    node_embeddings: torch.Tensor
-        The node embeddings.
-        Dimensions: (batch_size, num_genes)
-    codebook_embeddings: torch.Tensor
-        The codebook embeddings.
-        Dimensions: (codebook_size, num_genes)
-    code_indices: torch.Tensor
-        The indices of the nearest code for each node.
-        Dimensions: (batch_size,)
+    quantizer_input: torch.Tensor
+        Input to the VQ module.
+        Dimensions: (batch_size, hidden_channels)
+    quantizer_output: torch.Tensor
+        Output from the VQ module.
+        Dimensions: (batch_size, hidden_channels)
     wt_code: float
         The scaling factor for the code loss.
 
@@ -302,11 +298,14 @@ def mse_code_loss(
 
     Notes:
     -----
-    - Source --> Equation (3) from https://arxiv.org/abs/2112.00384
+    - The quantizer_input is latent node embeddings from the GNN module.
+    - The quantizer_output is quantized node embeddings, i.e. the nearest codebook embedding for each node.
+    - This loss function freezes the node embeddings and updates the codebook embeddings.
+    - Reference --> Equation (3) from https://arxiv.org/abs/2112.00384
     """
     code_loss = F.mse_loss(
-                        input=codebook_embeddings[code_indices],
-                        target=node_embeddings.detach(),
+                        input=quantizer_output,
+                        target=quantizer_input.detach(),
                         reduction='mean',
                     )
     return code_loss * wt_code

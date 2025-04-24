@@ -208,7 +208,7 @@ class VQGraph(BaseModel):
         - unnormalized_logits_batch: torch.Tensor
             The unnormalized logits for the batch of nodes (output of the predictor module).
         """
-        # execute the forward of the VQGraph_Encoder model
+        # execute the forward of the VQGraph_Encoder module
         h_gnn, \
         h_vq, \
         indices, \
@@ -220,7 +220,8 @@ class VQGraph(BaseModel):
                         )
 
         h_node = self.attribute_decoder(
-                    x=h_vq,
+                    # x=h_vq,
+                    x=h_gnn,
                     read_depth=batch_x.sum(dim=-1)
                 )
 
@@ -275,20 +276,18 @@ class VQGraph(BaseModel):
         # prepare dictionary of data required for computing loss
         # This slicing is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the target nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of target nodes is equal to the batch size. The remaining entries of the forward output are the logits for the sampled neighbors of the target nodes.
         train_loss_data = {
-                        'logits': unnormalized_logits_batch[:batch_size],
-                        'labels': train_batch.y[:batch_size],
-                        'pred_attr': h_node[:batch_size],
-                        'target_attr': train_batch.x[:batch_size],
-                        'dispersion': torch.exp(self.dispersion),
-                        'pred_adj': h_edge[:batch_size],
-                        'batch_edge_index': train_batch.edge_index,
-                        'quantizer_input': h_gnn[:batch_size],
-                        'quantized_output': h_vq[:batch_size],
-                        'node_embeddings': h_gnn[:batch_size],
-                        'codebook_embeddings': codebook_embeddings[0],
-                        'code_indices': indices[:batch_size],
-                        'batch_input_id': train_batch.input_id,
-                        'batch_nid': train_batch.n_id,
+                        'quantizer_input': h_gnn[:batch_size], # code and commit loss
+                        'quantizer_output': h_vq[:batch_size], # code and commit loss
+                        'codebook_embeddings': codebook_embeddings[0], # codebook orthogonal regularization loss
+                        'pred_attr': h_node[:batch_size], # attribute reconstruction loss
+                        'target_attr': train_batch.x[:batch_size], # attribute reconstruction loss
+                        'dispersion': torch.exp(self.dispersion), # attribute reconstruction loss
+                        'pred_adj': h_edge[:batch_size], # adjacency reconstruction loss
+                        'batch_edge_index': train_batch.edge_index, # adjacency reconstruction loss
+                        'batch_input_id': train_batch.input_id, # adjacency reconstruction loss
+                        'batch_nid': train_batch.n_id, # adjacency reconstruction loss
+                        'logits': unnormalized_logits_batch[:batch_size], # label prediction loss
+                        'labels': train_batch.y[:batch_size], # label prediction loss
                         }
 
         train_loss = self.common_step(
@@ -334,20 +333,18 @@ class VQGraph(BaseModel):
 
         # prepare dictionary of data required for computing loss
         val_loss_data = {
-                        'logits': unnormalized_logits_batch[:batch_size],
-                        'labels': val_batch.y[:batch_size],
+                        'quantizer_input': h_gnn[:batch_size],
+                        'quantizer_output': h_vq[:batch_size],
+                        'codebook_embeddings': codebook_embeddings[0],
                         'pred_attr': h_node[:batch_size],
                         'target_attr': val_batch.x[:batch_size],
-                        'pred_adj': h_edge[:batch_size],
                         'dispersion': torch.exp(self.dispersion),
+                        'pred_adj': h_edge[:batch_size],
                         'batch_edge_index': val_batch.edge_index,
-                        'quantizer_input': h_gnn[:batch_size],
-                        'quantized_output': h_vq[:batch_size],
-                        'node_embeddings': h_gnn[:batch_size],
-                        'codebook_embeddings': codebook_embeddings[0],
-                        'code_indices': indices[:batch_size],
                         'batch_input_id': val_batch.input_id,
                         'batch_nid': val_batch.n_id,
+                        'logits': unnormalized_logits_batch[:batch_size],
+                        'labels': val_batch.y[:batch_size],
                         }
 
         val_loss = self.common_step(

@@ -198,11 +198,11 @@ class MLP(BaseModel):
         # train_batch.n_id contains the IDs of all the target nodes and their sampled neighbors.
         batch_size = train_batch.batch_size
         train_loss_data = {
-                        'logits': unnormalized_logits_batch[:batch_size],
-                        'labels': train_batch.y[:batch_size],
                         'pred_attr': xhat_batch[:batch_size],
                         'target_attr': train_batch.x[:batch_size],
                         'dispersion': torch.exp(self.dispersion),
+                        'logits': unnormalized_logits_batch[:batch_size],
+                        'labels': train_batch.y[:batch_size],
                         }
 
         train_loss = self.common_step(
@@ -239,11 +239,11 @@ class MLP(BaseModel):
         # prepare dictionary of data required for computing loss
         batch_size = val_batch.batch_size
         val_loss_data = {
-                        'logits': unnormalized_logits_batch[:batch_size],
-                        'labels': val_batch.y[:batch_size],
                         'pred_attr': xhat_batch[:batch_size],
                         'target_attr': val_batch.x[:batch_size],
                         'dispersion': torch.exp(self.dispersion),
+                        'logits': unnormalized_logits_batch[:batch_size],
+                        'labels': val_batch.y[:batch_size],
                         }
 
         val_loss = self.common_step(
