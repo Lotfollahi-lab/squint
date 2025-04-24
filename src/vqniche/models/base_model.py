@@ -320,13 +320,11 @@ class BaseModel(pl.LightningModule):
                 out_channels=out_channels,
                 init_method=init_method
             )
-        else:
-            raise NotImplementedError(f'Attribute decoder {attribute_decoder_name} not implemented')
 
 
     def _init_predictor(
             self,
-            predictor_name: str = 'Linear',
+            predictor_name: Literal['Linear'] = 'Linear',
             in_channels: int = None,
             out_channels: int = None,
             init_method: str = 'kaiming_uniform'
