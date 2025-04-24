@@ -38,10 +38,14 @@ class VanillaGNN_Encoder(pl.LightningModule):
             **mlp_params,
             init_method=init_method,
         )
+        if self.mlp_module is not None:
+            gnn_in_channels = self.mlp_module.dim
+        else:
+            gnn_in_channels = in_channels
 
         # initialize the Vanilla GNN module
         self.gnn_module = init_gnn_module(
-            in_channels=self.mlp_module.dim,
+            in_channels=gnn_in_channels,
             **gnn_params,
             init_method=init_method
         )

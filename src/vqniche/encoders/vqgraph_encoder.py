@@ -43,13 +43,18 @@ class VQGraph_Encoder(pl.LightningModule):
             **mlp_params,
             init_method=init_method,
         )
+        if self.mlp_module is not None:
+            gnn_in_channels = self.mlp_module.dim
+        else:
+            gnn_in_channels = in_channels
 
         # initialize the GNN module
         self.gnn_module = init_gnn_module(
-            in_channels=self.mlp_module.dim,
+            in_channels=gnn_in_channels,
             **gnn_params,
             init_method=init_method,
         )
+        assert self.gnn_module is not None, "Number of GNN layers is 0. Please set num_layers to a positive integer."
 
         # initialize the codebook
         self._codebook = CosineSimCodebook(
