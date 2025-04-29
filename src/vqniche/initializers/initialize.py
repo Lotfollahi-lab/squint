@@ -15,6 +15,7 @@ from ..dataset.in_memory_dataset_blob import InMemoryDatasetBlob
 from ..dataloaders.in_memory_datamodule import InMemoryDataModule
 from ..models.vanilla_mlp import VanillaMLP
 from ..models.vanilla_gnn import VanillaGNN
+from ..models.vqniche import VQNiche
 
 
 def initialize_logger(
@@ -154,10 +155,12 @@ def initialize_datamodule(
 def set_model_class(
         model_name: str,
     ) -> pl.LightningModule:
-    if model_name == 'MLP':
+    if model_name == 'VanillaMLP':
         Model = VanillaMLP
     elif model_name in ['GraphSAGE', 'GATv2', 'GIN']:
         Model = VanillaGNN
+    elif model_name == 'VQNiche':
+        Model = VQNiche
     else:
         raise ValueError(f"Model {model_name} not found.")
     return Model
@@ -178,6 +181,7 @@ def initialize_model(
     predictor_name = config['model']['predictor_name']
     train_log_flags = config['model']['train_log_flags']
     encoder_params = config['model']['encoder_params']
+    attribute_decoder_params = config['model']['attribute_decoder_params']
     optimizer_params = config['model']['optimizer_params']
     loss_params = config['model']['loss_params']
 
@@ -190,9 +194,10 @@ def initialize_model(
                 **train_log_flags,
                 in_channels=in_channels,
                 out_channels=out_channels,
-                **encoder_params,
-                **optimizer_params,
-                **loss_params,
+                encoder_params=encoder_params,
+                attribute_decoder_params=attribute_decoder_params,
+                optimizer_params=optimizer_params,
+                loss_params=loss_params,
             )
     return model
 
