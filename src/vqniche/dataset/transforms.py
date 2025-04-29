@@ -1,14 +1,22 @@
 from torch_geometric.data import Data
 from typing import Optional, List
 
+import scanpy as sc
+import anndata as ad
+
+import torch
 import torch_geometric.transforms as T
 
 from ..preprocessors.normalizers import normalize_by_read_depth, normalize_total_log1p
 
 
 def init_data_transforms(
-        data_transform_names: List[str] = ['NormalizeFeatures',
-                                            'RandomNodeSplit'],
+        data_transform_names: List[str] = [
+            'SubsetHVG',
+            'NormalizeFeatures',
+            'RandomNodeSplit',
+        ],
+        n_genes: int = 1000,
         norm_method: str = 'total_log1p',
         target_size: int = 10_000,
         apply_CPM: bool = True,
@@ -22,6 +30,8 @@ def init_data_transforms(
     ----------
     - data_transform_names: List[str])
         The list of PyG transforms to initialize.
+    - n_genes: int
+        The number of highly variable genes to subset the data to.
     - norm_method: str
         The method to use for normalization.
     - target_size: int
@@ -42,7 +52,13 @@ def init_data_transforms(
     data_transforms = []
 
     for data_transform_name in data_transform_names:
-        if data_transform_name == 'NormalizeFeatures':
+        if data_transform_name == 'SubsetHVG':
+            data_transforms.append(
+                SubsetHVG(
+                    n_genes=n_genes
+                )
+            )
+        elif data_transform_name == 'NormalizeFeatures':
             data_transforms.append(
                 NormalizeFeatures(
                     feature_key='x',
@@ -65,6 +81,31 @@ def init_data_transforms(
             raise ValueError(f"{data_transform_name} Transform not found.")
 
     return data_transforms
+
+
+class SubsetHVG(T.BaseTransform):
+    def __init__(
+            self,
+            n_genes: int = 1000,
+        ):
+        self.n_genes = n_genes
+
+
+    def forward(
+            self,
+            data: Data
+        ) -> Data:
+        adata = ad.AnnData(data.x.numpy())
+        sc.pp.highly_variable_genes(
+            adata,
+            flavor='seurat_v3',
+            n_top_genes=self.n_genes,
+            subset=True
+        )
+        data.x = torch.from_numpy(adata.X).to(data.x.device)
+        data.num_features = data.x.shape[1]
+        print(f"SubsetHVG: Subsetted data to {data.num_features} features.")
+        return data
 
 
 class NormalizeFeatures(T.BaseTransform):
