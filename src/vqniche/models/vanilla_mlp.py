@@ -77,8 +77,6 @@ class VanillaMLP(BaseModel):
         - loss_kwargs: dict
             Keyword arguments for the loss functions.
         """
-        print(f"Initializing a {model_name} Model with the following components:")
-
         # Initialize the BaseModel class
         super().__init__(
             model_name=model_name,
@@ -96,13 +94,15 @@ class VanillaMLP(BaseModel):
             loss_kwargs=loss_kwargs,
         )
 
+        assert mlp_params['num_layers'] > 0, "Number of MLP layers is 0. Please set num_layers to a positive integer."
+
         # Initialize a MLP module as the encoder.
         self.encoder = MLP_Encoder(
             in_channels=in_channels,
             **mlp_params,
             init_method=init_method,
         )
-        assert self.encoder is not None, "Number of MLP layers is 0. Please set num_layers to a positive integer."
+        print(f"1. MLP Encoder: {mlp_params['num_layers']} Linear layer(s) that transform {in_channels} input features to {self.encoder.dim} hidden features.")
 
         # Initialize the attribute decoder.
         self.attribute_decoder = self._init_attribute_decoder(
@@ -111,7 +111,7 @@ class VanillaMLP(BaseModel):
             out_channels=in_channels,
             init_method=init_method,
         )
-        print(f"2. Attribute Decoder: {attribute_decoder_name} that reconstructs {self.encoder.dim} latent features to {in_channels} input features.")
+        print(f"2. Attribute Decoder: {attribute_decoder_name} that decodes {self.encoder.dim} latent features to {in_channels} input features.")
 
         # Initialize the predictor.
         # Currently, the predictor is hardcoded to be a simple linear layer.
@@ -121,7 +121,7 @@ class VanillaMLP(BaseModel):
             out_channels=out_channels,
             init_method=init_method,
         )
-        print(f"3. Predictor: Linear layer that transforms {self.encoder.dim} hidden features to {out_channels} output features.")
+        print(f"3. Predictor: Linear layer that transforms {self.encoder.dim} hidden features to {out_channels} dimensional logits.")
 
 
     def forward(
@@ -138,28 +138,28 @@ class VanillaMLP(BaseModel):
 
         Returns
         -------
-        - h_encoder: torch.Tensor
-            The latent node embeddings from the MLP encoder.
+        - h_latent: torch.Tensor
+            Latent node embeddings from the MLP Encoder.
         - xhat: torch.Tensor
-            The decoded node attributes.
+            Reconstructed node attributes from the Attribute Decoder.
         - unnormalized_logits: torch.Tensor
-            The unnormalized logits.
+            Unnormalized logits from the Predictor.
         """
         # forward pass through the MLP encoder
-        h_encoder = self.encoder(
+        h_latent = self.encoder(
                         batch_x,
                     )
 
         # decode the latent node embeddings to recover the node attributes
         xhat = self.attribute_decoder(
-                            x=h_encoder,
+                            x=h_latent,
                             read_depth=batch_x.sum(dim=-1)
                         )
 
         # forward pass through the predictor
-        unnormalized_logits = self.predictor(h_encoder)
+        unnormalized_logits = self.predictor(h_latent)
 
-        return h_encoder, \
+        return h_latent, \
                 xhat, \
                 unnormalized_logits
 
@@ -292,7 +292,7 @@ class VanillaMLP(BaseModel):
         X = []
         Y_cell_type = []
         Y_niche_type = []
-        H_encoder = []
+        H_latent = []
         X_hat = []
 
         for batch in self.trainer.datamodule.infer_dataloader():
@@ -302,23 +302,23 @@ class VanillaMLP(BaseModel):
             Y_cell_type.append(batch.y[:batch_size])
             Y_niche_type.append(batch.y_niche_types[:batch_size])
 
-            h_encoder, \
+            h_latent, \
             xhat_batch, \
             _ = self(batch.x.to(self.device))
 
-            H_encoder.append(h_encoder[:batch_size])
+            H_latent.append(h_latent[:batch_size])
             X_hat.append(xhat_batch[:batch_size])
 
         X = torch.cat(X, dim=0)
         Y_cell_type = torch.cat(Y_cell_type, dim=0)
         Y_niche_type = torch.cat(Y_niche_type, dim=0)
-        H_encoder = torch.cat(H_encoder, dim=0)
+        H_latent = torch.cat(H_latent, dim=0)
         X_hat = torch.cat(X_hat, dim=0)
 
         return X, \
                 Y_cell_type, \
                 Y_niche_type, \
-                H_encoder, \
+                H_latent, \
                 X_hat
 
 
@@ -336,7 +336,7 @@ class VanillaMLP(BaseModel):
         X, \
         _, \
         _, \
-        H_encoder, \
+        H_latent, \
         X_hat = self.inference()
 
         train_epoch_end_stats = {}
@@ -346,7 +346,7 @@ class VanillaMLP(BaseModel):
                 metrics.cosine_similarity(X, 'X')
             )
             train_epoch_end_stats.update(
-                metrics.cosine_similarity(H_encoder, 'H_encoder')
+                metrics.cosine_similarity(H_latent, 'H_latent')
             )
             train_epoch_end_stats.update(
                 metrics.cosine_similarity(X_hat, 'X_hat')
