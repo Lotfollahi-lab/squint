@@ -1,9 +1,9 @@
 """
-This file implements a single-layer MLP model.
+This file implements a Vanilla MLP Model.
 
-The MLP Model comprises of the following components:
-- Encoder: A Linear layer.
-- Attribute Decoder: A Linear or LinearSoftmax decoder.
+The Vanilla MLP Model comprises of the following components:
+- Encoder: A MLP module.
+- Attribute Decoder: A MLPSoftmax decoder.
 - Predictor: A Linear predictor.
 
 In addition, this provides the option to log the mean pairwise cosine similarity between the original attributes, decoded attributes, and MLP embeddings, and the Pearson correlation between the original and decoded node attributes at the end of each training epoch.
@@ -12,30 +12,28 @@ from typing import List, Literal, Dict
 
 import torch
 import torch_geometric
+from torch_geometric.nn import MLP as MLP_Encoder
 
 from .base_model import BaseModel
-from ..modules.mlp import MLP_Module as MLP_Encoder
 from ..utils import metrics
+# from ..modules.mlp import MLP_Module as MLP_Encoder
 
 
 class VanillaMLP(BaseModel):
     def __init__(
             self,
             model_name: Literal['VanillaMLP'] = 'VanillaMLP',
-            encoder_name: Literal['Linear'] = 'Linear',
-            attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
+            encoder_name: Literal['MLP_Encoder'] = 'MLP_Encoder',
+            attribute_decoder_name: Literal['MLPSoftmax'] = 'MLPSoftmax',
             predictor_name: Literal['Linear'] = 'Linear',
             in_channels: int = None,
             out_channels: int = None,
             log_similarity_stats: bool = False,
             log_pearson_correlation: bool = False,
-            mlp_params: dict = {},
-            init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform',
-            optimizer_name: str = 'adam',
-            lr: float = 0.01,
-            weight_decay: float = 0.0,
-            loss_names: List[str] = ['cross_entropy'],
-            loss_kwargs: dict = {'reduction': 'none'},
+            encoder_params: dict = {},
+            attribute_decoder_params: dict = {},
+            optimizer_params: dict = {},
+            loss_params: dict = {},
         ):
         """
         Initializes a Vanilla GNN model. Currently, this class supports GraphSAGE, GATv2, and GIN encoders.
@@ -60,22 +58,14 @@ class VanillaMLP(BaseModel):
         - out_channels: int
             The number of output features.
 
-        - mlp_params: dict
+        - encoder_params: dict
             The parameters for the MLP module.
-        - init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None]
-            The initialization method to use for all Linear layers in the model.
-
-        - optimizer_name: str
-            The optimizer name.
-        - lr: float
-            The learning rate.
-        - weight_decay: float
-            The weight decay.
-
-        - loss_names: list of str
-            The loss function names.
-        - loss_kwargs: dict
-            Keyword arguments for the loss functions.
+        - attribute_decoder_params: dict
+            The parameters for the attribute decoder module.
+        - optimizer_params: dict
+            The parameters for the optimizer.
+        - loss_params: dict
+            The parameters for the loss function.
         """
         # Initialize the BaseModel class
         super().__init__(
@@ -87,41 +77,38 @@ class VanillaMLP(BaseModel):
             log_pearson_correlation=log_pearson_correlation,
             in_channels=in_channels,
             out_channels=out_channels,
-            optimizer_name=optimizer_name,
-            lr=lr,
-            weight_decay=weight_decay,
-            loss_names=loss_names,
-            loss_kwargs=loss_kwargs,
+            **optimizer_params,
+            **loss_params,
         )
 
-        assert mlp_params['num_layers'] > 0, "Number of MLP layers is 0. Please set num_layers to a positive integer."
+        n_layers = encoder_params['mlp_params']['num_layers']
+        assert n_layers > 0, "Number of MLP layers is 0. Please set num_layers to a positive integer."
 
-        # Initialize a MLP module as the encoder.
+        # Initialize an MLP module as the encoder.
         self.encoder = MLP_Encoder(
             in_channels=in_channels,
-            **mlp_params,
-            init_method=init_method,
+            out_channels=encoder_params['out_channels'],
+            **encoder_params['mlp_params'],
         )
-        print(f"1. MLP Encoder: {mlp_params['num_layers']} Linear layer(s) that transform {in_channels} input features to {self.encoder.dim} hidden features.")
+        print(f"1. MLP Encoder: {self.encoder.num_layers} Linear layer(s) that transform {self.encoder.channel_list[0]} input features to {self.encoder.channel_list[-1]} hidden features.")
 
         # Initialize the attribute decoder.
         self.attribute_decoder = self._init_attribute_decoder(
-            attribute_decoder_name=attribute_decoder_name,
-            in_channels=self.encoder.dim,
+            in_channels=self.encoder.channel_list[-1],
             out_channels=in_channels,
-            init_method=init_method,
+            attribute_decoder_name=attribute_decoder_name,
+            attribute_decoder_params=attribute_decoder_params,
         )
-        print(f"2. Attribute Decoder: {attribute_decoder_name} that decodes {self.encoder.dim} latent features to {in_channels} input features.")
+        print(f"2. Attribute Decoder: {attribute_decoder_name} that decodes {self.encoder.channel_list[-1]} latent features to {in_channels} input features.")
 
         # Initialize the predictor.
         # Currently, the predictor is hardcoded to be a simple linear layer.
         self.predictor = self._init_predictor(
             predictor_name=predictor_name,
-            in_channels=self.encoder.dim,
+            in_channels=self.encoder.channel_list[-1],
             out_channels=out_channels,
-            init_method=init_method,
         )
-        print(f"3. Predictor: Linear layer that transforms {self.encoder.dim} hidden features to {out_channels} dimensional logits.")
+        print(f"3. Predictor: Linear layer that transforms {self.encoder.channel_list[-1]} hidden features to {out_channels} dimensional logits.")
 
 
     def forward(
