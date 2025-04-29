@@ -15,7 +15,6 @@ from ..dataset.in_memory_dataset_blob import InMemoryDatasetBlob
 from ..dataloaders.in_memory_datamodule import InMemoryDataModule
 from ..models.vanilla_mlp import VanillaMLP
 from ..models.vanilla_gnn import VanillaGNN
-from ..models.vqgraph import VQGraph
 
 
 def initialize_logger(
@@ -159,8 +158,6 @@ def set_model_class(
         Model = VanillaMLP
     elif model_name in ['GraphSAGE', 'GATv2', 'GIN']:
         Model = VanillaGNN
-    elif model_name == 'VQGraph':
-        Model = VQGraph
     else:
         raise ValueError(f"Model {model_name} not found.")
     return Model
