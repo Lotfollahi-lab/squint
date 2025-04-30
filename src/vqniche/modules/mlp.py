@@ -25,16 +25,7 @@ class MLP(MLP_Module):
         - If `in_channels` is not provided, the MLP module will assume the input channel is `mlp_params['hidden_channels'][0]`.
         - If `out_channels` is not provided, the MLP module will assume the output channel is `mlp_params['hidden_channels'][-1]`.
         """
-        if in_channels is None and out_channels is None and mlp_params['hidden_channels'] is None:
-            return
-
-        if mlp_params['hidden_channels'] is None and not (in_channels is not None and out_channels is not None):
-            raise ValueError("If `mlp_params['hidden_channels']` is not provided, `in_channels` and `out_channels` must be provided.")
-
-        if mlp_params['hidden_channels'] is not None:
-            channel_list = mlp_params['hidden_channels']
-        else:
-            channel_list = []
+        channel_list = mlp_params['hidden_channels']
 
         if in_channels is not None:
             channel_list = [in_channels] + channel_list

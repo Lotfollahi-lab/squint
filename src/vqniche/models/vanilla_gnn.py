@@ -89,7 +89,7 @@ class VanillaGNN(BaseModel):
                             gnn_name=encoder_name,
                             **encoder_params
                         )
-        print(f"1. Encoder: {len(self.encoder.mlp_module.lins)} Linear layer(s) followed by {self.encoder.gnn_module.num_layers} {self.encoder.gnn_module.gnn_layer_name} layer(s) that transform {in_channels} input features to {self.encoder.dim} hidden features.")
+        print(f"1. Encoder: {self.encoder.mlp_layers} Linear layer(s) followed by {self.encoder.gnn_layers} {self.encoder.gnn_module.gnn_layer_name} layer(s) that transform {in_channels} input features to {self.encoder.dim} hidden features.")
 
         # Initialize the attribute decoder.
         self.attribute_decoder = self._init_attribute_decoder(
