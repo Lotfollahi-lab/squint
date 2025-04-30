@@ -31,14 +31,17 @@ class VanillaGNN_Encoder(pl.LightningModule):
         """
         super().__init__()
 
-        self.mlp_module = MLP_Module(
-            in_channels=in_channels,
-            mlp_params=mlp_params,
-        )
-        if self.mlp_module is None:
+        if mlp_params['hidden_channels'] is None:
             gnn_in_channels = in_channels
+            self.mlp_module = None
+            self.mlp_layers = 0
         else:
-            gnn_in_channels = self.mlp_module.channel_list[-1]
+            gnn_in_channels = mlp_params['hidden_channels'][-1]
+            self.mlp_module = MLP_Module(
+                in_channels=in_channels,
+                mlp_params=mlp_params,
+            )
+            self.mlp_layers = len(self.mlp_module.lins)
 
         # initialize the GNN module
         self.gnn_module = init_gnn_module(
@@ -46,7 +49,7 @@ class VanillaGNN_Encoder(pl.LightningModule):
             gnn_name=gnn_name,
             gnn_params=gnn_params,
         )
-
+        self.gnn_layers = self.gnn_module.num_layers
         self.dim = self.gnn_module.dim
 
 
