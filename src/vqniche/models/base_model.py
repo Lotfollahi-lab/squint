@@ -10,7 +10,7 @@ from torch_geometric.nn.dense.linear import Linear
 
 from ..utils.loss import *
 from ..utils import metrics
-from ..decoders.linear_softmax import LinearSoftmax
+from ..decoders.mlp_softmax import MLPSoftmax
 
 
 class BaseModel(pl.LightningModule):
@@ -289,36 +289,36 @@ class BaseModel(pl.LightningModule):
 
     def _init_attribute_decoder(
             self,
-            attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
             in_channels: int = None,
             out_channels: int = None,
-            init_method: str = 'kaiming_uniform'
+            attribute_decoder_name: Literal['MLPSoftmax'] = 'MLPSoftmax',
+            attribute_decoder_params: dict = {}
         ) -> pl.LightningModule:
         """
         Initialize the attribute decoder module.
 
         Parameters
         ----------
-        - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
-            The name of the attribute decoder module.
         - in_channels: int
-            The input dimension of the attribute decoder module. This is the same as the hidden dimension of the Graph Convolution module.
+            The input dimension of the attribute decoder module.
         - out_channels: int
-            The output dimension of the attribute decoder module. This is the same as the number of genes.
-        - init_method: str
-            The initialization method for the attribute decoder module.
+            The output dimension of the attribute decoder module.
+        - attribute_decoder_name: Literal['MLPSoftmax']
+            The name of the attribute decoder module.
+        - attribute_decoder_params: dict
+            The parameters for the attribute decoder module.
 
         Returns
         -------
         - attribute_decoder: pl.LightningModule
             The attribute decoder module.
         """
-        if attribute_decoder_name in ['Linear', 'LinearSoftmax']:
-            return LinearSoftmax(
-                name=attribute_decoder_name,
+        if attribute_decoder_name == 'MLPSoftmax':
+            return MLPSoftmax(
                 in_channels=in_channels,
                 out_channels=out_channels,
-                init_method=init_method
+                name=attribute_decoder_name,
+                mlp_params=attribute_decoder_params['mlp_params'],
             )
 
 
