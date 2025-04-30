@@ -8,15 +8,15 @@ The Vanilla MLP Model comprises of the following components:
 
 In addition, this provides the option to log the mean pairwise cosine similarity between the original attributes, decoded attributes, and MLP embeddings, and the Pearson correlation between the original and decoded node attributes at the end of each training epoch.
 """
-from typing import List, Literal, Dict
+from typing import Literal, Dict
 
 import torch
 import torch_geometric
-from torch_geometric.nn import MLP as MLP_Encoder
+# from torch_geometric.nn import MLP as MLP_Encoder
 
 from .base_model import BaseModel
+from ..modules.mlp import MLP as MLP_Encoder
 from ..utils import metrics
-# from ..modules.mlp import MLP_Module as MLP_Encoder
 
 
 class VanillaMLP(BaseModel):
@@ -26,10 +26,10 @@ class VanillaMLP(BaseModel):
             encoder_name: Literal['MLP_Encoder'] = 'MLP_Encoder',
             attribute_decoder_name: Literal['MLPSoftmax'] = 'MLPSoftmax',
             predictor_name: Literal['Linear'] = 'Linear',
-            in_channels: int = None,
-            out_channels: int = None,
             log_similarity_stats: bool = False,
             log_pearson_correlation: bool = False,
+            in_channels: int = None,
+            out_channels: int = None,
             encoder_params: dict = {},
             attribute_decoder_params: dict = {},
             optimizer_params: dict = {},
@@ -40,11 +40,11 @@ class VanillaMLP(BaseModel):
 
         Parameters
         ----------
-        - model_name: Literal['MLP']
+        - model_name: Literal['VanillaMLP']
             The name of the model.
-        - encoder_name: Literal['Linear']
+        - encoder_name: Literal['MLP_Encoder']
             The name of the encoder module.
-        - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
+        - attribute_decoder_name: Literal['MLPSoftmax']
             The name of the attribute decoder module.
         - predictor_name: Literal['Linear']
             The name of the predictor module.
@@ -81,20 +81,15 @@ class VanillaMLP(BaseModel):
             **loss_params,
         )
 
-        n_layers = encoder_params['mlp_params']['num_layers']
-        assert n_layers > 0, "Number of MLP layers is 0. Please set num_layers to a positive integer."
-
         # Initialize an MLP module as the encoder.
         self.encoder = MLP_Encoder(
             in_channels=in_channels,
-            out_channels=encoder_params['out_channels'],
-            **encoder_params['mlp_params'],
+            mlp_params=encoder_params['mlp_params'],
         )
-        print(f"1. MLP Encoder: {self.encoder.num_layers} Linear layer(s) that transform {self.encoder.channel_list[0]} input features to {self.encoder.channel_list[-1]} hidden features.")
+        print(f"1. MLP Encoder: {self.encoder.num_layers} Linear layer(s) that transform {self.encoder.channel_list[0]} input features to {self.encoder.channel_list[-1]} latent features.")
 
         # Initialize the attribute decoder.
         self.attribute_decoder = self._init_attribute_decoder(
-            in_channels=self.encoder.channel_list[-1],
             out_channels=in_channels,
             attribute_decoder_name=attribute_decoder_name,
             attribute_decoder_params=attribute_decoder_params,

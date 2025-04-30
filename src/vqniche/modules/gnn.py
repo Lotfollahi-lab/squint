@@ -65,13 +65,7 @@ from torch_geometric.nn.aggr import MultiAggregation
 def init_gnn_module(
         in_channels: int = None,
         gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv'] = 'SAGEConv',
-        hidden_channels: List[int] | int = 500,
-        num_gnn_layers: int = 2,
-        act_first: bool = True,
-        activation: Union[str, Callable, None] = "relu",
-        norm: Union[str, Callable, None] = None,
-        dropout: float = 0.5,
-        init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform',
+        gnn_params: dict = {},
     ) -> torch.nn.Module:
     """
     Initialize the GNN module.
@@ -82,38 +76,19 @@ def init_gnn_module(
         The number of input channels.
     - gnn_name: str
         The name of the GNN module.
-    - hidden_channels: List[int] | int
-        The number of hidden channels.
-    - num_gnn_layers: int
-        The number of GNN layers.
-    - act_first: bool
-        Whether to apply the activation function before the GNN layer.
-    - activation: Union[str, Callable, None]
-        The activation function.
-    - norm: Union[str, Callable, None]
-        The normalization function.
-    - dropout: float
-        The dropout rate.
-    - init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None]
-        The initialization method.
+    - gnn_params: dict
+        The parameters for the GNN module.
 
     Returns
     -------
     - GNN_Module: torch.nn.Module
         The GNN module.
     """
-    print(f"gnn_name: {gnn_name}")
     GNN_Module = create_dynamic_gnn_module_class(gnn_name=gnn_name)
 
     return GNN_Module(
         in_channels=in_channels,
-        hidden_channels=hidden_channels,
-        num_gnn_layers=num_gnn_layers,
-        act_first=act_first,
-        activation=activation,
-        norm=norm,
-        dropout=dropout,
-        init_method=init_method,
+        **gnn_params,
     )
 
 
@@ -151,7 +126,7 @@ def create_dynamic_gnn_module_class(
             self,
             in_channels: int = None,
             hidden_channels: List[int] | int = 500,
-            num_gnn_layers: int = 2,
+            num_layers: int = 2,
             act_first: bool = True,
             activation: Union[str, Callable, None] = "relu",
             norm: Union[str, Callable, None] = None,
@@ -167,7 +142,7 @@ def create_dynamic_gnn_module_class(
                 The number of input channels.
             - hidden_channels: List[int] | int
                 The number of hidden channels.
-            - num_gnn_layers: int
+            - num_layers: int
                 The number of GNN layers.
             - act_first: bool
                 Whether to apply the activation function before the GNN layer.
@@ -180,12 +155,12 @@ def create_dynamic_gnn_module_class(
             - init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None]
                 The initialization method.
             """
-            self.num_layers = num_gnn_layers
+            self.num_layers = num_layers
 
             kwargs = {
                 'in_channels': in_channels,
                 'hidden_channels': hidden_channels,
-                'num_layers': num_gnn_layers,
+                'num_layers': num_layers,
                 'act_first': act_first,
                 'act': activation,
                 'dropout': dropout,
