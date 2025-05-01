@@ -13,9 +13,10 @@ class VQNiche_Encoder(pl.LightningModule):
     def __init__(
             self,
             in_channels: int = None,
-            gnn_name: Optional[Literal['SAGEConv', 'GATv2Conv', 'GINConv']] = None,
             mlp_params: dict = {},
+            gnn_name: Optional[Literal['SAGEConv', 'GATv2Conv', 'GINConv']] = None,
             gnn_params: dict = {},
+            start_vq_epoch: int = 0,
             vq_params: dict = {},
         ):
         """
@@ -25,16 +26,16 @@ class VQNiche_Encoder(pl.LightningModule):
         ----------
         - in_channels: int
             The number of input channels.
-        - gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv']
-            The name of the GNN module.
         - mlp_params: dict
             Keyword arguments for the MLP module.
+        - gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv']
+            The name of the GNN module.
         - gnn_params: dict
             Keyword arguments for the GNN module.
-        - init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None]
-            The initialization method to use.
-        - codebook_params: dict
-            Keyword arguments for the codebook.
+        - start_vq_epoch: int
+            The epoch to start training the VQ module. By default, the VQ module is trained from epoch 0.
+        - vq_params: dict
+            Keyword arguments for the VQ module.
         """
         super().__init__()
 
@@ -67,6 +68,7 @@ class VQNiche_Encoder(pl.LightningModule):
         assert self.mlp_layers > 0 or self.gnn_layers > 0, "Both MLP and GNN modules have 0 layers. Please set at least one of the num_layers to a positive integer."
 
         # initialize the vq module
+        self.start_vq_epoch = start_vq_epoch
         self.vq = self._init_vq_module(
                     vq_params_dict=vq_params
                     )
@@ -128,10 +130,14 @@ class VQNiche_Encoder(pl.LightningModule):
             h_latent = h_mlp
 
         # VQ-encode the node embeddings
-        h_quantized, \
-        indices, \
-        loss, \
-            = self.vq(h_latent)
+        if self.current_epoch < self.start_vq_epoch:
+            h_quantized = h_latent
+            indices = torch.zeros(h_latent.shape[0], dtype=torch.int64, device=h_latent.device)
+        else:
+            h_quantized, \
+            indices, \
+            _, \
+                = self.vq(h_latent)
 
         return h_latent, \
             h_quantized, \

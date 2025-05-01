@@ -97,7 +97,6 @@ class VQNiche(BaseModel):
                         )
 
         # Initialize the attribute decoder.
-        # Initialize the attribute decoder.
         self.attribute_decoder = self._init_attribute_decoder(
             out_channels=in_channels,
             attribute_decoder_name=attribute_decoder_name,
@@ -127,7 +126,8 @@ class VQNiche(BaseModel):
     def forward(
             self,
             batch_x: torch.Tensor,
-            batch_edge_index: torch.Tensor
+            batch_edge_index: torch.Tensor,
+            batch_xy_coordinates: torch.Tensor
         ) -> torch.Tensor:
         """
         Forward pass of the VQNiche model.
@@ -138,6 +138,8 @@ class VQNiche(BaseModel):
             The input features of the batch of nodes.
         - batch_edge_index: torch.Tensor
             The edge index tensor of the batch of nodes.
+        - batch_xy_coordinates: torch.Tensor
+            The spatial coordinates of the batch of nodes.
 
         Returns
         -------
@@ -168,10 +170,16 @@ class VQNiche(BaseModel):
                             batch_edge_index
                         )
 
-        xhat = self.attribute_decoder(
-                    x=h_quantized,
-                    read_depth=batch_x.sum(dim=-1)
-                )
+        if self.attribute_decoder.use_xy_coordinates:
+            xhat = self.attribute_decoder(
+                        x=torch.cat([h_quantized, batch_xy_coordinates], dim=-1),
+                        read_depth=batch_x.sum(dim=-1)
+                    )
+        else:
+            xhat = self.attribute_decoder(
+                        x=h_quantized,
+                        read_depth=batch_x.sum(dim=-1)
+                    )
 
         # decode the VQ-encoded edge embeddings to recover the adjacency matrix
         h_edge = self.decoder_edge(h_quantized)
@@ -215,10 +223,12 @@ class VQNiche(BaseModel):
             = self(
                     train_batch.x,
                     train_batch.edge_index,
+                    train_batch.xy_coordinates,
                 )
 
         # prepare dictionary of data required for computing loss
         # This slicing is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the target nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of target nodes is equal to the batch size. The remaining entries of the forward output are the logits for the sampled neighbors of the target nodes.
+        # print(f"{train_batch.}")
         train_loss_data = {
                         'quantizer_input': h_latent[:batch_size], # code and commit loss
                         'quantizer_output': h_quantized[:batch_size], # code and commit loss
@@ -270,6 +280,7 @@ class VQNiche(BaseModel):
             = self(
                     val_batch.x,
                     val_batch.edge_index,
+                    val_batch.xy_coordinates,
                 )
 
         # prepare dictionary of data required for computing loss
@@ -324,7 +335,8 @@ class VQNiche(BaseModel):
         unnormalized_logits_batch \
             = self(
                     test_batch.x,
-                    test_batch.edge_index
+                    test_batch.edge_index,
+                    test_batch.xy_coordinates,
                 )
 
         # prepare dictionary of data required for computing accuracy
@@ -367,7 +379,8 @@ class VQNiche(BaseModel):
             h_edge, \
             _ = self(
                     batch.x.to(self.device),
-                    batch.edge_index.to(self.device)
+                    batch.edge_index.to(self.device),
+                    batch.xy_coordinates.to(self.device)
                 )
 
             H_latent.append(h_latent[:batch_size])
