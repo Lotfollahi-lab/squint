@@ -35,6 +35,7 @@ from pathlib import Path
 import concurrent.futures
 from typing import Optional, Callable, List, Tuple
 
+import numpy as np
 import scanpy as sc
 import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
@@ -322,7 +323,7 @@ class InMemoryDatasetBlob(InMemoryDataset):
                 raise ValueError(f"Edge index {edge_index_name} is not undirected")
 
             # ----------------- Build Unsupervised Node Embeddings -----------------
-            # for small graphs, compute k eigenvectors corresponding to the k largest (in magnitude) eigenvalues of the adjacency matrix of the graph
+            # for small graphs, build spectral embeddings
             num_nodes = adata_batch.obsp[f"{edge_index_name}_connectivities"].shape[0]
             if num_nodes < 20_000:
                 print(f"Computing {self.graph_kwargs['k']['lm_eigvecs']} eigenvectors of {edge_index_name}...")
@@ -344,6 +345,13 @@ class InMemoryDatasetBlob(InMemoryDataset):
                 edge_index_name=edge_index_name
             )
             print(f"U_deepwalk_{edge_index_name}.shape: {batch_dict[f'U_deepwalk_{edge_index_name}'].shape}")
+
+            # build gosh embeddings
+            batch_dict[f"U_gosh_{edge_index_name}"] = self.build_gosh_embeddings(
+                batch_id=adata_batch.uns['batch'],
+                edge_index_name=edge_index_name
+            )
+            print(f"U_gosh_{edge_index_name}.shape: {batch_dict[f'U_gosh_{edge_index_name}'].shape}")
 
         for key, value in batch_dict.items():
             print(f"{key}: {value.shape=}, {value.dtype=}, {type(value)=}")
@@ -430,8 +438,7 @@ class InMemoryDatasetBlob(InMemoryDataset):
         edgelist_fname = batch_dir / f"{edge_index_name}.edgelist"
         emb_fname = batch_dir / f"U_deepwalk_{edge_index_name}.emb"
 
-
-        exec_str = f"{deepwalk_executable} -i:{edgelist_fname} -o:{emb_fname} -d:{self.graph_kwargs['k']['deepwalk']} -p:1 -q:1 -r:10 -l:10"
+        exec_str = f"{deepwalk_executable} -i:{edgelist_fname} -o:{emb_fname} -d:{self.graph_kwargs['k']['deepwalk']} -p:1 -q:1 -r:10 -l:40 -v"
 
         print(f"Running {exec_str}...")
         _ = subprocess.run(exec_str, shell=True)
@@ -442,22 +449,67 @@ class InMemoryDatasetBlob(InMemoryDataset):
         return U
 
 
+    def build_gosh_embeddings(
+            self,
+            batch_id: str,
+            edge_index_name: str,
+        ) -> Tensor:
+        """
+        Build GOSH embeddings for the given edge index name.
+
+        Parameters:
+        ----------
+        - batch_id: str
+            The batch id of the adjacency matrix.
+        - edge_index_name: str
+            The name of the edge index to build GOSH embeddings for.
+
+        Returns:
+        -------
+        - U: Tensor
+            The GOSH embeddings.
+
+        Notes:
+        ------
+        - The embedding is binary format for fast loading.
+        - For scaling to larger graphs, hyperparameters will need to be adjusted.
+        """
+        if not torch.cuda.is_available():
+            raise ValueError("GOSH embeddings are not supported on CPU")
+
+        gosh_executable = self.software_paths['gosh']
+        batch_dir = Path(self.processed_dir) / batch_id
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        edgelist_fname = batch_dir / f"{edge_index_name}.edgelist"
+        emb_fname = batch_dir / f"U_gosh_{edge_index_name}.emb"
+
+        exec_str = f"{gosh_executable} --input-graph {edgelist_fname} --output-embedding {emb_fname} --directed 0 --epochs 200 -d {self.graph_kwargs['k']['gosh']} -s 3 --negative-weight 1 --binary-output --sampling-algorithm 0 -a 0 -l 0.025 --learning-rate-decay-strategy 0 --coarsening-stopping-threshold 1000 --coarsening-stopping-precision 0.9 --coarsening-matching-threshold-ratio 400 --coarsening-min-vertices-in-graph 1000 --epoch-strategy s-fast --smoothing-ratio 0.5"
+
+        print(f"Running {exec_str}...")
+        _ = subprocess.run(exec_str, shell=True)
+        print(f"U_gosh_{edge_index_name}.emb saved to {emb_fname}")
+
+        U = torch.from_numpy(np.load(emb_fname)).to(torch.float32)
+
+        return U
+
+
     def _read_deepwalk_embeddings_from_disk(
             self,
             emb_fname: str,
         ) -> Tensor:
         """
-        Read the deepwalk embeddings from disk.
+        Read the DeepWalk embeddings from disk.
 
         Parameters:
         ----------
         - emb_fname: str
-            The name of the file to read the deepwalk embeddings from.
+            The name of the file to read the DeepWalk embeddings from.
 
         Returns:
         -------
         - U: Tensor
-            The deepwalk embeddings.
+            The DeepWalk embeddings.
 
         Notes:
         ------
