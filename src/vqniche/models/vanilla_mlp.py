@@ -408,9 +408,9 @@ class VanillaMLP(BaseModel):
                         H_adj
                     ).cpu().numpy()
                 )
-            node_degree_distribution = metrics.compute_node_degree_distribution(G)
-            node_degree_distribution_hat = metrics.compute_node_degree_distribution(G_hat)
-            mmd_degree = metrics.compute_mmd(
+            node_degree_distribution = metrics.node_degree_distribution(G)
+            node_degree_distribution_hat = metrics.node_degree_distribution(G_hat)
+            mmd_degree = metrics.mmd_score(
                             [node_degree_distribution],
                             [node_degree_distribution_hat],
                             method='l1_gaussian_tv',
