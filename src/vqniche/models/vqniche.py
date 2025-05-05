@@ -478,6 +478,16 @@ class VQNiche(BaseModel):
             train_epoch_end_stats['pearson_cell_wise'] = pearson_cell_wise
             train_epoch_end_stats['pearson_gene_wise'] = pearson_gene_wise
 
+            X_nbr = self.construct_mean_neighbor_features(X.cpu(), edge_index.cpu())
+            X_hat_nbr = self.construct_mean_neighbor_features(X_hat.cpu(), edge_index.cpu())
+            pearson_cell_wise_nbr = metrics.pearson_correlation(
+                        X_nbr,
+                        X_hat_nbr,
+                        compare_genes=False,
+                        mean=True,
+                    )
+            train_epoch_end_stats['pearson_cell_wise_nbr'] = pearson_cell_wise_nbr
+
         if self.log_mmd_degree:
             G = nx.from_numpy_array(
                     edge_index_to_adjacency_tensor(

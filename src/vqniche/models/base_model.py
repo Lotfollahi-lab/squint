@@ -358,7 +358,6 @@ class BaseModel(pl.LightningModule):
         if adjacency_decoder_name == 'MLP_AdjacencyDecoder':
             if 'out_channels' not in adjacency_decoder_params:
                 adjacency_decoder_params['out_channels'] = in_channels
-            print(f"{adjacency_decoder_params=}")
             return MLP_AdjacencyDecoder(
                 in_channels=in_channels,
                 out_channels=adjacency_decoder_params['out_channels'],
@@ -398,6 +397,46 @@ class BaseModel(pl.LightningModule):
                 out_channels=out_channels,
                 weight_initializer=init_method
             )
+
+
+    def construct_mean_neighbor_features(
+            self,
+            X: torch.Tensor,
+            edge_index: torch.Tensor
+        ) -> torch.Tensor:
+        """
+        Construct mean attribute vectors of the 1-hop neighbors of each node.
+
+        Parameters
+        ----------
+        - X: torch.Tensor
+            The attribute vectors of the nodes.
+        - edge_index: torch.Tensor
+            The edge index of the graph.
+
+        Returns
+        -------
+        - X_nbr: torch.Tensor
+            The mean attribute vectors of the 1-hop neighbors of each node.
+        """
+        # edge_index[0]: source nodes (j), edge_index[1]: target nodes (i)
+        row, col = edge_index
+
+        # Aggregate neighbor features: sum features of neighbors
+        X_sum = torch.zeros_like(X)
+        X_sum = X_sum.index_add(0, col, X[row])
+
+        # Count neighbors
+        deg = torch.zeros(X.shape[0], dtype=torch.float, device=X.device)
+        deg = deg.index_add(0, col, torch.ones_like(col, dtype=torch.float))
+
+        # Avoid division by zero
+        deg = deg.clamp(min=1).unsqueeze(1)  # shape (n, 1)
+
+        # Compute mean
+        X_nbr = X_sum / deg
+
+        return X_nbr
 
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
