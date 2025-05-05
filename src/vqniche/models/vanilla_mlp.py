@@ -12,7 +12,6 @@ from typing import Literal, Dict
 
 import torch
 import torch_geometric
-# from torch_geometric.nn import MLP as MLP_Encoder
 
 from .base_model import BaseModel
 from ..modules.mlp import MLP as MLP_Encoder
@@ -25,6 +24,7 @@ class VanillaMLP(BaseModel):
             model_name: Literal['VanillaMLP'] = 'VanillaMLP',
             encoder_name: Literal['MLP_Encoder'] = 'MLP_Encoder',
             attribute_decoder_name: Literal['MLPSoftmax'] = 'MLPSoftmax',
+            adjacency_decoder_name: Literal['MLP_AdjacencyDecoder'] = 'MLP_AdjacencyDecoder',
             predictor_name: Literal['Linear'] = 'Linear',
             log_similarity_stats: bool = False,
             log_pearson_correlation: bool = False,
@@ -32,6 +32,7 @@ class VanillaMLP(BaseModel):
             out_channels: int = None,
             encoder_params: dict = {},
             attribute_decoder_params: dict = {},
+            adjacency_decoder_params: dict = {},
             optimizer_params: dict = {},
             loss_params: dict = {},
         ):
@@ -46,6 +47,8 @@ class VanillaMLP(BaseModel):
             The name of the encoder module.
         - attribute_decoder_name: Literal['MLPSoftmax']
             The name of the attribute decoder module.
+        - adjacency_decoder_name: Literal['MLP_AdjacencyDecoder']
+            The name of the adjacency decoder module.
         - predictor_name: Literal['Linear']
             The name of the predictor module.
         - log_similarity_stats: bool
@@ -62,6 +65,8 @@ class VanillaMLP(BaseModel):
             The parameters for the MLP module.
         - attribute_decoder_params: dict
             The parameters for the attribute decoder module.
+        - adjacency_decoder_params: dict
+            The parameters for the adjacency decoder module.
         - optimizer_params: dict
             The parameters for the optimizer.
         - loss_params: dict
@@ -72,6 +77,7 @@ class VanillaMLP(BaseModel):
             model_name=model_name,
             encoder_name=encoder_name,
             attribute_decoder_name=attribute_decoder_name,
+            adjacency_decoder_name=adjacency_decoder_name,
             predictor_name=predictor_name,
             log_similarity_stats=log_similarity_stats,
             log_pearson_correlation=log_pearson_correlation,
@@ -96,6 +102,14 @@ class VanillaMLP(BaseModel):
         )
         print(f"2. Attribute Decoder: {attribute_decoder_name} that decodes {self.encoder.channel_list[-1]} latent features to {in_channels} input features.")
 
+        # Initialize the adjacency decoder.
+        self.adjacency_decoder = self._init_adjacency_decoder(
+            in_channels=self.encoder.channel_list[-1],
+            adjacency_decoder_name=adjacency_decoder_name,
+            adjacency_decoder_params=adjacency_decoder_params,
+        )
+        print(f"3. Adjacency Decoder: {adjacency_decoder_name} that decodes {self.encoder.channel_list[-1]} latent features to {self.encoder.channel_list[-1]} adjacency features.")
+
         # Initialize the predictor.
         # Currently, the predictor is hardcoded to be a simple linear layer.
         self.predictor = self._init_predictor(
@@ -103,7 +117,7 @@ class VanillaMLP(BaseModel):
             in_channels=self.encoder.channel_list[-1],
             out_channels=out_channels,
         )
-        print(f"3. Predictor: Linear layer that transforms {self.encoder.channel_list[-1]} hidden features to {out_channels} dimensional logits.")
+        print(f"4. Predictor: Linear layer that transforms {self.encoder.channel_list[-1]} hidden features to {out_channels} dimensional logits.")
 
 
     def forward(
@@ -138,11 +152,17 @@ class VanillaMLP(BaseModel):
                             read_depth=batch_x.sum(dim=-1)
                         )
 
+        # decode the latent node embeddings to recover the adjacency matrix
+        h_adj = self.adjacency_decoder(
+                        x=h_latent,
+                    )
+
         # forward pass through the predictor
         unnormalized_logits = self.predictor(h_latent)
 
         return h_latent, \
                 xhat, \
+                h_adj, \
                 unnormalized_logits
 
 
@@ -166,6 +186,7 @@ class VanillaMLP(BaseModel):
         # execute the forward of the GraphSAGE model
         _, \
         xhat_batch, \
+        h_adj_batch, \
         unnormalized_logits_batch = self(train_batch.x)
 
         # prepare dictionary of data required for computing loss
@@ -179,6 +200,10 @@ class VanillaMLP(BaseModel):
                         'dispersion': torch.exp(self.dispersion),
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': train_batch.y[:batch_size],
+                        'pred_adj': h_adj_batch[:batch_size],
+                        'batch_edge_index': train_batch.edge_index[:batch_size],
+                        'batch_input_id': train_batch.input_id[:batch_size],
+                        'batch_nid': train_batch.n_id[:batch_size],
                         }
 
         train_loss = self.common_step(
@@ -210,6 +235,7 @@ class VanillaMLP(BaseModel):
         # execute the forward of the GraphSAGE model
         _, \
         xhat_batch, \
+        h_adj_batch, \
         unnormalized_logits_batch = self(val_batch.x)
 
         # prepare dictionary of data required for computing loss
@@ -220,6 +246,10 @@ class VanillaMLP(BaseModel):
                         'dispersion': torch.exp(self.dispersion),
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': val_batch.y[:batch_size],
+                        'pred_adj': h_adj_batch[:batch_size],
+                        'batch_edge_index': val_batch.edge_index[:batch_size],
+                        'batch_input_id': val_batch.input_id[:batch_size],
+                        'batch_nid': val_batch.n_id[:batch_size],
                         }
 
         val_loss = self.common_step(
@@ -251,6 +281,7 @@ class VanillaMLP(BaseModel):
         # execute the forward of the GraphSAGE model
         _, \
         _, \
+        _, \
         unnormalized_logits_batch = self(test_batch.x)
 
         # prepare dictionary of data required for computing accuracy
@@ -276,6 +307,7 @@ class VanillaMLP(BaseModel):
         Y_niche_type = []
         H_latent = []
         X_hat = []
+        H_adj = []
 
         for batch in self.trainer.datamodule.infer_dataloader():
             batch_size = batch.batch_size
@@ -286,22 +318,26 @@ class VanillaMLP(BaseModel):
 
             h_latent, \
             xhat_batch, \
+            h_adj_batch, \
             _ = self(batch.x.to(self.device))
 
             H_latent.append(h_latent[:batch_size])
             X_hat.append(xhat_batch[:batch_size])
+            H_adj.append(h_adj_batch[:batch_size])
 
         X = torch.cat(X, dim=0)
         Y_cell_type = torch.cat(Y_cell_type, dim=0)
         Y_niche_type = torch.cat(Y_niche_type, dim=0)
         H_latent = torch.cat(H_latent, dim=0)
         X_hat = torch.cat(X_hat, dim=0)
+        H_adj = torch.cat(H_adj, dim=0)
 
         return X, \
                 Y_cell_type, \
                 Y_niche_type, \
                 H_latent, \
-                X_hat
+                X_hat, \
+                H_adj
 
 
     @torch.no_grad()
@@ -319,7 +355,8 @@ class VanillaMLP(BaseModel):
         _, \
         _, \
         H_latent, \
-        X_hat = self.inference()
+        X_hat, \
+        H_adj = self.inference()
 
         train_epoch_end_stats = {}
 

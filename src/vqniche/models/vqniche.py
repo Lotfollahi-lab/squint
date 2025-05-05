@@ -27,6 +27,7 @@ class VQNiche(BaseModel):
             model_name: Literal['VQNiche'] = 'VQNiche',
             encoder_name: Literal['VQNiche_Encoder'] = 'VQNiche_Encoder',
             attribute_decoder_name: Literal['MLPSoftmax'] = 'MLPSoftmax',
+            adjacency_decoder_name: Literal['MLP_AdjacencyDecoder'] = 'MLP_AdjacencyDecoder',
             predictor_name: Literal['Linear'] = 'Linear',
             log_similarity_stats: bool = False,
             log_pearson_correlation: bool = False,
@@ -35,6 +36,7 @@ class VQNiche(BaseModel):
             out_channels: int = None,
             encoder_params: dict = {},
             attribute_decoder_params: dict = {},
+            adjacency_decoder_params: dict = {},
             optimizer_params: dict = {},
             loss_params: dict = {},
         ):
@@ -49,6 +51,8 @@ class VQNiche(BaseModel):
             The name of the encoder module.
         - attribute_decoder_name: Literal['MLPSoftmax']
             The name of the attribute decoder module.
+        - adjacency_decoder_name: Literal['MLP_AdjacencyDecoder']
+            The name of the adjacency decoder module.
         - predictor_name: Literal['Linear']
             The name of the predictor module.
         - log_similarity_stats: bool
@@ -77,6 +81,7 @@ class VQNiche(BaseModel):
             model_name=model_name,
             encoder_name=encoder_name,
             attribute_decoder_name=attribute_decoder_name,
+            adjacency_decoder_name=adjacency_decoder_name,
             predictor_name=predictor_name,
             log_similarity_stats=log_similarity_stats,
             log_codebook_utilization=log_codebook_utilization,
@@ -106,12 +111,12 @@ class VQNiche(BaseModel):
 
         # Initialize the decoder module for the adjacency matrix
         # Currently, the decoder is hard-coded to be a simple linear layer.
-        self.decoder_edge = Linear(
-                                in_channels=self.encoder.dim,
-                                out_channels=self.encoder.dim,
-                                weight_initializer="kaiming_uniform"
-                            )
-        print(f"3. Adjacency Decoder: A linear layer that reconstructs the adjacency matrix from the latent node embeddings of dimension {self.encoder.dim}.")
+        self.adjacency_decoder = self._init_adjacency_decoder(
+            in_channels=self.encoder.dim,
+            adjacency_decoder_name=adjacency_decoder_name,
+            adjacency_decoder_params=adjacency_decoder_params,
+        )
+        print(f"3. Adjacency Decoder: {adjacency_decoder_name} that decodes {self.encoder.dim} latent features to {self.encoder.dim} adjacency features.")
 
         # Initialize the predictor.
         # Currently, the predictor is hardcoded to be a simple linear layer.
@@ -120,7 +125,7 @@ class VQNiche(BaseModel):
                             in_channels=self.encoder.dim,
                             out_channels=out_channels,
                         )
-        print(f"3. Predictor: Linear layer that transforms {self.encoder.dim} hidden features to {out_channels} dimensional logits.")
+        print(f"4. Predictor: {predictor_name} that transforms {self.encoder.dim} hidden features to {out_channels} dimensional logits.")
 
 
     def forward(
@@ -182,7 +187,7 @@ class VQNiche(BaseModel):
                     )
 
         # decode the VQ-encoded edge embeddings to recover the adjacency matrix
-        h_edge = self.decoder_edge(h_quantized)
+        h_adj = self.adjacency_decoder(h_quantized)
 
         unnormalized_logits_batch = self.predictor(h_latent)
 
@@ -190,7 +195,7 @@ class VQNiche(BaseModel):
             h_quantized, \
             indices, \
             xhat, \
-            h_edge, \
+            h_adj, \
             unnormalized_logits_batch
 
 
@@ -218,7 +223,7 @@ class VQNiche(BaseModel):
         h_quantized, \
         indices, \
         xhat, \
-        h_edge, \
+        h_adj, \
         unnormalized_logits_batch \
             = self(
                     train_batch.x,
@@ -235,7 +240,7 @@ class VQNiche(BaseModel):
                         'pred_attr': xhat[:batch_size], # attribute reconstruction loss
                         'target_attr': train_batch.x[:batch_size], # attribute reconstruction loss
                         'dispersion': torch.exp(self.dispersion), # attribute reconstruction loss
-                        'pred_adj': h_edge[:batch_size], # adjacency reconstruction loss
+                        'pred_adj': h_adj[:batch_size], # adjacency reconstruction loss
                         'batch_edge_index': train_batch.edge_index, # adjacency reconstruction loss
                         'batch_input_id': train_batch.input_id, # adjacency reconstruction loss
                         'batch_nid': train_batch.n_id, # adjacency reconstruction loss
@@ -275,7 +280,7 @@ class VQNiche(BaseModel):
         h_quantized, \
         indices, \
         xhat, \
-        h_edge, \
+        h_adj, \
         unnormalized_logits_batch \
             = self(
                     val_batch.x,
@@ -290,7 +295,7 @@ class VQNiche(BaseModel):
                         'pred_attr': xhat[:batch_size],
                         'target_attr': val_batch.x[:batch_size],
                         'dispersion': torch.exp(self.dispersion),
-                        'pred_adj': h_edge[:batch_size],
+                        'pred_adj': h_adj[:batch_size],
                         'batch_edge_index': val_batch.edge_index,
                         'batch_input_id': val_batch.input_id,
                         'batch_nid': val_batch.n_id,
@@ -363,7 +368,7 @@ class VQNiche(BaseModel):
         H_quantized = []
         Indices = []
         X_hat = []
-        H_edge = []
+        H_adj = []
 
         for batch in self.trainer.datamodule.infer_dataloader():
             batch_size = batch.batch_size
@@ -376,7 +381,7 @@ class VQNiche(BaseModel):
             h_quantized, \
             indices, \
             xhat, \
-            h_edge, \
+            h_adj, \
             _ = self(
                     batch.x.to(self.device),
                     batch.edge_index.to(self.device),
@@ -387,7 +392,7 @@ class VQNiche(BaseModel):
             H_quantized.append(h_quantized[:batch_size])
             Indices.append(indices[:batch_size])
             X_hat.append(xhat[:batch_size])
-            H_edge.append(h_edge[:batch_size])
+            H_adj.append(h_adj[:batch_size])
 
         X = torch.cat(X, dim=0)
         Y_cell_type = torch.cat(Y_cell_type, dim=0)
@@ -396,7 +401,7 @@ class VQNiche(BaseModel):
         H_quantized = torch.cat(H_quantized, dim=0)
         Indices = torch.cat(Indices, dim=0)
         X_hat = torch.cat(X_hat, dim=0)
-        H_edge = torch.cat(H_edge, dim=0)
+        H_adj = torch.cat(H_adj, dim=0)
 
         return X, \
             Y_cell_type, \
@@ -405,7 +410,7 @@ class VQNiche(BaseModel):
             H_quantized, \
             Indices, \
             X_hat, \
-            H_edge
+            H_adj
 
 
     @torch.no_grad()
@@ -427,7 +432,8 @@ class VQNiche(BaseModel):
         H_quantized, \
         Indices, \
         X_hat, \
-        _ = self.inference()
+        H_adj \
+            = self.inference()
 
         train_epoch_end_stats = {}
 

@@ -12,6 +12,7 @@ from typing import Literal, Dict
 
 import torch
 import torch_geometric
+
 from .base_model import BaseModel
 from ..encoders.vanilla_gnn_encoder import VanillaGNN_Encoder
 from ..utils import metrics
@@ -23,6 +24,7 @@ class VanillaGNN(BaseModel):
             model_name: Literal['GraphSAGE', 'GATv2', 'GIN'] = 'GraphSAGE',
             encoder_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv'] = 'SAGEConv',
             attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
+            adjacency_decoder_name: Literal['MLP_AdjacencyDecoder'] = 'MLP_AdjacencyDecoder',
             predictor_name: Literal['Linear'] = 'Linear',
             log_similarity_stats: bool = False,
             log_pearson_correlation: bool = False,
@@ -30,6 +32,7 @@ class VanillaGNN(BaseModel):
             out_channels: int = None,
             encoder_params: dict = {},
             attribute_decoder_params: dict = {},
+            adjacency_decoder_params: dict = {},
             optimizer_params: dict = {},
             loss_params: dict = {},
         ):
@@ -44,6 +47,8 @@ class VanillaGNN(BaseModel):
             The name of the encoder module.
         - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
             The name of the attribute decoder module.
+        - adjacency_decoder_name: Literal['MLP_AdjacencyDecoder']
+            The name of the adjacency decoder module.
         - predictor_name: Literal['Linear']
             The name of the predictor module.
         - log_similarity_stats: bool
@@ -60,6 +65,8 @@ class VanillaGNN(BaseModel):
             The parameters for the MLP module.
         - attribute_decoder_params: dict
             The parameters for the attribute decoder module.
+        - adjacency_decoder_params: dict
+            The parameters for the adjacency decoder module.
         - optimizer_params: dict
             The parameters for the optimizer.
         - loss_params: dict
@@ -72,6 +79,7 @@ class VanillaGNN(BaseModel):
             model_name=model_name,
             encoder_name=encoder_name,
             attribute_decoder_name=attribute_decoder_name,
+            adjacency_decoder_name=adjacency_decoder_name,
             predictor_name=predictor_name,
             log_similarity_stats=log_similarity_stats,
             log_pearson_correlation=log_pearson_correlation,
@@ -99,6 +107,14 @@ class VanillaGNN(BaseModel):
         )
         print(f"2. Attribute Decoder: {attribute_decoder_name} that decodes {self.encoder.dim} latent features to {in_channels} input features.")
 
+        # Initialize the adjacency decoder.
+        self.adjacency_decoder = self._init_adjacency_decoder(
+            in_channels=self.encoder.dim,
+            adjacency_decoder_name=adjacency_decoder_name,
+            adjacency_decoder_params=adjacency_decoder_params,
+        )
+        print(f"3. Adjacency Decoder: {adjacency_decoder_name} that decodes {self.encoder.dim} latent features to {self.encoder.dim} adjacency features.")
+
         # Initialize the predictor.
         # Currently, the predictor is hardcoded to be a simple linear layer.
         self.predictor = self._init_predictor(
@@ -106,7 +122,7 @@ class VanillaGNN(BaseModel):
                             in_channels=self.encoder.dim,
                             out_channels=out_channels,
                         )
-        print(f"3. Predictor: Linear layer that transforms {self.encoder.dim} hidden features to {out_channels} dimensional logits.")
+        print(f"4. Predictor: Linear layer that transforms {self.encoder.dim} hidden features to {out_channels} dimensional logits.")
 
 
     def forward(
@@ -149,11 +165,17 @@ class VanillaGNN(BaseModel):
                             read_depth=batch_x.sum(dim=-1)
                         )
 
+        # decode the latent node embeddings to recover the adjacency matrix
+        h_adj = self.adjacency_decoder(
+                        x=h_latent,
+                    )
+
         # forward pass through the predictor
         unnormalized_logits = self.predictor(h_latent)
 
         return h_latent, \
                 xhat, \
+                h_adj, \
                 unnormalized_logits
 
 
@@ -177,6 +199,7 @@ class VanillaGNN(BaseModel):
         # execute the forward of the GraphSAGE model
         _, \
         xhat_batch, \
+        h_adj_batch, \
         unnormalized_logits_batch = self(
                                         train_batch.x,
                                         train_batch.edge_index,
@@ -193,6 +216,10 @@ class VanillaGNN(BaseModel):
                         'dispersion': torch.exp(self.dispersion),
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': train_batch.y[:batch_size],
+                        'pred_adj': h_adj_batch[:batch_size],
+                        'batch_edge_index': train_batch.edge_index[:batch_size],
+                        'batch_input_id': train_batch.input_id[:batch_size],
+                        'batch_nid': train_batch.n_id[:batch_size],
                         }
 
         train_loss = self.common_step(
@@ -224,6 +251,7 @@ class VanillaGNN(BaseModel):
         # execute the forward of the GraphSAGE model
         _, \
         xhat_batch, \
+        h_adj_batch, \
         unnormalized_logits_batch = self(
                                         val_batch.x,
                                         val_batch.edge_index
@@ -237,6 +265,10 @@ class VanillaGNN(BaseModel):
                         'dispersion': torch.exp(self.dispersion),
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': val_batch.y[:batch_size],
+                        'pred_adj': h_adj_batch[:batch_size],
+                        'batch_edge_index': val_batch.edge_index[:batch_size],
+                        'batch_input_id': val_batch.input_id[:batch_size],
+                        'batch_nid': val_batch.n_id[:batch_size],
                         }
 
         val_loss = self.common_step(
@@ -268,6 +300,7 @@ class VanillaGNN(BaseModel):
         # execute the forward of the GraphSAGE model
         _, \
         _, \
+        _, \
         unnormalized_logits_batch = self(
                                         test_batch.x,
                                         test_batch.edge_index
@@ -296,6 +329,7 @@ class VanillaGNN(BaseModel):
         Y_niche_type = []
         H_latent = []
         X_hat = []
+        H_adj = []
 
         for batch in self.trainer.datamodule.infer_dataloader():
             batch_size = batch.batch_size
@@ -306,6 +340,7 @@ class VanillaGNN(BaseModel):
 
             h_latent, \
             xhat_batch, \
+            h_adj, \
             _ = self(
                         batch.x.to(self.device),
                         batch.edge_index.to(self.device)
@@ -313,18 +348,20 @@ class VanillaGNN(BaseModel):
 
             H_latent.append(h_latent[:batch_size])
             X_hat.append(xhat_batch[:batch_size])
-
+            H_adj.append(h_adj[:batch_size])
         X = torch.cat(X, dim=0)
         Y_cell_type = torch.cat(Y_cell_type, dim=0)
         Y_niche_type = torch.cat(Y_niche_type, dim=0)
         H_latent = torch.cat(H_latent, dim=0)
         X_hat = torch.cat(X_hat, dim=0)
+        H_adj = torch.cat(H_adj, dim=0)
 
         return X, \
                 Y_cell_type, \
                 Y_niche_type, \
                 H_latent, \
-                X_hat
+                X_hat, \
+                H_adj
 
 
     @torch.no_grad()
@@ -342,7 +379,8 @@ class VanillaGNN(BaseModel):
         _, \
         _, \
         H_latent, \
-        X_hat = self.inference()
+        X_hat, \
+        H_adj = self.inference()
 
         train_epoch_end_stats = {}
 
