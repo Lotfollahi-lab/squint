@@ -358,11 +358,19 @@ class VanillaGNN(BaseModel):
             )
 
         if self.log_pearson_correlation:
-            pearson = metrics.pearson_correlation(
-                            X.cpu().numpy(),
-                            X_hat.cpu().numpy(),
-                            compare_genes=False,
-                            mean=True,
-                        )
-            train_epoch_end_stats['pearson_correlation'] = pearson
+            pearson_cell_wise = metrics.pearson_correlation(
+                        X.cpu().numpy(),
+                        X_hat.cpu().numpy(),
+                        compare_genes=False,
+                        mean=True,
+                    )
+            pearson_gene_wise = metrics.pearson_correlation(
+                        X.cpu().numpy(),
+                        X_hat.cpu().numpy(),
+                        compare_genes=True,
+                        mean=True,
+                    )
+            train_epoch_end_stats['pearson_cell_wise'] = pearson_cell_wise
+            train_epoch_end_stats['pearson_gene_wise'] = pearson_gene_wise
+
         return train_epoch_end_stats
