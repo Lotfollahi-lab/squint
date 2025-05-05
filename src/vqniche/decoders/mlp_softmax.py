@@ -2,7 +2,6 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-# from torch_geometric.nn import MLP as MLP_Module
 import pytorch_lightning as pl
 
 from ..modules.mlp import MLP as MLP_Module

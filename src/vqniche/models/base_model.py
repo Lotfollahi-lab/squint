@@ -10,16 +10,18 @@ from torch_geometric.nn.dense.linear import Linear
 
 from ..utils.loss import *
 from ..utils import metrics
+from ..modules.mlp import MLP as MLP_AdjacencyDecoder
 from ..decoders.mlp_softmax import MLPSoftmax
 
 
 class BaseModel(pl.LightningModule):
     def __init__(
             self,
-            model_name: str = 'BaseModel',
-            encoder_name: str = 'GraphSAGE',
-            attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
-            predictor_name: str = 'Linear',
+            model_name: str,
+            encoder_name: str,
+            attribute_decoder_name: str,
+            adjacency_decoder_name: str,
+            predictor_name: str,
             log_similarity_stats: bool = False,
             log_pearson_correlation: bool = False,
             log_codebook_utilization: Optional[bool] = None,
@@ -40,10 +42,12 @@ class BaseModel(pl.LightningModule):
             The name of the model.
         - encoder_name: str
             The encoder name.
-        - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
+        - attribute_decoder_name: str
             The name of the attribute decoder module.
+        - adjacency_decoder_name: str
+            The name of the adjacency decoder module.
         - predictor_name: str
-            The predictor name.
+            The name of the predictor module.
         - log_similarity_stats: bool
             Whether to log the similarity statistics.
         - log_pearson_correlation: bool
@@ -72,6 +76,7 @@ class BaseModel(pl.LightningModule):
         self.model_name = model_name
         self.encoder_name = encoder_name
         self.attribute_decoder_name = attribute_decoder_name
+        self.adjacency_decoder_name = adjacency_decoder_name
         self.predictor_name = predictor_name
         self.log_similarity_stats = log_similarity_stats
         self.log_pearson_correlation = log_pearson_correlation
@@ -320,6 +325,40 @@ class BaseModel(pl.LightningModule):
                 name=attribute_decoder_name,
                 use_xy_coordinates=attribute_decoder_params['use_xy_coordinates'],
                 mlp_params=attribute_decoder_params['mlp_params'],
+            )
+
+
+    def _init_adjacency_decoder(
+            self,
+            in_channels: int,
+            adjacency_decoder_name: Literal['MLP_AdjacencyDecoder'] = 'MLP_AdjacencyDecoder',
+            adjacency_decoder_params: dict = {}
+        ) -> torch.nn.Module:
+        """
+        Initialize the adjacency decoder module.
+
+        Parameters
+        ----------
+        - in_channels: int
+            The input dimension of the adjacency decoder module.
+        - adjacency_decoder_name: Literal['MLP_AdjacencyDecoder']
+            The name of the adjacency decoder module.
+        - adjacency_decoder_params: dict
+            The parameters for the adjacency decoder module.
+
+        Returns
+        -------
+        - adjacency_decoder: torch.nn.Module
+            The adjacency decoder module.
+        """
+        if adjacency_decoder_name == 'MLP_AdjacencyDecoder':
+            if 'out_channels' not in adjacency_decoder_params:
+                adjacency_decoder_params['out_channels'] = in_channels
+            print(f"{adjacency_decoder_params=}")
+            return MLP_AdjacencyDecoder(
+                in_channels=in_channels,
+                out_channels=adjacency_decoder_params['out_channels'],
+                mlp_params=adjacency_decoder_params['mlp_params'],
             )
 
 
