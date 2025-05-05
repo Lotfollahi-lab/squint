@@ -13,12 +13,16 @@ The implementation is based on the paper: VQNiche: Rethinking Graph Representati
 """
 from typing import List, Literal
 
+import networkx as nx
+
 import torch
 import torch_geometric
-from torch_geometric.nn.dense.linear import Linear
+
 from .base_model import BaseModel
 from ..encoders.vqniche_encoder import VQNiche_Encoder
 from ..utils import metrics
+from ..utils.type_conversions import edge_index_to_adjacency_tensor
+from ..utils.metrics import build_reconstructed_adjacency_matrix
 
 
 class VQNiche(BaseModel):
@@ -31,6 +35,7 @@ class VQNiche(BaseModel):
             predictor_name: Literal['Linear'] = 'Linear',
             log_similarity_stats: bool = False,
             log_pearson_correlation: bool = False,
+            log_mmd_degree: bool = False,
             log_codebook_utilization: bool = True,
             in_channels: int = None,
             out_channels: int = None,
@@ -59,6 +64,8 @@ class VQNiche(BaseModel):
             Whether to log the pairwise similarity statistics for all embeddings.
         - log_pearson_correlation: bool
             Whether to log the Pearson correlation between original and reconstructed cell-gene matrices.
+        - log_mmd_degree: bool
+            Whether to log the MMD metric between the degree distribution of the original and reconstructed graphs.
         - log_codebook_utilization: bool
             Whether to log the codebook utilization.
 
@@ -86,6 +93,7 @@ class VQNiche(BaseModel):
             log_similarity_stats=log_similarity_stats,
             log_codebook_utilization=log_codebook_utilization,
             log_pearson_correlation=log_pearson_correlation,
+            log_mmd_degree=log_mmd_degree,
             in_channels=in_channels,
             out_channels=out_channels,
             **optimizer_params,
@@ -406,6 +414,7 @@ class VQNiche(BaseModel):
         return X, \
             Y_cell_type, \
             Y_niche_type, \
+            self.trainer.datamodule.data.edge_index, \
             H_latent, \
             H_quantized, \
             Indices, \
@@ -428,6 +437,7 @@ class VQNiche(BaseModel):
         X, \
         _, \
         _, \
+        edge_index, \
         H_latent, \
         H_quantized, \
         Indices, \
@@ -467,6 +477,28 @@ class VQNiche(BaseModel):
                     )
             train_epoch_end_stats['pearson_cell_wise'] = pearson_cell_wise
             train_epoch_end_stats['pearson_gene_wise'] = pearson_gene_wise
+
+        if self.log_mmd_degree:
+            G = nx.from_numpy_array(
+                    edge_index_to_adjacency_tensor(
+                        edge_index
+                    ).cpu().numpy()
+                )
+
+            G_hat = nx.from_numpy_array(
+                    build_reconstructed_adjacency_matrix(
+                        H_adj
+                    ).cpu().numpy()
+                )
+            node_degree_distribution = metrics.compute_node_degree_distribution(G)
+            node_degree_distribution_hat = metrics.compute_node_degree_distribution(G_hat)
+            mmd_degree = metrics.compute_mmd(
+                            [node_degree_distribution],
+                            [node_degree_distribution_hat],
+                            method='l1_gaussian_tv',
+                            sigma=1.0,
+                        )
+            train_epoch_end_stats['mmd_degree'] = mmd_degree
 
         if self.log_codebook_utilization:
             train_epoch_end_stats['codebook_utilization'] = 1.0 * len(set(Indices.cpu().numpy())) / self.encoder.vq.codebook.shape[0]

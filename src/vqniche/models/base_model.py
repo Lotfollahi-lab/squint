@@ -24,6 +24,7 @@ class BaseModel(pl.LightningModule):
             predictor_name: str,
             log_similarity_stats: bool = False,
             log_pearson_correlation: bool = False,
+            log_mmd_degree: bool = False,
             log_codebook_utilization: Optional[bool] = None,
             in_channels: int = None,
             out_channels: int = None,
@@ -52,6 +53,8 @@ class BaseModel(pl.LightningModule):
             Whether to log the similarity statistics.
         - log_pearson_correlation: bool
             Whether to log the Pearson correlation.
+        - log_mmd_degree: bool
+            Whether to log the MMD metric between the degree distribution of the original and reconstructed graphs.
         - log_codebook_utilization: bool
             Whether to log the codebook utilization.
 
@@ -80,6 +83,7 @@ class BaseModel(pl.LightningModule):
         self.predictor_name = predictor_name
         self.log_similarity_stats = log_similarity_stats
         self.log_pearson_correlation = log_pearson_correlation
+        self.log_mmd_degree = log_mmd_degree
         if log_codebook_utilization is not None:
             self.log_codebook_utilization = log_codebook_utilization
 
