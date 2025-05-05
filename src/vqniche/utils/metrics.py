@@ -380,7 +380,7 @@ def total_discrepancy(
     return total_discrepancy
 
 
-def mmd(
+def mmd_score(
         D: List[np.ndarray],
         D_hat: List[np.ndarray],
         method: Literal['l1_gaussian_tv', 'l2_gaussian_tv'] = 'l1_gaussian_tv',
