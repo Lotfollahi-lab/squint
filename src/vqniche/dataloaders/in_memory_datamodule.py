@@ -181,6 +181,8 @@ class InMemoryDataModule(LightningNodeData):
                             x=data.x,
                             edge_index=data.edge_index,
                             y=data.y,
+                            y_cell_types=data.y_cell_types,
+                            y_niche_types=data.y_niche_types,
                             xy_coordinates=data.xy_coordinates,
                             train_mask=data.train_mask,
                             val_mask=data.val_mask,
