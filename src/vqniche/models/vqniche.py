@@ -21,6 +21,7 @@ import torch_geometric
 from .base_model import BaseModel
 from ..encoders.vqniche_encoder import VQNiche_Encoder
 from ..utils import metrics
+from ..utils.loss_utils import aggregate_1hop_neighbor_features
 from ..utils.type_conversions import edge_index_to_adjacency_tensor
 from ..utils.metrics import build_reconstructed_adjacency_matrix
 
@@ -108,6 +109,7 @@ class VQNiche(BaseModel):
                             in_channels=in_channels,
                             **encoder_params
                         )
+        print(f"1. VQNiche Encoder: {encoder_name} that transforms {in_channels} input features to {self.encoder.dim} quantized features.")
 
         # Initialize the attribute decoder.
         self.attribute_decoder = self._init_attribute_decoder(
@@ -224,13 +226,11 @@ class VQNiche(BaseModel):
         - train_loss: torch.Tensor
             The computed loss for this batch.
         """
-        batch_size = train_batch.batch_size
-
         # execute the forward of the VQNiche model
         h_latent, \
         h_quantized, \
         indices, \
-        xhat, \
+        xhat_batch, \
         h_adj, \
         unnormalized_logits_batch \
             = self(
@@ -241,12 +241,14 @@ class VQNiche(BaseModel):
 
         # prepare dictionary of data required for computing loss
         # This slicing is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the target nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of target nodes is equal to the batch size. The remaining entries of the forward output are the logits for the sampled neighbors of the target nodes.
-        # print(f"{train_batch.}")
+        batch_size = train_batch.batch_size
         train_loss_data = {
                         'quantizer_input': h_latent[:batch_size], # code and commit loss
                         'quantizer_output': h_quantized[:batch_size], # code and commit loss
-                        'pred_attr': xhat[:batch_size], # attribute reconstruction loss
-                        'target_attr': train_batch.x[:batch_size], # attribute reconstruction loss
+                        'pred_attr': xhat_batch, # attribute reconstruction loss
+                        'target_attr': train_batch.x, # attribute reconstruction loss
+                        'edge_index': train_batch.edge_index, # attribute reconstruction loss
+                        'batch_size': batch_size, # attribute reconstruction loss
                         'dispersion': torch.exp(self.dispersion), # attribute reconstruction loss
                         'pred_adj': h_adj[:batch_size], # adjacency reconstruction loss
                         'batch_edge_index': train_batch.edge_index, # adjacency reconstruction loss
@@ -282,12 +284,11 @@ class VQNiche(BaseModel):
         - val_loss: torch.Tensor
             The computed loss for this batch.
         """
-        batch_size = val_batch.batch_size
-
+        # execute the forward of the VQNiche model
         h_latent, \
         h_quantized, \
         indices, \
-        xhat, \
+        xhat_batch, \
         h_adj, \
         unnormalized_logits_batch \
             = self(
@@ -297,11 +298,14 @@ class VQNiche(BaseModel):
                 )
 
         # prepare dictionary of data required for computing loss
+        batch_size = val_batch.batch_size
         val_loss_data = {
                         'quantizer_input': h_latent[:batch_size],
                         'quantizer_output': h_quantized[:batch_size],
-                        'pred_attr': xhat[:batch_size],
-                        'target_attr': val_batch.x[:batch_size],
+                        'pred_attr': xhat_batch,
+                        'target_attr': val_batch.x,
+                        'edge_index': val_batch.edge_index,
+                        'batch_size': batch_size,
                         'dispersion': torch.exp(self.dispersion),
                         'pred_adj': h_adj[:batch_size],
                         'batch_edge_index': val_batch.edge_index,
@@ -461,6 +465,9 @@ class VQNiche(BaseModel):
             train_epoch_end_stats.update(
                 metrics.cosine_similarity(X_hat, 'X_hat')
             )
+            train_epoch_end_stats.update(
+                metrics.cosine_similarity(H_adj, 'H_adj')
+            )
 
         if self.log_pearson_correlation:
             pearson_cell_wise = metrics.pearson_correlation(
@@ -478,8 +485,16 @@ class VQNiche(BaseModel):
             train_epoch_end_stats['pearson_cell_wise'] = pearson_cell_wise
             train_epoch_end_stats['pearson_gene_wise'] = pearson_gene_wise
 
-            X_nbr = self.construct_mean_neighbor_features(X.cpu(), edge_index.cpu())
-            X_hat_nbr = self.construct_mean_neighbor_features(X_hat.cpu(), edge_index.cpu())
+            X_nbr = aggregate_1hop_neighbor_features(
+                        X=X.cpu(),
+                        edge_index=edge_index.cpu(),
+                        return_mean=True,
+                    )
+            X_hat_nbr = aggregate_1hop_neighbor_features(
+                        X=X_hat.cpu(),
+                        edge_index=edge_index.cpu(),
+                        return_mean=True,
+                    )
             pearson_1hop_nbr = metrics.pearson_correlation(
                         X_nbr,
                         X_hat_nbr,
@@ -494,12 +509,14 @@ class VQNiche(BaseModel):
                         edge_index
                     ).cpu().numpy()
                 )
-
+            print(f"{G.number_of_edges()=}")
             G_hat = nx.from_numpy_array(
                     build_reconstructed_adjacency_matrix(
                         H_adj
                     ).cpu().numpy()
                 )
+            print(f"{G_hat.number_of_edges()=}")
+
             node_degree_distribution = metrics.node_degree_distribution(G)
             node_degree_distribution_hat = metrics.node_degree_distribution(G_hat)
             mmd_degree = metrics.mmd_score(

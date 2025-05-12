@@ -18,6 +18,7 @@ import torch_geometric
 from .base_model import BaseModel
 from ..modules.mlp import MLP as MLP_Encoder
 from ..utils import metrics
+from ..utils.loss_utils import aggregate_1hop_neighbor_features
 from ..utils.type_conversions import edge_index_to_adjacency_tensor
 from ..utils.metrics import build_reconstructed_adjacency_matrix
 
@@ -202,8 +203,10 @@ class VanillaMLP(BaseModel):
         # train_batch.n_id contains the IDs of all the target nodes and their sampled neighbors.
         batch_size = train_batch.batch_size
         train_loss_data = {
-                        'pred_attr': xhat_batch[:batch_size],
-                        'target_attr': train_batch.x[:batch_size],
+                        'pred_attr': xhat_batch,
+                        'target_attr': train_batch.x,
+                        'edge_index': train_batch.edge_index,
+                        'batch_size': batch_size,
                         'dispersion': torch.exp(self.dispersion),
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': train_batch.y[:batch_size],
@@ -248,8 +251,10 @@ class VanillaMLP(BaseModel):
         # prepare dictionary of data required for computing loss
         batch_size = val_batch.batch_size
         val_loss_data = {
-                        'pred_attr': xhat_batch[:batch_size],
-                        'target_attr': val_batch.x[:batch_size],
+                        'pred_attr': xhat_batch,
+                        'target_attr': val_batch.x,
+                        'edge_index': val_batch.edge_index,
+                        'batch_size': batch_size,
                         'dispersion': torch.exp(self.dispersion),
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': val_batch.y[:batch_size],
@@ -379,6 +384,9 @@ class VanillaMLP(BaseModel):
             train_epoch_end_stats.update(
                 metrics.cosine_similarity(X_hat, 'X_hat')
             )
+            train_epoch_end_stats.update(
+                metrics.cosine_similarity(H_adj, 'H_adj')
+            )
 
         if self.log_pearson_correlation:
             pearson_cell_wise = metrics.pearson_correlation(
@@ -396,11 +404,19 @@ class VanillaMLP(BaseModel):
             train_epoch_end_stats['pearson_cell_wise'] = pearson_cell_wise
             train_epoch_end_stats['pearson_gene_wise'] = pearson_gene_wise
 
-            X_nbr = self.construct_mean_neighbor_features(X.cpu(), edge_index.cpu())
-            X_hat_nbr = self.construct_mean_neighbor_features(X_hat.cpu(), edge_index.cpu())
+            X_nbr = aggregate_1hop_neighbor_features(
+                        X=X.cpu(),
+                        edge_index=edge_index.cpu(),
+                        return_mean=True,
+                    )
+            X_hat_nbr = aggregate_1hop_neighbor_features(
+                        X=X_hat.cpu(),
+                        edge_index=edge_index.cpu(),
+                        return_mean=True,
+                    )
             pearson_1hop_nbr = metrics.pearson_correlation(
-                        X_nbr,
-                        X_hat_nbr,
+                        X=X_nbr,
+                        X_hat=X_hat_nbr,
                         compare_genes=False,
                         mean=True,
                     )
@@ -412,12 +428,15 @@ class VanillaMLP(BaseModel):
                         edge_index
                     ).cpu().numpy()
                 )
+            print(f"{G.number_of_edges()=}")
 
             G_hat = nx.from_numpy_array(
                     build_reconstructed_adjacency_matrix(
                         H_adj
                     ).cpu().numpy()
                 )
+            print(f"{G_hat.number_of_edges()=}")
+
             node_degree_distribution = metrics.node_degree_distribution(G)
             node_degree_distribution_hat = metrics.node_degree_distribution(G_hat)
             mmd_degree = metrics.mmd_score(

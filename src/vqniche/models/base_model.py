@@ -170,7 +170,11 @@ class BaseModel(pl.LightningModule):
             elif loss_fn_name == 'nb_attribute_reconstruction':
                 loss_fn = nb_attribute_reconstruction
 
-                loss_fn_data_keys = ['pred_attr', 'target_attr', 'dispersion']
+                loss_fn_data_keys = ['pred_attr', 'target_attr', 'edge_index', 'batch_size', 'dispersion']
+
+                k_hop_nb_loss = loss_kwargs.get('k_hop_nb_loss')
+                if k_hop_nb_loss is not None:
+                    loss_fn_params['k_hop_nb_loss'] = k_hop_nb_loss
 
                 wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
                 if wt_attr_reconstr is not None:
@@ -397,46 +401,6 @@ class BaseModel(pl.LightningModule):
                 out_channels=out_channels,
                 weight_initializer=init_method
             )
-
-
-    def construct_mean_neighbor_features(
-            self,
-            X: torch.Tensor,
-            edge_index: torch.Tensor
-        ) -> torch.Tensor:
-        """
-        Construct mean attribute vectors of the 1-hop neighbors of each node.
-
-        Parameters
-        ----------
-        - X: torch.Tensor
-            The attribute vectors of the nodes.
-        - edge_index: torch.Tensor
-            The edge index of the graph.
-
-        Returns
-        -------
-        - X_nbr: torch.Tensor
-            The mean attribute vectors of the 1-hop neighbors of each node.
-        """
-        # edge_index[0]: source nodes (j), edge_index[1]: target nodes (i)
-        row, col = edge_index
-
-        # Aggregate neighbor features: sum features of neighbors
-        X_sum = torch.zeros_like(X)
-        X_sum = X_sum.index_add(0, col, X[row])
-
-        # Count neighbors
-        deg = torch.zeros(X.shape[0], dtype=torch.float, device=X.device)
-        deg = deg.index_add(0, col, torch.ones_like(col, dtype=torch.float))
-
-        # Avoid division by zero
-        deg = deg.clamp(min=1).unsqueeze(1)  # shape (n, 1)
-
-        # Compute mean
-        X_nbr = X_sum / deg
-
-        return X_nbr
 
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
