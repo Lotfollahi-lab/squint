@@ -30,12 +30,17 @@ Tradeoffs:
 """
 import os
 import copy
+import subprocess
 from pathlib import Path
 import concurrent.futures
-
-import scanpy as sc
 from typing import Optional, Callable, List, Tuple
 
+import numpy as np
+import scanpy as sc
+import scipy.sparse as sp
+from scipy.sparse.linalg import eigsh
+
+import torch
 from torch import Tensor
 from torch_geometric.data import InMemoryDataset, Data
 from torch_geometric.utils import is_undirected
@@ -57,7 +62,8 @@ class InMemoryDatasetBlob(InMemoryDataset):
             transform: Optional[Callable] = None,
             pre_transform: Optional[Callable] = None,
             pre_filter: Optional[Callable] = None,
-            overwrite: bool = False
+            overwrite: bool = False,
+            software_paths: dict = {}
         ) -> InMemoryDataset:
         """
         CustomInMemoryDataset class for loading PyG Data objects from AnnData files.
@@ -84,6 +90,8 @@ class InMemoryDatasetBlob(InMemoryDataset):
             A function that takes in an PyG Data object and returns True if the data object should be included in the final dataset.
         - overwrite: bool
             If True, the existing processed data is overwritten and then loaded. If False, the processed data is loaded from the processed directory.
+        - software_paths: dict
+            Dictionary containing the paths to the third-party software used to build the dataset.
 
         Returns:
         -------
@@ -103,6 +111,8 @@ class InMemoryDatasetBlob(InMemoryDataset):
         if isinstance(data_directory_path, str):
             data_directory_path = Path(data_directory_path)
         self.data_directory_path = data_directory_path
+
+        self.software_paths = software_paths
 
         # root = Root directory where the processed data is saved.
         # rerun the self.process if the processed data is not found or if overwrite is set to True.
@@ -228,8 +238,11 @@ class InMemoryDatasetBlob(InMemoryDataset):
         spatial_key = self.graph_kwargs['spatial_key']
         include_self_loop = self.graph_kwargs['include_self_loop']
 
-        for delaunay in [True, False]:
-            for radius in self.graph_kwargs['radius_list'] + [None]:
+        for delaunay in [False]:
+            radius_list = [None]
+            if self.graph_kwargs['radius_list'] is not None:
+                radius_list = self.graph_kwargs['radius_list'] + [None]
+            for radius in radius_list:
                 # n_neighs is used only if delaunay is False
                 if delaunay:
                     n_neighs_list = [None]
@@ -264,6 +277,7 @@ class InMemoryDatasetBlob(InMemoryDataset):
         # ----------------- Build Data Dict -----------------
         batch_dict = {}
 
+            # ----------------- Build Feature Matrices -----------------
         # build for node features (sparse csr matrix to float tensor)
         # NOTE: adata_batch.X is assumed to a the raw cell-gene counts matrix.
         assert len(self.feature_names) > 0, "At least one feature name must be provided"
@@ -275,6 +289,7 @@ class InMemoryDatasetBlob(InMemoryDataset):
             else:
                 raise ValueError(f"Feature name {feature_name} not supported")
 
+            # ----------------- Build Torch One-Hot Labels -----------------
         # build for node labels (categorical pandas series to one hot tensor)
         for label_name, label_key in zip(self.label_names, self.label_keys):
             batch_dict[f"y_{label_name}"] = pandas_to_torch_one_hot(
@@ -282,6 +297,7 @@ class InMemoryDatasetBlob(InMemoryDataset):
                                                 categories=self.label_categories[label_name]
                                             )
 
+            # ----------------- Build Edge Indices -----------------
         # build one edge index for each edge index name (as defined by above)
         assert len(self.edge_index_names) > 0, "At least one edge index name must be provided"
         for edge_index_name in self.edge_index_names:
@@ -305,6 +321,37 @@ class InMemoryDatasetBlob(InMemoryDataset):
             # check if the edge index is undirected
             if not is_undirected(batch_dict[f"edge_index_{edge_index_name}"]):
                 raise ValueError(f"Edge index {edge_index_name} is not undirected")
+
+            # ----------------- Build Unsupervised Node Embeddings -----------------
+            # for small graphs, build spectral embeddings
+            num_nodes = adata_batch.obsp[f"{edge_index_name}_connectivities"].shape[0]
+            if num_nodes < 20_000:
+                print(f"Computing {self.graph_kwargs['k']['lm_eigvecs']} eigenvectors of {edge_index_name}...")
+                batch_dict[f"U_lm_eigvecs_{edge_index_name}"] = self.build_lm_eigenvectors(
+                    A=adata_batch.obsp[f"{edge_index_name}_connectivities"],
+                )
+                print(f"U_lm_eigvecs_{edge_index_name}.shape: {batch_dict[f'U_lm_eigvecs_{edge_index_name}'].shape}")
+
+            # save graph to disk in edgelist format
+            self.save_adjacency_matrix_to_edgelist(
+                batch_id=adata_batch.uns['batch'],
+                A=adata_batch.obsp[f"{edge_index_name}_connectivities"],
+                edge_index_name=edge_index_name
+            )
+
+            # build deepwalk embeddings
+            batch_dict[f"U_deepwalk_{edge_index_name}"] = self.build_deepwalk_embeddings(
+                batch_id=adata_batch.uns['batch'],
+                edge_index_name=edge_index_name
+            )
+            print(f"U_deepwalk_{edge_index_name}.shape: {batch_dict[f'U_deepwalk_{edge_index_name}'].shape}")
+
+            # build gosh embeddings
+            batch_dict[f"U_gosh_{edge_index_name}"] = self.build_gosh_embeddings(
+                batch_id=adata_batch.uns['batch'],
+                edge_index_name=edge_index_name
+            )
+            print(f"U_gosh_{edge_index_name}.shape: {batch_dict[f'U_gosh_{edge_index_name}'].shape}")
 
         for key, value in batch_dict.items():
             print(f"{key}: {value.shape=}, {value.dtype=}, {type(value)=}")
@@ -330,6 +377,198 @@ class InMemoryDatasetBlob(InMemoryDataset):
             data_batch = self.pre_transform(data_batch)
 
         return data_batch
+
+
+    def build_lm_eigenvectors(
+            self,
+            A: sp.csr_matrix,
+        ) -> Tensor:
+        """
+        Build k eigenvectors corresponding to the k largest (in magnitude) eigenvalues of the adjacency matrix of the graph.
+
+        Parameters:
+        ----------
+        - A: sp.csr_matrix
+            The adjacency matrix of the graph.
+
+        Returns:
+        -------
+        - U: Tensor
+            The eigenvectors of the Laplacian matrix of the graph.
+        """
+        U = eigsh(
+                    A=A,
+                    which='LM',
+                    k=self.graph_kwargs['k']['lm_eigvecs'],
+                    tol=1e-4,
+                    maxiter=1e6,
+                )[1]
+        U = torch.from_numpy(U).to(torch.float32)
+
+        return U
+
+
+    def build_deepwalk_embeddings(
+            self,
+            batch_id: str,
+            edge_index_name: str,
+        ) -> Tensor:
+        """
+        Build deepwalk embeddings for the given edge index name.
+
+        Parameters:
+        ----------
+        - batch_id: str
+            The batch id of the adjacency matrix.
+        - edge_index_name: str
+            The name of the edge index to build deepwalk embeddings for.
+
+        Returns:
+        -------
+        - U: Tensor
+            The deepwalk embeddings.
+
+        Notes:
+        ------
+        - Setting p=1 and q=1 in node2vec is equivalent to computing deepwalk embeddings.
+        """
+        deepwalk_executable = self.software_paths['deepwalk']
+        batch_dir = Path(self.processed_dir) / batch_id
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        edgelist_fname = batch_dir / f"{edge_index_name}.edgelist"
+        emb_fname = batch_dir / f"U_deepwalk_{edge_index_name}.emb"
+
+        exec_str = f"{deepwalk_executable} -i:{edgelist_fname} -o:{emb_fname} -d:{self.graph_kwargs['k']['deepwalk']} -p:1 -q:1 -r:10 -l:40 -v"
+
+        print(f"Running {exec_str}...")
+        _ = subprocess.run(exec_str, shell=True)
+        print(f"U_deepwalk_{edge_index_name}.emb saved to {emb_fname}")
+
+        U = self._read_deepwalk_embeddings_from_disk(emb_fname)
+
+        return U
+
+
+    def build_gosh_embeddings(
+            self,
+            batch_id: str,
+            edge_index_name: str,
+        ) -> Tensor:
+        """
+        Build GOSH embeddings for the given edge index name.
+
+        Parameters:
+        ----------
+        - batch_id: str
+            The batch id of the adjacency matrix.
+        - edge_index_name: str
+            The name of the edge index to build GOSH embeddings for.
+
+        Returns:
+        -------
+        - U: Tensor
+            The GOSH embeddings.
+
+        Notes:
+        ------
+        - The embedding is binary format for fast loading.
+        - For scaling to larger graphs, hyperparameters will need to be adjusted.
+        """
+        if not torch.cuda.is_available():
+            raise ValueError("GOSH embeddings are not supported on CPU")
+
+        gosh_executable = self.software_paths['gosh']
+        batch_dir = Path(self.processed_dir) / batch_id
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        edgelist_fname = batch_dir / f"{edge_index_name}.edgelist"
+        emb_fname = batch_dir / f"U_gosh_{edge_index_name}.emb"
+
+        exec_str = f"{gosh_executable} --input-graph {edgelist_fname} --output-embedding {emb_fname} --directed 0 --epochs 200 -d {self.graph_kwargs['k']['gosh']} -s 3 --negative-weight 1 --binary-output --sampling-algorithm 0 -a 0 -l 0.025 --learning-rate-decay-strategy 0 --coarsening-stopping-threshold 1000 --coarsening-stopping-precision 0.9 --coarsening-matching-threshold-ratio 400 --coarsening-min-vertices-in-graph 1000 --epoch-strategy s-fast --smoothing-ratio 0.5"
+
+        print(f"Running {exec_str}...")
+        _ = subprocess.run(exec_str, shell=True)
+        print(f"U_gosh_{edge_index_name}.emb saved to {emb_fname}")
+
+        U = torch.from_numpy(np.load(emb_fname)).to(torch.float32)
+
+        return U
+
+
+    def _read_deepwalk_embeddings_from_disk(
+            self,
+            emb_fname: str,
+        ) -> Tensor:
+        """
+        Read the DeepWalk embeddings from disk.
+
+        Parameters:
+        ----------
+        - emb_fname: str
+            The name of the file to read the DeepWalk embeddings from.
+
+        Returns:
+        -------
+        - U: Tensor
+            The DeepWalk embeddings.
+
+        Notes:
+        ------
+        - The first line of the file contains the number of nodes and the number of dimensions.
+        - The remaining lines contain the node id and the embedding vector.
+        """
+        is_first_line = True
+        with open(emb_fname, 'r') as f:
+            for line in f:
+                line = line.strip().split()
+                if is_first_line:
+                    is_first_line = False
+                    n_nodes, n_dims = int(line[0]), int(line[1])
+                    U = torch.zeros(n_nodes, n_dims)
+                    continue
+                node_id = int(line[0])
+                U[node_id] = torch.tensor(
+                                [float(x) for x in line[1:]],
+                                dtype=torch.float32
+                            )
+
+        return U
+
+
+    def save_adjacency_matrix_to_edgelist(
+            self,
+            batch_id: str,
+            A: sp.csr_matrix,
+            edge_index_name: str,
+        ) -> None:
+        """
+        Save the adjacency matrix to disk in edgelist format.
+
+        Parameters:
+        ----------
+        - batch_id: str
+            The batch id of the adjacency matrix.
+        - A: sp.csr_matrix
+            The adjacency matrix to save.
+        - edge_index_name: str
+            The name of the edge index to save.
+        """
+        assert isinstance(A, sp.csr_matrix), "A must be a scipy.csr_matrix"
+
+        batch_dir = Path(self.processed_dir) / batch_id
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        edgelist_fname = batch_dir / f"{edge_index_name}.edgelist"
+
+        with open(edgelist_fname, 'w') as f:
+            for row in range(A.shape[0]):
+                start_idx = A.indptr[row]
+                end_idx = A.indptr[row + 1]
+                cols = A.indices[start_idx:end_idx]
+
+                for col in cols:
+                    f.write(f"{row} {col}\n")
+
+        print(f"Saved {edge_index_name} to {edgelist_fname}...")
+        return
 
 
     @property
