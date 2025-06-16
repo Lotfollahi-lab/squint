@@ -428,14 +428,12 @@ class VanillaMLP(BaseModel):
                         edge_index
                     ).cpu().numpy()
                 )
-            print(f"{G.number_of_edges()=}")
 
             G_hat = nx.from_numpy_array(
                     build_reconstructed_adjacency_matrix(
                         H_adj
                     ).cpu().numpy()
                 )
-            print(f"{G_hat.number_of_edges()=}")
 
             node_degree_distribution = metrics.node_degree_distribution(G)
             node_degree_distribution_hat = metrics.node_degree_distribution(G_hat)
