@@ -10,18 +10,21 @@ from torch_geometric.nn.dense.linear import Linear
 
 from ..utils.loss import *
 from ..utils import metrics
-from ..decoders.linear_softmax import LinearSoftmax
+from ..modules.mlp import MLP as MLP_AdjacencyDecoder
+from ..decoders.mlp_softmax import MLPSoftmax
 
 
 class BaseModel(pl.LightningModule):
     def __init__(
             self,
-            model_name: str = 'BaseModel',
-            encoder_name: str = 'GraphSAGE',
-            attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
-            predictor_name: str = 'Linear',
+            model_name: str,
+            encoder_name: str,
+            attribute_decoder_name: str,
+            adjacency_decoder_name: str,
+            predictor_name: str,
             log_similarity_stats: bool = False,
             log_pearson_correlation: bool = False,
+            log_mmd_degree: bool = False,
             log_codebook_utilization: Optional[bool] = None,
             in_channels: int = None,
             out_channels: int = None,
@@ -40,14 +43,18 @@ class BaseModel(pl.LightningModule):
             The name of the model.
         - encoder_name: str
             The encoder name.
-        - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
+        - attribute_decoder_name: str
             The name of the attribute decoder module.
+        - adjacency_decoder_name: str
+            The name of the adjacency decoder module.
         - predictor_name: str
-            The predictor name.
+            The name of the predictor module.
         - log_similarity_stats: bool
             Whether to log the similarity statistics.
         - log_pearson_correlation: bool
             Whether to log the Pearson correlation.
+        - log_mmd_degree: bool
+            Whether to log the MMD metric between the degree distribution of the original and reconstructed graphs.
         - log_codebook_utilization: bool
             Whether to log the codebook utilization.
 
@@ -72,9 +79,11 @@ class BaseModel(pl.LightningModule):
         self.model_name = model_name
         self.encoder_name = encoder_name
         self.attribute_decoder_name = attribute_decoder_name
+        self.adjacency_decoder_name = adjacency_decoder_name
         self.predictor_name = predictor_name
         self.log_similarity_stats = log_similarity_stats
         self.log_pearson_correlation = log_pearson_correlation
+        self.log_mmd_degree = log_mmd_degree
         if log_codebook_utilization is not None:
             self.log_codebook_utilization = log_codebook_utilization
 
@@ -161,7 +170,11 @@ class BaseModel(pl.LightningModule):
             elif loss_fn_name == 'nb_attribute_reconstruction':
                 loss_fn = nb_attribute_reconstruction
 
-                loss_fn_data_keys = ['pred_attr', 'target_attr', 'dispersion']
+                loss_fn_data_keys = ['pred_attr', 'target_attr', 'edge_index', 'batch_size', 'dispersion']
+
+                k_hop_nb_loss = loss_kwargs.get('k_hop_nb_loss')
+                if k_hop_nb_loss is not None:
+                    loss_fn_params['k_hop_nb_loss'] = k_hop_nb_loss
 
                 wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
                 if wt_attr_reconstr is not None:
@@ -289,36 +302,70 @@ class BaseModel(pl.LightningModule):
 
     def _init_attribute_decoder(
             self,
-            attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
             in_channels: int = None,
             out_channels: int = None,
-            init_method: str = 'kaiming_uniform'
+            attribute_decoder_name: Literal['MLPSoftmax'] = 'MLPSoftmax',
+            attribute_decoder_params: dict = {}
         ) -> pl.LightningModule:
         """
         Initialize the attribute decoder module.
 
         Parameters
         ----------
-        - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
-            The name of the attribute decoder module.
         - in_channels: int
-            The input dimension of the attribute decoder module. This is the same as the hidden dimension of the Graph Convolution module.
+            The input dimension of the attribute decoder module.
         - out_channels: int
-            The output dimension of the attribute decoder module. This is the same as the number of genes.
-        - init_method: str
-            The initialization method for the attribute decoder module.
+            The output dimension of the attribute decoder module.
+        - attribute_decoder_name: Literal['MLPSoftmax']
+            The name of the attribute decoder module.
+        - attribute_decoder_params: dict
+            The parameters for the attribute decoder module.
 
         Returns
         -------
         - attribute_decoder: pl.LightningModule
             The attribute decoder module.
         """
-        if attribute_decoder_name in ['Linear', 'LinearSoftmax']:
-            return LinearSoftmax(
-                name=attribute_decoder_name,
+        if attribute_decoder_name == 'MLPSoftmax':
+            return MLPSoftmax(
                 in_channels=in_channels,
                 out_channels=out_channels,
-                init_method=init_method
+                name=attribute_decoder_name,
+                use_xy_coordinates=attribute_decoder_params['use_xy_coordinates'],
+                mlp_params=attribute_decoder_params['mlp_params'],
+            )
+
+
+    def _init_adjacency_decoder(
+            self,
+            in_channels: int,
+            adjacency_decoder_name: Literal['MLP_AdjacencyDecoder'] = 'MLP_AdjacencyDecoder',
+            adjacency_decoder_params: dict = {}
+        ) -> torch.nn.Module:
+        """
+        Initialize the adjacency decoder module.
+
+        Parameters
+        ----------
+        - in_channels: int
+            The input dimension of the adjacency decoder module.
+        - adjacency_decoder_name: Literal['MLP_AdjacencyDecoder']
+            The name of the adjacency decoder module.
+        - adjacency_decoder_params: dict
+            The parameters for the adjacency decoder module.
+
+        Returns
+        -------
+        - adjacency_decoder: torch.nn.Module
+            The adjacency decoder module.
+        """
+        if adjacency_decoder_name == 'MLP_AdjacencyDecoder':
+            if 'out_channels' not in adjacency_decoder_params:
+                adjacency_decoder_params['out_channels'] = in_channels
+            return MLP_AdjacencyDecoder(
+                in_channels=in_channels,
+                out_channels=adjacency_decoder_params['out_channels'],
+                mlp_params=adjacency_decoder_params['mlp_params'],
             )
 
 

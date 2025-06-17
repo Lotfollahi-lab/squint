@@ -10,12 +10,12 @@ from torch_geometric.loader import DataLoader as BatchBuilder
 from pytorch_lightning.loggers import WandbLogger
 
 from ..preprocessors.graph_constructors import set_edge_index_name
-from ..dataset.transforms import SetExperimentDataKeys, init_data_transforms
+from ..dataset.transforms import SetExperimentDataKeys, init_gene_count_transforms, init_train_transforms
 from ..dataset.in_memory_dataset_blob import InMemoryDatasetBlob
 from ..dataloaders.in_memory_datamodule import InMemoryDataModule
 from ..models.vanilla_mlp import VanillaMLP
 from ..models.vanilla_gnn import VanillaGNN
-from ..models.vqgraph import VQGraph
+from ..models.vqniche import VQNiche
 
 
 def initialize_logger(
@@ -36,46 +36,43 @@ def initialize_logger(
 def initialize_dataset_blob(
         config: Dict,
     ) -> InMemoryDatasetBlob:
-    # --------------------- Set Data Keys ---------------------
-    # decide which node features to use in this experiment
-    feature_name = config['dataset']['feature_name']
-
-    # decide which edge index to use in this experiment
-    graph_params = config['dataset']['graph_params']
-    spatial_key = graph_params['spatial_key']
-    delaunay = graph_params['delaunay']
-    n_neighs = graph_params['n_neighs']
-    radius = graph_params['radius']
-
-    assert delaunay or n_neighs or radius, "Specify at least one of delaunay, n_neighs, or radius."
-
-    edge_index_name = set_edge_index_name(
-                        spatial_key=spatial_key,
-                        delaunay=delaunay,
-                        n_neighs=n_neighs,
-                        radius=radius,
+    # --------------------- Initialize Transforms ---------------------
+    # 1. gene count transforms: e.g. subset HVGs, normalize features, etc.
+    gene_count_transform_names = config['dataset']['gene_count_transform_names']
+    gene_count_transform_params = config['dataset']['gene_count_transform_params']
+    GeneCountTransforms = init_gene_count_transforms(
+                        gene_count_transform_names=gene_count_transform_names,
+                        **gene_count_transform_params
                     )
 
-    # decide which node labels to use in this experiment
+    # 2. set experiment data keys: e.g. feature names, label name, edge index name
+    graph_params = config['dataset']['graph_params']
+    edge_index_name = set_edge_index_name(
+                        spatial_key=graph_params['spatial_key'],
+                        delaunay=graph_params['delaunay'],
+                        n_neighs=graph_params['n_neighs'],
+                        radius=graph_params['radius'],
+                    )
+    feature_names = config['dataset']['feature_names']
     label_name = config['dataset']['label_name']
-
-    # --------------------- Initialize Data Transforms ---------------------
     ExperimentDataKeys = SetExperimentDataKeys(
-                            feature_name=feature_name,
+                            feature_names=feature_names,
                             label_name=label_name,
                             edge_index_name=edge_index_name
                         )
 
-    # e.g. normalize features , train-val-test split, etc.
-    data_transform_names = config['dataset']['transform_names']
-    transform_params = config['dataset']['transform_params']
-    DataTransforms = init_data_transforms(
-                        data_transform_names=data_transform_names,
-                        **transform_params
+    # 3. train transforms: e.g. random node split, etc.
+    train_transform_names = config['dataset']['train_transform_names']
+    train_transform_params = config['dataset']['train_transform_params']
+    TrainTransforms = init_train_transforms(
+                        train_transform_names=train_transform_names,
+                        **train_transform_params
                     )
 
     # initialize a composed transform
-    transforms = T.Compose([ExperimentDataKeys] + DataTransforms)
+    # NOTE: transforms are not order-invariant
+    transforms_list = GeneCountTransforms + [ExperimentDataKeys] + TrainTransforms
+    transforms = T.Compose(transforms_list)
 
     # --------------------- Initialize Dataset Blob ---------------------
     # set root data directory
@@ -155,12 +152,12 @@ def initialize_datamodule(
 def set_model_class(
         model_name: str,
     ) -> pl.LightningModule:
-    if model_name == 'MLP':
+    if model_name == 'VanillaMLP':
         Model = VanillaMLP
     elif model_name in ['GraphSAGE', 'GATv2', 'GIN']:
         Model = VanillaGNN
-    elif model_name == 'VQGraph':
-        Model = VQGraph
+    elif model_name == 'VQNiche':
+        Model = VQNiche
     else:
         raise ValueError(f"Model {model_name} not found.")
     return Model
@@ -178,9 +175,12 @@ def initialize_model(
     model_name = config['model']['model_name']
     encoder_name = config['model']['encoder_name']
     attribute_decoder_name = config['model']['attribute_decoder_name']
+    adjacency_decoder_name = config['model']['adjacency_decoder_name']
     predictor_name = config['model']['predictor_name']
     train_log_flags = config['model']['train_log_flags']
     encoder_params = config['model']['encoder_params']
+    attribute_decoder_params = config['model']['attribute_decoder_params']
+    adjacency_decoder_params = config['model']['adjacency_decoder_params']
     optimizer_params = config['model']['optimizer_params']
     loss_params = config['model']['loss_params']
 
@@ -189,13 +189,16 @@ def initialize_model(
                 model_name=model_name,
                 encoder_name=encoder_name,
                 attribute_decoder_name=attribute_decoder_name,
+                adjacency_decoder_name=adjacency_decoder_name,
                 predictor_name=predictor_name,
                 **train_log_flags,
                 in_channels=in_channels,
                 out_channels=out_channels,
-                **encoder_params,
-                **optimizer_params,
-                **loss_params,
+                encoder_params=encoder_params,
+                attribute_decoder_params=attribute_decoder_params,
+                adjacency_decoder_params=adjacency_decoder_params,
+                optimizer_params=optimizer_params,
+                loss_params=loss_params,
             )
     return model
 

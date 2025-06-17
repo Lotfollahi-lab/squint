@@ -154,7 +154,7 @@ def compute_distribution(
     return distribution
 
 
-def compute_node_degree_distribution(
+def node_degree_distribution(
         G: nx.Graph,
     ) -> torch.Tensor:
     """
@@ -285,7 +285,7 @@ def compute_spectral_distribution(
     )
 
 
-def compute_distribution_discrepancy(
+def distribution_discrepancy(
         x: np.ndarray,
         y: np.ndarray,
         method: Literal['l1_gaussian_tv', 'l2_gaussian_tv'] = 'l1_gaussian_tv',
@@ -346,7 +346,7 @@ def compute_distribution_discrepancy(
     return discrepancy
 
 
-def compute_total_discrepancy(
+def total_discrepancy(
         X: List[np.ndarray],
         Y: List[np.ndarray],
         method: Literal['l1_gaussian_tv', 'l2_gaussian_tv'] = 'l1_gaussian_tv',
@@ -370,7 +370,7 @@ def compute_total_discrepancy(
     total_discrepancy = 0.0
     for x in X:
         for y in Y:
-            total_discrepancy += compute_distribution_discrepancy(
+            total_discrepancy += distribution_discrepancy(
                                     x=x,
                                     y=y,
                                     method=method,
@@ -380,7 +380,7 @@ def compute_total_discrepancy(
     return total_discrepancy
 
 
-def compute_mmd(
+def mmd_score(
         D: List[np.ndarray],
         D_hat: List[np.ndarray],
         method: Literal['l1_gaussian_tv', 'l2_gaussian_tv'] = 'l1_gaussian_tv',
@@ -392,7 +392,7 @@ def compute_mmd(
     Parameters
     ----------
     - D: List[numpy.ndarray]
-        A collection of distributions, one per originalgraph.
+        A collection of distributions, one per original graph.
     - D_hat: List[numpy.ndarray]
         A collection of distributions, one per reconstructed graph.
     - method: Literal['l1_gaussian_tv', 'l2_gaussian_tv']
@@ -408,25 +408,24 @@ def compute_mmd(
     """
     assert len(D) == len(D_hat)
 
-    Kxx = compute_total_discrepancy(
+    Kxx = total_discrepancy(
         X=D,
         Y=D,
         method=method,
         sigma=sigma,
     )
-    Kyy = compute_total_discrepancy(
+    Kyy = total_discrepancy(
         X=D_hat,
         Y=D_hat,
         method=method,
         sigma=sigma,
     )
-    Kxy = compute_total_discrepancy(
+    Kxy = total_discrepancy(
         X=D,
         Y=D_hat,
         method=method,
         sigma=sigma,
     )
-    print(f"Kxx: {Kxx}, Kyy: {Kyy}, Kxy: {Kxy}")
     mmd = Kxx + Kyy - 2 * Kxy
     return mmd
 

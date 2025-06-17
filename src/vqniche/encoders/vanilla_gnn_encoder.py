@@ -3,9 +3,8 @@ from typing import Literal
 import torch
 import pytorch_lightning as pl
 
+from ..modules.mlp import MLP as MLP_Module
 from ..modules.gnn import init_gnn_module
-from ..modules.mlp import MLP_Module
-
 
 class VanillaGNN_Encoder(pl.LightningModule):
 
@@ -15,7 +14,6 @@ class VanillaGNN_Encoder(pl.LightningModule):
             gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv'] = 'SAGEConv',
             mlp_params: dict = {},
             gnn_params: dict = {},
-            init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None] = 'kaiming_uniform',
         ):
         """
         Initialize the VanillaGNN_Encoder.
@@ -30,32 +28,28 @@ class VanillaGNN_Encoder(pl.LightningModule):
             Keyword arguments for the MLP module.
         - gnn_params: dict
             Keyword arguments for the GNN module.
-        - init_method: Literal['kaiming_uniform', 'glorot', 'uniform', None]
-            The initialization method to use.
         """
         super().__init__()
 
-        # initialize the MLP module if num_layers > 0
-        if mlp_params['num_layers'] == 0:
-            self.mlp_module = None
+        if mlp_params['hidden_channels'] is None:
             gnn_in_channels = in_channels
+            self.mlp_module = None
+            self.mlp_layers = 0
         else:
+            gnn_in_channels = mlp_params['hidden_channels'][-1]
             self.mlp_module = MLP_Module(
                 in_channels=in_channels,
-                **mlp_params,
-                init_method=init_method,
+                mlp_params=mlp_params,
             )
-            gnn_in_channels = self.mlp_module.dim
+            self.mlp_layers = len(self.mlp_module.lins)
 
-        # initialize the Vanilla GNN module
+        # initialize the GNN module
         self.gnn_module = init_gnn_module(
             in_channels=gnn_in_channels,
             gnn_name=gnn_name,
-            **gnn_params,
-            init_method=init_method
+            gnn_params=gnn_params,
         )
-        assert self.gnn_module is not None, "Number of GNN layers is 0. Please set num_layers to a positive integer."
-
+        self.gnn_layers = self.gnn_module.num_layers
         self.dim = self.gnn_module.dim
 
 
@@ -76,8 +70,8 @@ class VanillaGNN_Encoder(pl.LightningModule):
 
         Returns
         -------
-        - h_gnn: torch.Tensor
-            Forward (output) of the GNN module.
+        - h_latent: torch.Tensor
+            Forward (output) of just the GNN module or MLP followed by the GNN module.
         """
         # forward pass of the MLP module
         if self.mlp_module is not None:
@@ -86,9 +80,9 @@ class VanillaGNN_Encoder(pl.LightningModule):
             h_mlp = batch_x
 
         # forward pass of the GNN module
-        h_gnn = self.gnn_module(
+        h_latent = self.gnn_module(
             h_mlp,
             batch_edge_index
         )
 
-        return h_gnn
+        return h_latent
