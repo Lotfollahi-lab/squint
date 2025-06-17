@@ -322,36 +322,38 @@ class InMemoryDatasetBlob(InMemoryDataset):
             if not is_undirected(batch_dict[f"edge_index_{edge_index_name}"]):
                 raise ValueError(f"Edge index {edge_index_name} is not undirected")
 
-            # ----------------- Build Unsupervised Node Embeddings -----------------
-            # for small graphs, build spectral embeddings
-            num_nodes = adata_batch.obsp[f"{edge_index_name}_connectivities"].shape[0]
-            if num_nodes < 20_000:
-                print(f"Computing {self.graph_kwargs['k']['lm_eigvecs']} eigenvectors of {edge_index_name}...")
-                batch_dict[f"U_lm_eigvecs_{edge_index_name}"] = self.build_lm_eigenvectors(
-                    A=adata_batch.obsp[f"{edge_index_name}_connectivities"],
-                )
-                print(f"U_lm_eigvecs_{edge_index_name}.shape: {batch_dict[f'U_lm_eigvecs_{edge_index_name}'].shape}")
-
             # save graph to disk in edgelist format
+            print(f"Saving {edge_index_name} to disk in edgelist format...")
             self.save_adjacency_matrix_to_edgelist(
                 batch_id=adata_batch.uns['batch'],
                 A=adata_batch.obsp[f"{edge_index_name}_connectivities"],
                 edge_index_name=edge_index_name
             )
 
-            # build deepwalk embeddings
-            batch_dict[f"U_deepwalk_{edge_index_name}"] = self.build_deepwalk_embeddings(
-                batch_id=adata_batch.uns['batch'],
-                edge_index_name=edge_index_name
-            )
-            print(f"U_deepwalk_{edge_index_name}.shape: {batch_dict[f'U_deepwalk_{edge_index_name}'].shape}")
+            # ----------------- Build Unsupervised Node Embeddings -----------------
+            # if dimensions for lm_eigvecs are specified, build spectral embeddings
+            if 'lm_eigvecs' in self.graph_kwargs['k']:
+                print(f"Computing {self.graph_kwargs['k']['lm_eigvecs']} eigenvectors of {edge_index_name}...")
+                batch_dict[f"U_lm_eigvecs_{edge_index_name}"] = self.build_lm_eigenvectors(
+                    A=adata_batch.obsp[f"{edge_index_name}_connectivities"],
+                )
+                print(f"U_lm_eigvecs_{edge_index_name}.shape: {batch_dict[f'U_lm_eigvecs_{edge_index_name}'].shape}")
 
-            # build gosh embeddings
-            batch_dict[f"U_gosh_{edge_index_name}"] = self.build_gosh_embeddings(
-                batch_id=adata_batch.uns['batch'],
-                edge_index_name=edge_index_name
-            )
-            print(f"U_gosh_{edge_index_name}.shape: {batch_dict[f'U_gosh_{edge_index_name}'].shape}")
+            # if dimensions for deepwalk are specified, build deepwalk embeddings
+            if 'deepwalk' in self.graph_kwargs['k']:
+                batch_dict[f"U_deepwalk_{edge_index_name}"] = self.build_deepwalk_embeddings(
+                    batch_id=adata_batch.uns['batch'],
+                    edge_index_name=edge_index_name
+                )
+                print(f"U_deepwalk_{edge_index_name}.shape: {batch_dict[f'U_deepwalk_{edge_index_name}'].shape}")
+
+            # if dimensions for gosh are specified, build gosh embeddings
+            if 'gosh' in self.graph_kwargs['k']:
+                batch_dict[f"U_gosh_{edge_index_name}"] = self.build_gosh_embeddings(
+                    batch_id=adata_batch.uns['batch'],
+                    edge_index_name=edge_index_name
+                )
+                print(f"U_gosh_{edge_index_name}.shape: {batch_dict[f'U_gosh_{edge_index_name}'].shape}")
 
         for key, value in batch_dict.items():
             print(f"{key}: {value.shape=}, {value.dtype=}, {type(value)=}")
