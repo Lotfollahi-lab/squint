@@ -88,33 +88,6 @@ def cosine_similarity(
     }
 
 
-def build_reconstructed_adjacency_matrix(
-        pred_adj: torch.Tensor,
-    ) -> torch.Tensor:
-    """
-    Build the reconstructed adjacency matrix from the predicted adjacency matrix and the edge index.
-
-    Parameters
-    ----------
-    - pred_adj: torch.Tensor
-        The quantized matrix coming from the decoder module.
-        Dimensions: (num_nodes, decoder_embedding_dim)
-
-    Returns
-    -------
-    - reconstructed_adjacency_matrix: torch.Tensor
-        The reconstructed adjacency matrix.
-        Dimensions: (num_nodes, num_nodes)
-    """
-    reconstr_adj = torch.matmul(pred_adj.detach(), pred_adj.detach().t())
-    reconstr_adj = (reconstr_adj - reconstr_adj.min()) / (reconstr_adj.max() - reconstr_adj.min() + 1e-8)
-
-    reconstr_adj[reconstr_adj < 0.5] = 0
-    reconstr_adj[reconstr_adj >= 0.5] = 1
-
-    return reconstr_adj
-
-
 def compute_distribution(
         input: np.ndarray,
         n_bins: Optional[int] = 50,

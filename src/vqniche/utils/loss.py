@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from ..utils.type_conversions import edge_index_to_adjacency_tensor
 from ..utils.vqgraph_helpers import l2norm
 from ..utils.loss_utils import aggregate_1hop_neighbor_features
+from ..utils.adjacency_reconstruction import reconstruct_adjacency_matrix
 
 
 def cross_entropy(
@@ -164,6 +165,7 @@ def mse_adjacency_reconstruction(
         batch_edge_index: torch.Tensor,
         batch_input_id: torch.Tensor,
         batch_nid: torch.Tensor,
+        adj_reconstr_method: Literal['threshold-matmul'] = 'threshold-matmul',
         wt_adj_reconstr: float = 0.1
     ) -> torch.Tensor:
     """
@@ -182,6 +184,10 @@ def mse_adjacency_reconstruction(
         Dimensions: (batch_size,)
     batch_nid: torch.Tensor
         The global node IDs of the seed and all sampled nodes in the batch.
+    adj_reconstr_method: Literal['threshold-matmul']
+        The method to use to reconstruct the adjacency matrix.
+        Options:
+            - 'threshold-matmul': Use a thresholded matrix multiplication to reconstruct the adjacency matrix.
     wt_adj_reconstr: float
         The scaling factor for the adjacency reconstruction loss.
 
@@ -207,14 +213,15 @@ def mse_adjacency_reconstruction(
 
     # quantize the predicted adjacency matrix coming from the decoder
     # then, subset the quantized adjacency matrix to only include the nodes in the current batch
-    adj_quantized = torch.matmul(pred_adj.detach(), pred_adj.detach().t())
-    adj_quantized = (adj_quantized - adj_quantized.min()) / (adj_quantized.max() - adj_quantized.min() + 1e-8)
-    adj_quantized = adj_quantized.to(global_batch_adj.device)
+    adj_reconstr = reconstruct_adjacency_matrix(
+                        decoder_embeddings=pred_adj.detach(),
+                        method=adj_reconstr_method,
+                    ).to(global_batch_adj.device)
 
     # compute the mean root squared error between the quantized adjacency matrix and the original adjacency matrix
     mse_adj_reconstr_loss = torch.sqrt(
                                 F.mse_loss(
-                                    input=adj_quantized,
+                                    input=adj_reconstr,
                                     target=global_batch_adj,
                                     reduction='mean'
                                 )

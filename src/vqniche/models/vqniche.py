@@ -23,7 +23,7 @@ from ..encoders.vqniche_encoder import VQNiche_Encoder
 from ..utils import metrics
 from ..utils.loss_utils import aggregate_1hop_neighbor_features
 from ..utils.type_conversions import edge_index_to_adjacency_tensor
-from ..utils.metrics import build_reconstructed_adjacency_matrix
+from ..utils.adjacency_reconstruction import reconstruct_adjacency_matrix
 
 
 class VQNiche(BaseModel):
@@ -509,12 +509,13 @@ class VQNiche(BaseModel):
                         edge_index
                     ).cpu().numpy()
                 )
-
             G_hat = nx.from_numpy_array(
-                    build_reconstructed_adjacency_matrix(
-                        H_adj
+                    reconstruct_adjacency_matrix(
+                        decoder_embeddings=H_adj.detach(),
+                        method=self.loss_kwargs['adj_reconstr_method'],
                     ).cpu().numpy()
                 )
+            print(f"{G.number_of_edges()=} | {G_hat.number_of_edges()=}")
 
             node_degree_distribution = metrics.node_degree_distribution(G)
             node_degree_distribution_hat = metrics.node_degree_distribution(G_hat)

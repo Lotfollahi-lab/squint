@@ -185,6 +185,10 @@ class BaseModel(pl.LightningModule):
 
                 loss_fn_data_keys = ['pred_adj', 'batch_edge_index', 'batch_input_id', 'batch_nid']
 
+                adj_reconstr_method = loss_kwargs.get('adj_reconstr_method')
+                if adj_reconstr_method is not None:
+                    loss_fn_params['adj_reconstr_method'] = adj_reconstr_method
+
                 wt_adj_reconstr = loss_kwargs.get('wt_adj_reconstr')
                 if wt_adj_reconstr is not None:
                     loss_fn_params['wt_adj_reconstr'] = wt_adj_reconstr
