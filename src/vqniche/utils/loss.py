@@ -165,6 +165,7 @@ def mse_adjacency_reconstruction(
         batch_edge_index: torch.Tensor,
         batch_input_id: torch.Tensor,
         batch_nid: torch.Tensor,
+        total_num_nodes: int | None = None,
         adj_reconstr_kwargs: dict = {},
         wt_adj_reconstr: float = 0.1
     ) -> torch.Tensor:
@@ -184,6 +185,10 @@ def mse_adjacency_reconstruction(
         Dimensions: (batch_size,)
     batch_nid: torch.Tensor
         The global node IDs of the seed and all sampled nodes in the batch.
+        Dimensions: (batch_size + num_sampled_nodes,)
+    total_num_nodes: int | None
+        The total number of nodes in the graph.
+        If None, the maximum node ID in edge_index will be used.
     adj_reconstr_kwargs: dict
         The keyword arguments for the adjacency reconstruction method.
     wt_adj_reconstr: float
@@ -199,28 +204,36 @@ def mse_adjacency_reconstruction(
     - In VQGraph, `pred_adj` is the output from the adjacency decoder module (after vector quantization).
     - this implementation assumes that sampling and mini-batching is used in the dataloader.
     """
-    # sampling-dataloaders (e.g. NeighborLoader) use local node IDs by default in the batch_edge_index.
-    # we need to convert these local node IDs to global node IDs to subset the adjacency tensor
+    # sampling-dataloaders (e.g. NeighborLoader) use local node IDs by default in the batch_edge_index. 
+    # i.e. [[0, 1], [1, 2]] means that the 0-th node in the batch is connected to the 1-st node in the batch...
+    # so we convert these local node IDs to global node IDs to get that the 0-th node in the batch is the i-th node in the global graph...
     global_edge_index = batch_nid[batch_edge_index]
 
-    # edge_index_to_adjacency_tensor returns a tensor of shape (num_nodes, num_nodes) where num_nodes is the maximum node ID in global_edge_index
-    # we subset the adjacency tensor to only include the nodes in the current batch
-    global_batch_adj = edge_index_to_adjacency_tensor(
+    # total_num_nodes is the total number of nodes in the graph. 
+    # by including total_num_nodes, edge_index_to_adjacency_tensor returns a tensor of shape (total_num_batch, total_num_nodes) where total_num_batch is the number of seed nodes in the batch + all the number of sampled neighbors and total_num_nodes is the total number of nodes in the graph.
+    # then, we subset the adjacency tensor to only include the seed nodes in the current batch
+    # global_adj is a tensor of shape (batch_size, total_num_nodes) capturing the adjacency information of the seed nodes in the current batch with all nodes in the graph
+    # this ensures that computing the loss batch-wise means chunking the adjacency matrix into sets of rows and is thus equivalent to computing the loss on the entire graph
+    global_adj = edge_index_to_adjacency_tensor(
                                 edge_index=global_edge_index,
-                            )[batch_input_id, :][:, batch_input_id]
+                                max_num_nodes=total_num_nodes
+                            )[batch_input_id, :]
 
     # quantize the predicted adjacency matrix coming from the decoder
     # then, subset the quantized adjacency matrix to only include the nodes in the current batch
     adj_reconstr = reconstruct_adjacency_matrix(
                         decoder_embeddings=pred_adj,
+                        total_num_nodes=total_num_nodes,
                         **adj_reconstr_kwargs,
-                    ).to(global_batch_adj.device)
+                    ).to(global_adj.device)
+    
+    print(f"{global_adj.shape=} | {adj_reconstr.shape=}")
 
     # compute the mean root squared error between the quantized adjacency matrix and the original adjacency matrix
     mse_adj_reconstr_loss = torch.sqrt(
                                 F.mse_loss(
                                     input=adj_reconstr,
-                                    target=global_batch_adj,
+                                    target=global_adj,
                                     reduction='mean'
                                 )
                             )
