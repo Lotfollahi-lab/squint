@@ -432,10 +432,11 @@ class VanillaMLP(BaseModel):
             G_hat = nx.from_numpy_array(
                     reconstruct_adjacency_matrix(
                         decoder_embeddings=H_adj.detach(),
-                        method=self.loss_kwargs['adj_reconstr_method'],
+                        **self.loss_kwargs['adj_reconstr_kwargs'],
                     ).cpu().numpy()
                 )
             print(f"{G.number_of_edges()=} | {G_hat.number_of_edges()=}")
+            print(f"{max(G.degree())=} | {max(G_hat.degree())=}")
 
             node_degree_distribution = metrics.node_degree_distribution(G)
             node_degree_distribution_hat = metrics.node_degree_distribution(G_hat)

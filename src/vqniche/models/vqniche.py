@@ -516,6 +516,7 @@ class VQNiche(BaseModel):
                     ).cpu().numpy()
                 )
             print(f"{G.number_of_edges()=} | {G_hat.number_of_edges()=}")
+            print(f"{max(G.degree())=} | {max(G_hat.degree())=}")
 
             node_degree_distribution = metrics.node_degree_distribution(G)
             node_degree_distribution_hat = metrics.node_degree_distribution(G_hat)

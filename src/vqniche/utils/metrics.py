@@ -311,7 +311,9 @@ def distribution_discrepancy(
 
     if method == 'l1_gaussian_tv':
         distance = np.abs(x - y).sum() / 2.0
+        print(f'distance: {distance}')
         discrepancy = np.exp(-distance * distance / (2.0 * sigma ** 2))
+        print(f'discrepancy: {discrepancy}')
     elif method == 'l2_gaussian_tv':
         distance = np.linalg.norm(x - y, ord=2)
         discrepancy = np.exp(-distance / (2.0 * sigma ** 2))
@@ -399,6 +401,7 @@ def mmd_score(
         method=method,
         sigma=sigma,
     )
+    print(f'Kxx: {Kxx}, Kyy: {Kyy}, Kxy: {Kxy}')
     mmd = Kxx + Kyy - 2 * Kxy
     return mmd
 

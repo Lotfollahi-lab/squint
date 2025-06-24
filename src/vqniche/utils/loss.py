@@ -165,7 +165,7 @@ def mse_adjacency_reconstruction(
         batch_edge_index: torch.Tensor,
         batch_input_id: torch.Tensor,
         batch_nid: torch.Tensor,
-        adj_reconstr_method: Literal['threshold-matmul'] = 'threshold-matmul',
+        adj_reconstr_kwargs: dict = {},
         wt_adj_reconstr: float = 0.1
     ) -> torch.Tensor:
     """
@@ -184,10 +184,8 @@ def mse_adjacency_reconstruction(
         Dimensions: (batch_size,)
     batch_nid: torch.Tensor
         The global node IDs of the seed and all sampled nodes in the batch.
-    adj_reconstr_method: Literal['threshold-matmul']
-        The method to use to reconstruct the adjacency matrix.
-        Options:
-            - 'threshold-matmul': Use a thresholded matrix multiplication to reconstruct the adjacency matrix.
+    adj_reconstr_kwargs: dict
+        The keyword arguments for the adjacency reconstruction method.
     wt_adj_reconstr: float
         The scaling factor for the adjacency reconstruction loss.
 
@@ -214,8 +212,8 @@ def mse_adjacency_reconstruction(
     # quantize the predicted adjacency matrix coming from the decoder
     # then, subset the quantized adjacency matrix to only include the nodes in the current batch
     adj_reconstr = reconstruct_adjacency_matrix(
-                        decoder_embeddings=pred_adj.detach(),
-                        method=adj_reconstr_method,
+                        decoder_embeddings=pred_adj,
+                        **adj_reconstr_kwargs,
                     ).to(global_batch_adj.device)
 
     # compute the mean root squared error between the quantized adjacency matrix and the original adjacency matrix
