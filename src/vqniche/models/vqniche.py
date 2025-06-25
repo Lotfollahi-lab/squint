@@ -256,6 +256,7 @@ class VQNiche(BaseModel):
                         'batch_nid': train_batch.n_id, # adjacency reconstruction loss
                         'logits': unnormalized_logits_batch[:batch_size], # label prediction loss
                         'labels': train_batch.y[:batch_size], # label prediction loss
+                        'total_num_nodes': self.trainer.datamodule.data.num_nodes,
                         }
 
         train_loss = self.common_step(
@@ -313,6 +314,7 @@ class VQNiche(BaseModel):
                         'batch_nid': val_batch.n_id,
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': val_batch.y[:batch_size],
+                        'total_num_nodes': self.trainer.datamodule.data.num_nodes,
                         }
 
         val_loss = self.common_step(
