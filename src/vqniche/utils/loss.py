@@ -176,7 +176,7 @@ def mse_adjacency_reconstruction(
     ----------
     pred_adj: torch.Tensor
         The output from the adjacency decoder module.
-        Dimensions: (batch_size, num_genes)
+        Dimensions: (batch_size + num_sampled_nodes, decoder_embedding_dim)
     batch_edge_index: torch.Tensor
         The edge index of the batch with respect to local node IDs of seed nodes.
         Dimensions: (2, num_edges_in_batch)
@@ -222,12 +222,19 @@ def mse_adjacency_reconstruction(
     # quantize the predicted adjacency matrix coming from the decoder
     # then, subset the quantized adjacency matrix to only include the nodes in the current batch
     adj_reconstr = reconstruct_adjacency_matrix(
-                        decoder_embeddings=pred_adj,
-                        total_num_nodes=total_num_nodes,
+                        h_adj=pred_adj,
                         **adj_reconstr_kwargs,
-                    ).to(global_adj.device)
+                    )[:batch_input_id.shape[0], :].to(global_adj.device)
     
-    print(f"{global_adj.shape=} | {adj_reconstr.shape=}")
+    # If total_num_nodes is provided and is greater than the current width, pad with zeros
+    if total_num_nodes is not None and adj_reconstr.shape[1] < total_num_nodes:
+        padding_size = total_num_nodes - adj_reconstr.shape[1]
+        adj_reconstr = torch.nn.functional.pad(
+            adj_reconstr, 
+            pad=(0, padding_size, 0, 0),  # pad only the right side (columns)
+            mode='constant', 
+            value=0
+        )
 
     # compute the mean root squared error between the quantized adjacency matrix and the original adjacency matrix
     mse_adj_reconstr_loss = torch.sqrt(
