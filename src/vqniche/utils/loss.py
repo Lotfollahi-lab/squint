@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from ..utils.type_conversions import edge_index_to_adjacency_tensor
 from ..utils.vqgraph_helpers import l2norm
 from ..utils.loss_utils import aggregate_1hop_neighbor_features
-from ..utils.adjacency_reconstruction import reconstruct_adjacency_matrix
+from ..utils.adjacency_reconstruction import reconstruct_adjacency_matrix as construct_real_valued_adjacency_matrix
 
 
 def cross_entropy(
@@ -166,7 +166,7 @@ def mse_adjacency_reconstruction(
         batch_input_id: torch.Tensor,
         batch_nid: torch.Tensor,
         total_num_nodes: int | None = None,
-        adj_reconstr_kwargs: dict = {},
+        estimate_adj_kwargs: dict = {},
         wt_adj_reconstr: float = 0.1
     ) -> torch.Tensor:
     """
@@ -189,8 +189,8 @@ def mse_adjacency_reconstruction(
     total_num_nodes: int | None
         The total number of nodes in the graph.
         If None, the maximum node ID in edge_index will be used.
-    adj_reconstr_kwargs: dict
-        The keyword arguments for the adjacency reconstruction method.
+    estimate_adj_kwargs: dict
+        The keyword arguments for the adjacency estimation method.
     wt_adj_reconstr: float
         The scaling factor for the adjacency reconstruction loss.
 
@@ -212,25 +212,28 @@ def mse_adjacency_reconstruction(
     # total_num_nodes is the total number of nodes in the graph. 
     # by including total_num_nodes, edge_index_to_adjacency_tensor returns a tensor of shape (total_num_batch, total_num_nodes) where total_num_batch is the number of seed nodes in the batch + all the number of sampled neighbors and total_num_nodes is the total number of nodes in the graph.
     # then, we subset the adjacency tensor to only include the seed nodes in the current batch
-    # global_adj is a tensor of shape (batch_size, total_num_nodes) capturing the adjacency information of the seed nodes in the current batch with all nodes in the graph
     # this ensures that computing the loss batch-wise means chunking the adjacency matrix into sets of rows and is thus equivalent to computing the loss on the entire graph
-    global_adj = edge_index_to_adjacency_tensor(
+    # thus, adj_global is a tensor of shape (batch_size, total_num_nodes) capturing the adjacency information of the seed nodes in the current batch with all nodes in the graph
+    adj_global = edge_index_to_adjacency_tensor(
                                 edge_index=global_edge_index,
                                 max_num_nodes=total_num_nodes
                             )[batch_input_id, :]
 
-    # quantize the predicted adjacency matrix coming from the decoder
-    # then, subset the quantized adjacency matrix to only include the nodes in the current batch
-    adj_reconstr = reconstruct_adjacency_matrix(
+    # construct a quantized real-valued adjacency matrix from the decoded node-wise vectors
+    # the method returns a tensor of shape (batch_size + num_sampled_nodes, batch_size + num_sampled_nodes)
+    # we set k=None to return a real-valued adjacency matrix
+    # so, we subset the quantized adjacency matrix to only include the seed nodes in the current batch
+    adj_quantized = construct_real_valued_adjacency_matrix(
                         h_adj=pred_adj,
-                        **adj_reconstr_kwargs,
-                    )[:batch_input_id.shape[0], :].to(global_adj.device)
+                        nonlinearity=estimate_adj_kwargs['nonlinearity'],
+                        k=None,
+                    )[:batch_input_id.shape[0], :]
     
-    # If total_num_nodes is provided and is greater than the current width, pad with zeros
-    if total_num_nodes is not None and adj_reconstr.shape[1] < total_num_nodes:
-        padding_size = total_num_nodes - adj_reconstr.shape[1]
-        adj_reconstr = torch.nn.functional.pad(
-            adj_reconstr, 
+    # If total_num_nodes is provided and is greater than the current width, pad with zeros so that it's shape matches that of adj_global
+    if total_num_nodes is not None and adj_quantized.shape[1] < total_num_nodes:
+        padding_size = total_num_nodes - adj_quantized.shape[1]
+        adj_quantized = torch.nn.functional.pad(
+            adj_quantized, 
             pad=(0, padding_size, 0, 0),  # pad only the right side (columns)
             mode='constant', 
             value=0
@@ -239,8 +242,8 @@ def mse_adjacency_reconstruction(
     # compute the mean root squared error between the quantized adjacency matrix and the original adjacency matrix
     mse_adj_reconstr_loss = torch.sqrt(
                                 F.mse_loss(
-                                    input=adj_reconstr,
-                                    target=global_adj,
+                                    input=adj_quantized,
+                                    target=adj_global.detach(),
                                     reduction='mean'
                                 )
                             )
