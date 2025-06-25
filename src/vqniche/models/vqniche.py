@@ -513,8 +513,8 @@ class VQNiche(BaseModel):
                 )
             G_hat = nx.from_numpy_array(
                     reconstruct_adjacency_matrix(
-                        decoder_embeddings=H_adj.detach(),
-                        method=self.loss_kwargs['adj_reconstr_method'],
+                        h_adj=H_adj.detach(),
+                        **self.loss_kwargs['adj_reconstr_kwargs'],
                     ).cpu().numpy()
                 )
             print(f"{G.number_of_edges()=} | {G_hat.number_of_edges()=}")
