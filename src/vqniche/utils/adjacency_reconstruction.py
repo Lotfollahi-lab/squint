@@ -4,7 +4,7 @@ import torch
 
 
 def reconstruct_adjacency_matrix(
-        decoder_embeddings: torch.Tensor,
+        h_adj: torch.Tensor,
         method: Literal['threshold-matmul'] = 'threshold-matmul',
         **kwargs
     ) -> torch.Tensor:
@@ -13,7 +13,7 @@ def reconstruct_adjacency_matrix(
     
     Parameters
     ----------
-    - decoder_embeddings: torch.Tensor
+    - h_adj: torch.Tensor
         The decoded node-wisevectors produced by the the adjacency decoder module.
         Dimensions: (num_nodes, decoder_embedding_dim)
     - method: Literal['threshold-matmul']
@@ -28,34 +28,41 @@ def reconstruct_adjacency_matrix(
         The reconstructed adjacency matrix.
     """
     if method == 'threshold-matmul':
-        return adjacency_via_threshold_matmul(decoder_embeddings)
+        return adjacency_via_threshold_matmul(h_adj)
 
     else:
         raise NotImplementedError(f"Invalid method: {method}")
 
 
 def adjacency_via_threshold_matmul(
-        decoder_embeddings: torch.Tensor,
+        h_adj: torch.Tensor,
+        threshold: float = 0.5,
     ) -> torch.Tensor:
     """
     Reconstruct the adjacency matrix from the decoded node-wise vectors using a thresholded matrix multiplication.
 
     Parameters
     ----------
-    - decoder_embeddings: torch.Tensor
+    - h_adj: torch.Tensor
         The decoded node-wise vectors produced by the the adjacency decoder module.
         Dimensions: (num_nodes, decoder_embedding_dim)
+    - threshold: float
+        The threshold to use to reconstruct the adjacency matrix.
+        Default: 0.5
 
     Returns
     -------
-    - adj_reconstr: torch.Tensor
+    - A_hat: torch.Tensor
         The reconstructed adjacency matrix.
         Dimensions: (num_nodes, num_nodes)
     """
-    adj_reconstr = torch.matmul(decoder_embeddings.detach(), decoder_embeddings.detach().t())
-    adj_reconstr = (adj_reconstr - adj_reconstr.min()) / (adj_reconstr.max() - adj_reconstr.min() + 1e-8)
+    A_hat = torch.matmul(
+                        h_adj,
+                        h_adj.t()
+                    )
+    A_hat = (A_hat - A_hat.min()) / (A_hat.max() - A_hat.min() + 1e-8)
 
-    adj_reconstr[adj_reconstr < 0.5] = 0
-    adj_reconstr[adj_reconstr >= 0.5] = 1
+    A_hat[A_hat < threshold] = 0
+    A_hat[A_hat >= threshold] = 1
 
-    return adj_reconstr
+    return A_hat
