@@ -155,7 +155,7 @@ def node_degree_distribution(
     return node_degree_distribution
 
 
-def compute_node_clustering_coefficient_distribution(
+def node_clustering_coefficient_distribution(
         G: nx.Graph,
         n_bins: Optional[int] = 100,
         density: Optional[bool] = False,
@@ -197,9 +197,9 @@ def compute_node_clustering_coefficient_distribution(
     )
 
 
-def compute_spectral_distribution(
+def spectral_distribution(
         G: nx.Graph,
-        k: Optional[int] = None,
+        k: Optional[int] = 250,
         n_bins: Optional[int] = 50,
         density: Optional[bool] = False,
         normalize: Optional[bool] = True

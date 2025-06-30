@@ -12,8 +12,10 @@ The Predictor builds the logits for the label prediction task using the quantize
 The implementation is based on the paper: VQNiche: Rethinking Graph Representation Space for Bridging GNNs and MLPs.
 """
 from typing import List, Literal
+from pathlib import Path
 
 import networkx as nx
+import matplotlib.pyplot as plt
 
 import torch
 import torch_geometric
@@ -529,6 +531,16 @@ class VQNiche(BaseModel):
                             sigma=1.0,
                         )
             train_epoch_end_stats['mmd_degree'] = mmd_degree
+            
+            spectral_distribution = metrics.spectral_distribution(G)
+            spectral_distribution_hat = metrics.spectral_distribution(G_hat)
+            mmd_spectral = metrics.mmd_score(
+                            [spectral_distribution],
+                            [spectral_distribution_hat],
+                            method='l1_gaussian_tv',
+                            sigma=1.0,
+                        )
+            train_epoch_end_stats['mmd_spectral'] = mmd_spectral
 
         if self.log_codebook_utilization:
             train_epoch_end_stats['codebook_utilization'] = 1.0 * len(set(Indices.cpu().numpy())) / self.encoder.vq.codebook.shape[0]
