@@ -15,9 +15,9 @@ import networkx as nx
 import torch
 import torch_geometric
 
+from vqniche import metrics
 from .base_model import BaseModel
 from ..encoders.vanilla_gnn_encoder import VanillaGNN_Encoder
-from ..utils import metrics
 from ..utils.loss_utils import aggregate_1hop_neighbor_features
 from ..utils.type_conversions import edge_index_to_adjacency_tensor
 from ..utils.adjacency_reconstruction import reconstruct_adjacency_matrix
@@ -449,6 +449,11 @@ class VanillaGNN(BaseModel):
 
 
         if self.log_mmd_degree:
+            discrepancy_kwargs = {
+                'kernel': 'l1_gaussian_tv',
+                'bandwidth': 1.0,
+            }
+            
             G = nx.from_numpy_array(
                     edge_index_to_adjacency_tensor(
                         edge_index
@@ -463,13 +468,12 @@ class VanillaGNN(BaseModel):
             print(f"{G.number_of_edges()=} | {G_hat.number_of_edges()=}")
             print(f"{max(G.degree())=} | {max(G_hat.degree())=}")
 
-            node_degree_distribution = metrics.node_degree_distribution(G)
-            node_degree_distribution_hat = metrics.node_degree_distribution(G_hat)
+            degree_histogram = metrics.degree_histogram(G)
+            degree_histogram_hat = metrics.degree_histogram(G_hat)
             mmd_degree = metrics.mmd_score(
-                            [node_degree_distribution],
-                            [node_degree_distribution_hat],
-                            method='l1_gaussian_tv',
-                            sigma=1.0,
+                            [degree_histogram],
+                            [degree_histogram_hat],
+                            discrepancy_kwargs=discrepancy_kwargs,
                         )
             train_epoch_end_stats['mmd_degree'] = mmd_degree
 

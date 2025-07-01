@@ -20,9 +20,9 @@ import matplotlib.pyplot as plt
 import torch
 import torch_geometric
 
+from vqniche import metrics
 from .base_model import BaseModel
 from ..encoders.vqniche_encoder import VQNiche_Encoder
-from ..utils import metrics
 from ..utils.loss_utils import aggregate_1hop_neighbor_features
 from ..utils.type_conversions import edge_index_to_adjacency_tensor
 from ..utils.adjacency_reconstruction import reconstruct_adjacency_matrix as construct_binary_adjacency_matrix
@@ -502,6 +502,11 @@ class VQNiche(BaseModel):
             train_epoch_end_stats['pearson_1hop_nbr'] = pearson_1hop_nbr
 
         if self.log_mmd_degree:
+            discrepancy_kwargs = {
+                'kernel': 'l1_gaussian_tv',
+                'bandwidth': 1.0,
+            }
+
             G = nx.from_numpy_array(
                     edge_index_to_adjacency_tensor(
                         edge_index
@@ -515,26 +520,24 @@ class VQNiche(BaseModel):
                 )
             print(f"{G.number_of_edges()=} | {G_hat.number_of_edges()=}")
             print(f"{max(G.degree())=} | {max(G_hat.degree())=}")
-
-            node_degree_distribution = metrics.node_degree_distribution(G)
-            node_degree_distribution_hat = metrics.node_degree_distribution(G_hat)
+            
+            degree_histogram = metrics.degree_histogram(G)
+            degree_histogram_hat = metrics.degree_histogram(G_hat)
             mmd_degree = metrics.mmd_score(
-                            [node_degree_distribution],
-                            [node_degree_distribution_hat],
-                            method='l1_gaussian_tv',
-                            sigma=1.0,
+                            [degree_histogram],
+                            [degree_histogram_hat],
+                            discrepancy_kwargs=discrepancy_kwargs,
                         )
             train_epoch_end_stats['mmd_degree'] = mmd_degree
             
-            spectral_distribution = metrics.spectral_distribution(G)
-            spectral_distribution_hat = metrics.spectral_distribution(G_hat)
-            mmd_spectral = metrics.mmd_score(
-                            [spectral_distribution],
-                            [spectral_distribution_hat],
-                            method='l1_gaussian_tv',
-                            sigma=1.0,
+            eigenvalues_pmf = metrics.eigenvalues_pmf(G)
+            eigenvalues_pmf_hat = metrics.eigenvalues_pmf(G_hat)
+            mmd_eigenvalues = metrics.mmd_score(
+                            [eigenvalues_pmf],
+                            [eigenvalues_pmf_hat],
+                            discrepancy_kwargs=discrepancy_kwargs,
                         )
-            train_epoch_end_stats['mmd_spectral'] = mmd_spectral
+            train_epoch_end_stats['mmd_eigenvalues'] = mmd_eigenvalues
 
         if self.log_codebook_utilization:
             train_epoch_end_stats['codebook_utilization'] = 1.0 * len(set(Indices.cpu().numpy())) / self.encoder.vq.codebook.shape[0]

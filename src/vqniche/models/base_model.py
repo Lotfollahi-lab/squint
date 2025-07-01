@@ -8,8 +8,8 @@ import torch_geometric
 import pytorch_lightning as pl
 from torch_geometric.nn.dense.linear import Linear
 
+from vqniche import metrics
 from ..utils.loss import *
-from ..utils import metrics
 from ..modules.mlp import MLP as MLP_AdjacencyDecoder
 from ..decoders.mlp_softmax import MLPSoftmax
 
