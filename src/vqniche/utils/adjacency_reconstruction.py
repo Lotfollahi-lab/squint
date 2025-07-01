@@ -4,7 +4,8 @@ import torch
 
 
 def reconstruct_adjacency_matrix(
-        h_adj: torch.Tensor,
+        h_index_nodes: torch.Tensor,
+        h_target_nodes: Optional[torch.Tensor] = None,
         nonlinearity: Literal['min-max', 'sigmoid', 'softmax', 'relu-clamp'] = 'min-max',
         k: Optional[int] = None,
     ) -> torch.Tensor:
@@ -13,9 +14,13 @@ def reconstruct_adjacency_matrix(
 
     Parameters
     ----------
-    - h_adj: torch.Tensor
-        The decoded node-wise vectors produced by the the adjacency decoder module.
-        Dimensions: (num_nodes, decoder_embedding_dim)
+    - h_index_nodes: torch.Tensor
+        The decoded node-wise vectors produced by the the adjacency decoder module for the index (e.g. batch) nodes.
+        Dimensions: (num_index_nodes, decoder_embedding_dim)
+    - h_target_nodes: Optional[torch.Tensor]
+        The decoded node-wise vectors produced by the the adjacency decoder module for the target (e.g. sampled) nodes. If None, the target nodes are assumed to be the same as the index nodes.
+        Dimensions: (num_target_nodes, decoder_embedding_dim).
+        Default: None
     - nonlinearity: Literal['min-max', 'sigmoid', 'softmax', 'relu-clamp']
         The nonlinearity function to apply to the matrix product.
         - 'min-max': Min-max normalization to [0, 1] range
@@ -39,10 +44,12 @@ def reconstruct_adjacency_matrix(
     - If k is not provided, the real-valued adjacency matrix is returned.
     """
     # construct a real-valued adjacency matrix from the decoded node-wise vectors
-    A_hat = torch.matmul(
-                h_adj,
-                h_adj.t()
-            )
+    if h_target_nodes is None:
+        # if target nodes are not provided, use index nodes for both sides
+        A_hat = torch.matmul(h_index_nodes, h_index_nodes.T)
+    else:
+        # if target nodes are provided, multiply index nodes with target nodes
+        A_hat = torch.matmul(h_index_nodes, h_target_nodes.T)
     
     # apply the specified nonlinearity
     if nonlinearity == 'min-max':
@@ -62,7 +69,7 @@ def reconstruct_adjacency_matrix(
         A_hat = torch.relu(A_hat)
         A_hat = torch.clamp(A_hat, 0, 1)
         
-    # if k is provided, use top-k to convert to binary adjacency matrix
+    # if k is provided, use top-k to convert to binary symmetric adjacency matrix
     if k is not None:
         # get top-k indices for each row
         topk_indices = torch.topk(A_hat, k=k, dim=1)[1]
@@ -72,14 +79,14 @@ def reconstruct_adjacency_matrix(
         
         # set 1s at the top-k positions for each row
         batch_indices = torch.arange(A_hat.shape[0]).unsqueeze(1).expand(-1, k)
-        A_hat[batch_indices, topk_indices] = 1        
+        A_hat[batch_indices, topk_indices] = 1
 
-    # if A_hat is not symmetric, make it symmetric
-    if not torch.allclose(A_hat, A_hat.T):
-        # make the tensor symmetric: A_hat = (A_hat + A_hat.T) / 2
-        A_hat = (A_hat + A_hat.T) / 2
-        
-        # convert to binary (in case averaging created 0.5 values) to ensure that the adjacency matrix is binary
-        A_hat = torch.where(A_hat > 0, 1, 0)
+        # if A_hat is not symmetric, make it symmetric
+        if not torch.allclose(A_hat, A_hat.T):
+            # make the tensor symmetric: A_hat = (A_hat + A_hat.T) / 2
+            A_hat = (A_hat + A_hat.T) / 2
+            
+            # convert to binary (in case averaging created 0.5 values) to ensure that the adjacency matrix is binary
+            A_hat = torch.where(A_hat > 0, 1, 0)
     
     return A_hat

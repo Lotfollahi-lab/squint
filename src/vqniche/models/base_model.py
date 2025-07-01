@@ -183,7 +183,7 @@ class BaseModel(pl.LightningModule):
             elif loss_fn_name == 'mse_adjacency_reconstruction':
                 loss_fn = mse_adjacency_reconstruction
 
-                loss_fn_data_keys = ['pred_adj', 'batch_edge_index', 'batch_input_id', 'batch_nid', 'total_num_nodes']
+                loss_fn_data_keys = ['batch_size', 'h_adj', 'batch_edge_index']
 
                 estimate_adj_kwargs = loss_kwargs.get('estimate_adj_kwargs')
                 if estimate_adj_kwargs is not None:

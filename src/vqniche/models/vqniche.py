@@ -250,15 +250,12 @@ class VQNiche(BaseModel):
                         'pred_attr': xhat_batch, # attribute reconstruction loss
                         'target_attr': train_batch.x, # attribute reconstruction loss
                         'edge_index': train_batch.edge_index, # attribute reconstruction loss
-                        'batch_size': batch_size, # attribute reconstruction loss
+                        'batch_size': batch_size, # attribute and adjacency reconstruction loss
                         'dispersion': torch.exp(self.dispersion), # attribute reconstruction loss
-                        'pred_adj': h_adj[:batch_size], # adjacency reconstruction loss
+                        'h_adj': h_adj, # adjacency reconstruction loss
                         'batch_edge_index': train_batch.edge_index, # adjacency reconstruction loss
-                        'batch_input_id': train_batch.input_id, # adjacency reconstruction loss
-                        'batch_nid': train_batch.n_id, # adjacency reconstruction loss
                         'logits': unnormalized_logits_batch[:batch_size], # label prediction loss
                         'labels': train_batch.y[:batch_size], # label prediction loss
-                        'total_num_nodes': self.trainer.datamodule.data.num_nodes,
                         }
 
         train_loss = self.common_step(
@@ -310,13 +307,10 @@ class VQNiche(BaseModel):
                         'edge_index': val_batch.edge_index,
                         'batch_size': batch_size,
                         'dispersion': torch.exp(self.dispersion),
-                        'pred_adj': h_adj[:batch_size],
+                        'h_adj': h_adj,
                         'batch_edge_index': val_batch.edge_index,
-                        'batch_input_id': val_batch.input_id,
-                        'batch_nid': val_batch.n_id,
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': val_batch.y[:batch_size],
-                        'total_num_nodes': self.trainer.datamodule.data.num_nodes,
                         }
 
         val_loss = self.common_step(
@@ -515,7 +509,7 @@ class VQNiche(BaseModel):
                 )
             G_hat = nx.from_numpy_array(
                     construct_binary_adjacency_matrix(
-                        h_adj=H_adj.detach(),
+                        h_index_nodes=H_adj.detach(),
                         **self.loss_kwargs['estimate_adj_kwargs'],
                     ).cpu().numpy()
                 )
