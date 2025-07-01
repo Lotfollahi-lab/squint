@@ -21,7 +21,7 @@ from .base_model import BaseModel
 from ..modules.mlp import MLP as MLP_Encoder
 from ..utils.loss_utils import aggregate_1hop_neighbor_features
 from ..utils.type_conversions import edge_index_to_adjacency_tensor
-from ..utils.adjacency_reconstruction import reconstruct_adjacency_matrix
+from ..utils.adjacency_reconstruction import reconstruct_adjacency_matrix as construct_binary_adjacency_matrix
 
 
 class VanillaMLP(BaseModel):
@@ -209,12 +209,10 @@ class VanillaMLP(BaseModel):
                         'edge_index': train_batch.edge_index,
                         'batch_size': batch_size,
                         'dispersion': torch.exp(self.dispersion),
+                        'h_adj': h_adj_batch,
+                        'batch_edge_index': train_batch.edge_index,
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': train_batch.y[:batch_size],
-                        'pred_adj': h_adj_batch[:batch_size],
-                        'batch_edge_index': train_batch.edge_index,
-                        'batch_input_id': train_batch.input_id,
-                        'batch_nid': train_batch.n_id,
                         }
 
         train_loss = self.common_step(
@@ -257,12 +255,10 @@ class VanillaMLP(BaseModel):
                         'edge_index': val_batch.edge_index,
                         'batch_size': batch_size,
                         'dispersion': torch.exp(self.dispersion),
+                        'h_adj': h_adj_batch,
+                        'batch_edge_index': val_batch.edge_index,
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': val_batch.y[:batch_size],
-                        'pred_adj': h_adj_batch[:batch_size],
-                        'batch_edge_index': val_batch.edge_index,
-                        'batch_input_id': val_batch.input_id,
-                        'batch_nid': val_batch.n_id,
                         }
 
         val_loss = self.common_step(
@@ -436,9 +432,9 @@ class VanillaMLP(BaseModel):
                 )
 
             G_hat = nx.from_numpy_array(
-                    reconstruct_adjacency_matrix(
-                        decoder_embeddings=H_adj.detach(),
-                        **self.loss_kwargs['adj_reconstr_kwargs'],
+                    construct_binary_adjacency_matrix(
+                        h_index_nodes=H_adj.detach(),
+                        **self.loss_kwargs['estimate_adj_kwargs'],
                     ).cpu().numpy()
                 )
             print(f"{G.number_of_edges()=} | {G_hat.number_of_edges()=}")
@@ -452,5 +448,14 @@ class VanillaMLP(BaseModel):
                             discrepancy_kwargs=discrepancy_kwargs,
                         )
             train_epoch_end_stats['mmd_degree'] = mmd_degree
+
+            eigenvalues_pmf = metrics.eigenvalues_pmf(G)
+            eigenvalues_pmf_hat = metrics.eigenvalues_pmf(G_hat)
+            mmd_eigenvalues = metrics.mmd_score(
+                            [eigenvalues_pmf],
+                            [eigenvalues_pmf_hat],
+                            discrepancy_kwargs=discrepancy_kwargs,
+                        )
+            train_epoch_end_stats['mmd_eigenvalues'] = mmd_eigenvalues
 
         return train_epoch_end_stats

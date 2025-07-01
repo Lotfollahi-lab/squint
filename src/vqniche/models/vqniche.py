@@ -233,7 +233,7 @@ class VQNiche(BaseModel):
         h_quantized, \
         indices, \
         xhat_batch, \
-        h_adj, \
+        h_adj_batch, \
         unnormalized_logits_batch \
             = self(
                     train_batch.x,
@@ -252,7 +252,7 @@ class VQNiche(BaseModel):
                         'edge_index': train_batch.edge_index, # attribute reconstruction loss
                         'batch_size': batch_size, # attribute and adjacency reconstruction loss
                         'dispersion': torch.exp(self.dispersion), # attribute reconstruction loss
-                        'h_adj': h_adj, # adjacency reconstruction loss
+                        'h_adj': h_adj_batch, # adjacency reconstruction loss
                         'batch_edge_index': train_batch.edge_index, # adjacency reconstruction loss
                         'logits': unnormalized_logits_batch[:batch_size], # label prediction loss
                         'labels': train_batch.y[:batch_size], # label prediction loss
@@ -289,7 +289,7 @@ class VQNiche(BaseModel):
         h_quantized, \
         indices, \
         xhat_batch, \
-        h_adj, \
+        h_adj_batch, \
         unnormalized_logits_batch \
             = self(
                     val_batch.x,
@@ -307,7 +307,7 @@ class VQNiche(BaseModel):
                         'edge_index': val_batch.edge_index,
                         'batch_size': batch_size,
                         'dispersion': torch.exp(self.dispersion),
-                        'h_adj': h_adj,
+                        'h_adj': h_adj_batch,
                         'batch_edge_index': val_batch.edge_index,
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': val_batch.y[:batch_size],
