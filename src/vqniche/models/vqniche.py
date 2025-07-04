@@ -11,21 +11,13 @@ The Predictor builds the logits for the label prediction task using the quantize
 
 The implementation is based on the paper: VQNiche: Rethinking Graph Representation Space for Bridging GNNs and MLPs.
 """
-from typing import List, Literal
-from pathlib import Path
-
-import networkx as nx
-import matplotlib.pyplot as plt
+from typing import Literal
 
 import torch
 import torch_geometric
 
-from vqniche import metrics
 from .base_model import BaseModel
 from ..encoders.vqniche_encoder import VQNiche_Encoder
-from ..utils.loss_utils import aggregate_1hop_neighbor_features
-from ..utils.type_conversions import edge_index_to_adjacency_tensor
-from ..utils.adjacency_reconstruction import reconstruct_adjacency_matrix as construct_binary_adjacency_matrix
 
 
 class VQNiche(BaseModel):
@@ -370,7 +362,18 @@ class VQNiche(BaseModel):
 
 
     @torch.no_grad()
-    def inference(self):
+    def collect_inference_data(
+            self,
+            dataloader: torch.utils.data.DataLoader
+        ) -> dict:
+        """
+        Collect input data and model outputs for all nodes in the specified dataloader.
+        
+        Returns
+        -------
+        - dict
+            Dictionary containing inference data with keys: X, edge_index, H_latent, X_hat, H_adj, H_quantized, Indices
+        """
         X = []
         Y_cell_type = []
         Y_niche_type = []
@@ -380,7 +383,7 @@ class VQNiche(BaseModel):
         X_hat = []
         H_adj = []
 
-        for batch in self.trainer.datamodule.infer_dataloader():
+        for batch in dataloader:
             batch_size = batch.batch_size
 
             X.append(batch.x[:batch_size])
@@ -413,132 +416,14 @@ class VQNiche(BaseModel):
         X_hat = torch.cat(X_hat, dim=0)
         H_adj = torch.cat(H_adj, dim=0)
 
-        return X, \
-            Y_cell_type, \
-            Y_niche_type, \
-            self.trainer.datamodule.data.edge_index, \
-            H_latent, \
-            H_quantized, \
-            Indices, \
-            X_hat, \
-            H_adj
-
-
-    @torch.no_grad()
-    def compute_train_epoch_stats(self) -> List[int]:
-        """
-        If the log_similarity_stats flag is set to True, compute statistics for original and decoded node attributes, and latent and quantized node embeddings at the end of each training epoch.
-        If the log_pearson_correlation flag is set to True, compute the Pearson correlation between original and decoded attributes at the end of each training epoch.
-        If the log_codebook_utilization flag is set to True, compute the codebook utilization at the end of each training epoch.
-
-        Returns
-        -------
-        - train_epoch_end_stats: dict
-            Dictionary containing the computed statistics.
-        """
-        X, \
-        _, \
-        _, \
-        edge_index, \
-        H_latent, \
-        H_quantized, \
-        Indices, \
-        X_hat, \
-        H_adj \
-            = self.inference()
-
-        train_epoch_end_stats = {}
-
-        # Concatenate all embeddings
-        if self.log_similarity_stats:
-            train_epoch_end_stats.update(
-                metrics.cosine_similarity(X, 'X')
-            )
-            train_epoch_end_stats.update(
-                metrics.cosine_similarity(H_latent, 'H_latent')
-            )
-            train_epoch_end_stats.update(
-                metrics.cosine_similarity(H_quantized, 'H_quantized')
-            )
-            train_epoch_end_stats.update(
-                metrics.cosine_similarity(X_hat, 'X_hat')
-            )
-            train_epoch_end_stats.update(
-                metrics.cosine_similarity(H_adj, 'H_adj')
-            )
-
-        if self.log_pearson_correlation:
-            pearson_cell_wise = metrics.pearson_correlation(
-                        X.cpu().numpy(),
-                        X_hat.cpu().numpy(),
-                        compare_genes=False,
-                        mean=True,
-                    )
-            pearson_gene_wise = metrics.pearson_correlation(
-                        X.cpu().numpy(),
-                        X_hat.cpu().numpy(),
-                        compare_genes=True,
-                        mean=True,
-                    )
-            train_epoch_end_stats['pearson_cell_wise'] = pearson_cell_wise
-            train_epoch_end_stats['pearson_gene_wise'] = pearson_gene_wise
-
-            X_nbr = aggregate_1hop_neighbor_features(
-                        X=X.cpu(),
-                        edge_index=edge_index.cpu(),
-                        return_mean=True,
-                    )
-            X_hat_nbr = aggregate_1hop_neighbor_features(
-                        X=X_hat.cpu(),
-                        edge_index=edge_index.cpu(),
-                        return_mean=True,
-                    )
-            pearson_1hop_nbr = metrics.pearson_correlation(
-                        X_nbr,
-                        X_hat_nbr,
-                        compare_genes=False,
-                        mean=True,
-                    )
-            train_epoch_end_stats['pearson_1hop_nbr'] = pearson_1hop_nbr
-
-        if self.log_mmd_degree:
-            discrepancy_kwargs = {
-                'kernel': 'l1_gaussian_tv',
-                'bandwidth': 1.0,
-            }
-
-            G = nx.from_numpy_array(
-                    edge_index_to_adjacency_tensor(
-                        edge_index
-                    ).cpu().numpy()
-                )
-            G_hat = nx.from_numpy_array(
-                    construct_binary_adjacency_matrix(
-                        h_index_nodes=H_adj.detach(),
-                        **self.loss_kwargs['estimate_adj_kwargs'],
-                    ).cpu().numpy()
-                )
-            print(f"{G.number_of_edges()=} | {G_hat.number_of_edges()=}")
-            print(f"{max(G.degree())=} | {max(G_hat.degree())=}")
-            
-            degree_histogram = metrics.degree_histogram(G)
-            degree_histogram_hat = metrics.degree_histogram(G_hat)
-            mmd_degree = metrics.mmd_score(
-                            [degree_histogram],
-                            [degree_histogram_hat],
-                            discrepancy_kwargs=discrepancy_kwargs,
-                        )
-            train_epoch_end_stats['mmd_degree'] = mmd_degree
-            
-            eigenvalues_pmf = metrics.eigenvalues_pmf(G)
-            eigenvalues_pmf_hat = metrics.eigenvalues_pmf(G_hat)
-            mmd_eigenvalues = metrics.mmd_score(
-                            [eigenvalues_pmf],
-                            [eigenvalues_pmf_hat],
-                            discrepancy_kwargs=discrepancy_kwargs,
-                        )
-            train_epoch_end_stats['mmd_eigenvalues'] = mmd_eigenvalues
-
-        if self.log_codebook_utilization:
-            train_epoch_end_stats['codebook_utilization'] = 1.0 * len(set(Indices.cpu().numpy())) / self.encoder.vq.codebook.shape[0]
-        return train_epoch_end_stats
+        return {
+            'X': X,
+            'Y_cell_type': Y_cell_type,
+            'Y_niche_type': Y_niche_type,
+            'edge_index': dataloader.data.edge_index,
+            'H_latent': H_latent,
+            'X_hat': X_hat,
+            'H_adj': H_adj,
+            'H_quantized': H_quantized,
+            'Indices': Indices
+        }
