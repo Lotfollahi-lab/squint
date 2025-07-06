@@ -1,7 +1,7 @@
 import os
 import yaml
 import argparse
-from typing import Dict
+from typing import Dict, Optional
 from pathlib import Path
 
 
@@ -29,7 +29,11 @@ def parse_test_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def collect_test_configs(args: argparse.Namespace) -> Dict:
+def collect_test_configs(
+        args: Optional[argparse.Namespace] = None,
+        wandb_run_dir: Optional[str] = None,
+        model_ckpt_fname: Optional[str] = None,
+        ) -> Dict:
     """
     Collect configurations from the config file from the wandb run directory and command line arguments for testing.
 
@@ -41,19 +45,31 @@ def collect_test_configs(args: argparse.Namespace) -> Dict:
     ----------
     - Dict: The configuration dictionary.
     """
-    # Get the config file name from command line argument
-    config_fname = Path(args.wandb_run_dir) / 'files' / 'config.yaml'
-
-    # Read parameters from config file
+    assert args is not None or wandb_run_dir is not None, \
+        "Either args or wandb_run_dir must be provided"
+    
+    # get wandb run directory from command line arguments if provided, otherwise from the wandb_run_dir argument
+    if args is not None:
+        wandb_run_dir = args.wandb_run_dir
+        
+    # get config file path from wandb run directory
+    config_fname = Path(wandb_run_dir) / 'files' / 'config.yaml'
+    
+    # read parameters from config file
     with open(config_fname, "r") as f:
         config = yaml.safe_load(f)
 
-    # Set model checkpoint file name
-    config['experiment']['wandb_run_dir'] = args.wandb_run_dir
-    if args.model_ckpt:
-        config['model']['model_ckpt'] = args.model_ckpt
+    # set model checkpoint file name from command line arguments if provided, otherwise from the model_ckpt_fname argument, else find best checkpoint from wandb run directory
+    if args is not None and args.model_ckpt_fname is not None:
+        config['model']['model_ckpt_fname'] = args.model_ckpt_fname
+    elif model_ckpt_fname is not None:
+        config['model']['model_ckpt_fname'] = model_ckpt_fname
     else:
-        config['model']['model_ckpt'] = find_best_checkpoint(args.wandb_run_dir)
+        config['model']['model_ckpt_fname'] = find_best_checkpoint(wandb_run_dir)
+
+    # write wandb_run_directory and model_ckpt_fname to config
+    config['experiment']['wandb_run_dir'] = wandb_run_dir
+    config['model']['model_ckpt_fname'] = config['model']['model_ckpt_fname']
 
     return config
 
