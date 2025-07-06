@@ -26,12 +26,13 @@ class BaseModel(pl.LightningModule):
             attribute_decoder_name: str,
             adjacency_decoder_name: str,
             predictor_name: str,
-            log_similarity_stats: bool = False,
-            log_pearson_correlation: bool = False,
-            log_mmd_degree: bool = False,
-            log_codebook_utilization: Optional[bool] = None,
             in_channels: int = None,
             out_channels: int = None,
+            log_metrics_during_training: bool = False,
+            log_similarity: bool = False,
+            log_attribute_imputation: bool = False,
+            log_graph_imputation: bool = False,
+            log_codebook_utilization: Optional[bool] = None,
             optimizer_name: str = 'adam',
             lr: float = 0.01,
             weight_decay: float = 0.0,
@@ -53,19 +54,22 @@ class BaseModel(pl.LightningModule):
             The name of the adjacency decoder module.
         - predictor_name: str
             The name of the predictor module.
-        - log_similarity_stats: bool
-            Whether to log the similarity statistics.
-        - log_pearson_correlation: bool
-            Whether to log the Pearson correlation.
-        - log_mmd_degree: bool
-            Whether to log the MMD metric between the degree distribution of the original and reconstructed graphs.
-        - log_codebook_utilization: bool
-            Whether to log the codebook utilization.
 
         - in_channels: int
             The number of input channels.
         - out_channels: int
             The number of output channels.
+
+        - log_metrics_during_training: bool
+            Whether to log the metrics during training.
+        - log_similarity: bool
+            Whether to log the similarity statistics.
+        - log_attribute_imputation: bool
+            Whether to log metrics for attribute imputation.
+        - log_graph_imputation: bool
+            Whether to log metrics for graph imputation.
+        - log_codebook_utilization: bool
+            Whether to log the codebook utilization.
 
         - optimizer_name: str
             The optimizer name.
@@ -78,24 +82,29 @@ class BaseModel(pl.LightningModule):
             The loss function names.
         - loss_kwargs: dict
             The loss function keyword arguments.
-
         """
+        # names of the model components
         self.model_name = model_name
         self.encoder_name = encoder_name
         self.attribute_decoder_name = attribute_decoder_name
         self.adjacency_decoder_name = adjacency_decoder_name
         self.predictor_name = predictor_name
-        self.log_similarity_stats = log_similarity_stats
-        self.log_pearson_correlation = log_pearson_correlation
-        self.log_mmd_degree = log_mmd_degree
-        if log_codebook_utilization is not None:
-            self.log_codebook_utilization = log_codebook_utilization
 
         super().__init__()
 
         # Data parameters
         self.in_channels = in_channels
         self.out_channels = out_channels
+
+        # log flags
+        self.log_metrics_during_training = log_metrics_during_training
+        self.log_similarity = log_similarity
+        self.log_attribute_imputation = log_attribute_imputation
+        self.log_graph_imputation = log_graph_imputation
+        if log_codebook_utilization is not None:
+            self.log_codebook_utilization = log_codebook_utilization
+
+        self.train_val_epoch_metrics = pd.DataFrame()
 
         # Optimizer parameters
         self.optimizer_name = optimizer_name
@@ -106,14 +115,6 @@ class BaseModel(pl.LightningModule):
         self.loss_kwargs = loss_kwargs
         self.dispersion = torch.nn.Parameter(torch.randn(self.in_channels))
         self.loss_fn_tuples = self.set_loss_fn_tuples(loss_names, loss_kwargs)
-
-        # Inference mode: Batch-wise
-        # for epoch in epochs:
-        #    for batch in loader:
-        #       for layer in model.layers:
-        #         layer.forward(batch)
-
-        self.train_val_epoch_metrics = pd.DataFrame()
 
         self.save_hyperparameters()
 
@@ -578,21 +579,56 @@ class BaseModel(pl.LightningModule):
 
         Notes
         -----
-        - We use this hook to log the train and validation loss terms and accuracies in the training loop.
+        - We use this hook to log embedding similarity, imputation, and codebook utilization metrics if enabled, as well as the loss term values and accuracies at the end of every training epoch.
         """
-        # compute the training epoch end stats such as embedding similarity, pearson correlation, codebook utilization, etc.
-        train_epoch_end_stats = self.compute_train_epoch_stats()
-        for key, value in train_epoch_end_stats.items():
-            self.log(
-                name=key,
-                value=value,
-                prog_bar=False,
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-            )
+        # log model evaluation metrics at the end of each training epoch if enabled
+        if self.log_metrics_during_training:    
+            metrics_dict = {}
+        
+            # collect the raw input data and model embeddings for the infer_dataloader()
+            # infer_dataloader() returns a dataloader for the entire dataset
+            # child classes should implement this method
+            inference_data = self.collect_inference_data(
+                                self.trainer.datamodule.infer_dataloader()
+                            )
+            
+            if self.log_similarity:
+                metrics_dict.update(
+                    self.compute_similarity_metrics(                
+                            data_dict=inference_data
+                    )
+                )
+            if self.log_attribute_imputation:
+                metrics_dict.update(
+                    self.compute_attribute_imputation_metrics(
+                        data_dict=inference_data
+                    )
+                )
+            if self.log_graph_imputation:
+                metrics_dict.update(
+                    self.compute_graph_imputation_metrics(
+                        data_dict=inference_data
+                    )
+                )
+                
+            if self.model_name == 'VQNiche':
+                if self.log_codebook_utilization:
+                    num_active_codes = len(set(inference_data['Indices'].cpu().numpy()))
+                    total_codes = 1.0 * self.encoder.vq.codebook.shape[0]
+                    metrics_dict['codebook_utilization'] = num_active_codes / total_codes
 
-        # log the metrics at the end of each epoch
+            # log the training epoch end stats
+            for key, value in metrics_dict.items():
+                self.log(
+                    name=key,
+                    value=value,
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
+        
+        # print to stdout all logged values during the training epoch
         metric_names = ['epoch'] + list(self.trainer.callback_metrics.keys())
         metrics_values = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
         print("--------------------------------")
@@ -600,138 +636,179 @@ class BaseModel(pl.LightningModule):
             print(f"{metric_name}: {metric_value}")
         print("--------------------------------\n")
 
+        # update the training and validation epoch metrics dataframe with metrics logged during the training epoch
         self.train_val_epoch_metrics = pd.concat(
-            [self.train_val_epoch_metrics, pd.DataFrame([metrics_values], columns=metric_names)],
+            [
+                self.train_val_epoch_metrics,
+                pd.DataFrame(
+                    [metrics_values],
+                    columns=metric_names
+                )
+            ],
             ignore_index=True
         )
 
+        # call the parent class method to complete default behavior
         return super().on_train_epoch_end()
 
 
-    def compute_train_epoch_stats(self) -> dict:
+    def compute_similarity_metrics(
+            self,
+            data_dict: dict,
+        ) -> dict:
         """
-        Compute the training epoch end stats such as embedding similarity, pearson correlation, and MMD degree statistics.
-        This is a common implementation that can be overridden by child classes if needed.
-        
-        The method computes the following statistics based on the configured flags:
-        - Similarity statistics (log_similarity_stats): Cosine similarity between X, H_latent, X_hat, and H_adj
-        - Pearson correlation (log_pearson_correlation): Cell-wise, gene-wise, and 1-hop neighbor correlations
-        - MMD degree statistics (log_mmd_degree): Degree distribution and eigenvalue comparisons between original and reconstructed graphs
-        - Codebook utilization (log_codebook_utilization): The ratio of the number of active codes to the total number of codes in the codebook
+        Compute cosine similarity between the raw input data and the model embeddings.
+
+        Parameters
+        ----------
+        - data_dict: dict
+            Dictionary containing the inference data with keys: X, Y_cell_type, Y_niche_type, edge_index, H_latent, X_hat, H_adj, and H_quantized and Indices (if VQNiche)
 
         Returns
         -------
         - dict
-            Dictionary containing the computed statistics with keys corresponding to the enabled metrics.
+            Dictionary containing the computed cosine similarity between the raw input data and the model embeddings.
+
+        Notes
+        -----
+        - This method may be used to check if any of the embeddings have collapsed.
         """
-        # collect the inference data for computing the training epoch end stats such as embedding similarity, pearson correlation, codebook utilization, etc.
-        # infer_dataloader() returns a dataloader for the entire dataset
-        # child classes should implement this method to collect the inference data
-        inference_data = self.collect_inference_data(
-                            self.trainer.datamodule.infer_dataloader()
-                        )
+        similarity_metrics = {}
 
-        train_epoch_end_stats = {}
-
-        # Similarity statistics
-        if self.log_similarity_stats:
-            train_epoch_end_stats.update(
-                metrics.cosine_similarity(inference_data['X'], 'X')
-            )
-            train_epoch_end_stats.update(
-                metrics.cosine_similarity(inference_data['H_latent'], 'H_latent')
-            )
-            train_epoch_end_stats.update(
-                metrics.cosine_similarity(inference_data['X_hat'], 'X_hat')
-            )
-            train_epoch_end_stats.update(
-                metrics.cosine_similarity(inference_data['H_adj'], 'H_adj')
-            )
-            if self.model_name == 'VQNiche':
-                train_epoch_end_stats.update(
-                    metrics.cosine_similarity(inference_data['H_quantized'], 'H_quantized')
-                )
-
-        # Pearson correlation
-        if self.log_pearson_correlation:
-            pearson_cell_wise = metrics.pearson_correlation(
-                        inference_data['X'].cpu().numpy(),
-                        inference_data['X_hat'].cpu().numpy(),
-                        compare_genes=False,
-                        mean=True,
-                    )
-            pearson_gene_wise = metrics.pearson_correlation(
-                        inference_data['X'].cpu().numpy(),
-                        inference_data['X_hat'].cpu().numpy(),
-                        compare_genes=True,
-                        mean=True,
-                    )
-            train_epoch_end_stats['pearson_cell_wise'] = pearson_cell_wise
-            train_epoch_end_stats['pearson_gene_wise'] = pearson_gene_wise
-
-            X_nbr = aggregate_1hop_neighbor_features(
-                        X=inference_data['X'].cpu(),
-                        edge_index=inference_data['edge_index'].cpu(),
-                        return_mean=True,
-                    )
-            X_hat_nbr = aggregate_1hop_neighbor_features(
-                        X=inference_data['X_hat'].cpu(),
-                        edge_index=inference_data['edge_index'].cpu(),
-                        return_mean=True,
-                    )
-            pearson_1hop_nbr = metrics.pearson_correlation(
-                        X_nbr,
-                        X_hat_nbr,
-                        compare_genes=False,
-                        mean=True,
-                    )
-            train_epoch_end_stats['pearson_1hop_nbr'] = pearson_1hop_nbr
-
-        # MMD degree statistics
-        if self.log_mmd_degree:
-            discrepancy_kwargs = {
-                'kernel': 'l1_gaussian_tv',
-                'bandwidth': 1.0,
-            }
-            
-            G = nx.from_numpy_array(
-                    edge_index_to_adjacency_tensor(
-                        inference_data['edge_index']
-                    ).cpu().numpy()
-                )
-            G_hat = nx.from_numpy_array(
-                    construct_binary_adjacency_matrix(
-                        h_index_nodes=inference_data['H_adj'].detach(),
-                        **self.loss_kwargs['estimate_adj_kwargs'],
-                    ).cpu().numpy()
-                )
-            print(f"{G.number_of_edges()=} | {G_hat.number_of_edges()=}")
-            print(f"{max(G.degree())=} | {max(G_hat.degree())=}")
-
-            degree_histogram = metrics.degree_histogram(G)
-            degree_histogram_hat = metrics.degree_histogram(G_hat)
-            mmd_degree = metrics.mmd_score(
-                            [degree_histogram],
-                            [degree_histogram_hat],
-                            discrepancy_kwargs=discrepancy_kwargs,
-                        )
-            train_epoch_end_stats['mmd_degree'] = mmd_degree
-
-            eigenvalues_pmf = metrics.eigenvalues_pmf(G)
-            eigenvalues_pmf_hat = metrics.eigenvalues_pmf(G_hat)
-            mmd_eigenvalues = metrics.mmd_score(
-                            [eigenvalues_pmf],
-                            [eigenvalues_pmf_hat],
-                            discrepancy_kwargs=discrepancy_kwargs,
-                        )
-            train_epoch_end_stats['mmd_eigenvalues'] = mmd_eigenvalues
-        
-        # Codebook utilization
+        similarity_metrics.update(
+            metrics.cosine_similarity(data_dict['X'], 'X')
+        )
+        similarity_metrics.update(
+            metrics.cosine_similarity(data_dict['H_latent'], 'H_latent')
+        )
+        similarity_metrics.update(
+            metrics.cosine_similarity(data_dict['X_hat'], 'X_hat')
+        )
+        similarity_metrics.update(
+            metrics.cosine_similarity(data_dict['H_adj'], 'H_adj')
+        )
         if self.model_name == 'VQNiche':
-            if self.log_codebook_utilization:
-                    train_epoch_end_stats['codebook_utilization'] = 1.0 * len(set(inference_data['Indices'].cpu().numpy())) / self.encoder.vq.codebook.shape[0]
+            similarity_metrics.update(
+                metrics.cosine_similarity(data_dict['H_quantized'], 'H_quantized')
+            )
 
-        return train_epoch_end_stats
+        return similarity_metrics
+
+
+    def compute_attribute_imputation_metrics(
+            self,
+            data_dict: dict,
+        ) -> dict:
+        """
+        Compute metrics to measure the quality of imputation of the original and estimated attributes (here, gene expression).
+
+        Parameters
+        ----------
+        - data_dict: dict
+            Dictionary containing the inference data with keys: X, Y_cell_type, Y_niche_type, edge_index, H_latent, X_hat, H_adj, and H_quantized and Indices (if VQNiche)
+
+        Returns
+        -------
+        - dict
+            Dictionary containing the computed metrics for attribute imputation.
+        """
+        attribute_imputation_metrics = {}
+        
+        # Pearson correlation between the original and estimated gene expression of a cell averaged across cells (row-wise)
+        pearson_cell_wise = metrics.pearson_correlation(
+            data_dict['X'].cpu().numpy(),
+            data_dict['X_hat'].cpu().numpy(),
+            compare_genes=False,
+            mean=True,
+        )
+        attribute_imputation_metrics['pearson_cell_wise'] = pearson_cell_wise
+
+        # Pearson correlation between the original and estimated gene expression averaged across genes (column-wise)
+        pearson_gene_wise = metrics.pearson_correlation(
+                    data_dict['X'].cpu().numpy(),
+                    data_dict['X_hat'].cpu().numpy(),
+                    compare_genes=True,
+                    mean=True,
+                )
+        attribute_imputation_metrics['pearson_gene_wise'] = pearson_gene_wise
+        
+        # Pearson correlation between the original and estimated gene expression of 1-hop neighborhood of a cell averaged across cells
+        X_nbr = aggregate_1hop_neighbor_features(
+                    X=data_dict['X'].cpu(),
+                    edge_index=data_dict['edge_index'].cpu(),
+                    return_mean=True,
+                )
+        X_hat_nbr = aggregate_1hop_neighbor_features(
+                    X=data_dict['X_hat'].cpu(),
+                    edge_index=data_dict['edge_index'].cpu(),
+                    return_mean=True,
+                )
+        pearson_1hop_nbr = metrics.pearson_correlation(
+                    X_nbr,
+                    X_hat_nbr,
+                    compare_genes=False,
+                    mean=True,
+                )
+        attribute_imputation_metrics['pearson_1hop_nbr'] = pearson_1hop_nbr
+
+        return attribute_imputation_metrics
+        
+
+    def compute_graph_imputation_metrics(
+            self,
+            data_dict: dict,
+        ) -> dict:
+        """
+        Compute metrics to measure the quality of imputation of the original and estimated graph structure.
+
+        Parameters
+        ----------
+        - data_dict: dict
+            Dictionary containing the inference data with keys: X, Y_cell_type, Y_niche_type, edge_index, H_latent, X_hat, H_adj, and H_quantized and Indices (if VQNiche)
+
+        Returns
+        -------
+        - dict
+            Dictionary containing the computed metrics for graph imputation.
+        """
+        graph_imputation_metrics = {}
+
+        # build a networkx graph from the edge index
+        G = nx.from_numpy_array(
+                edge_index_to_adjacency_tensor(
+                    data_dict['edge_index']
+                ).cpu().numpy()
+            )
+
+        # build a networkx graph from the estimated adjacency matrix
+        G_hat = nx.from_numpy_array(
+                construct_binary_adjacency_matrix(
+                    h_index_nodes=data_dict['H_adj'].detach(),
+                    **self.loss_kwargs['estimate_adj_kwargs'],
+                ).cpu().numpy()
+            )
+        
+        # compute the number of edges and the maximum degree of the original and estimated graph
+        graph_imputation_metrics['G_num_edges'] = G.number_of_edges()
+        graph_imputation_metrics['G_hat_num_edges'] = G_hat.number_of_edges()
+        graph_imputation_metrics['G_max_degree'] = max(G.degree())
+        graph_imputation_metrics['G_hat_max_degree'] = max(G_hat.degree())
+
+        # compute MMD between the degree distribution of the original and estimated graph
+        mmd_degree = metrics.mmd_score(
+                        [metrics.degree_histogram(G)],
+                        [metrics.degree_histogram(G_hat)],
+                    )
+        graph_imputation_metrics['mmd_degree'] = mmd_degree
+
+        # compute MMD between the eigenvalue distribution of the original and estimated graph
+        mmd_eigenvalues = metrics.mmd_score(
+                        [metrics.eigenvalues_pmf(G)],
+                        [metrics.eigenvalues_pmf(G_hat)],
+                    )
+        graph_imputation_metrics['mmd_eigenvalues'] = mmd_eigenvalues
+        
+        return graph_imputation_metrics
 
 
     def collect_inference_data(self) -> dict:
