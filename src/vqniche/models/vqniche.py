@@ -28,10 +28,7 @@ class VQNiche(BaseModel):
             attribute_decoder_name: Literal['MLPSoftmax'] = 'MLPSoftmax',
             adjacency_decoder_name: Literal['MLP_AdjacencyDecoder'] = 'MLP_AdjacencyDecoder',
             predictor_name: Literal['Linear'] = 'Linear',
-            log_similarity_stats: bool = False,
-            log_pearson_correlation: bool = False,
-            log_mmd_degree: bool = False,
-            log_codebook_utilization: bool = True,
+            train_log_flags: dict = {},
             in_channels: int = None,
             out_channels: int = None,
             encoder_params: dict = {},
@@ -55,19 +52,14 @@ class VQNiche(BaseModel):
             The name of the adjacency decoder module.
         - predictor_name: Literal['Linear']
             The name of the predictor module.
-        - log_similarity_stats: bool
-            Whether to log the pairwise similarity statistics for all embeddings.
-        - log_pearson_correlation: bool
-            Whether to log the Pearson correlation between original and reconstructed cell-gene matrices.
-        - log_mmd_degree: bool
-            Whether to log the MMD metric between the degree distribution of the original and reconstructed graphs.
-        - log_codebook_utilization: bool
-            Whether to log the codebook utilization.
 
         - in_channels: int
             The number of input features.
         - out_channels: int
             The number of output features.
+
+        - train_log_flags: dict
+            The flags for logging metrics during training.
 
         - encoder_params: dict
             The parameters for the MLP module.
@@ -85,12 +77,9 @@ class VQNiche(BaseModel):
             attribute_decoder_name=attribute_decoder_name,
             adjacency_decoder_name=adjacency_decoder_name,
             predictor_name=predictor_name,
-            log_similarity_stats=log_similarity_stats,
-            log_codebook_utilization=log_codebook_utilization,
-            log_pearson_correlation=log_pearson_correlation,
-            log_mmd_degree=log_mmd_degree,
             in_channels=in_channels,
             out_channels=out_channels,
+            **train_log_flags,
             **optimizer_params,
             **loss_params,
         )

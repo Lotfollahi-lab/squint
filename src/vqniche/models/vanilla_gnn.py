@@ -25,11 +25,9 @@ class VanillaGNN(BaseModel):
             attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
             adjacency_decoder_name: Literal['MLP_AdjacencyDecoder'] = 'MLP_AdjacencyDecoder',
             predictor_name: Literal['Linear'] = 'Linear',
-            log_similarity_stats: bool = False,
-            log_pearson_correlation: bool = False,
-            log_mmd_degree: bool = False,
             in_channels: int = None,
             out_channels: int = None,
+            train_log_flags: dict = {},
             encoder_params: dict = {},
             attribute_decoder_params: dict = {},
             adjacency_decoder_params: dict = {},
@@ -51,17 +49,14 @@ class VanillaGNN(BaseModel):
             The name of the adjacency decoder module.
         - predictor_name: Literal['Linear']
             The name of the predictor module.
-        - log_similarity_stats: bool
-            Whether to log the similarity statistics.
-        - log_pearson_correlation: bool
-            Whether to log the Pearson correlation.
-        - log_mmd_degree: bool
-            Whether to log the MMD metric between the degree distribution of the original and reconstructed graphs.
 
         - in_channels: int
             The number of input features.
         - out_channels: int
             The number of output features.
+
+        - train_log_flags: dict
+            The flags for logging metrics during training.
 
         - encoder_params: dict
             The parameters for the MLP module.
@@ -83,11 +78,9 @@ class VanillaGNN(BaseModel):
             attribute_decoder_name=attribute_decoder_name,
             adjacency_decoder_name=adjacency_decoder_name,
             predictor_name=predictor_name,
-            log_similarity_stats=log_similarity_stats,
-            log_pearson_correlation=log_pearson_correlation,
-            log_mmd_degree=log_mmd_degree,
             in_channels=in_channels,
             out_channels=out_channels,
+            **train_log_flags,
             **optimizer_params,
             **loss_params,
         )
