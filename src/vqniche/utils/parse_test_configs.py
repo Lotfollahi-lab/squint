@@ -19,10 +19,18 @@ def parse_test_arguments() -> argparse.Namespace:
     parser.add_argument('--wandb_run_dir',
                         type=str,
                         help='Path to the wandb run directory')
-    parser.add_argument('--model_ckpt',
+    parser.add_argument('--model_ckpt_fname',
                         type=str,
                         default=None,
                         help='Optional model checkpoint file name')
+    parser.add_argument('--metric_name',
+                        type=str,
+                        default='pearson_1hop_nbr',
+                        help='Metric name to find the best checkpoint')
+    parser.add_argument('--mode',
+                        type=Literal['min', 'max'],
+                        default='max',
+                        help='Mode to find the best checkpoint')
     parser.add_argument('--override',
                         nargs='+',
                         help='Override parameters in the config file')
