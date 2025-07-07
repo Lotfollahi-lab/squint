@@ -10,7 +10,6 @@ import torch
 def mmd_score(
         D: List[np.ndarray],
         D_hat: List[np.ndarray],
-        discrepancy_kwargs: Optional[dict] = None,
     ) -> float:
     """
     Compute the Maximum Mean Discrepancy (MMD) between two collections of distributions.
@@ -21,14 +20,6 @@ def mmd_score(
         A collection of distributions.
     - D_hat: List[numpy.ndarray]
         A collection of distributions.
-    - discrepancy_kwargs: Optional[dict]
-        Keyword arguments for the discrepancy computation.
-        Options:
-            - kernel: Literal['l1_gaussian_tv', 'l2_gaussian_tv']
-                The kernel to use to compute the discrepancy.
-                Options: 'l1_gaussian_tv', 'l2_gaussian_tv'
-            - bandwidth: float
-                The bandwidth of the Gaussian kernel.
 
     Returns
     -------
@@ -40,17 +31,14 @@ def mmd_score(
     K_XX = total_discrepancy(
         X=D,
         Y=D,
-        discrepancy_kwargs=discrepancy_kwargs,
     )
     K_YY = total_discrepancy(
         X=D_hat,
         Y=D_hat,
-        discrepancy_kwargs=discrepancy_kwargs,
     )
     K_XY = total_discrepancy(
         X=D,
         Y=D_hat,
-        discrepancy_kwargs=discrepancy_kwargs,
     )
     mmd = K_XX + K_YY - 2 * K_XY
     return mmd
@@ -59,7 +47,6 @@ def mmd_score(
 def total_discrepancy(
         X: List[np.ndarray],
         Y: List[np.ndarray],
-        discrepancy_kwargs: Optional[dict] = None,
     ) -> np.ndarray:
     """
     Compute the total discrepancy between two collections of distributions.
@@ -70,14 +57,6 @@ def total_discrepancy(
         First collection of distributions.
     - Y: List[numpy.ndarray]
         Second collection of distributions.
-    - discrepancy_kwargs: Optional[dict]
-        Keyword arguments for the discrepancy computation.
-        Options:
-            - kernel: Literal['l1_gaussian_tv', 'l2_gaussian_tv']
-                The kernel to use to compute the discrepancy.
-                Options: 'l1_gaussian_tv', 'l2_gaussian_tv'
-            - bandwidth: float
-                The bandwidth of the Gaussian kernel.
     """
     total_discrepancy = 0.0
     for x in X:
@@ -85,7 +64,6 @@ def total_discrepancy(
             total_discrepancy += distribution_discrepancy(
                                     x=x,
                                     y=y,
-                                    **discrepancy_kwargs,
                                 )
     total_discrepancy /= len(X) * len(Y)
     return total_discrepancy
@@ -94,7 +72,7 @@ def total_discrepancy(
 def distribution_discrepancy(
         x: np.ndarray,
         y: np.ndarray,
-        kernel: Literal['l1_gaussian_tv'] = 'l1_gaussian_tv',
+        kernel: Optional[Literal['l1_gaussian_tv']] = 'l1_gaussian_tv',
         bandwidth: Optional[float] = 1.0,
     ) -> float:
     """
