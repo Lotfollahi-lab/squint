@@ -1,7 +1,8 @@
+from typing import Dict, Optional, Literal
+
 import os
 import yaml
 import argparse
-from typing import Dict, Optional
 from pathlib import Path
 
 
@@ -74,30 +75,42 @@ def collect_test_configs(
     return config
 
 
-def find_best_checkpoint(wandb_run_dir):
+def find_best_checkpoint(
+        wandb_run_dir: str,
+        mode: Literal['min', 'max'] = 'min',
+        metric_name: Literal['mmd_eigenvalues', 'pearson_1hop_nbr'] = 'pearson_1hop_nbr',
+    ) -> str:
     """
-    Find checkpoint file name with highest validation accuracy.
+    Find checkpoint file name with best metric value.
 
     Parameters:
     ----------
     - wandb_run_dir: str
         The directory containing the wandb run files.
+    - mode: Literal['min', 'max']
+        The mode to find the best checkpoint.
+    - metric_name: str
+        The name of the metric to find the best checkpoint.
 
     Returns:
     ----------
-    - str: The path to the checkpoint file with the highest validation accuracy.
+    - str: The path to the checkpoint file with the best metric value.
+    - e.g. if mode is 'max' and metric_name is 'pearson_1hop_nbr', the function will return the checkpoint file with the highest Pearson correlation between the original and reconstructed cell-gene matrices
+    - e.g. if mode is 'min' and metric_name is 'mmd_eigenvalues', the function will return the checkpoint file with the lowest MMD between the eigenvalue distributions of the original and reconstructed graphs
     """
     ckpt_dir = Path(wandb_run_dir) / 'files' / 'checkpoints'
 
-    best_acc = -1
+    # initialize value of best metric to be the minimum or maximum possible value
+    best_metric_val = -1 if mode == 'min' else 1
+    
     best_ckpt = None
     for f in os.listdir(ckpt_dir):
         if f.endswith('.ckpt'):
             try:
-                # Extract val_acc from filename like "epoch=X-val_acc=Y.ckpt"
-                val_acc = float(f.split('val_acc=')[1].split('.ckpt')[0])
-                if val_acc > best_acc:
-                    best_acc = val_acc
+                # Extract metric value from filename like "epoch=X-metric_name=Y.ckpt"
+                metric_val = float(f.split(f'{metric_name}=')[1].split('.ckpt')[0])
+                if (mode == 'min' and metric_val < best_metric_val) or (mode == 'max' and metric_val > best_metric_val):
+                    best_metric_val = metric_val
                     best_ckpt = f
             except:
                 continue
