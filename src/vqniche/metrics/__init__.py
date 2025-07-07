@@ -25,7 +25,7 @@ from .cas import (
     compute_cas,
 )
 
-from .utils import (
+from .benchmarking import (
     compute_benchmarking_metrics,
 )
 
