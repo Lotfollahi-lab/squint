@@ -791,8 +791,8 @@ class BaseModel(pl.LightningModule):
         # compute the number of edges and the maximum degree of the original and estimated graph
         graph_imputation_metrics['G_num_edges'] = G.number_of_edges()
         graph_imputation_metrics['G_hat_num_edges'] = G_hat.number_of_edges()
-        graph_imputation_metrics['G_max_degree'] = max(G.degree())
-        graph_imputation_metrics['G_hat_max_degree'] = max(G_hat.degree())
+        graph_imputation_metrics['G_max_degree'] = max(dict(G.degree()).values())
+        graph_imputation_metrics['G_hat_max_degree'] = max(dict(G_hat.degree()).values())
 
         # compute MMD between the degree distribution of the original and estimated graph
         mmd_degree = metrics.mmd_score(
