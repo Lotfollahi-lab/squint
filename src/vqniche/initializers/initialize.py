@@ -26,8 +26,9 @@ def initialize_logger(
                 log_model=config['logging']['log_model'],
             )
 
-    config_path = Path(logger.experiment.dir) / 'config.yaml'
-    with open(config_path, 'w') as config_file:
+    # Save the complete original user-specified configuration
+    user_config_path = Path(logger.experiment.dir) / 'user_specified_config.yaml'
+    with open(user_config_path, 'w') as config_file:
         yaml.dump(config, config_file)
 
     return logger

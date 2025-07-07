@@ -62,7 +62,7 @@ def collect_test_configs(
         wandb_run_dir = args.wandb_run_dir
         
     # get config file path from wandb run directory
-    config_fname = Path(wandb_run_dir) / 'files' / 'config.yaml'
+    config_fname = Path(wandb_run_dir) / 'files' / 'user_specified_config.yaml'
     
     # read parameters from config file
     with open(config_fname, "r") as f:
