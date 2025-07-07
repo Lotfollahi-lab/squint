@@ -4,6 +4,7 @@ import os
 import yaml
 import argparse
 from pathlib import Path
+import numpy as np
 
 
 def parse_test_arguments() -> argparse.Namespace:
@@ -85,7 +86,7 @@ def collect_test_configs(
 
 def find_best_checkpoint(
         wandb_run_dir: str,
-        mode: Literal['min', 'max'] = 'min',
+        mode: Literal['min', 'max'] = 'max',
         metric_name: Literal['mmd_eigenvalues', 'pearson_1hop_nbr'] = 'pearson_1hop_nbr',
     ) -> str:
     """
@@ -109,8 +110,7 @@ def find_best_checkpoint(
     ckpt_dir = Path(wandb_run_dir) / 'files' / 'checkpoints'
 
     # initialize value of best metric to be the minimum or maximum possible value
-    best_metric_val = -1 if mode == 'min' else 1
-    
+    best_metric_val = np.inf if mode == 'min' else -np.inf
     best_ckpt = None
     for f in os.listdir(ckpt_dir):
         if f.endswith('.ckpt'):
