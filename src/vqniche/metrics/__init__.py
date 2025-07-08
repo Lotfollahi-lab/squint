@@ -29,6 +29,10 @@ from .benchmarking import (
     compute_benchmarking_metrics,
 )
 
+from .utils import (
+    compute_knn_graph_connectivities_and_distances,
+)
+
 # Import metrics for attributes
 from .pearson_correlation import (
     pearson_correlation,
@@ -62,4 +66,6 @@ __all__ = [
     "cosine_similarity",
     # Label functions
     "accuracy_score",
+    # Utils functions
+    "compute_knn_graph_connectivities_and_distances",
 ]

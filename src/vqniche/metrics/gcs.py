@@ -144,7 +144,7 @@ def compute_gcs(
 
     if batch_key is None:
         print("Computing GCS for entire dataset...")
-        n_neighbors = adata.uns[f"{latent_knng_key}_n_neighbors"]
+        # n_neighbors = adata.uns[latent_knng_key]
         # Compute Frobenius norm of the matrix of differences to quantify
         # distance (square root of the sum of absolute squares)
         connectivities_diff = (
