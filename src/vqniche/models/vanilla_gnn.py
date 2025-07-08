@@ -333,6 +333,7 @@ class VanillaGNN(BaseModel):
         X = []
         Y_cell_type = []
         Y_niche_type = []
+        XY_coordinates = []
         H_latent = []
         X_hat = []
         H_adj = []
@@ -343,6 +344,7 @@ class VanillaGNN(BaseModel):
             X.append(batch.x[:batch_size])
             Y_cell_type.append(batch.y[:batch_size])
             Y_niche_type.append(batch.y_niche_types[:batch_size])
+            XY_coordinates.append(batch.xy_coordinates[:batch_size])
 
             h_latent, \
             xhat_batch, \
@@ -358,6 +360,7 @@ class VanillaGNN(BaseModel):
         X = torch.cat(X, dim=0)
         Y_cell_type = torch.cat(Y_cell_type, dim=0)
         Y_niche_type = torch.cat(Y_niche_type, dim=0)
+        XY_coordinates = torch.cat(XY_coordinates, dim=0)
         H_latent = torch.cat(H_latent, dim=0)
         X_hat = torch.cat(X_hat, dim=0)
         H_adj = torch.cat(H_adj, dim=0)
@@ -366,6 +369,7 @@ class VanillaGNN(BaseModel):
             'X': X,
             'Y_cell_type': Y_cell_type,
             'Y_niche_type': Y_niche_type,
+            'XY_coordinates': XY_coordinates,
             'edge_index': dataloader.data.edge_index,
             'H_latent': H_latent,
             'X_hat': X_hat,
