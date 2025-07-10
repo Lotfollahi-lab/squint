@@ -331,8 +331,8 @@ class VanillaGNN(BaseModel):
             Dictionary containing inference data with keys: X, edge_index, H_latent, X_hat, H_adj
         """
         X = []
-        Y_cell_type = []
-        Y_niche_type = []
+        Y_cell_types = []
+        Y_niche_types = []
         XY_coordinates = []
         H_latent = []
         X_hat = []
@@ -342,8 +342,8 @@ class VanillaGNN(BaseModel):
             batch_size = batch.batch_size
 
             X.append(batch.x[:batch_size])
-            Y_cell_type.append(batch.y[:batch_size])
-            Y_niche_type.append(batch.y_niche_types[:batch_size])
+            Y_cell_types.append(batch.y[:batch_size])
+            Y_niche_types.append(batch.y_niche_types[:batch_size])
             XY_coordinates.append(batch.xy_coordinates[:batch_size])
 
             h_latent, \
@@ -358,8 +358,8 @@ class VanillaGNN(BaseModel):
             X_hat.append(xhat_batch[:batch_size])
             H_adj.append(h_adj[:batch_size])
         X = torch.cat(X, dim=0)
-        Y_cell_type = torch.cat(Y_cell_type, dim=0)
-        Y_niche_type = torch.cat(Y_niche_type, dim=0)
+        Y_cell_types = torch.cat(Y_cell_types, dim=0)
+        Y_niche_types = torch.cat(Y_niche_types, dim=0)
         XY_coordinates = torch.cat(XY_coordinates, dim=0)
         H_latent = torch.cat(H_latent, dim=0)
         X_hat = torch.cat(X_hat, dim=0)
@@ -367,8 +367,8 @@ class VanillaGNN(BaseModel):
 
         return {
             'X': X,
-            'Y_cell_type': Y_cell_type,
-            'Y_niche_type': Y_niche_type,
+            'Y_cell_types': Y_cell_types,
+            'Y_niche_types': Y_niche_types,
             'XY_coordinates': XY_coordinates,
             'edge_index': dataloader.data.edge_index,
             'H_latent': H_latent,
