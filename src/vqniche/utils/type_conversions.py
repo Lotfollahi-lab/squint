@@ -145,7 +145,8 @@ def torch_one_hot_to_label_name(
     pd.Series
         The pandas Series of label names.
     """
-    return pd.Series(label_categories[one_hot.argmax(dim=1)])
+    indices = one_hot.argmax(dim=1).cpu().numpy()
+    return pd.Series([label_categories[i] for i in indices])
 
 
 def data_batch_to_adata_list(
