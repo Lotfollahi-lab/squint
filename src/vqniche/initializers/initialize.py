@@ -26,8 +26,9 @@ def initialize_logger(
                 log_model=config['logging']['log_model'],
             )
 
-    config_path = Path(logger.experiment.dir) / 'config.yaml'
-    with open(config_path, 'w') as config_file:
+    # Save the complete original user-specified configuration
+    user_config_path = Path(logger.experiment.dir) / 'user_specified_config.yaml'
+    with open(user_config_path, 'w') as config_file:
         yaml.dump(config, config_file)
 
     return logger
@@ -191,10 +192,10 @@ def initialize_model(
                 attribute_decoder_name=attribute_decoder_name,
                 adjacency_decoder_name=adjacency_decoder_name,
                 predictor_name=predictor_name,
-                **train_log_flags,
                 in_channels=in_channels,
                 out_channels=out_channels,
                 encoder_params=encoder_params,
+                train_log_flags=train_log_flags,
                 attribute_decoder_params=attribute_decoder_params,
                 adjacency_decoder_params=adjacency_decoder_params,
                 optimizer_params=optimizer_params,

@@ -76,6 +76,7 @@ def pandas_to_torch_one_hot(
 
 def edge_index_to_adjacency_tensor(
         edge_index: torch.Tensor,
+        max_num_nodes: int | None = None
     ) -> torch.Tensor:
     """
     Convert an edge index to an adjacency tensor.
@@ -85,18 +86,22 @@ def edge_index_to_adjacency_tensor(
     edge_index: torch.Tensor
         The edge index to convert to an adjacency tensor.
         Dimensions: (2, num_edges)
+    max_num_nodes: int | None
+        The maximum number of nodes in the graph.
+        If None, the maximum node ID in edge_index will be used.
 
     Returns:
     --------
     adjacency_matrix: torch.Tensor
         The adjacency tensor.
-        Dimensions: (edge_index.max() + 1, edge_index.max() + 1)
+        Dimensions: (edge_index.max() + 1, edge_index.max() + 1) if max_num_nodes is None else (max_num_nodes, max_num_nodes)
     """
     # to_undirected ensures that the adjacency matrix is symmetric
     # to_dense_adj returns a tensor of shape (1, num_nodes, num_nodes)
-    # here, num_nodes = edge_index.max() + 1
+    # here, num_nodes = edge_index.max() + 1 if max_num_nodes is None else max_num_nodes
     adjacency_matrix = to_dense_adj(
-                        edge_index.to(torch.long)
+                        edge_index.to(torch.long),
+                        max_num_nodes=max_num_nodes
                         )[0]
     return adjacency_matrix
 
@@ -140,7 +145,8 @@ def torch_one_hot_to_label_name(
     pd.Series
         The pandas Series of label names.
     """
-    return pd.Series(label_categories[one_hot.argmax(dim=1)])
+    indices = one_hot.argmax(dim=1).cpu().numpy()
+    return pd.Series([label_categories[i] for i in indices])
 
 
 def data_batch_to_adata_list(

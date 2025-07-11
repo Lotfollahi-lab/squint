@@ -30,6 +30,7 @@ Tradeoffs:
 """
 import os
 import copy
+import pickle
 import subprocess
 from pathlib import Path
 import concurrent.futures
@@ -166,6 +167,14 @@ class InMemoryDatasetBlob(InMemoryDataset):
             # sorting the categories for consistency across batches so that the one-hot encoding is consistent. e.g. when the one-hot encoding is [0, 1, 0], the label name is the second name in the sorted list of that label.
             self.label_categories[label_name] = sorted(list(self.label_categories[label_name]))
             print(f"Label Name: {label_name} | {self.label_categories[label_name]=}")
+
+        # save the label categories to disk
+        with open(Path(self.processed_dir) / "label_categories.pkl", "wb") as f:
+            pickle.dump(self.label_categories, f)
+
+        # save the gene panel to disk
+        with open(Path(self.processed_dir) / "gene_panel.pkl", "wb") as f:
+            pickle.dump(self.gene_panel, f)
 
         # ----------------- Second Pass over AnnData Batches -----------------
         # This pass is used to process each batch of AnnData into a PyG Data object.

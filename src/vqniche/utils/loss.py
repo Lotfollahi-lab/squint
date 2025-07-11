@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from ..utils.type_conversions import edge_index_to_adjacency_tensor
 from ..utils.vqgraph_helpers import l2norm
 from ..utils.loss_utils import aggregate_1hop_neighbor_features
+from ..utils.adjacency_reconstruction import reconstruct_adjacency_matrix as construct_real_valued_adjacency_matrix
 
 
 def cross_entropy(
@@ -160,10 +161,10 @@ def nb_attribute_reconstruction(
 
 
 def mse_adjacency_reconstruction(
-        pred_adj: torch.Tensor,
+        batch_size: int,
+        h_adj: torch.Tensor,
         batch_edge_index: torch.Tensor,
-        batch_input_id: torch.Tensor,
-        batch_nid: torch.Tensor,
+        estimate_adj_kwargs: dict = {},
         wt_adj_reconstr: float = 0.1
     ) -> torch.Tensor:
     """
@@ -171,17 +172,16 @@ def mse_adjacency_reconstruction(
 
     Parameters
     ----------
-    pred_adj: torch.Tensor
+    batch_size: int
+        The size of the batch.
+    h_adj: torch.Tensor
         The output from the adjacency decoder module.
-        Dimensions: (batch_size, num_genes)
+        Dimensions: (batch_size + num_sampled_nodes, decoder_embedding_dim)
     batch_edge_index: torch.Tensor
         The edge index of the batch with respect to local node IDs of seed nodes.
         Dimensions: (2, num_edges_in_batch)
-    batch_input_id: torch.Tensor
-        The global node IDs of the seed nodes of the batch with respect to the entire graph.
-        Dimensions: (batch_size,)
-    batch_nid: torch.Tensor
-        The global node IDs of the seed and all sampled nodes in the batch.
+    estimate_adj_kwargs: dict
+        The keyword arguments for the adjacency estimation method.
     wt_adj_reconstr: float
         The scaling factor for the adjacency reconstruction loss.
 
@@ -192,30 +192,38 @@ def mse_adjacency_reconstruction(
 
     Notes
     -----
-    - In VQGraph, `pred_adj` is the output from the adjacency decoder module (after vector quantization).
+    - In VQGraph, `h_adj` is the output from the adjacency decoder module which is fed quantized node embeddings.
     - this implementation assumes that sampling and mini-batching is used in the dataloader.
     """
-    # sampling-dataloaders (e.g. NeighborLoader) use local node IDs by default in the batch_edge_index.
-    # we need to convert these local node IDs to global node IDs to subset the adjacency tensor
-    global_edge_index = batch_nid[batch_edge_index]
+    # sampling-dataloaders (e.g. NeighborLoader) use local node IDs by default in the batch_edge_index. 
+    # i.e. [[0, 1], [1, 2]] means that the 0-th node in the batch is connected to the 1-st node in the batch...
+    # the global node IDs are the node IDs of the seed nodes in the batch with respect to the entire graph
+    # e.g. the 0-th node in the batch may be the i-th node in the global graph...
+    # we stay within the batch-wise scope for computing the adjacency reconstruction loss
+    # this means that the loss is computing for the subgraph induced by the index nodes in the current batch
+    # this is NOT equivalent to chunking the adjacency matrix into sets of rows and is thus NOT equivalent to computing the loss on the entire graph
+    # finally, we subset the tensor to include adjacency information for the index nodes with all nodes in the induced subgraph
+    # i.e. adj_batch is a tensor of shape (batch_size, batch_size + num_sampled_nodes) where the (i, j)-th entry is 1 if the i-th node of the batch is connected to the j-th node of the batch, and 0 otherwise
+    adj_batch = edge_index_to_adjacency_tensor(
+                                edge_index=batch_edge_index,
+                            )[:batch_size]
 
-    # edge_index_to_adjacency_tensor returns a tensor of shape (num_nodes, num_nodes) where num_nodes is the maximum node ID in global_edge_index
-    # we subset the adjacency tensor to only include the nodes in the current batch
-    global_batch_adj = edge_index_to_adjacency_tensor(
-                                edge_index=global_edge_index,
-                            )[batch_input_id, :][:, batch_input_id]
-
-    # quantize the predicted adjacency matrix coming from the decoder
-    # then, subset the quantized adjacency matrix to only include the nodes in the current batch
-    adj_quantized = torch.matmul(pred_adj.detach(), pred_adj.detach().t())
-    adj_quantized = (adj_quantized - adj_quantized.min()) / (adj_quantized.max() - adj_quantized.min() + 1e-8)
-    adj_quantized = adj_quantized.to(global_batch_adj.device)
+    # next, we construct a quantized real-valued adjacency matrix from the decoded node-wise vectors
+    # this is real-valued so that the model can learn potential adjacency values
+    # by setting h_index_nodes=h_adj[:batch_size] and h_target_nodes=h_adj, we compute the potential adjacency for each index node of the batch with all the nodes in the induced subgraph of the batch
+    # i.e. adj_quantized is a tensor of shape (batch_size, batch_size + num_sampled_nodes) where the (i, j)-th entry is the potential adjacency between the i-th node of the batch and the j-th node of the batch
+    adj_quantized = construct_real_valued_adjacency_matrix(
+                        h_index_nodes=h_adj[:batch_size],
+                        h_target_nodes=h_adj,
+                        nonlinearity=estimate_adj_kwargs['nonlinearity'],
+                        k=None, # returns real-valued adjacency matrix
+                    )
 
     # compute the mean root squared error between the quantized adjacency matrix and the original adjacency matrix
     mse_adj_reconstr_loss = torch.sqrt(
                                 F.mse_loss(
                                     input=adj_quantized,
-                                    target=global_batch_adj,
+                                    target=adj_batch.detach(),
                                     reduction='mean'
                                 )
                             )

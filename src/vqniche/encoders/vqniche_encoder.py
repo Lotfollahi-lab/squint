@@ -16,7 +16,6 @@ class VQNiche_Encoder(pl.LightningModule):
             mlp_params: dict = {},
             gnn_name: Optional[Literal['SAGEConv', 'GATv2Conv', 'GINConv']] = None,
             gnn_params: dict = {},
-            start_vq_epoch: int = 0,
             vq_params: dict = {},
         ):
         """
@@ -32,8 +31,6 @@ class VQNiche_Encoder(pl.LightningModule):
             The name of the GNN module.
         - gnn_params: dict
             Keyword arguments for the GNN module.
-        - start_vq_epoch: int
-            The epoch to start training the VQ module. By default, the VQ module is trained from epoch 0.
         - vq_params: dict
             Keyword arguments for the VQ module.
         """
@@ -68,7 +65,6 @@ class VQNiche_Encoder(pl.LightningModule):
         assert self.mlp_layers > 0 or self.gnn_layers > 0, "Both MLP and GNN modules have 0 layers. Please set at least one of the num_layers to a positive integer."
 
         # initialize the vq module
-        self.start_vq_epoch = start_vq_epoch
         self.vq = self._init_vq_module(
                     vq_params_dict=vq_params
                     )
@@ -130,14 +126,10 @@ class VQNiche_Encoder(pl.LightningModule):
             h_latent = h_mlp
 
         # VQ-encode the node embeddings
-        if self.current_epoch < self.start_vq_epoch:
-            h_quantized = h_latent
-            indices = torch.zeros(h_latent.shape[0], dtype=torch.int64, device=h_latent.device)
-        else:
-            h_quantized, \
-            indices, \
-            _, \
-                = self.vq(h_latent)
+        h_quantized, \
+        indices, \
+        _, \
+            = self.vq(h_latent)
 
         return h_latent, \
             h_quantized, \

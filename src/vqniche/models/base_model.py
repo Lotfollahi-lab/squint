@@ -2,16 +2,20 @@ from pathlib import Path
 from typing import List, Tuple, Callable, Optional, Literal
 
 import pandas as pd
+import networkx as nx
 
 import torch
 import torch_geometric
 import pytorch_lightning as pl
 from torch_geometric.nn.dense.linear import Linear
 
+from vqniche import metrics
 from ..utils.loss import *
-from ..utils import metrics
 from ..modules.mlp import MLP as MLP_AdjacencyDecoder
 from ..decoders.mlp_softmax import MLPSoftmax
+from ..utils.loss_utils import aggregate_1hop_neighbor_features
+from ..utils.type_conversions import edge_index_to_adjacency_tensor
+from ..utils.adjacency_reconstruction import reconstruct_adjacency_matrix as construct_binary_adjacency_matrix
 
 
 class BaseModel(pl.LightningModule):
@@ -22,12 +26,13 @@ class BaseModel(pl.LightningModule):
             attribute_decoder_name: str,
             adjacency_decoder_name: str,
             predictor_name: str,
-            log_similarity_stats: bool = False,
-            log_pearson_correlation: bool = False,
-            log_mmd_degree: bool = False,
-            log_codebook_utilization: Optional[bool] = None,
             in_channels: int = None,
             out_channels: int = None,
+            log_metrics_during_training: bool = False,
+            log_similarity: bool = False,
+            log_attribute_imputation: bool = False,
+            log_graph_imputation: bool = False,
+            log_codebook_utilization: Optional[bool] = None,
             optimizer_name: str = 'adam',
             lr: float = 0.01,
             weight_decay: float = 0.0,
@@ -49,19 +54,22 @@ class BaseModel(pl.LightningModule):
             The name of the adjacency decoder module.
         - predictor_name: str
             The name of the predictor module.
-        - log_similarity_stats: bool
-            Whether to log the similarity statistics.
-        - log_pearson_correlation: bool
-            Whether to log the Pearson correlation.
-        - log_mmd_degree: bool
-            Whether to log the MMD metric between the degree distribution of the original and reconstructed graphs.
-        - log_codebook_utilization: bool
-            Whether to log the codebook utilization.
 
         - in_channels: int
             The number of input channels.
         - out_channels: int
             The number of output channels.
+
+        - log_metrics_during_training: bool
+            Whether to log the metrics during training.
+        - log_similarity: bool
+            Whether to log the similarity statistics.
+        - log_attribute_imputation: bool
+            Whether to log metrics for attribute imputation.
+        - log_graph_imputation: bool
+            Whether to log metrics for graph imputation.
+        - log_codebook_utilization: bool
+            Whether to log the codebook utilization.
 
         - optimizer_name: str
             The optimizer name.
@@ -74,24 +82,29 @@ class BaseModel(pl.LightningModule):
             The loss function names.
         - loss_kwargs: dict
             The loss function keyword arguments.
-
         """
+        # names of the model components
         self.model_name = model_name
         self.encoder_name = encoder_name
         self.attribute_decoder_name = attribute_decoder_name
         self.adjacency_decoder_name = adjacency_decoder_name
         self.predictor_name = predictor_name
-        self.log_similarity_stats = log_similarity_stats
-        self.log_pearson_correlation = log_pearson_correlation
-        self.log_mmd_degree = log_mmd_degree
-        if log_codebook_utilization is not None:
-            self.log_codebook_utilization = log_codebook_utilization
 
         super().__init__()
 
         # Data parameters
         self.in_channels = in_channels
         self.out_channels = out_channels
+
+        # log flags
+        self.log_metrics_during_training = log_metrics_during_training
+        self.log_similarity = log_similarity
+        self.log_attribute_imputation = log_attribute_imputation
+        self.log_graph_imputation = log_graph_imputation
+        if log_codebook_utilization is not None:
+            self.log_codebook_utilization = log_codebook_utilization
+
+        self.train_val_epoch_metrics = pd.DataFrame()
 
         # Optimizer parameters
         self.optimizer_name = optimizer_name
@@ -102,14 +115,6 @@ class BaseModel(pl.LightningModule):
         self.loss_kwargs = loss_kwargs
         self.dispersion = torch.nn.Parameter(torch.randn(self.in_channels))
         self.loss_fn_tuples = self.set_loss_fn_tuples(loss_names, loss_kwargs)
-
-        # Inference mode: Batch-wise
-        # for epoch in epochs:
-        #    for batch in loader:
-        #       for layer in model.layers:
-        #         layer.forward(batch)
-
-        self.train_val_epoch_metrics = pd.DataFrame()
 
         self.save_hyperparameters()
 
@@ -183,7 +188,11 @@ class BaseModel(pl.LightningModule):
             elif loss_fn_name == 'mse_adjacency_reconstruction':
                 loss_fn = mse_adjacency_reconstruction
 
-                loss_fn_data_keys = ['pred_adj', 'batch_edge_index', 'batch_input_id', 'batch_nid']
+                loss_fn_data_keys = ['batch_size', 'h_adj', 'batch_edge_index']
+
+                estimate_adj_kwargs = loss_kwargs.get('estimate_adj_kwargs')
+                if estimate_adj_kwargs is not None:
+                    loss_fn_params['estimate_adj_kwargs'] = estimate_adj_kwargs
 
                 wt_adj_reconstr = loss_kwargs.get('wt_adj_reconstr')
                 if wt_adj_reconstr is not None:
@@ -518,53 +527,6 @@ class BaseModel(pl.LightningModule):
         )
 
 
-    def on_train_epoch_end(self) -> None:
-        """
-        Callback function to be executed at the end of each training epoch.
-
-        Notes
-        -----
-        - We use this hook to log the train and validation loss terms and accuracies in the training loop.
-        """
-        # compute the training epoch end stats such as embedding similarity, pearson correlation, codebook utilization, etc.
-        train_epoch_end_stats = self.compute_train_epoch_stats()
-        for key, value in train_epoch_end_stats.items():
-            self.log(
-                name=key,
-                value=value,
-                prog_bar=False,
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-            )
-
-        # log the metrics at the end of each epoch
-        metric_names = ['epoch'] + list(self.trainer.callback_metrics.keys())
-        metrics_values = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
-        print("--------------------------------")
-        for metric_name, metric_value in zip(metric_names, metrics_values):
-            print(f"{metric_name}: {metric_value}")
-        print("--------------------------------\n")
-
-        self.train_val_epoch_metrics = pd.concat(
-            [self.train_val_epoch_metrics, pd.DataFrame([metrics_values], columns=metric_names)],
-            ignore_index=True
-        )
-
-        return super().on_train_epoch_end()
-
-
-    def on_fit_end(self):
-        epoch_metrics_fname = Path(self.logger.experiment.dir) / 'train_val_epoch_metrics.csv'
-        self.train_val_epoch_metrics.to_csv(
-            path_or_buf=epoch_metrics_fname,
-            sep=',',
-            index=False
-        )
-
-        return super().on_fit_end()
-
-
     def forward(
             self,
             batch_x: torch.Tensor,
@@ -611,16 +573,255 @@ class BaseModel(pl.LightningModule):
         raise NotImplementedError('Training step not implemented')
 
 
-    def compute_train_epoch_stats(self) -> dict:
+    def on_train_epoch_end(self) -> None:
         """
-        Compute the training epoch end stats such as embedding similarity, pearson correlation, codebook utilization, etc.
+        Callback function to be executed at the end of each training epoch.
+
+        Notes
+        -----
+        - We use this hook to log embedding similarity, imputation, and codebook utilization metrics if enabled, as well as the loss term values and accuracies at the end of every training epoch.
+        """
+        # log model evaluation metrics at the end of each training epoch if enabled
+        if self.log_metrics_during_training:    
+            metrics_dict = {}
+        
+            # collect the raw input data and model embeddings for the infer_dataloader()
+            # infer_dataloader() returns a dataloader for the entire dataset
+            # child classes should implement this method
+            inference_data = self.collect_inference_data(
+                                self.trainer.datamodule.infer_dataloader()
+                            )
+            
+            if self.log_similarity:
+                metrics_dict.update(
+                    self.compute_similarity_metrics(                
+                            data_dict=inference_data
+                    )
+                )
+            if self.log_attribute_imputation:
+                metrics_dict.update(
+                    self.compute_attribute_imputation_metrics(
+                        data_dict=inference_data
+                    )
+                )
+            if self.log_graph_imputation:
+                metrics_dict.update(
+                    self.compute_graph_imputation_metrics(
+                        data_dict=inference_data
+                    )
+                )
+                
+            if self.model_name == 'VQNiche':
+                if self.log_codebook_utilization:
+                    num_active_codes = len(set(inference_data['Indices'].cpu().numpy()))
+                    total_codes = 1.0 * self.encoder.vq.codebook.shape[0]
+                    metrics_dict['codebook_utilization'] = num_active_codes / total_codes
+
+            # log the training epoch end stats
+            for key, value in metrics_dict.items():
+                self.log(
+                    name=key,
+                    value=value,
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
+        
+        # print to stdout all logged values during the training epoch
+        metric_names = ['epoch'] + list(self.trainer.callback_metrics.keys())
+        metrics_values = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
+        print("--------------------------------")
+        for metric_name, metric_value in zip(metric_names, metrics_values):
+            print(f"{metric_name}: {metric_value}")
+        print("--------------------------------\n")
+
+        # update the training and validation epoch metrics dataframe with metrics logged during the training epoch
+        self.train_val_epoch_metrics = pd.concat(
+            [
+                self.train_val_epoch_metrics,
+                pd.DataFrame(
+                    [metrics_values],
+                    columns=metric_names
+                )
+            ],
+            ignore_index=True
+        )
+
+        # call the parent class method to complete default behavior
+        return super().on_train_epoch_end()
+
+
+    def compute_similarity_metrics(
+            self,
+            data_dict: dict,
+        ) -> dict:
+        """
+        Compute cosine similarity between the raw input data and the model embeddings.
+
+        Parameters
+        ----------
+        - data_dict: dict
+            Dictionary containing the inference data with keys: X, Y_cell_type, Y_niche_type, edge_index, H_latent, X_hat, H_adj, and H_quantized and Indices (if VQNiche)
 
         Returns
         -------
         - dict
-            The training epoch end stats.
+            Dictionary containing the computed cosine similarity between the raw input data and the model embeddings.
+
+        Notes
+        -----
+        - This method may be used to check if any of the embeddings have collapsed.
         """
-        raise NotImplementedError('Training epoch end stats not implemented')
+        similarity_metrics = {}
+
+        similarity_metrics.update(
+            metrics.cosine_similarity(data_dict['X'], 'X')
+        )
+        similarity_metrics.update(
+            metrics.cosine_similarity(data_dict['H_latent'], 'H_latent')
+        )
+        similarity_metrics.update(
+            metrics.cosine_similarity(data_dict['X_hat'], 'X_hat')
+        )
+        similarity_metrics.update(
+            metrics.cosine_similarity(data_dict['H_adj'], 'H_adj')
+        )
+        if self.model_name == 'VQNiche':
+            similarity_metrics.update(
+                metrics.cosine_similarity(data_dict['H_quantized'], 'H_quantized')
+            )
+
+        return similarity_metrics
+
+
+    def compute_attribute_imputation_metrics(
+            self,
+            data_dict: dict,
+        ) -> dict:
+        """
+        Compute metrics to measure the quality of imputation of the original and estimated attributes (here, gene expression).
+
+        Parameters
+        ----------
+        - data_dict: dict
+            Dictionary containing the inference data with keys: X, Y_cell_type, Y_niche_type, edge_index, H_latent, X_hat, H_adj, and H_quantized and Indices (if VQNiche)
+
+        Returns
+        -------
+        - dict
+            Dictionary containing the computed metrics for attribute imputation.
+        """
+        attribute_imputation_metrics = {}
+        
+        # Pearson correlation between the original and estimated gene expression of a cell averaged across cells (row-wise)
+        pearson_cell_wise = metrics.pearson_correlation(
+            data_dict['X'].cpu().numpy(),
+            data_dict['X_hat'].cpu().numpy(),
+            compare_genes=False,
+            mean=True,
+        )
+        attribute_imputation_metrics['pearson_cell_wise'] = pearson_cell_wise
+
+        # Pearson correlation between the original and estimated gene expression averaged across genes (column-wise)
+        pearson_gene_wise = metrics.pearson_correlation(
+                    data_dict['X'].cpu().numpy(),
+                    data_dict['X_hat'].cpu().numpy(),
+                    compare_genes=True,
+                    mean=True,
+                )
+        attribute_imputation_metrics['pearson_gene_wise'] = pearson_gene_wise
+        
+        # Pearson correlation between the original and estimated gene expression of 1-hop neighborhood of a cell averaged across cells
+        X_nbr = aggregate_1hop_neighbor_features(
+                    X=data_dict['X'].cpu(),
+                    edge_index=data_dict['edge_index'].cpu(),
+                    return_mean=True,
+                )
+        X_hat_nbr = aggregate_1hop_neighbor_features(
+                    X=data_dict['X_hat'].cpu(),
+                    edge_index=data_dict['edge_index'].cpu(),
+                    return_mean=True,
+                )
+        pearson_1hop_nbr = metrics.pearson_correlation(
+                    X_nbr,
+                    X_hat_nbr,
+                    compare_genes=False,
+                    mean=True,
+                )
+        attribute_imputation_metrics['pearson_1hop_nbr'] = pearson_1hop_nbr
+
+        return attribute_imputation_metrics
+        
+
+    def compute_graph_imputation_metrics(
+            self,
+            data_dict: dict,
+        ) -> dict:
+        """
+        Compute metrics to measure the quality of imputation of the original and estimated graph structure.
+
+        Parameters
+        ----------
+        - data_dict: dict
+            Dictionary containing the inference data with keys: X, Y_cell_type, Y_niche_type, edge_index, H_latent, X_hat, H_adj, and H_quantized and Indices (if VQNiche)
+
+        Returns
+        -------
+        - dict
+            Dictionary containing the computed metrics for graph imputation.
+        """
+        graph_imputation_metrics = {}
+
+        # build a networkx graph from the edge index
+        G = nx.from_numpy_array(
+                edge_index_to_adjacency_tensor(
+                    data_dict['edge_index']
+                ).cpu().numpy()
+            )
+
+        # build a networkx graph from the estimated adjacency matrix
+        G_hat = nx.from_numpy_array(
+                construct_binary_adjacency_matrix(
+                    h_index_nodes=data_dict['H_adj'].detach(),
+                    **self.loss_kwargs['estimate_adj_kwargs'],
+                ).cpu().numpy()
+            )
+        
+        # compute the number of edges and the maximum degree of the original and estimated graph
+        graph_imputation_metrics['G_num_edges'] = G.number_of_edges()
+        graph_imputation_metrics['G_hat_num_edges'] = G_hat.number_of_edges()
+        graph_imputation_metrics['G_max_degree'] = max(dict(G.degree()).values())
+        graph_imputation_metrics['G_hat_max_degree'] = max(dict(G_hat.degree()).values())
+
+        # compute MMD between the degree distribution of the original and estimated graph
+        mmd_degree = metrics.mmd_score(
+                        [metrics.degree_histogram(G)],
+                        [metrics.degree_histogram(G_hat)],
+                    )
+        graph_imputation_metrics['mmd_degree'] = mmd_degree
+
+        # compute MMD between the eigenvalue distribution of the original and estimated graph
+        mmd_eigenvalues = metrics.mmd_score(
+                        [metrics.eigenvalues_pmf(G)],
+                        [metrics.eigenvalues_pmf(G_hat)],
+                    )
+        graph_imputation_metrics['mmd_eigenvalues'] = mmd_eigenvalues
+        
+        return graph_imputation_metrics
+
+
+    def collect_inference_data(self) -> dict:
+        """
+        Get inference data for computing training epoch stats.
+        Child classes should override this method to provide the required data.
+
+        Returns
+        -------
+        - dict
+            Dictionary containing inference data with keys: X, edge_index, H_latent, X_hat, H_adj
+        """
+        raise NotImplementedError('collect_inference_data should be implemented by the subclass')
 
 
     def validation_step(
@@ -667,3 +868,21 @@ class BaseModel(pl.LightningModule):
             The computed test accuracy.
         """
         raise NotImplementedError('Test step not implemented')
+    
+
+    def on_fit_end(self) -> None:
+        """
+        Callback function to be executed at the end of the training loop.
+
+        Notes
+        -----
+        - We use this hook to save the training and validation epoch metrics to a CSV file.
+        """
+        epoch_metrics_fname = Path(self.logger.experiment.dir) / 'train_val_epoch_metrics.csv'
+        self.train_val_epoch_metrics.to_csv(
+            path_or_buf=epoch_metrics_fname,
+            sep=',',
+            index=False
+        )
+
+        return super().on_fit_end()

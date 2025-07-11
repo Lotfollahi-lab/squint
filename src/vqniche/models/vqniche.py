@@ -11,19 +11,13 @@ The Predictor builds the logits for the label prediction task using the quantize
 
 The implementation is based on the paper: VQNiche: Rethinking Graph Representation Space for Bridging GNNs and MLPs.
 """
-from typing import List, Literal
-
-import networkx as nx
+from typing import Literal
 
 import torch
 import torch_geometric
 
 from .base_model import BaseModel
 from ..encoders.vqniche_encoder import VQNiche_Encoder
-from ..utils import metrics
-from ..utils.loss_utils import aggregate_1hop_neighbor_features
-from ..utils.type_conversions import edge_index_to_adjacency_tensor
-from ..utils.metrics import build_reconstructed_adjacency_matrix
 
 
 class VQNiche(BaseModel):
@@ -34,10 +28,7 @@ class VQNiche(BaseModel):
             attribute_decoder_name: Literal['MLPSoftmax'] = 'MLPSoftmax',
             adjacency_decoder_name: Literal['MLP_AdjacencyDecoder'] = 'MLP_AdjacencyDecoder',
             predictor_name: Literal['Linear'] = 'Linear',
-            log_similarity_stats: bool = False,
-            log_pearson_correlation: bool = False,
-            log_mmd_degree: bool = False,
-            log_codebook_utilization: bool = True,
+            train_log_flags: dict = {},
             in_channels: int = None,
             out_channels: int = None,
             encoder_params: dict = {},
@@ -61,19 +52,14 @@ class VQNiche(BaseModel):
             The name of the adjacency decoder module.
         - predictor_name: Literal['Linear']
             The name of the predictor module.
-        - log_similarity_stats: bool
-            Whether to log the pairwise similarity statistics for all embeddings.
-        - log_pearson_correlation: bool
-            Whether to log the Pearson correlation between original and reconstructed cell-gene matrices.
-        - log_mmd_degree: bool
-            Whether to log the MMD metric between the degree distribution of the original and reconstructed graphs.
-        - log_codebook_utilization: bool
-            Whether to log the codebook utilization.
 
         - in_channels: int
             The number of input features.
         - out_channels: int
             The number of output features.
+
+        - train_log_flags: dict
+            The flags for logging metrics during training.
 
         - encoder_params: dict
             The parameters for the MLP module.
@@ -91,12 +77,9 @@ class VQNiche(BaseModel):
             attribute_decoder_name=attribute_decoder_name,
             adjacency_decoder_name=adjacency_decoder_name,
             predictor_name=predictor_name,
-            log_similarity_stats=log_similarity_stats,
-            log_codebook_utilization=log_codebook_utilization,
-            log_pearson_correlation=log_pearson_correlation,
-            log_mmd_degree=log_mmd_degree,
             in_channels=in_channels,
             out_channels=out_channels,
+            **train_log_flags,
             **optimizer_params,
             **loss_params,
         )
@@ -231,7 +214,7 @@ class VQNiche(BaseModel):
         h_quantized, \
         indices, \
         xhat_batch, \
-        h_adj, \
+        h_adj_batch, \
         unnormalized_logits_batch \
             = self(
                     train_batch.x,
@@ -248,12 +231,10 @@ class VQNiche(BaseModel):
                         'pred_attr': xhat_batch, # attribute reconstruction loss
                         'target_attr': train_batch.x, # attribute reconstruction loss
                         'edge_index': train_batch.edge_index, # attribute reconstruction loss
-                        'batch_size': batch_size, # attribute reconstruction loss
+                        'batch_size': batch_size, # attribute and adjacency reconstruction loss
                         'dispersion': torch.exp(self.dispersion), # attribute reconstruction loss
-                        'pred_adj': h_adj[:batch_size], # adjacency reconstruction loss
+                        'h_adj': h_adj_batch, # adjacency reconstruction loss
                         'batch_edge_index': train_batch.edge_index, # adjacency reconstruction loss
-                        'batch_input_id': train_batch.input_id, # adjacency reconstruction loss
-                        'batch_nid': train_batch.n_id, # adjacency reconstruction loss
                         'logits': unnormalized_logits_batch[:batch_size], # label prediction loss
                         'labels': train_batch.y[:batch_size], # label prediction loss
                         }
@@ -289,7 +270,7 @@ class VQNiche(BaseModel):
         h_quantized, \
         indices, \
         xhat_batch, \
-        h_adj, \
+        h_adj_batch, \
         unnormalized_logits_batch \
             = self(
                     val_batch.x,
@@ -307,10 +288,8 @@ class VQNiche(BaseModel):
                         'edge_index': val_batch.edge_index,
                         'batch_size': batch_size,
                         'dispersion': torch.exp(self.dispersion),
-                        'pred_adj': h_adj[:batch_size],
+                        'h_adj': h_adj_batch,
                         'batch_edge_index': val_batch.edge_index,
-                        'batch_input_id': val_batch.input_id,
-                        'batch_nid': val_batch.n_id,
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': val_batch.y[:batch_size],
                         }
@@ -372,22 +351,35 @@ class VQNiche(BaseModel):
 
 
     @torch.no_grad()
-    def inference(self):
+    def collect_inference_data(
+            self,
+            dataloader: torch.utils.data.DataLoader
+        ) -> dict:
+        """
+        Collect input data and model outputs for all nodes in the specified dataloader.
+        
+        Returns
+        -------
+        - dict
+            Dictionary containing inference data with keys: X, edge_index, H_latent, X_hat, H_adj, H_quantized, Indices
+        """
         X = []
-        Y_cell_type = []
-        Y_niche_type = []
+        Y_cell_types = []
+        Y_niche_types = []
+        XY_coordinates = []
         H_latent = []
         H_quantized = []
         Indices = []
         X_hat = []
         H_adj = []
 
-        for batch in self.trainer.datamodule.infer_dataloader():
+        for batch in dataloader:
             batch_size = batch.batch_size
 
             X.append(batch.x[:batch_size])
-            Y_cell_type.append(batch.y[:batch_size])
-            Y_niche_type.append(batch.y_niche_types[:batch_size])
+            Y_cell_types.append(batch.y[:batch_size])
+            Y_niche_types.append(batch.y_niche_types[:batch_size])
+            XY_coordinates.append(batch.xy_coordinates[:batch_size])
 
             h_latent, \
             h_quantized, \
@@ -407,125 +399,24 @@ class VQNiche(BaseModel):
             H_adj.append(h_adj[:batch_size])
 
         X = torch.cat(X, dim=0)
-        Y_cell_type = torch.cat(Y_cell_type, dim=0)
-        Y_niche_type = torch.cat(Y_niche_type, dim=0)
+        Y_cell_types = torch.cat(Y_cell_types, dim=0)
+        Y_niche_types = torch.cat(Y_niche_types, dim=0)
+        XY_coordinates = torch.cat(XY_coordinates, dim=0)
         H_latent = torch.cat(H_latent, dim=0)
         H_quantized = torch.cat(H_quantized, dim=0)
         Indices = torch.cat(Indices, dim=0)
         X_hat = torch.cat(X_hat, dim=0)
         H_adj = torch.cat(H_adj, dim=0)
 
-        return X, \
-            Y_cell_type, \
-            Y_niche_type, \
-            self.trainer.datamodule.data.edge_index, \
-            H_latent, \
-            H_quantized, \
-            Indices, \
-            X_hat, \
-            H_adj
-
-
-    @torch.no_grad()
-    def compute_train_epoch_stats(self) -> List[int]:
-        """
-        If the log_similarity_stats flag is set to True, compute statistics for original and decoded node attributes, and latent and quantized node embeddings at the end of each training epoch.
-        If the log_pearson_correlation flag is set to True, compute the Pearson correlation between original and decoded attributes at the end of each training epoch.
-        If the log_codebook_utilization flag is set to True, compute the codebook utilization at the end of each training epoch.
-
-        Returns
-        -------
-        - train_epoch_end_stats: dict
-            Dictionary containing the computed statistics.
-        """
-        X, \
-        _, \
-        _, \
-        edge_index, \
-        H_latent, \
-        H_quantized, \
-        Indices, \
-        X_hat, \
-        H_adj \
-            = self.inference()
-
-        train_epoch_end_stats = {}
-
-        # Concatenate all embeddings
-        if self.log_similarity_stats:
-            train_epoch_end_stats.update(
-                metrics.cosine_similarity(X, 'X')
-            )
-            train_epoch_end_stats.update(
-                metrics.cosine_similarity(H_latent, 'H_latent')
-            )
-            train_epoch_end_stats.update(
-                metrics.cosine_similarity(H_quantized, 'H_quantized')
-            )
-            train_epoch_end_stats.update(
-                metrics.cosine_similarity(X_hat, 'X_hat')
-            )
-            train_epoch_end_stats.update(
-                metrics.cosine_similarity(H_adj, 'H_adj')
-            )
-
-        if self.log_pearson_correlation:
-            pearson_cell_wise = metrics.pearson_correlation(
-                        X.cpu().numpy(),
-                        X_hat.cpu().numpy(),
-                        compare_genes=False,
-                        mean=True,
-                    )
-            pearson_gene_wise = metrics.pearson_correlation(
-                        X.cpu().numpy(),
-                        X_hat.cpu().numpy(),
-                        compare_genes=True,
-                        mean=True,
-                    )
-            train_epoch_end_stats['pearson_cell_wise'] = pearson_cell_wise
-            train_epoch_end_stats['pearson_gene_wise'] = pearson_gene_wise
-
-            X_nbr = aggregate_1hop_neighbor_features(
-                        X=X.cpu(),
-                        edge_index=edge_index.cpu(),
-                        return_mean=True,
-                    )
-            X_hat_nbr = aggregate_1hop_neighbor_features(
-                        X=X_hat.cpu(),
-                        edge_index=edge_index.cpu(),
-                        return_mean=True,
-                    )
-            pearson_1hop_nbr = metrics.pearson_correlation(
-                        X_nbr,
-                        X_hat_nbr,
-                        compare_genes=False,
-                        mean=True,
-                    )
-            train_epoch_end_stats['pearson_1hop_nbr'] = pearson_1hop_nbr
-
-        if self.log_mmd_degree:
-            G = nx.from_numpy_array(
-                    edge_index_to_adjacency_tensor(
-                        edge_index
-                    ).cpu().numpy()
-                )
-
-            G_hat = nx.from_numpy_array(
-                    build_reconstructed_adjacency_matrix(
-                        H_adj
-                    ).cpu().numpy()
-                )
-
-            node_degree_distribution = metrics.node_degree_distribution(G)
-            node_degree_distribution_hat = metrics.node_degree_distribution(G_hat)
-            mmd_degree = metrics.mmd_score(
-                            [node_degree_distribution],
-                            [node_degree_distribution_hat],
-                            method='l1_gaussian_tv',
-                            sigma=1.0,
-                        )
-            train_epoch_end_stats['mmd_degree'] = mmd_degree
-
-        if self.log_codebook_utilization:
-            train_epoch_end_stats['codebook_utilization'] = 1.0 * len(set(Indices.cpu().numpy())) / self.encoder.vq.codebook.shape[0]
-        return train_epoch_end_stats
+        return {
+            'X': X,
+            'Y_cell_types': Y_cell_types,
+            'Y_niche_types': Y_niche_types,
+            'XY_coordinates': XY_coordinates,
+            'edge_index': dataloader.data.edge_index,
+            'H_latent': H_latent,
+            'X_hat': X_hat,
+            'H_adj': H_adj,
+            'H_quantized': H_quantized,
+            'Indices': Indices
+        }
