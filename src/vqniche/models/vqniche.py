@@ -11,7 +11,7 @@ The Predictor builds the logits for the label prediction task using the quantize
 
 The implementation is based on the paper: VQNiche: Rethinking Graph Representation Space for Bridging GNNs and MLPs.
 """
-from typing import Literal
+from typing import Literal, List
 
 import torch
 import torch_geometric
@@ -28,7 +28,7 @@ class VQNiche(BaseModel):
             attribute_decoder_name: Literal['MLPSoftmax'] = 'MLPSoftmax',
             adjacency_decoder_name: Literal['MLP_AdjacencyDecoder'] = 'MLP_AdjacencyDecoder',
             predictor_name: Literal['Linear'] = 'Linear',
-            train_log_flags: dict = {},
+            train_metrics_list: List[str] = [],
             in_channels: int = None,
             out_channels: int = None,
             encoder_params: dict = {},
@@ -58,8 +58,8 @@ class VQNiche(BaseModel):
         - out_channels: int
             The number of output features.
 
-        - train_log_flags: dict
-            The flags for logging metrics during training.
+        - train_metrics_list: List[str]
+            The list of metrics to compute during training.
 
         - encoder_params: dict
             The parameters for the MLP module.
@@ -79,7 +79,7 @@ class VQNiche(BaseModel):
             predictor_name=predictor_name,
             in_channels=in_channels,
             out_channels=out_channels,
-            **train_log_flags,
+            train_metrics_list=train_metrics_list,
             **optimizer_params,
             **loss_params,
         )

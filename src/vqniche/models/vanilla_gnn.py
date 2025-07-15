@@ -8,7 +8,7 @@ The Vanilla GNN Model is a simple GNN model that comprises of the following comp
 
 In addition, this provides the option to log the mean pairwise cosine similarity between the original attributes, decoded attributes, and GNN embeddings, and the Pearson correlation between the original and decoded node attributes at the end of each training epoch.
 """
-from typing import Literal
+from typing import Literal, List
 
 import torch
 import torch_geometric
@@ -27,7 +27,7 @@ class VanillaGNN(BaseModel):
             predictor_name: Literal['Linear'] = 'Linear',
             in_channels: int = None,
             out_channels: int = None,
-            train_log_flags: dict = {},
+            train_metrics_list: List[str] = [],
             encoder_params: dict = {},
             attribute_decoder_params: dict = {},
             adjacency_decoder_params: dict = {},
@@ -80,7 +80,7 @@ class VanillaGNN(BaseModel):
             predictor_name=predictor_name,
             in_channels=in_channels,
             out_channels=out_channels,
-            **train_log_flags,
+            train_metrics_list=train_metrics_list,
             **optimizer_params,
             **loss_params,
         )
