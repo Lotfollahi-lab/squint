@@ -308,7 +308,7 @@ class VQNiche(BaseModel):
             test_batch: torch_geometric.data.Data
         ) -> torch.Tensor:
         """
-        Definition of a single test step of the GraphSAGE model on the current batch of nodes received from the test dataloader at the current training epoch.
+        Definition of a single test step of the VQNiche model on the current batch of nodes received from the test dataloader at the current training epoch.
 
         Parameters
         ----------
@@ -320,34 +320,20 @@ class VQNiche(BaseModel):
         - test_loss: torch.Tensor
             The computed loss for this batch.
         """
-        batch_size = test_batch.batch_size
-
-        # execute the forward of the GraphSAGE model
+        # execute the forward of the VQNiche model
         _, \
         _, \
         _, \
         _, \
         _, \
-        unnormalized_logits_batch \
+        _ \
             = self(
                     test_batch.x,
                     test_batch.edge_index,
                     test_batch.xy_coordinates,
                 )
 
-        # prepare dictionary of data required for computing accuracy
-        test_acc_data = {
-                        'logits': unnormalized_logits_batch[:batch_size],
-                        'labels': test_batch.y[:batch_size],
-                        }
-
-        test_acc = self.common_step(
-            batch_loss_data=test_acc_data,
-            batch_size=batch_size,
-            mode='test',
-        )
-
-        return test_acc
+        return torch.tensor(0.0)
 
 
     @torch.no_grad()
@@ -372,7 +358,8 @@ class VQNiche(BaseModel):
         Indices = []
         X_hat = []
         H_adj = []
-
+        Logits = []
+        
         for batch in dataloader:
             batch_size = batch.batch_size
 
@@ -386,7 +373,7 @@ class VQNiche(BaseModel):
             indices, \
             xhat, \
             h_adj, \
-            _ = self(
+            logits = self(
                     batch.x.to(self.device),
                     batch.edge_index.to(self.device),
                     batch.xy_coordinates.to(self.device)
@@ -397,6 +384,7 @@ class VQNiche(BaseModel):
             Indices.append(indices[:batch_size])
             X_hat.append(xhat[:batch_size])
             H_adj.append(h_adj[:batch_size])
+            Logits.append(logits[:batch_size])
 
         X = torch.cat(X, dim=0)
         Y_cell_types = torch.cat(Y_cell_types, dim=0)
@@ -407,7 +395,8 @@ class VQNiche(BaseModel):
         Indices = torch.cat(Indices, dim=0)
         X_hat = torch.cat(X_hat, dim=0)
         H_adj = torch.cat(H_adj, dim=0)
-
+        Logits = torch.cat(Logits, dim=0)
+        
         return {
             'X': X,
             'Y_cell_types': Y_cell_types,
@@ -417,6 +406,7 @@ class VQNiche(BaseModel):
             'H_latent': H_latent,
             'X_hat': X_hat,
             'H_adj': H_adj,
+            'Logits': Logits,
             'H_quantized': H_quantized,
-            'Indices': Indices
+            'Indices': Indices,
         }

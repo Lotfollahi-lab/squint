@@ -262,7 +262,7 @@ class VanillaMLP(BaseModel):
             test_batch: torch_geometric.data.Data
         ) -> torch.Tensor:
         """
-        Definition of a single test step of the GraphSAGE model on the current batch of nodes received from the test dataloader at the current training epoch.
+        Definition of a single test step of the Vanilla MLP model on the current batch of nodes received from the test dataloader at the current training epoch.
 
         Parameters
         ----------
@@ -274,26 +274,12 @@ class VanillaMLP(BaseModel):
         - test_loss: torch.Tensor
             The computed loss for this batch.
         """
-        # execute the forward of the GraphSAGE model
+        # execute the forward of the Vanilla MLP model
         _, \
         _, \
-        _, \
-        unnormalized_logits_batch = self(test_batch.x)
+        _ = self(test_batch.x)
 
-        # prepare dictionary of data required for computing accuracy
-        batch_size = test_batch.batch_size
-        test_acc_data = {
-                        'logits': unnormalized_logits_batch[:batch_size],
-                        'labels': test_batch.y[:batch_size],
-                        }
-
-        test_acc = self.common_step(
-            batch_loss_data=test_acc_data,
-            batch_size=batch_size,
-            mode='test',
-        )
-
-        return test_acc
+        return torch.tensor(0.0)
 
 
     @torch.no_grad()
@@ -316,7 +302,7 @@ class VanillaMLP(BaseModel):
         H_latent = []
         X_hat = []
         H_adj = []
-
+        Logits = []
         for batch in dataloader:
             batch_size = batch.batch_size
 
@@ -328,12 +314,13 @@ class VanillaMLP(BaseModel):
             h_latent, \
             xhat_batch, \
             h_adj_batch, \
-            _ = self(batch.x.to(self.device))
+            logits = self(batch.x.to(self.device))
 
             H_latent.append(h_latent[:batch_size])
             X_hat.append(xhat_batch[:batch_size])
             H_adj.append(h_adj_batch[:batch_size])
-
+            Logits.append(logits[:batch_size])
+            
         X = torch.cat(X, dim=0)
         Y_cell_types = torch.cat(Y_cell_types, dim=0)
         Y_niche_types = torch.cat(Y_niche_types, dim=0)
@@ -341,6 +328,7 @@ class VanillaMLP(BaseModel):
         H_latent = torch.cat(H_latent, dim=0)
         X_hat = torch.cat(X_hat, dim=0)
         H_adj = torch.cat(H_adj, dim=0)
+        Logits = torch.cat(Logits, dim=0)
 
         return {
             'X': X,
@@ -350,5 +338,6 @@ class VanillaMLP(BaseModel):
             'edge_index': dataloader.data.edge_index,
             'H_latent': H_latent,
             'X_hat': X_hat,
-            'H_adj': H_adj
+            'H_adj': H_adj,
+            'Logits': Logits,
         }
