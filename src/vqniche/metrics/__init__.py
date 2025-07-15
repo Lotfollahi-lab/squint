@@ -1,6 +1,6 @@
 # Import metrics for adjacency
 from .mmd import (
-    mmd_score,
+    compute_mmd_score,
     degree_histogram,
     eigenvalues_pmf,
 )
@@ -50,7 +50,7 @@ from .accuracy_score import (
 # Define __all__ to specify what should be imported with "from vqniche.metrics import *"
 __all__ = [
     # MMD functions
-    "mmd_score",
+    "compute_mmd_score",
     "degree_histogram",
     "eigenvalues_pmf",
     # Global spatial conservation metric (cell label supervised)
