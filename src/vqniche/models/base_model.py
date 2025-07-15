@@ -13,9 +13,10 @@ from vqniche import metrics
 from ..utils.loss import *
 from ..modules.mlp import MLP as MLP_AdjacencyDecoder
 from ..decoders.mlp_softmax import MLPSoftmax
-from ..utils.loss_utils import aggregate_1hop_neighbor_features
 from ..utils.type_conversions import edge_index_to_adjacency_tensor
 from ..utils.adjacency_reconstruction import reconstruct_adjacency_matrix as construct_binary_adjacency_matrix
+from ..utils.type_conversions import inference_data_dict_to_adata
+from ..metrics.benchmarking import compute_benchmarking_metrics
 
 
 class BaseModel(pl.LightningModule):
@@ -28,11 +29,7 @@ class BaseModel(pl.LightningModule):
             predictor_name: str,
             in_channels: int = None,
             out_channels: int = None,
-            log_metrics_during_training: bool = False,
-            log_similarity: bool = False,
-            log_attribute_imputation: bool = False,
-            log_graph_imputation: bool = False,
-            log_codebook_utilization: Optional[bool] = None,
+            train_metrics_list: List[str] = [],
             optimizer_name: str = 'adam',
             lr: float = 0.01,
             weight_decay: float = 0.0,
@@ -60,16 +57,8 @@ class BaseModel(pl.LightningModule):
         - out_channels: int
             The number of output channels.
 
-        - log_metrics_during_training: bool
-            Whether to log the metrics during training.
-        - log_similarity: bool
-            Whether to log the similarity statistics.
-        - log_attribute_imputation: bool
-            Whether to log metrics for attribute imputation.
-        - log_graph_imputation: bool
-            Whether to log metrics for graph imputation.
-        - log_codebook_utilization: bool
-            Whether to log the codebook utilization.
+        - train_metrics_list: List[str]
+            The list of metrics to compute during training.
 
         - optimizer_name: str
             The optimizer name.
@@ -96,13 +85,8 @@ class BaseModel(pl.LightningModule):
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        # log flags
-        self.log_metrics_during_training = log_metrics_during_training
-        self.log_similarity = log_similarity
-        self.log_attribute_imputation = log_attribute_imputation
-        self.log_graph_imputation = log_graph_imputation
-        if log_codebook_utilization is not None:
-            self.log_codebook_utilization = log_codebook_utilization
+        # metrics to compute during training
+        self.train_metrics_list = train_metrics_list
 
         self.train_val_epoch_metrics = pd.DataFrame()
 
@@ -528,40 +512,26 @@ class BaseModel(pl.LightningModule):
         - We use this hook to log embedding similarity, imputation, and codebook utilization metrics if enabled, as well as the loss term values and accuracies at the end of every training epoch.
         """
         # log model evaluation metrics at the end of each training epoch if enabled
-        if self.log_metrics_during_training:    
-            metrics_dict = {}
-        
+        if len(self.train_metrics_list) > 0:
             # collect the raw input data and model embeddings for the infer_dataloader()
             # infer_dataloader() returns a dataloader for the entire dataset
             # child classes should implement this method
             inference_data = self.collect_inference_data(
                                 self.trainer.datamodule.infer_dataloader()
                             )
-            
-            if self.log_similarity:
-                metrics_dict.update(
-                    self.compute_similarity_metrics(                
-                            data_dict=inference_data
-                    )
-                )
-            if self.log_attribute_imputation:
-                metrics_dict.update(
-                    self.compute_attribute_imputation_metrics(
-                        data_dict=inference_data
-                    )
-                )
-            if self.log_graph_imputation:
-                metrics_dict.update(
-                    self.compute_graph_imputation_metrics(
-                        data_dict=inference_data
-                    )
-                )
-                
-            if self.model_name == 'VQNiche':
-                if self.log_codebook_utilization:
-                    num_active_codes = len(set(inference_data['Indices'].cpu().numpy()))
-                    total_codes = 1.0 * self.encoder.vq.codebook.shape[0]
-                    metrics_dict['codebook_utilization'] = num_active_codes / total_codes
+
+            # convert the inference data to an AnnData object
+            adata = inference_data_dict_to_adata(
+                inference_data=inference_data,
+                label_categories_dict=None,
+            )
+
+            # compute the benchmarking metrics
+            metrics_dict = compute_benchmarking_metrics(
+                adata=adata,
+                metrics=self.train_metrics_list,
+                **self.loss_kwargs['estimate_adj_kwargs'],
+            )
 
             # log the training epoch end stats
             for key, value in metrics_dict.items():
@@ -596,165 +566,6 @@ class BaseModel(pl.LightningModule):
 
         # call the parent class method to complete default behavior
         return super().on_train_epoch_end()
-
-
-    def compute_similarity_metrics(
-            self,
-            data_dict: dict,
-        ) -> dict:
-        """
-        Compute cosine similarity between the raw input data and the model embeddings.
-
-        Parameters
-        ----------
-        - data_dict: dict
-            Dictionary containing the inference data with keys: X, Y_cell_type, Y_niche_type, edge_index, H_latent, X_hat, H_adj, and H_quantized and Indices (if VQNiche)
-
-        Returns
-        -------
-        - dict
-            Dictionary containing the computed cosine similarity between the raw input data and the model embeddings.
-
-        Notes
-        -----
-        - This method may be used to check if any of the embeddings have collapsed.
-        """
-        similarity_metrics = {}
-
-        similarity_metrics.update(
-            metrics.cosine_similarity(data_dict['X'], 'X')
-        )
-        similarity_metrics.update(
-            metrics.cosine_similarity(data_dict['H_latent'], 'H_latent')
-        )
-        similarity_metrics.update(
-            metrics.cosine_similarity(data_dict['X_hat'], 'X_hat')
-        )
-        similarity_metrics.update(
-            metrics.cosine_similarity(data_dict['H_adj'], 'H_adj')
-        )
-        if self.model_name == 'VQNiche':
-            similarity_metrics.update(
-                metrics.cosine_similarity(data_dict['H_quantized'], 'H_quantized')
-            )
-
-        return similarity_metrics
-
-
-    def compute_attribute_imputation_metrics(
-            self,
-            data_dict: dict,
-        ) -> dict:
-        """
-        Compute metrics to measure the quality of imputation of the original and estimated attributes (here, gene expression).
-
-        Parameters
-        ----------
-        - data_dict: dict
-            Dictionary containing the inference data with keys: X, Y_cell_type, Y_niche_type, edge_index, H_latent, X_hat, H_adj, and H_quantized and Indices (if VQNiche)
-
-        Returns
-        -------
-        - dict
-            Dictionary containing the computed metrics for attribute imputation.
-        """
-        attribute_imputation_metrics = {}
-        
-        # Pearson correlation between the original and estimated gene expression of a cell averaged across cells (row-wise)
-        pearson_cell_wise = metrics.pearson_correlation(
-            data_dict['X'].cpu().numpy(),
-            data_dict['X_hat'].cpu().numpy(),
-            compare_genes=False,
-            mean=True,
-        )
-        attribute_imputation_metrics['pearson_cell_wise'] = pearson_cell_wise
-
-        # Pearson correlation between the original and estimated gene expression averaged across genes (column-wise)
-        pearson_gene_wise = metrics.pearson_correlation(
-                    data_dict['X'].cpu().numpy(),
-                    data_dict['X_hat'].cpu().numpy(),
-                    compare_genes=True,
-                    mean=True,
-                )
-        attribute_imputation_metrics['pearson_gene_wise'] = pearson_gene_wise
-        
-        # Pearson correlation between the original and estimated gene expression of 1-hop neighborhood of a cell averaged across cells
-        X_nbr = aggregate_1hop_neighbor_features(
-                    X=data_dict['X'].cpu(),
-                    edge_index=data_dict['edge_index'].cpu(),
-                    return_mean=True,
-                )
-        X_hat_nbr = aggregate_1hop_neighbor_features(
-                    X=data_dict['X_hat'].cpu(),
-                    edge_index=data_dict['edge_index'].cpu(),
-                    return_mean=True,
-                )
-        pearson_1hop_nbr = metrics.pearson_correlation(
-                    X_nbr,
-                    X_hat_nbr,
-                    compare_genes=False,
-                    mean=True,
-                )
-        attribute_imputation_metrics['pearson_1hop_nbr'] = pearson_1hop_nbr
-
-        return attribute_imputation_metrics
-        
-
-    def compute_graph_imputation_metrics(
-            self,
-            data_dict: dict,
-        ) -> dict:
-        """
-        Compute metrics to measure the quality of imputation of the original and estimated graph structure.
-
-        Parameters
-        ----------
-        - data_dict: dict
-            Dictionary containing the inference data with keys: X, Y_cell_type, Y_niche_type, edge_index, H_latent, X_hat, H_adj, and H_quantized and Indices (if VQNiche)
-
-        Returns
-        -------
-        - dict
-            Dictionary containing the computed metrics for graph imputation.
-        """
-        graph_imputation_metrics = {}
-
-        # build a networkx graph from the edge index
-        G = nx.from_numpy_array(
-                edge_index_to_adjacency_tensor(
-                    data_dict['edge_index']
-                ).cpu().numpy()
-            )
-
-        # build a networkx graph from the estimated adjacency matrix
-        G_hat = nx.from_numpy_array(
-                construct_binary_adjacency_matrix(
-                    h_index_nodes=data_dict['H_adj'].detach(),
-                    **self.loss_kwargs['estimate_adj_kwargs'],
-                ).cpu().numpy()
-            )
-        
-        # compute the number of edges and the maximum degree of the original and estimated graph
-        graph_imputation_metrics['G_num_edges'] = G.number_of_edges()
-        graph_imputation_metrics['G_hat_num_edges'] = G_hat.number_of_edges()
-        graph_imputation_metrics['G_max_degree'] = max(dict(G.degree()).values())
-        graph_imputation_metrics['G_hat_max_degree'] = max(dict(G_hat.degree()).values())
-
-        # compute MMD between the degree distribution of the original and estimated graph
-        mmd_degree = metrics.mmd_score(
-                        [metrics.degree_histogram(G)],
-                        [metrics.degree_histogram(G_hat)],
-                    )
-        graph_imputation_metrics['mmd_degree'] = mmd_degree
-
-        # compute MMD between the eigenvalue distribution of the original and estimated graph
-        mmd_eigenvalues = metrics.mmd_score(
-                        [metrics.eigenvalues_pmf(G)],
-                        [metrics.eigenvalues_pmf(G_hat)],
-                    )
-        graph_imputation_metrics['mmd_eigenvalues'] = mmd_eigenvalues
-        
-        return graph_imputation_metrics
 
 
     def collect_inference_data(self) -> dict:
