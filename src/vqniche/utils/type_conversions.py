@@ -1,11 +1,12 @@
-import torch
+from typing import List, Optional, Dict
+
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 import networkx as nx
 import anndata as ad
-from typing import List, Optional
 
+import torch
 from torch_geometric.data import Batch
 from torch_geometric.utils import to_dense_adj
 from torch_geometric.data import InMemoryDataset
@@ -172,7 +173,7 @@ def adjacency_tensor_to_networkx(
 
 def torch_one_hot_to_label_name(
         one_hot: torch.Tensor,
-        label_categories: list[str]
+        label_categories: Optional[list[str]] = None
     ) -> pd.Series:
     """
     Convert a one-hot encoded label tensor to a pandas Series of label names.
@@ -181,8 +182,9 @@ def torch_one_hot_to_label_name(
     ----------
     one_hot: torch.Tensor
         The one-hot encoded label tensor.
-    label_categories: list[str]
+    label_categories: Optional[list[str]]
         The list of label categories where the index of the one-hot encoded label tensor matches the index of the label name in the list.
+        If None, the label categories will be integers.
 
     Returns:
     --------
@@ -190,7 +192,90 @@ def torch_one_hot_to_label_name(
         The pandas Series of label names.
     """
     indices = one_hot.argmax(dim=1).cpu().numpy()
-    return pd.Series([label_categories[i] for i in indices])
+    if label_categories is None:
+        return pd.Series(indices).astype('category')
+    else:
+        return pd.Series([label_categories[i] for i in indices]).astype('category')
+
+
+def build_inference_adata(
+        inference_data: Dict,
+        label_categories_dict: Optional[Dict] = None,
+    ) -> ad.AnnData:
+    """
+    Build an AnnData object from inference data dictionary.
+    
+    Parameters
+    ----------
+    inference_data : Dict
+        Dictionary containing inference results with keys:
+        - 'X': Input features (torch.Tensor)
+        - 'Y_cell_types': Cell type labels as one-hot vectors (torch.Tensor)
+        - 'Y_niche_types': Niche type labels as one-hot vectors (torch.Tensor)
+        - 'edge_index': Edge indices (torch.Tensor)
+        - 'H_latent': Latent representations (torch.Tensor)
+        - 'X_hat': Reconstructed features (torch.Tensor)
+        - 'H_adj': Adjacency representations (torch.Tensor)
+        - 'Logits': Logits (torch.Tensor)
+        - 'H_quantized': Quantized representations (torch.Tensor, optional)
+        - 'Indices': Quantization indices (torch.Tensor, optional)
+    label_categories_dict : Optional[Dict]
+        If provided, a dictionary containing 'cell_types' and 'niche_types' as keys and label categories as values.
+        For example, {'cell_types': ['cell_type_1', 'cell_type_2', 'cell_type_3'], 'niche_types': ['niche_type_1', 'niche_type_2', 'niche_type_3']}.
+        If not provided, the label categories will be set to integer categories.
+
+    Returns
+    -------
+    ad.AnnData
+        AnnData object with inference results stored in appropriate slots.
+        
+    TODO:
+    -----
+    - Label categories is hardcoded to 'cell_types' and 'niche_types'. The dataloader needs to be updated to allow for dynamically adding label categories if available.
+    """
+    # Create AnnData object with input features
+    adata = ad.AnnData(X=inference_data['X'].cpu().numpy())
+    
+    # Convert one-hot labels to category labels
+    for label_name in ['cell_types', 'niche_types']:
+        if label_name in inference_data:
+            if label_categories_dict is not None:
+                label_categories = list(label_categories_dict[label_name])
+            else:
+                label_categories = None
+            
+            labels = torch_one_hot_to_label_name(
+                        one_hot=inference_data[f'Y_{label_name}'],
+                        label_categories=label_categories
+                    )
+            labels.index = adata.obs.index
+            adata.obs[label_name] = labels
+    
+    adata.obsm['Y_cell_types'] = inference_data['Y_cell_types']
+    adata.obsm['Y_niche_types'] = inference_data['Y_niche_types']
+    adata.obsm['Logits'] = inference_data['Logits']
+
+    adata.obsm['spatial'] = inference_data['XY_coordinates'].cpu().numpy()
+    
+    # Store embeddings in obsm
+    adata.obsm['H_latent'] = inference_data['H_latent'].cpu().numpy()
+    adata.obsm['X_hat'] = inference_data['X_hat'].cpu().numpy()
+    adata.obsm['H_adj'] = inference_data['H_adj'].cpu().numpy()
+    
+    # Convert edge index to adjacency matrix and store in obsp
+    edge_index = inference_data['edge_index']
+    adj_matrix = to_dense_adj(edge_index)[0]
+    sparse_adj = sp.csr_matrix(adj_matrix.cpu().numpy())
+    adata.obsp['spatial_connectivities'] = sparse_adj
+    
+    # Add H_quantized and Indices only if they exist
+    if 'H_quantized' in inference_data:
+        adata.obsm['H_quantized'] = inference_data['H_quantized'].cpu().numpy()
+    
+    if 'Indices' in inference_data:
+        adata.obs['Indices'] = inference_data['Indices'].cpu().numpy()
+    
+    return adata
 
 
 def data_batch_to_adata_list(
