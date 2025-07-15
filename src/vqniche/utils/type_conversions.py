@@ -198,7 +198,7 @@ def torch_one_hot_to_label_name(
         return pd.Series([label_categories[i] for i in indices]).astype('category')
 
 
-def build_inference_adata(
+def inference_data_dict_to_adata(
         inference_data: Dict,
         label_categories_dict: Optional[Dict] = None,
     ) -> ad.AnnData:
@@ -232,6 +232,7 @@ def build_inference_adata(
     TODO:
     -----
     - Label categories is hardcoded to 'cell_types' and 'niche_types'. The dataloader needs to be updated to allow for dynamically adding label categories if available.
+    - TODO: Give the adata better structure.
     """
     # Create AnnData object with input features
     adata = ad.AnnData(X=inference_data['X'].cpu().numpy())
@@ -251,22 +252,20 @@ def build_inference_adata(
             labels.index = adata.obs.index
             adata.obs[label_name] = labels
     
-    adata.obsm['Y_cell_types'] = inference_data['Y_cell_types']
-    adata.obsm['Y_niche_types'] = inference_data['Y_niche_types']
-    adata.obsm['Logits'] = inference_data['Logits']
+    adata.uns['Y_cell_types'] = inference_data['Y_cell_types']
+    adata.uns['Y_niche_types'] = inference_data['Y_niche_types']
+    adata.uns['Logits'] = inference_data['Logits']
 
     adata.obsm['spatial'] = inference_data['XY_coordinates'].cpu().numpy()
     
     # Store embeddings in obsm
     adata.obsm['H_latent'] = inference_data['H_latent'].cpu().numpy()
-    adata.obsm['X_hat'] = inference_data['X_hat'].cpu().numpy()
     adata.obsm['H_adj'] = inference_data['H_adj'].cpu().numpy()
     
-    # Convert edge index to adjacency matrix and store in obsp
-    edge_index = inference_data['edge_index']
-    adj_matrix = to_dense_adj(edge_index)[0]
-    sparse_adj = sp.csr_matrix(adj_matrix.cpu().numpy())
-    adata.obsp['spatial_connectivities'] = sparse_adj
+    # Store edge index
+    adata.uns['X'] = inference_data['X'].cpu()
+    adata.uns['X_hat'] = inference_data['X_hat'].cpu()
+    adata.uns['edge_index'] = inference_data['edge_index'].cpu()
     
     # Add H_quantized and Indices only if they exist
     if 'H_quantized' in inference_data:
