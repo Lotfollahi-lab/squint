@@ -7,7 +7,7 @@ import scipy.sparse as sp
 import torch
 
 
-def mmd_score(
+def compute_mmd_score(
         D: List[np.ndarray],
         D_hat: List[np.ndarray],
     ) -> float:
