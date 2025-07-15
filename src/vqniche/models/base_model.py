@@ -436,11 +436,10 @@ class BaseModel(pl.LightningModule):
             self,
             batch_loss_data: dict,
             batch_size: int,
-            mode: Literal['train', 'val', 'test'] = 'train',
+            mode: Literal['train', 'val'] = 'train',
         ) -> torch.Tensor:
         """
-        Compute the loss for a model for a given batch if mode is 'train' or 'val', but not if mode is 'test'.
-        Log the loss (if available) and accuracy for the current batch.
+        Compute and log the loss for a model for a given batch during training or validation.
 
         Parameters
         ----------
@@ -448,83 +447,30 @@ class BaseModel(pl.LightningModule):
             The data required to compute the loss.
         - batch_size: int
             The size of the batch.
-        - mode: Literal['train', 'val', 'test']
-            The mode of the model (train, val, test).
+        - mode: Literal['train', 'val']
+            The mode of the fit process (train, val).
 
         Returns
         -------
         - torch.Tensor
-            The computed loss for the current batch if mode is 'train' or 'val'. The computed accuracy for the current batch if mode is 'test'.
+            The computed loss for the current batch.
         """
-        if mode in ['train', 'val']:
-            loss_value = self.criterion(
-                loss_data=batch_loss_data,
-                curr_batch_size=batch_size,
-            )
-        elif mode == 'test':
-            loss_value = None
-
-        acc_value = metrics.accuracy_score(
-            unnormalized_logits=batch_loss_data['logits'],
-            one_hot_labels=batch_loss_data['labels'],
-        )
-
-        self.log_metrics(
-            loss_value=loss_value,
-            acc_value=acc_value,
+        loss_value = self.criterion(
+            loss_data=batch_loss_data,
             curr_batch_size=batch_size,
-            mode=mode,
         )
-
-        if mode in ['train', 'val']:
-            return loss_value
-        elif mode == 'test':
-            return acc_value
-
-
-    def log_metrics(
-            self,
-            loss_value: torch.Tensor = None,
-            acc_value: torch.Tensor = None,
-            curr_batch_size: int = None,
-            mode: Literal['train', 'val', 'test'] = 'train',
-        ) -> None:
-        """
-        Log total loss (if available) and accuracy for the model during training, validation, and testing.
-
-        Parameters
-        ----------
-        - loss_value: torch.Tensor
-            The computed loss.
-        - acc_value: torch.Tensor
-            The computed accuracy.
-        - curr_batch_size: int
-            The number of samples in the current batch.
-        - mode: Literal['train', 'val', 'test']
-            The mode of the model (train, val, test).
-        """
-        assert acc_value is not None, 'Accuracy value is None'
-
-        if loss_value is not None:
-            self.log(
-                name=f'{mode}_loss',
-                value=loss_value,
-                prog_bar=False,
-                on_step=False,
-                on_epoch=True,
-                batch_size=curr_batch_size,
-                sync_dist=True,
-            )
 
         self.log(
-            name=f'{mode}_acc',
-            value=acc_value,
+            name=f'{mode}_loss',
+            value=loss_value,
             prog_bar=False,
             on_step=False,
             on_epoch=True,
-            batch_size=curr_batch_size,
+            batch_size=batch_size,
             sync_dist=True,
         )
+
+        return loss_value
 
 
     def forward(
