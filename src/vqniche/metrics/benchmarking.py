@@ -3,8 +3,8 @@ Source: https://github.com/Lotfollahi-lab/nichecompass/blob/main/src/nichecompas
 
 This module contains the functionality to compute all benchmarking metrics based
 on the spatial (physical) feature space and the learned latent feature space of
-a deep generative model. The benchmark consists of metrics for spatial
-conservation, biological conservation, niche identification and batch
+a deep generative model. The benchmark consists of metrics for gene expression imputation, spatial neighborhood reconstruction, spatial
+conservation, biological conservation, niche identification, and batch
 correction.
 """
 
@@ -28,18 +28,16 @@ from .nasw import compute_nasw
 def compute_benchmarking_metrics(
         adata: AnnData,
         metrics: list=[
-                        "cas", # global spatial conservation (cell label supervised)
-                        "mlami", # global spatial conservation (unsupervised)
-                        "clisis", # local spatial conservation (cell label supervised)
-                        "gcs", # local spatial conservation (unsupervised)
+                        "mlami", # unsupervised global spatial conservation
+                        "gcs", # unsupervised local spatial conservation
                         "nasw", # niche coherence
                     ],
         cell_type_key: str="cell_type",
         batch_key: Optional[str]=None, 
         spatial_key: str="spatial",
-        latent_key: str="nichecompass_latent",
+        latent_key: str="H_adj",
         pcr_X_pre: Optional[np.array]=None,
-        n_jobs: int=1,
+        fully_connected: bool=False,
         seed: int=0
     ) -> dict:
     """
@@ -61,8 +59,9 @@ def compute_benchmarking_metrics(
     pcr_X_pre:
         The unintegrated feature space for the computation of the pcr metric.
         If None, computes PCA on the raw counts stored in `adata.X`.
-    n_jobs:
-        Number of jobs to use for parallelization of neighbor search.
+    fully_connected:
+        If True, uses a Gaussian kernel to assign low weights to nodes more distant than the k-nearest neighbors.
+        If False, uses a hard threshold to restrict the number of neighbors to `n_neighbors` using a UMAP connectivities.
     seed:
         Random seed for reproducibility.
 
@@ -73,6 +72,11 @@ def compute_benchmarking_metrics(
     """
     start_time = time.time()
 
+    benchmarking_dict = {}
+
+    # ------------------------------------------------------------------------
+    # Compute Connectivity Graphs for metrics that use them
+    # ------------------------------------------------------------------------
     # Metrics use different k's for the knn graph
     # Based on specified metrics, determine which knn graphs to compute
     n_neighbors_list = []
@@ -84,8 +88,6 @@ def compute_benchmarking_metrics(
         n_neighbors_list.append(50) # kbet-specific k
     if any(metric in ["clisis", "clisi", "blisi"] for metric in metrics):
         n_neighbors_list.append(90) # lisi-specific k
-    
-    benchmarking_dict = {}
     
     # Compute nearest neighbor graphs
     # Otherwise different metrics require different neighbor graphs and
@@ -101,9 +103,10 @@ def compute_benchmarking_metrics(
                         adata=adata,
                         feature_key=spatial_key,
                         knng_key=f"{spatial_key}_{n_neighbors}knng",
+                        fully_connected=fully_connected,
                         n_neighbors=n_neighbors,
                         random_state=seed,
-                        n_jobs=n_jobs)
+                    )
             else:
                 print(f"Using precomputed spatial nearest neighbor graph "
                       f"with {n_neighbors} neighbors...")
@@ -118,10 +121,10 @@ def compute_benchmarking_metrics(
                         adata=adata,
                         feature_key=latent_key,
                         knng_key=f"{latent_key}_{n_neighbors}knng",
+                        fully_connected=fully_connected,
                         n_neighbors=n_neighbors,
                         random_state=seed,
-                        n_jobs=n_jobs) # pynndescent has to be version 0.5.8 
-                                       # otherwise this can throw errors for some random seeds and big latents
+                    )
             else:
                 print(f"Using precomputed latent nearest neighbor graph "
                       f"with {n_neighbors} neighbors...")
@@ -132,11 +135,11 @@ def compute_benchmarking_metrics(
         print("Neighbor graphs computed. "
               f"Elapsed time: {minutes} minutes "
               f"{seconds} seconds.\n")
-            
-    # Compute benchmarking metrics
-    print("Computing benchmarking metrics...")
-    
-    # Global spatial conservation metric (cell label supervised)    
+
+    # ------------------------------------------------------------------------
+    # Global spatial conservation metrics
+    # ------------------------------------------------------------------------
+    # Supervised (cell-type label)
     if "cas" in metrics:
         print("Computing CAS metric...")
         benchmarking_dict["cas"] = compute_cas(
@@ -156,7 +159,7 @@ def compute_benchmarking_metrics(
               f"Elapsed time: {minutes} minutes "
               f"{seconds} seconds.\n")
 
-    # Global spatial conservation metric (unsupervised)
+    # Unsupervised
     if "mlami" in metrics:
         print("Computing MLAMI Metric...")
         benchmarking_dict["mlami"] = compute_mlami(
@@ -175,7 +178,10 @@ def compute_benchmarking_metrics(
               f"Elapsed time: {minutes} minutes "
               f"{seconds} seconds.\n")
     
-    # Local spatial conservation metric (cell label supervised)
+    # ------------------------------------------------------------------------
+    # Local spatial conservation metrics
+    # ------------------------------------------------------------------------
+    # Supervised (cell-type label)
     if "clisis" in metrics:
         try:
             print("Computing CLISIS metric...")
@@ -199,7 +205,7 @@ def compute_benchmarking_metrics(
             print("Could not compute CLISIS metric.")
             benchmarking_dict["clisis"] = 0.
     
-    # Local spatial conservation metric (unsupervised) 
+    # Unsupervised
     if "gcs" in metrics:
         print("Computing GCS metric...")
         benchmarking_dict["gcs"] = compute_gcs(
@@ -218,7 +224,10 @@ def compute_benchmarking_metrics(
               f"Elapsed time: {minutes} minutes "
               f"{seconds} seconds.\n")            
     
+    # ------------------------------------------------------------------------
     # Niche coherence metrics
+    # ------------------------------------------------------------------------
+    # Supervised (cell-type label)
     if "cnmi" in metrics or "cari" in metrics:
         print("Computing CNMI and CARI metrics...")
         cnmi_cari_dict = scib_metrics.nmi_ari_cluster_labels_kmeans(
@@ -237,6 +246,7 @@ def compute_benchmarking_metrics(
         if "cari" in metrics:
               benchmarking_dict["cari"] = cnmi_cari_dict["ari"]
     
+    # Supervised (cell-type label)
     if "casw" in metrics:
         print("Computing CASW Metric...")
         benchmarking_dict["casw"] = scib_metrics.silhouette_label(
@@ -250,6 +260,7 @@ def compute_benchmarking_metrics(
               f"Elapsed time: {minutes} minutes "
               f"{seconds} seconds.\n")
     
+    # Supervised (cell-type label)
     if "clisi" in metrics:
         try:
             print("Computing CLISI metric...")
@@ -267,6 +278,7 @@ def compute_benchmarking_metrics(
             print("Could not compute CLISI metric.")
             benchmarking_dict["clisi"] = 0.
         
+    # Unsupervised
     if "nasw" in metrics:
         print("Computing NASW Metric...")
         benchmarking_dict["nasw"] = compute_nasw(
@@ -282,7 +294,10 @@ def compute_benchmarking_metrics(
               f"Elapsed time: {minutes} minutes "
               f"{seconds} seconds.\n")
 
+    # ------------------------------------------------------------------------
     # Batch correction metrics
+    # ------------------------------------------------------------------------
+    # Supervised (cell-type label)
     if batch_key is not None:
         if "basw" in metrics:
             print("Computing BASW Metric...")
@@ -297,7 +312,22 @@ def compute_benchmarking_metrics(
             print("BASW metric computed. "
                   f"Elapsed time: {minutes} minutes "
                   f"{seconds} seconds.\n")
+    
+        # Supervised (cell-type label)
+        if "kbet" in metrics:
+            benchmarking_dict["kbet"] = scib_metrics.kbet_per_label(
+                X=adata.obsp[f"{latent_key}_50knng_connectivities"],
+                batches=adata.obs[batch_key],
+                labels=adata.obs[cell_type_key])
               
+            elapsed_time = time.time() - start_time
+            minutes = int(elapsed_time // 60)
+            seconds = int(elapsed_time % 60)
+            print("KBET metric computed. "
+                  f"Elapsed time: {minutes} minutes "
+                  f"{seconds} seconds.")
+
+        # Unsupervised
         if "blisi" in metrics:
             try:
                 print("Computing BLISI Metric...")
@@ -314,20 +344,8 @@ def compute_benchmarking_metrics(
             except:
                 print("Could not compute BLISI metric.")
                 benchmarking_dict["blisi"] = 0.
-              
-        if "kbet" in metrics:
-            benchmarking_dict["kbet"] = scib_metrics.kbet_per_label(
-                X=adata.obsp[f"{latent_key}_50knng_connectivities"],
-                batches=adata.obs[batch_key],
-                labels=adata.obs[cell_type_key])
-              
-            elapsed_time = time.time() - start_time
-            minutes = int(elapsed_time // 60)
-            seconds = int(elapsed_time % 60)
-            print("KBET metric computed. "
-                  f"Elapsed time: {minutes} minutes "
-                  f"{seconds} seconds.")
-            
+
+        # Unsupervised
         if "pcr" in metrics:
             # https://github.com/yoseflab/scib-metrics/blob/0.4.0/src/scib_metrics/benchmark/_core.py#L171
             if pcr_X_pre is None:
