@@ -2,6 +2,69 @@ from typing import Optional
 
 import numpy as np
 from scipy.stats import pearsonr
+from anndata import AnnData
+
+from ..utils.loss_utils import aggregate_1hop_neighbor_features
+
+
+def compute_pearson_correlation(
+        adata: AnnData,
+        X_key: str = 'X',
+        X_hat_key: str = 'X_hat',
+        nbr_key: Optional[str] = None,
+    ) -> float:
+    """
+    Compute the Pearson correlation between original and reconstructed gene expressions.
+    If nbr_key is provided, the Pearson correlation is computed between the 1-hop neighbor-wise gene expressions.
+
+    Parameters
+    ----------
+    - adata: AnnData
+        The AnnData object containing the original and reconstructed gene expressions.
+    - X_key: str
+        The key in adata.obsm where the original gene expressions are stored.
+    - X_hat_key: str
+        The key in adata.obsm where the reconstructed gene expressions are stored.
+    - nbr_key: Optional[str]
+        The key in adata.obsm where the edge index is stored.
+        If provided, the Pearson correlation is computed between the 1-hop neighbor-wise gene expressions.
+
+    Returns
+    -------
+    - pearson_correlation: float
+        The Pearson correlation between the original and reconstructed gene expressions.
+        If nbr_key is provided, the Pearson correlation is computed between the 1-hop neighbor-wise gene expressions.
+    
+    Notes
+    -----
+    - This function only supports using the same edge index for the original and reconstructed gene expressions of the 1 hop neighborhood.
+    - 
+    - Currently, this function only supports using the same edge index for the original and reconstructed gene expressions of the 1 hop neighborhood. This may need to be updated to support the original and reconstructed edge indices.
+    """
+    if nbr_key is not None:
+        X_nbr = aggregate_1hop_neighbor_features(
+                    X=adata.uns[X_key],
+                    edge_index=adata.uns[nbr_key],
+                    return_mean=True,
+                )
+        X_hat_nbr = aggregate_1hop_neighbor_features(
+                    X=adata.uns[X_hat_key],
+                    edge_index=adata.uns[nbr_key],
+                    return_mean=True,
+                )
+        return pearson_correlation(
+            X=X_nbr,
+            X_hat=X_hat_nbr,
+            compare_genes=False,
+            mean=True,
+        )
+    else:
+        return pearson_correlation(
+            X=adata.uns[X_key],
+            X_hat=adata.uns[X_hat_key],
+            compare_genes=False,
+            mean=True,
+        )
 
 
 def pearson_correlation(
@@ -11,7 +74,7 @@ def pearson_correlation(
         mean: Optional[bool] = True
     ) -> float:
     """
-    Compute the Pearson correlation between original and reconstructed cell-gene matrices.
+    Compute the Pearson correlation between original and reconstructed gene expressions.
 
     Parameters
     ----------
