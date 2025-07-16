@@ -49,6 +49,8 @@ from .accuracy_score import (
 
 # Define __all__ to specify what should be imported with "from vqniche.metrics import *"
 __all__ = [
+    # Benchmarking function
+    "compute_benchmarking_metrics",
     # MMD functions
     "compute_mmd_score",
     "degree_histogram",
@@ -59,8 +61,6 @@ __all__ = [
     "compute_nasw",
     "compute_clisis",
     "compute_cas",
-    # Benchmarking functions
-    "compute_benchmarking_metrics",
     # Attribute functions
     "pearson_correlation",
     "cosine_similarity",
