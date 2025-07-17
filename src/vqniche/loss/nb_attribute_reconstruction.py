@@ -7,7 +7,7 @@ from typing import Literal
 import torch
 import torch.nn.functional as F
 
-from ...utils.loss_utils import aggregate_1hop_neighbor_features
+from vqniche.utils.loss_utils import aggregate_1hop_neighbor_features
 
 
 def nb_attribute_reconstruction(

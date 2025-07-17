@@ -5,8 +5,8 @@ MSE adjacency reconstruction loss function.
 import torch
 import torch.nn.functional as F
 
-from ...utils.type_conversions import edge_index_to_adjacency_tensor
-from ...utils.adjacency_reconstruction import reconstruct_adjacency_matrix as construct_real_valued_adjacency_matrix
+from vqniche.utils.type_conversions import edge_index_to_adjacency_tensor
+from vqniche.utils.adjacency_reconstruction import reconstruct_adjacency_matrix as construct_real_valued_adjacency_matrix
 
 
 def mse_adjacency_reconstruction(
