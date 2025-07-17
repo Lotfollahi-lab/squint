@@ -239,7 +239,7 @@ def inference_data_dict_to_adata(
     
     # Convert one-hot labels to category labels
     for label_name in ['cell_types', 'niche_types']:
-        if label_name in inference_data:
+        if f'Y_{label_name}' in inference_data:
             if label_categories_dict is not None:
                 label_categories = list(label_categories_dict[label_name])
             else:
