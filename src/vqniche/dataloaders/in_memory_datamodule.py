@@ -274,6 +274,7 @@ class InMemoryDataModule(LightningNodeData):
                                         num_workers=self.num_workers,
                                         input_nodes=self.input_train_nodes,
                                         neighbor_sampler=train_sampler,
+                                        shuffle=False,
                                         **self.loader_params,
                                         **self.sampler_params,
                                     )
@@ -313,6 +314,7 @@ class InMemoryDataModule(LightningNodeData):
                                 num_workers=self.num_workers,
                                 input_nodes=self.input_val_nodes,
                                 neighbor_sampler=val_sampler,
+                                shuffle=False,
                                 **self.loader_params,
                                 **sampler_params,
                             )
@@ -352,6 +354,7 @@ class InMemoryDataModule(LightningNodeData):
                                 num_workers=self.num_workers,
                                 input_nodes=self.input_test_nodes,
                                 neighbor_sampler=test_sampler,
+                                shuffle=False,
                                 **self.loader_params,
                                 **sampler_params,
                             )
@@ -389,6 +392,7 @@ class InMemoryDataModule(LightningNodeData):
                                     num_workers=self.num_workers,
                                     input_nodes=None,
                                     neighbor_sampler=infer_sampler,
+                                    shuffle=False,
                                     **self.loader_params,
                                     **sampler_params,
                                 )
