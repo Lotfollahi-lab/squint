@@ -485,36 +485,43 @@ class BaseModel(pl.LightningModule):
         raise NotImplementedError('Forward pass should be implemented by the subclass')
 
 
-    def training_step(
+    def collect_inference_data(
             self,
-            train_batch: torch_geometric.data.Data,
-            batch_idx: Optional[int] = None,
-        ) -> torch.Tensor:
+            dataloader: torch.utils.data.DataLoader
+        ) -> dict:
         """
-        Training step for the model.
+        Get inference data for computing training epoch stats.
+        Child classes should override this method to provide the required data.
 
         Parameters
         ----------
-        - train_batch: torch_geometric.data.Data
-            The training batch.
-        - batch_idx: int
-            The batch index.
+        - dataloader: torch.utils.data.DataLoader
+            The dataloader to collect inference data from.
 
         Returns
         -------
-        - torch.Tensor
-            The computed loss.
+        - inference_data: dict
+            Dictionary containing inference data with keys: X, edge_index, H_latent, X_hat, H_adj
         """
-        raise NotImplementedError('Training step not implemented')
+        raise NotImplementedError('collect_inference_data should be implemented by the subclass')
 
 
-    def on_train_epoch_end(self) -> None:
+    def log_metrics(
+        self,
+    ) -> None:
         """
-        Callback function to be executed at the end of each training epoch.
+        Log metrics for a given mode. The dataloader is obtained from the trainer.datamodule depending on the mode.
 
+        Parameters
+        ----------
+        - mode: Literal['train', 'val', 'test', 'infer']
+            The mode of the fit process (train, val, test, infer).
+            
         Notes
         -----
-        - We use this hook to log embedding similarity, imputation, and codebook utilization metrics if enabled, as well as the loss term values and accuracies at the end of every training epoch.
+        - Currently, this only supports infer_dataloader(), i.e. the full graph.
+        - This method is called at the end of validation which ensures that the model is in evaluation mode.
+        TODO: fix this to work for train, val, test, and infer dataloaders
         """
         # log model evaluation metrics at the end of each training epoch if enabled
         if len(self.train_metrics_list) > 0:
@@ -522,8 +529,8 @@ class BaseModel(pl.LightningModule):
             # infer_dataloader() returns a dataloader for the entire dataset
             # child classes should implement this method
             inference_data = self.collect_inference_data(
-                                self.trainer.datamodule.infer_dataloader()
-                            )
+                self.trainer.datamodule.infer_dataloader()
+            )
 
             # convert the inference data to an AnnData object
             adata = inference_data_dict_to_adata(
@@ -548,16 +555,16 @@ class BaseModel(pl.LightningModule):
                     on_epoch=True,
                     sync_dist=True,
                 )
-        
-        # print to stdout all logged values during the training epoch
+
         metric_names = ['epoch'] + list(self.trainer.callback_metrics.keys())
         metrics_values = [self.current_epoch] + [value.item() for value in self.trainer.callback_metrics.values()]
-        print("--------------------------------")
+        print(f"-----------------Infer Dataloader Metrics-----------------")
         for metric_name, metric_value in zip(metric_names, metrics_values):
-            print(f"{metric_name}: {metric_value}")
-        print("--------------------------------\n")
+            if metric_name in self.train_metrics_list:
+                print(f"{metric_name}: {metric_value}")
+        print("----------------------------------------------------------\n")
 
-        # update the training and validation epoch metrics dataframe with metrics logged during the training epoch
+        # update the global epoch metrics dataframe with loss term values and metrics logged during the training epoch
         self.train_val_epoch_metrics = pd.concat(
             [
                 self.train_val_epoch_metrics,
@@ -569,21 +576,45 @@ class BaseModel(pl.LightningModule):
             ignore_index=True
         )
 
-        # call the parent class method to complete default behavior
-        return super().on_train_epoch_end()
 
-
-    def collect_inference_data(self) -> dict:
+    def on_train_epoch_start(self) -> None:
         """
-        Get inference data for computing training epoch stats.
-        Child classes should override this method to provide the required data.
+        Hook to be executed at the start of each epoch.
+        """
+        print(f"--------------------------------Start of Epoch {self.current_epoch}--------------------------------------")
+
+        # call the parent class method to complete default behavior
+        return super().on_train_epoch_start()
+
+
+    def training_step(
+            self,
+            train_batch: torch_geometric.data.Data,
+            batch_idx: Optional[int] = None,
+        ) -> torch.Tensor:
+        """
+        Training step for the model.
+
+        Parameters
+        ----------
+        - train_batch: torch_geometric.data.Data
+            The training batch.
+        - batch_idx: int
+            The batch index.
 
         Returns
         -------
-        - dict
-            Dictionary containing inference data with keys: X, edge_index, H_latent, X_hat, H_adj
+        - torch.Tensor
+            The computed loss.
         """
-        raise NotImplementedError('collect_inference_data should be implemented by the subclass')
+        raise NotImplementedError('Training step not implemented')
+
+
+    def on_validation_epoch_start(self) -> None:
+        """
+        Hook to be executed at the start of each validation section.
+        """
+        return super().on_validation_epoch_start()
 
 
     def validation_step(
@@ -609,6 +640,17 @@ class BaseModel(pl.LightningModule):
         raise NotImplementedError('Validation step not implemented')
 
 
+    def on_validation_epoch_end(self) -> None:
+        """
+        Hook to be executed at the end of each validation section.
+        """
+        # compute andlog metrics for the entire tissue section using the model in evaluation mode
+        self.log_metrics()
+        
+        # call the parent class method to complete default behavior
+        return super().on_validation_epoch_end()
+
+
     def test_step(
             self,
             test_batch: torch_geometric.data.Data,
@@ -631,6 +673,20 @@ class BaseModel(pl.LightningModule):
         """
         raise NotImplementedError('Test step not implemented')
     
+
+    def on_train_epoch_end(self) -> None:
+        """
+        Hook to be executed at the end of each training section.
+
+        Notes
+        -----
+        - We use this hook to log embedding similarity, imputation, and codebook utilization metrics if enabled, as well as the loss term values and accuracies at the end of every training epoch.
+        """
+        print(f"--------------------------------End of Epoch {self.current_epoch}--------------------------------------\n\n")
+
+        # call the parent class method to complete default behavior
+        return super().on_train_epoch_end()
+
 
     def on_fit_end(self) -> None:
         """
