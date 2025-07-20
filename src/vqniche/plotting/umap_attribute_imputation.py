@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import scanpy as sc
@@ -10,6 +10,7 @@ def plot_umap_attribute_imputation(
         adata: ad.AnnData,
         embedding_keys: list[str],
         label_key: str = 'cell_types',
+        save_fname: Optional[str] = None,
     ):
     """
     This function plots the UMAP embedding of original and imputed attributes colored by the label.
@@ -22,6 +23,8 @@ def plot_umap_attribute_imputation(
         Keys in adata.obsm to use for the embedding.
     label_key : str
         Key in adata.obs to use for the label.
+    save_fname : Optional[str]
+        Path to save the plot. If None, the plot is not saved.
     
     Returns
     -------
@@ -58,7 +61,14 @@ def plot_umap_attribute_imputation(
             if legend:
                 legend.set_title(label_key)
         
-    plt.show()
+    if save_fname:
+        plt.savefig(
+            fname=save_fname,
+            dpi=300,
+            bbox_inches='tight',
+        )
+    else:
+        plt.show()
     
     
 def compute_umap(
