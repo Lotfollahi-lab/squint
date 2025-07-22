@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from vqniche.utils.loss_utils import aggregate_1hop_neighbor_features
 
 
-def nb_attribute_reconstruction(
+def nb_attribute_reconstruction_loss(
         pred_attr: torch.Tensor,
         target_attr: torch.Tensor,
         edge_index: torch.Tensor,

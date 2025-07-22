@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 
-def mse_attribute_reconstruction(
+def mse_attribute_reconstruction_loss(
         pred_attr: torch.Tensor,
         target_attr: torch.Tensor,
         wt_attr_reconstr: float = 0.1

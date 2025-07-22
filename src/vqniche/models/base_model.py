@@ -11,10 +11,10 @@ from torch_geometric.nn.dense.linear import Linear
 from ..modules.mlp import MLP as MLP_AdjacencyDecoder
 from ..decoders.mlp_softmax import MLPSoftmax
 from vqniche.loss import (
-    cross_entropy,
-    mse_attribute_reconstruction,
-    nb_attribute_reconstruction,
-    mse_adjacency_reconstruction,
+    cross_entropy_loss,
+    mse_attribute_reconstruction_loss,
+    nb_attribute_reconstruction_loss,
+    mse_adjacency_reconstruction_loss,
     mse_joint_code_commit_loss,
     mse_commit_loss,
     mse_code_loss,
@@ -140,9 +140,9 @@ class BaseModel(pl.LightningModule):
             print(f"Loss function: {loss_fn_name}")
             loss_fn_params = {}
 
-            if loss_fn_name == 'cross_entropy':
+            if loss_fn_name == 'cross_entropy_loss':
                 # set the cross-entropy loss function
-                loss_fn = cross_entropy
+                loss_fn = cross_entropy_loss
 
                 # set key names for data required to compute cross-entropy loss
                 loss_fn_data_keys = ['logits', 'labels']
@@ -152,8 +152,8 @@ class BaseModel(pl.LightningModule):
                 if wt_cross_entropy is not None:
                     loss_fn_params['wt_cross_entropy'] = wt_cross_entropy
 
-            elif loss_fn_name == 'mse_attribute_reconstruction':
-                loss_fn = mse_attribute_reconstruction
+            elif loss_fn_name == 'mse_attribute_reconstruction_loss':
+                loss_fn = mse_attribute_reconstruction_loss
 
                 loss_fn_data_keys = ['pred_attr', 'target_attr']
 
@@ -161,8 +161,8 @@ class BaseModel(pl.LightningModule):
                 if wt_attr_reconstr is not None:
                     loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
 
-            elif loss_fn_name == 'nb_attribute_reconstruction':
-                loss_fn = nb_attribute_reconstruction
+            elif loss_fn_name == 'nb_attribute_reconstruction_loss':
+                loss_fn = nb_attribute_reconstruction_loss
 
                 loss_fn_data_keys = ['pred_attr', 'target_attr', 'edge_index', 'batch_size', 'dispersion']
 
@@ -174,8 +174,8 @@ class BaseModel(pl.LightningModule):
                 if wt_attr_reconstr is not None:
                     loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
 
-            elif loss_fn_name == 'mse_adjacency_reconstruction':
-                loss_fn = mse_adjacency_reconstruction
+            elif loss_fn_name == 'mse_adjacency_reconstruction_loss':
+                loss_fn = mse_adjacency_reconstruction_loss
 
                 loss_fn_data_keys = ['batch_size', 'h_adj', 'batch_edge_index']
 

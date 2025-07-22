@@ -9,7 +9,7 @@ from vqniche.utils.type_conversions import edge_index_to_adjacency_tensor
 from vqniche.utils.adjacency_reconstruction import reconstruct_adjacency_matrix as construct_real_valued_adjacency_matrix
 
 
-def mse_adjacency_reconstruction(
+def mse_adjacency_reconstruction_loss(
         batch_size: int,
         h_adj: torch.Tensor,
         batch_edge_index: torch.Tensor,

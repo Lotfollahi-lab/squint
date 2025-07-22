@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 
-def cross_entropy(
+def cross_entropy_loss(
         logits: torch.Tensor,
         labels: torch.Tensor,
         wt_cross_entropy: float = 1.0
