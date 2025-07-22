@@ -29,7 +29,7 @@ def parse_test_arguments() -> argparse.Namespace:
                         default='pearson_1hop_nbr',
                         help='Metric name to find the best checkpoint')
     parser.add_argument('--mode',
-                        type=Literal['min', 'max'],
+                        type=str,
                         default='max',
                         help='Mode to find the best checkpoint')
     parser.add_argument('--override',

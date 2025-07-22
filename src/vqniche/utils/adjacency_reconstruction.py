@@ -6,7 +6,7 @@ import torch
 def reconstruct_adjacency_matrix(
         h_index_nodes: torch.Tensor,
         h_target_nodes: Optional[torch.Tensor] = None,
-        nonlinearity: Literal['min-max', 'sigmoid', 'softmax', 'relu-clamp'] = 'min-max',
+        nonlinearity: Literal['min-max', 'sigmoid', 'softmax', 'relu-clamp'] = 'relu-clamp',
         k: Optional[int] = None,
     ) -> torch.Tensor:
     """

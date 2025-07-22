@@ -178,7 +178,7 @@ def initialize_model(
     attribute_decoder_name = config['model']['attribute_decoder_name']
     adjacency_decoder_name = config['model']['adjacency_decoder_name']
     predictor_name = config['model']['predictor_name']
-    train_log_flags = config['model']['train_log_flags']
+    train_metrics_list = config['model']['train_metrics_list']
     encoder_params = config['model']['encoder_params']
     attribute_decoder_params = config['model']['attribute_decoder_params']
     adjacency_decoder_params = config['model']['adjacency_decoder_params']
@@ -195,7 +195,7 @@ def initialize_model(
                 in_channels=in_channels,
                 out_channels=out_channels,
                 encoder_params=encoder_params,
-                train_log_flags=train_log_flags,
+                train_metrics_list=train_metrics_list,
                 attribute_decoder_params=attribute_decoder_params,
                 adjacency_decoder_params=adjacency_decoder_params,
                 optimizer_params=optimizer_params,
