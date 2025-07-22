@@ -195,7 +195,8 @@ class SetExperimentDataKeys(T.BaseTransform):
             self,
             feature_names: List[Literal['X', 'U_lm_eigvecs', 'U_deepwalk', 'U_gosh']] = ['X'],
             label_name: str = 'cell_types',
-            edge_index_name: str = 'spatial-delaunay'
+            edge_index_name: str = 'spatial-delaunay',
+            conditioning_sources: List[Literal['absolute_xy']] = []
         ):
         """
         Set data.x, data.y, and data.edge_index keys for the PyG Data object from Experiment keys.
@@ -209,6 +210,8 @@ class SetExperimentDataKeys(T.BaseTransform):
             The key for the node labels to set.
         - edge_index_name: Literal['spatial-delaunay']
             The key for the edge index to set.
+        - conditioning_sources: List[Literal['absolute_xy']]
+            The keys for the conditioning sources to set.
 
         Notes:
         -----
@@ -219,6 +222,8 @@ class SetExperimentDataKeys(T.BaseTransform):
         self.feature_names = feature_names
         self.label_name = label_name
         self.edge_index_name = edge_index_name
+        self.conditioning_sources = conditioning_sources
+
 
     def set_node_attributes(
             self,
@@ -257,6 +262,7 @@ class SetExperimentDataKeys(T.BaseTransform):
             )
         return x
 
+
     def set_node_labels(
             self,
             data: Data,
@@ -268,6 +274,7 @@ class SetExperimentDataKeys(T.BaseTransform):
             return getattr(data, f"y_{self.label_name}")
         else:
             raise ValueError(f"Label key {self.label_name} not found in data.")
+
 
     def set_edge_index(
             self,
@@ -281,6 +288,33 @@ class SetExperimentDataKeys(T.BaseTransform):
         else:
             raise ValueError(f"Edge index key {self.edge_index_name} not found in data.")
 
+
+    def set_conditioning_features(
+            self,
+            data: Data,
+        ) -> Optional[torch.Tensor]:
+        """
+        Set the conditioning features in the data object given the conditioning_sources.
+        """
+        if len(self.conditioning_sources) > 0:
+            conditioning_features = []
+            for source in self.conditioning_sources:
+                if source == 'absolute_xy':
+                    conditioning_features.append(data.xy_coordinates)
+                elif source == 'U_lm_eigvecs':
+                    conditioning_features.append(getattr(data, f"U_lm_eigvecs_{self.edge_index_name}"))
+                elif source == 'U_deepwalk':
+                    conditioning_features.append(getattr(data, f"U_deepwalk_{self.edge_index_name}"))
+                elif source == 'U_gosh':
+                    conditioning_features.append(getattr(data, f"U_gosh_{self.edge_index_name}"))
+
+            conditioning_features = torch.cat(conditioning_features, dim=-1)
+
+            return conditioning_features
+        else:
+            return None
+
+
     def forward(
             self,
             data: Data
@@ -292,6 +326,14 @@ class SetExperimentDataKeys(T.BaseTransform):
         data.y = self.set_node_labels(data)
         data.edge_index = self.set_edge_index(data)
 
+        conditioning_features = self.set_conditioning_features(data)
+        if conditioning_features is not None:
+            data.conditioning_features = conditioning_features
+            data.condition_dim = conditioning_features.shape[1]
+        else:
+            data.condition_dim = 0
+        print(f"{hasattr(data, 'conditioning_features')=}")
+        
         data.num_features = data.x.shape[1]
         data.num_classes = data.y.shape[1]
         data.num_nodes = data.x.shape[0]

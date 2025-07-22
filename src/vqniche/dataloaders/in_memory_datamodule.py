@@ -176,18 +176,27 @@ class InMemoryDataModule(LightningNodeData):
         print(f"Sample Neighbors for Inference: {self.sample_neighbors_for_inference}")
 
         # subset the data to exclude metadata such as cell-ids (strings) which cause errors
-        # Nice-To-Have: Add functionality to allow for the inclusion of metadata
         data_for_loader = Data(
-                            x=data.x,
-                            edge_index=data.edge_index,
-                            y=data.y,
-                            y_cell_types=data.y_cell_types,
-                            y_niche_types=data.y_niche_types,
-                            xy_coordinates=data.xy_coordinates,
-                            train_mask=data.train_mask,
-                            val_mask=data.val_mask,
-                            test_mask=data.test_mask,
-                        )
+            x=data.x,
+            edge_index=data.edge_index,
+            y=data.y,
+            y_cell_types=data.y_cell_types,
+            y_niche_types=data.y_niche_types,
+            xy_coordinates=data.xy_coordinates,
+            train_mask=data.train_mask,
+            val_mask=data.val_mask,
+            test_mask=data.test_mask,
+        )
+
+        # Add conditioning features if they exist
+        if hasattr(data, 'conditioning_features'):
+            data_for_loader.conditioning_features = data.conditioning_features
+            data_for_loader.condition_dim = data.condition_dim
+            print(f"Has Conditioning features: {data_for_loader.conditioning_features.shape}")
+        else:
+            print(f"No Conditioning features")
+            data_for_loader.condition_dim = 0
+
         # keep all other keys that start with 'y_'
         for key in list(data.keys()):
             if key.startswith('y_'):

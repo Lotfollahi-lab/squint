@@ -56,10 +56,15 @@ def initialize_dataset_blob(
                     )
     feature_names = config['dataset']['feature_names']
     label_name = config['dataset']['label_name']
+    conditioning_sources = config['dataset'].get(
+                            'conditioning_sources',
+                            [],
+                        )
     ExperimentDataKeys = SetExperimentDataKeys(
                             feature_names=feature_names,
                             label_name=label_name,
-                            edge_index_name=edge_index_name
+                            edge_index_name=edge_index_name,
+                            conditioning_sources=conditioning_sources
                         )
 
     # 3. train transforms: e.g. random node split, etc.
@@ -118,6 +123,7 @@ def initialize_databatch(
     # TODO: fix this hard-coding
     data_batch.num_features = int(data_batch.num_features)
     data_batch.num_classes = int(data_batch.num_classes)
+    data_batch.condition_dim = int(data_batch.condition_dim)
 
     print(f"Batch ID(s): {adata_batch_idx}")
     print(f"Data Batch: {data_batch}")
@@ -167,6 +173,7 @@ def set_model_class(
 def initialize_model(
         config: Dict,
         in_channels: int,
+        condition_dim: int,
         out_channels: int,
     ) -> pl.LightningModule:
     # set model class
@@ -193,6 +200,7 @@ def initialize_model(
                 adjacency_decoder_name=adjacency_decoder_name,
                 predictor_name=predictor_name,
                 in_channels=in_channels,
+                condition_dim=condition_dim,
                 out_channels=out_channels,
                 encoder_params=encoder_params,
                 train_metrics_list=train_metrics_list,
