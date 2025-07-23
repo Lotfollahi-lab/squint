@@ -7,17 +7,17 @@ import pytorch_lightning as pl
 
 class FiLM(pl.LightningModule):
     """
-    Feature-wise Linear Modulation (FiLM) module.
-    
-    This module applies an affine transformation to input features, where the 
-    transformation parameters (gamma for scaling, beta for shifting) are computed 
-    from conditioning inputs.
+    Feature-wise Linear Modulation (FiLM) module with optional dropout and residual connection.
     """
     def __init__(
             self,
             in_channels: int,
             condition_dim: int,
             use_bias: bool = True,
+            use_dropout: bool = False,
+            dropout_prob: float = 0.1,
+            use_residual: bool = False,
+            residual_weight: float = 1.0,
         ):
         """
         Initialize the FiLM module.
@@ -30,22 +30,30 @@ class FiLM(pl.LightningModule):
             Dimension of the conditioning input
         use_bias : bool, optional
             Whether to include a bias (beta) term in the FiLM transformation
-            Default: True
+        use_dropout : bool, optional
+            Whether to apply dropout to gamma and beta
+        dropout_prob : float, optional
+            Dropout probability (only used if use_dropout is True)
+        use_residual : bool, optional
+            Whether to add residual connection from input x
+        residual_weight : float, optional
+            Weight of the FiLM-transformed term in the residual sum
         """
         super().__init__()
         
         self.name = 'FiLM'
-        
-        # Layer to generate FiLM parameters from conditioning input
-        film_param_dim = in_channels * (2 if use_bias else 1)
-        self.param_generator = nn.Linear(
-            condition_dim,
-            film_param_dim
-        )
-        
         self.in_channels = in_channels
         self.use_bias = use_bias
+        self.use_dropout = use_dropout
+        self.use_residual = use_residual
+        self.residual_weight = residual_weight
         
+        film_param_dim = in_channels * (2 if use_bias else 1)
+        self.param_generator = nn.Linear(condition_dim, film_param_dim)
+
+        if use_dropout:
+            self.dropout = nn.Dropout(p=dropout_prob)
+
         # Initialize parameters to perform identity transformation
         nn.init.ones_(self.param_generator.weight)
         nn.init.zeros_(self.param_generator.bias)
@@ -62,31 +70,34 @@ class FiLM(pl.LightningModule):
         Parameters
         ----------
         x : torch.Tensor
-            Input features to be modulated
-            Shape: (batch_size, in_channels)
+            Input features to be modulated (N, in_channels)
         conditions : torch.Tensor
-            Conditioning inputs used to generate FiLM parameters
-            Shape: (batch_size, condition_dim)
+            Conditioning inputs (N, condition_dim)
             
         Returns
         -------
         torch.Tensor
-            FiLM-modulated features
-            Shape: (batch_size, in_channels)
+            FiLM-modulated features (N, in_channels)
         """
-        # Generate FiLM parameters
         film_params = self.param_generator(conditions)
-        
-        # Split into gamma and beta
+
         if self.use_bias:
             gamma, beta = torch.chunk(film_params, 2, dim=-1)
         else:
             gamma = film_params
             beta = None
-        
-        # Apply FiLM transformation
+
+        if self.use_dropout:
+            gamma = self.dropout(gamma)
+            if beta is not None:
+                beta = self.dropout(beta)
+
         x_conditioned = gamma * x
         if self.use_bias:
             x_conditioned = x_conditioned + beta
-            
-        return x_conditioned
+
+        if self.use_residual:
+            # Combine original and conditioned features
+            return x + self.residual_weight * x_conditioned
+        else:
+            return x_conditioned
