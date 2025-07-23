@@ -15,6 +15,7 @@ from vqniche.loss import (
     mse_attribute_reconstruction_loss,
     nb_attribute_reconstruction_loss,
     mse_adjacency_reconstruction_loss,
+    bce_adjacency_reconstruction_loss,
     mse_joint_code_commit_loss,
     mse_commit_loss,
     mse_code_loss,
@@ -176,6 +177,19 @@ class BaseModel(pl.LightningModule):
 
             elif loss_fn_name == 'mse_adjacency_reconstruction_loss':
                 loss_fn = mse_adjacency_reconstruction_loss
+
+                loss_fn_data_keys = ['batch_size', 'h_adj', 'batch_edge_index']
+
+                estimate_adj_kwargs = loss_kwargs.get('estimate_adj_kwargs')
+                if estimate_adj_kwargs is not None:
+                    loss_fn_params['estimate_adj_kwargs'] = estimate_adj_kwargs
+
+                wt_adj_reconstr = loss_kwargs.get('wt_adj_reconstr')
+                if wt_adj_reconstr is not None:
+                    loss_fn_params['wt_adj_reconstr'] = wt_adj_reconstr
+
+            elif loss_fn_name == 'bce_adjacency_reconstruction_loss':
+                loss_fn = bce_adjacency_reconstruction_loss
 
                 loss_fn_data_keys = ['batch_size', 'h_adj', 'batch_edge_index']
 
