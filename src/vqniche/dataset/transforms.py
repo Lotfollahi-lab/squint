@@ -301,10 +301,33 @@ class SetExperimentDataKeys(T.BaseTransform):
             for source in self.conditioning_sources:
                 if source == 'absolute_xy':
                     conditioning_features.append(data.xy_coordinates)
+
+                elif source == 'fourier_xy':
+                    conditioning_features.append(
+                        fourier_encode(
+                            data.xy_coordinates,
+                        )
+                    )
+
+                elif source == 'relative_xy':
+                    centroid = data.xy_coordinates.mean(dim=0, keepdim=True)
+                    rel_coords = data.xy_coordinates - centroid
+                    conditioning_features.append(rel_coords)
+
+                elif source == 'rbf_distances':
+                    # Compute distance from centroid
+                    centroid = data.xy_coordinates.mean(dim=0, keepdim=True)
+                    dists = torch.norm(data.xy_coordinates - centroid, dim=1)  # (N,)
+                    centers = torch.linspace(dists.min(), dists.max(), steps=8).to(dists.device)
+                    rbf_feats = rbf_encode(dists, centers, gamma=10.0)
+                    conditioning_features.append(rbf_feats)
+
                 elif source == 'U_lm_eigvecs':
                     conditioning_features.append(getattr(data, f"U_lm_eigvecs_{self.edge_index_name}"))
+
                 elif source == 'U_deepwalk':
                     conditioning_features.append(getattr(data, f"U_deepwalk_{self.edge_index_name}"))
+
                 elif source == 'U_gosh':
                     conditioning_features.append(getattr(data, f"U_gosh_{self.edge_index_name}"))
 
@@ -345,3 +368,27 @@ class SetExperimentDataKeys(T.BaseTransform):
                 delattr(data, key)
 
         return data
+    
+    
+def fourier_encode(coords, num_freqs=6):
+    """
+    Sinusoidal positional encoding of 2D coordinates.
+    coords: Tensor of shape (N, 2)
+    returns: (N, 4 * num_freqs)
+    """
+    freq_bands = 2 ** torch.arange(num_freqs, device=coords.device) * torch.pi
+    coords = coords.unsqueeze(-1)  # (N, 2, 1)
+    sin = torch.sin(freq_bands * coords)  # (N, 2, F)
+    cos = torch.cos(freq_bands * coords)  # (N, 2, F)
+    enc = torch.cat([sin, cos], dim=-1)   # (N, 2, 2F)
+    return enc.view(coords.size(0), -1)   # (N, 4F)
+
+def rbf_encode(distances, centers, gamma):
+    """
+    RBF encoding: Gaussian basis functions centered at given values.
+    distances: (N, )
+    centers: (R, )
+    returns: (N, R)
+    """
+    diff = distances.unsqueeze(1) - centers.view(1, -1)
+    return torch.exp(-gamma * (diff ** 2))
