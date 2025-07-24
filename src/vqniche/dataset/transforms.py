@@ -321,6 +321,9 @@ class SetExperimentDataKeys(T.BaseTransform):
                     centers = torch.linspace(dists.min(), dists.max(), steps=8).to(dists.device)
                     rbf_feats = rbf_encode(dists, centers, gamma=10.0)
                     conditioning_features.append(rbf_feats)
+                    
+                elif source == 'cell_types':
+                    conditioning_features.append(data.y)
 
                 elif source == 'U_lm_eigvecs':
                     conditioning_features.append(getattr(data, f"U_lm_eigvecs_{self.edge_index_name}"))
