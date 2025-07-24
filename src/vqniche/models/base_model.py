@@ -611,6 +611,18 @@ class BaseModel(pl.LightningModule):
                 self.trainer.datamodule.infer_dataloader()
             )
 
+            if self.model_name == 'VQNiche':
+                codebook_utilization = 1.0 * len(set(inference_data['Indices'].cpu().numpy())) / self.encoder.vq.codebook.shape[0]
+
+                self.log(
+                    name='codebook_utilization',
+                    value=codebook_utilization,
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
+
             # convert the inference data to an AnnData object
             adata = inference_data_dict_to_adata(
                 inference_data=inference_data,
