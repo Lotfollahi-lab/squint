@@ -12,7 +12,6 @@ class FiLM(pl.LightningModule):
     def __init__(
             self,
             in_channels: int,
-            condition_dim: int,
             use_bias: bool = True,
             use_dropout: bool = False,
             dropout_prob: float = 0.1,
@@ -26,8 +25,6 @@ class FiLM(pl.LightningModule):
         ----------
         in_channels : int
             Number of input channels/features to be modulated
-        condition_dim : int
-            Dimension of the conditioning input
         use_bias : bool, optional
             Whether to include a bias (beta) term in the FiLM transformation
         use_dropout : bool, optional
@@ -48,11 +45,29 @@ class FiLM(pl.LightningModule):
         self.use_residual = use_residual
         self.residual_weight = residual_weight
         
-        film_param_dim = in_channels * (2 if use_bias else 1)
-        self.param_generator = nn.Linear(condition_dim, film_param_dim)
+        self.film_param_dim = in_channels * (2 if use_bias else 1)
+        self.param_generator = None  # Will be initialized in setup()
 
         if use_dropout:
             self.dropout = nn.Dropout(p=dropout_prob)
+
+
+    def setup(
+            self,
+            condition_dim: int,
+        ) -> None:
+        """
+        Initialize the parameter generator once condition_dim is known.
+        
+        Parameters
+        ----------
+        condition_dim : int
+            Dimension of the conditioning input
+        """
+        self.param_generator = nn.Linear(
+            condition_dim,
+            self.film_param_dim,
+        ).to(self.device)
 
         # Initialize parameters to perform identity transformation
         nn.init.ones_(self.param_generator.weight)
@@ -79,6 +94,9 @@ class FiLM(pl.LightningModule):
         torch.Tensor
             FiLM-modulated features (N, in_channels)
         """
+        if self.param_generator is None:
+            self.setup(conditions.shape[-1])
+        
         film_params = self.param_generator(conditions)
 
         if self.use_bias:

@@ -355,9 +355,6 @@ class SetExperimentDataKeys(T.BaseTransform):
         conditioning_features = self.set_conditioning_features(data)
         if conditioning_features is not None:
             data.conditioning_features = conditioning_features
-            data.condition_dim = conditioning_features.shape[1]
-        else:
-            data.condition_dim = 0
         print(f"{hasattr(data, 'conditioning_features')=}")
         
         data.num_features = data.x.shape[1]

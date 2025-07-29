@@ -30,7 +30,6 @@ class VQNiche(BaseModel):
             predictor_name: Literal['Linear'] = 'Linear',
             train_metrics_list: List[str] = [],
             in_channels: int = None,
-            condition_dim: int = 0,
             out_channels: int = None,
             encoder_params: dict = {},
             attribute_decoder_params: dict = {},
@@ -56,8 +55,6 @@ class VQNiche(BaseModel):
 
         - in_channels: int
             The number of input features.
-        - condition_dim: int
-            The dimension of the conditioning features.
         - out_channels: int
             The number of output features.
 
@@ -93,7 +90,6 @@ class VQNiche(BaseModel):
         # The out_channels parameter is not passed to the VQNiche_Encoder to separate the encoder from the predictor.
         self.encoder = VQNiche_Encoder(
                             in_channels=in_channels,
-                            condition_dim=condition_dim,
                             **encoder_params
                         )
         print(f"1. VQNiche Encoder: {encoder_name} that transforms {in_channels} input features to {self.encoder.dim} quantized features.")

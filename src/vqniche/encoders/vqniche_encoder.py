@@ -14,7 +14,6 @@ class VQNiche_Encoder(pl.LightningModule):
     def __init__(
             self,
             in_channels: int = None,
-            condition_dim: int = 0,
             mlp_params: dict = {},
             gnn_name: Optional[Literal['SAGEConv', 'GATv2Conv', 'GINConv']] = None,
             gnn_params: dict = {},
@@ -28,8 +27,6 @@ class VQNiche_Encoder(pl.LightningModule):
         ----------
         - in_channels: int
             The number of input channels.
-        - condition_dim: int
-            The dimension of the conditioning features.
         - mlp_params: dict
             Keyword arguments for the MLP module.
         - gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv']
@@ -74,7 +71,6 @@ class VQNiche_Encoder(pl.LightningModule):
         # initialize the conditioning module
         self.conditioning_module = self._init_conditioning_module(
             in_channels=vq_params['dim'],
-            condition_dim=condition_dim,
             **conditioning_params,
         )
 
@@ -89,7 +85,6 @@ class VQNiche_Encoder(pl.LightningModule):
     def _init_conditioning_module(
             self,
             in_channels: int,
-            condition_dim: int,
             conditioning_module_name: Optional[Literal['FiLM']] = None,
             conditioning_kwargs: Optional[dict] = {},
         ):
@@ -100,7 +95,6 @@ class VQNiche_Encoder(pl.LightningModule):
 
         return Conditioning_Module(
             in_channels=in_channels,
-            condition_dim=condition_dim,
             **conditioning_kwargs,
         )
 

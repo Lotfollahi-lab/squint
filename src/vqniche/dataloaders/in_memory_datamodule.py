@@ -191,11 +191,9 @@ class InMemoryDataModule(LightningNodeData):
         # Add conditioning features if they exist
         if hasattr(data, 'conditioning_features'):
             data_for_loader.conditioning_features = data.conditioning_features
-            data_for_loader.condition_dim = data.condition_dim
             print(f"Has Conditioning features: {data_for_loader.conditioning_features.shape}")
         else:
             print(f"No Conditioning features")
-            data_for_loader.condition_dim = 0
 
         # keep all other keys that start with 'y_'
         for key in list(data.keys()):
