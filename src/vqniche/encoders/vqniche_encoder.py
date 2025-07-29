@@ -90,7 +90,7 @@ class VQNiche_Encoder(pl.LightningModule):
             conditioning_module_name: Optional[Literal['FiLM']] = None,
             conditioning_kwargs: Optional[dict] = {},
         ):
-        if len(condition_list) > 0:
+        if condition_list is not None:
             if conditioning_module_name == 'FiLM':
                 Conditioning_Module = FiLM
             else:

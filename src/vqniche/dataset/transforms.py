@@ -351,7 +351,7 @@ class SetExperimentDataKeys(T.BaseTransform):
         data.y = self.set_node_labels(data)
         data.edge_index = self.set_edge_index(data)
 
-        if len(self.encoder_condition_list) > 0:
+        if self.encoder_condition_list is not None:
             data.encoder_conditions = self.set_conditioning_features(
                 data=data,
                 condition_list=self.encoder_condition_list,
