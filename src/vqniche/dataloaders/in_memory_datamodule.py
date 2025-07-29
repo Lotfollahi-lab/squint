@@ -180,6 +180,7 @@ class InMemoryDataModule(LightningNodeData):
             x=data.x,
             edge_index=data.edge_index,
             y=data.y,
+            conditioning_features=data.conditioning_features,
             y_cell_types=data.y_cell_types,
             y_niche_types=data.y_niche_types,
             xy_coordinates=data.xy_coordinates,
@@ -187,13 +188,6 @@ class InMemoryDataModule(LightningNodeData):
             val_mask=data.val_mask,
             test_mask=data.test_mask,
         )
-
-        # Add conditioning features if they exist
-        if hasattr(data, 'conditioning_features'):
-            data_for_loader.conditioning_features = data.conditioning_features
-            print(f"Has Conditioning features: {data_for_loader.conditioning_features.shape}")
-        else:
-            print(f"No Conditioning features")
 
         # keep all other keys that start with 'y_'
         for key in list(data.keys()):

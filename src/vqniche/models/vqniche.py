@@ -213,28 +213,18 @@ class VQNiche(BaseModel):
         - train_loss: torch.Tensor
             The computed loss for this batch.
         """
-        # execute the forward of the VQNiche model
-        if not hasattr(train_batch, 'conditioning_features'):
-            forward_kwargs = {
-                'batch_x': train_batch.x,
-                'batch_edge_index': train_batch.edge_index,
-                'batch_xy_coordinates': train_batch.xy_coordinates,
-            }
-        else:
-            forward_kwargs = {
-                'batch_x': train_batch.x,
-                'batch_edge_index': train_batch.edge_index,
-                'batch_xy_coordinates': train_batch.xy_coordinates,
-                'batch_conditioning_features': train_batch.conditioning_features,
-            }
-
         h_latent, \
         h_quantized, \
         indices, \
         xhat_batch, \
         h_adj_batch, \
         unnormalized_logits_batch \
-            = self(**forward_kwargs)
+            = self(
+                batch_x=train_batch.x,
+                batch_edge_index=train_batch.edge_index,
+                batch_xy_coordinates=train_batch.xy_coordinates,
+                batch_conditioning_features=train_batch.conditioning_features,
+            )
 
         # prepare dictionary of data required for computing loss
         # This slicing is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the target nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of target nodes is equal to the batch size. The remaining entries of the forward output are the logits for the sampled neighbors of the target nodes.
@@ -279,20 +269,6 @@ class VQNiche(BaseModel):
         - val_loss: torch.Tensor
             The computed loss for this batch.
         """
-        if not hasattr(val_batch, 'conditioning_features'):
-            forward_kwargs = {
-                'batch_x': val_batch.x,  
-                'batch_edge_index': val_batch.edge_index,
-                'batch_xy_coordinates': val_batch.xy_coordinates,
-            }
-        else:
-            forward_kwargs = {
-                'batch_x': val_batch.x,
-                'batch_edge_index': val_batch.edge_index,
-                'batch_xy_coordinates': val_batch.xy_coordinates,
-                'batch_conditioning_features': val_batch.conditioning_features,
-            }
-
         # execute the forward of the VQNiche model
         h_latent, \
         h_quantized, \
@@ -300,7 +276,12 @@ class VQNiche(BaseModel):
         xhat_batch, \
         h_adj_batch, \
         unnormalized_logits_batch \
-            = self(**forward_kwargs)
+            = self(
+                batch_x=val_batch.x,
+                batch_edge_index=val_batch.edge_index,
+                batch_xy_coordinates=val_batch.xy_coordinates,
+                batch_conditioning_features=val_batch.conditioning_features,
+            )
 
         # prepare dictionary of data required for computing loss
         batch_size = val_batch.batch_size
@@ -344,20 +325,6 @@ class VQNiche(BaseModel):
         - test_loss: torch.Tensor
             The computed loss for this batch.
         """
-        if not hasattr(test_batch, 'conditioning_features'):
-            forward_kwargs = {
-                'batch_x': test_batch.x,
-                'batch_edge_index': test_batch.edge_index,
-                'batch_xy_coordinates': test_batch.xy_coordinates,
-            }
-        else:
-            forward_kwargs = {
-                'batch_x': test_batch.x,
-                'batch_edge_index': test_batch.edge_index,
-                'batch_xy_coordinates': test_batch.xy_coordinates,
-                'batch_conditioning_features': test_batch.conditioning_features,
-            }
-
         # execute the forward of the VQNiche model
         _, \
         _, \
@@ -365,7 +332,12 @@ class VQNiche(BaseModel):
         _, \
         _, \
         _ \
-            = self(**forward_kwargs)
+            = self(
+                batch_x=test_batch.x,
+                batch_edge_index=test_batch.edge_index,
+                batch_xy_coordinates=test_batch.xy_coordinates,
+                batch_conditioning_features=test_batch.conditioning_features,
+            )
 
         return torch.tensor(0.0)
 
@@ -402,26 +374,17 @@ class VQNiche(BaseModel):
             Y_niche_types.append(batch.y_niche_types[:batch_size])
             XY_coordinates.append(batch.xy_coordinates[:batch_size])
 
-            if not hasattr(batch, 'conditioning_features'):
-                forward_kwargs = {
-                    'batch_x': batch.x.to(self.device),
-                    'batch_edge_index': batch.edge_index.to(self.device),
-                    'batch_xy_coordinates': batch.xy_coordinates.to(self.device),
-                }
-            else:
-                forward_kwargs = {
-                    'batch_x': batch.x.to(self.device),
-                    'batch_edge_index': batch.edge_index.to(self.device),
-                    'batch_xy_coordinates': batch.xy_coordinates.to(self.device),
-                    'batch_conditioning_features': batch.conditioning_features.to(self.device),
-                }
-
             h_latent, \
             h_quantized, \
             indices, \
             xhat, \
             h_adj, \
-            logits = self(**forward_kwargs)
+            logits = self(
+                batch_x=batch.x.to(self.device),
+                batch_edge_index=batch.edge_index.to(self.device),
+                batch_xy_coordinates=batch.xy_coordinates.to(self.device),
+                batch_conditioning_features=batch.conditioning_features.to(self.device),
+            )
 
             H_latent.append(h_latent[:batch_size])
             H_quantized.append(h_quantized[:batch_size])

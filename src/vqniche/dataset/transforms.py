@@ -292,53 +292,51 @@ class SetExperimentDataKeys(T.BaseTransform):
     def set_conditioning_features(
             self,
             data: Data,
-        ) -> Optional[torch.Tensor]:
+        ) -> torch.Tensor:
         """
         Set the conditioning features in the data object given the conditioning_sources.
         """
-        if len(self.conditioning_sources) > 0:
-            conditioning_features = []
-            for source in self.conditioning_sources:
-                if source == 'absolute_xy':
-                    conditioning_features.append(data.xy_coordinates)
+        conditioning_features = []
 
-                elif source == 'fourier_xy':
-                    conditioning_features.append(
-                        fourier_encode(
-                            data.xy_coordinates,
-                        )
+        for source in self.conditioning_sources:
+            if source == 'absolute_xy':
+                conditioning_features.append(data.xy_coordinates)
+
+            elif source == 'fourier_xy':
+                conditioning_features.append(
+                    fourier_encode(
+                        data.xy_coordinates,
                     )
+                )
 
-                elif source == 'relative_xy':
-                    centroid = data.xy_coordinates.mean(dim=0, keepdim=True)
-                    rel_coords = data.xy_coordinates - centroid
-                    conditioning_features.append(rel_coords)
+            elif source == 'relative_xy':
+                centroid = data.xy_coordinates.mean(dim=0, keepdim=True)
+                rel_coords = data.xy_coordinates - centroid
+                conditioning_features.append(rel_coords)
 
-                elif source == 'rbf_distances':
-                    # Compute distance from centroid
-                    centroid = data.xy_coordinates.mean(dim=0, keepdim=True)
-                    dists = torch.norm(data.xy_coordinates - centroid, dim=1)  # (N,)
-                    centers = torch.linspace(dists.min(), dists.max(), steps=8).to(dists.device)
-                    rbf_feats = rbf_encode(dists, centers, gamma=10.0)
-                    conditioning_features.append(rbf_feats)
-                    
-                elif source == 'cell_types':
-                    conditioning_features.append(data.y)
+            elif source == 'rbf_distances':
+                # Compute distance from centroid
+                centroid = data.xy_coordinates.mean(dim=0, keepdim=True)
+                dists = torch.norm(data.xy_coordinates - centroid, dim=1)  # (N,)
+                centers = torch.linspace(dists.min(), dists.max(), steps=8).to(dists.device)
+                rbf_feats = rbf_encode(dists, centers, gamma=10.0)
+                conditioning_features.append(rbf_feats)
+                
+            elif source == 'cell_types':
+                conditioning_features.append(data.y)
 
-                elif source == 'U_lm_eigvecs':
-                    conditioning_features.append(getattr(data, f"U_lm_eigvecs_{self.edge_index_name}"))
+            elif source == 'U_lm_eigvecs':
+                conditioning_features.append(getattr(data, f"U_lm_eigvecs_{self.edge_index_name}"))
 
-                elif source == 'U_deepwalk':
-                    conditioning_features.append(getattr(data, f"U_deepwalk_{self.edge_index_name}"))
+            elif source == 'U_deepwalk':
+                conditioning_features.append(getattr(data, f"U_deepwalk_{self.edge_index_name}"))
 
-                elif source == 'U_gosh':
-                    conditioning_features.append(getattr(data, f"U_gosh_{self.edge_index_name}"))
+            elif source == 'U_gosh':
+                conditioning_features.append(getattr(data, f"U_gosh_{self.edge_index_name}"))
 
-            conditioning_features = torch.cat(conditioning_features, dim=-1)
+        conditioning_features = torch.cat(conditioning_features, dim=-1)
 
-            return conditioning_features
-        else:
-            return None
+        return conditioning_features
 
 
     def forward(
@@ -352,10 +350,10 @@ class SetExperimentDataKeys(T.BaseTransform):
         data.y = self.set_node_labels(data)
         data.edge_index = self.set_edge_index(data)
 
-        conditioning_features = self.set_conditioning_features(data)
-        if conditioning_features is not None:
-            data.conditioning_features = conditioning_features
-        print(f"{hasattr(data, 'conditioning_features')=}")
+        if len(self.conditioning_sources) > 0:
+            data.conditioning_features = self.set_conditioning_features(data)
+        else:
+            data.conditioning_features = None
         
         data.num_features = data.x.shape[1]
         data.num_classes = data.y.shape[1]
