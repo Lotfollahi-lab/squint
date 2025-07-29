@@ -196,7 +196,7 @@ class SetExperimentDataKeys(T.BaseTransform):
             feature_names: List[Literal['X', 'U_lm_eigvecs', 'U_deepwalk', 'U_gosh']] = ['X'],
             label_name: str = 'cell_types',
             edge_index_name: str = 'spatial-delaunay',
-            conditioning_sources: List[Literal['absolute_xy']] = []
+            encoder_condition_list: List[str] = []
         ):
         """
         Set data.x, data.y, and data.edge_index keys for the PyG Data object from Experiment keys.
@@ -210,8 +210,8 @@ class SetExperimentDataKeys(T.BaseTransform):
             The key for the node labels to set.
         - edge_index_name: Literal['spatial-delaunay']
             The key for the edge index to set.
-        - conditioning_sources: List[Literal['absolute_xy']]
-            The keys for the conditioning sources to set.
+        - encoder_condition_list: List[str]
+            List of condition names to be used for conditioning the encoder.
 
         Notes:
         -----
@@ -222,7 +222,7 @@ class SetExperimentDataKeys(T.BaseTransform):
         self.feature_names = feature_names
         self.label_name = label_name
         self.edge_index_name = edge_index_name
-        self.conditioning_sources = conditioning_sources
+        self.encoder_condition_list = encoder_condition_list
 
 
     def set_node_attributes(
@@ -292,13 +292,14 @@ class SetExperimentDataKeys(T.BaseTransform):
     def set_conditioning_features(
             self,
             data: Data,
+            condition_list: List[str] = [],
         ) -> torch.Tensor:
         """
-        Set the conditioning features in the data object given the conditioning_sources.
+        Set the conditioning features in the data object given the a list of condition names.
         """
         conditioning_features = []
 
-        for source in self.conditioning_sources:
+        for source in condition_list:
             if source == 'absolute_xy':
                 conditioning_features.append(data.xy_coordinates)
 
@@ -350,10 +351,13 @@ class SetExperimentDataKeys(T.BaseTransform):
         data.y = self.set_node_labels(data)
         data.edge_index = self.set_edge_index(data)
 
-        if len(self.conditioning_sources) > 0:
-            data.conditioning_features = self.set_conditioning_features(data)
+        if len(self.encoder_condition_list) > 0:
+            data.encoder_conditions = self.set_conditioning_features(
+                data=data,
+                condition_list=self.encoder_condition_list,
+            )
         else:
-            data.conditioning_features = None
+            data.encoder_conditions = None
         
         data.num_features = data.x.shape[1]
         data.num_classes = data.y.shape[1]

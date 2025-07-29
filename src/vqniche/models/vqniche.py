@@ -126,7 +126,7 @@ class VQNiche(BaseModel):
             batch_x: torch.Tensor,
             batch_edge_index: torch.Tensor,
             batch_xy_coordinates: torch.Tensor,
-            batch_conditioning_features: Optional[torch.Tensor] = None,
+            batch_encoder_conditions: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         """
         Forward pass of the VQNiche model.
@@ -139,8 +139,8 @@ class VQNiche(BaseModel):
             The edge index tensor of the batch of nodes.
         - batch_xy_coordinates: torch.Tensor
             The spatial coordinates of the batch of nodes.
-        - batch_conditioning_features: torch.Tensor
-            The conditioning features of the batch of nodes.
+        - batch_encoder_conditions: torch.Tensor
+            The conditioning features for the encoder of the batch of nodes.
 
         Returns
         -------
@@ -169,7 +169,7 @@ class VQNiche(BaseModel):
             = self.encoder(
                             batch_x,
                             batch_edge_index,
-                            batch_conditioning_features,
+                            batch_encoder_conditions,
                         )
 
         if self.attribute_decoder.use_xy_coordinates:
@@ -223,7 +223,7 @@ class VQNiche(BaseModel):
                 batch_x=train_batch.x,
                 batch_edge_index=train_batch.edge_index,
                 batch_xy_coordinates=train_batch.xy_coordinates,
-                batch_conditioning_features=train_batch.conditioning_features,
+                batch_encoder_conditions=train_batch.encoder_conditions,
             )
 
         # prepare dictionary of data required for computing loss
@@ -280,7 +280,7 @@ class VQNiche(BaseModel):
                 batch_x=val_batch.x,
                 batch_edge_index=val_batch.edge_index,
                 batch_xy_coordinates=val_batch.xy_coordinates,
-                batch_conditioning_features=val_batch.conditioning_features,
+                batch_encoder_conditions=val_batch.encoder_conditions,
             )
 
         # prepare dictionary of data required for computing loss
@@ -336,7 +336,7 @@ class VQNiche(BaseModel):
                 batch_x=test_batch.x,
                 batch_edge_index=test_batch.edge_index,
                 batch_xy_coordinates=test_batch.xy_coordinates,
-                batch_conditioning_features=test_batch.conditioning_features,
+                batch_encoder_conditions=test_batch.encoder_conditions,
             )
 
         return torch.tensor(0.0)
@@ -383,7 +383,7 @@ class VQNiche(BaseModel):
                 batch_x=batch.x.to(self.device),
                 batch_edge_index=batch.edge_index.to(self.device),
                 batch_xy_coordinates=batch.xy_coordinates.to(self.device),
-                batch_conditioning_features=batch.conditioning_features.to(self.device),
+                batch_encoder_conditions=batch.encoder_conditions.to(self.device),
             )
 
             H_latent.append(h_latent[:batch_size])

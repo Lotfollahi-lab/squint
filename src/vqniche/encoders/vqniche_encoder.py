@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Literal, Optional, List
 
 import torch
 import pytorch_lightning as pl
@@ -85,18 +85,23 @@ class VQNiche_Encoder(pl.LightningModule):
     def _init_conditioning_module(
             self,
             in_channels: int,
+            condition_list: Optional[List[str]] = [],
             conditioning_module_name: Optional[Literal['FiLM']] = None,
             conditioning_kwargs: Optional[dict] = {},
         ):
-        if conditioning_module_name == 'FiLM':
-            Conditioning_Module = FiLM
+        if len(condition_list) > 0:
+            if conditioning_module_name == 'FiLM':
+                Conditioning_Module = FiLM
+            else:
+                raise ValueError(f"Conditioning module {conditioning_module_name} not found.")
+        
+            return Conditioning_Module(
+                in_channels=in_channels,
+                condition_list=condition_list,
+                **conditioning_kwargs,
+            )
         else:
             return None
-
-        return Conditioning_Module(
-            in_channels=in_channels,
-            **conditioning_kwargs,
-        )
 
 
     def _init_vq_module(
@@ -117,7 +122,7 @@ class VQNiche_Encoder(pl.LightningModule):
             self,
             batch_x: torch.Tensor,
             batch_edge_index: torch.Tensor,
-            batch_conditioning_features: Optional[torch.Tensor] = None,
+            batch_encoder_conditions: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         """
         Forward pass of the VQGraph_Encoder model.
@@ -128,8 +133,8 @@ class VQNiche_Encoder(pl.LightningModule):
             The input features of the batch of nodes.
         - batch_edge_index: torch.Tensor
             The edge index tensor of the batch of nodes.
-        - batch_conditioning_features: Optional[torch.Tensor]
-            The conditioning features of the batch of nodes.
+        - batch_encoder_conditions: Optional[torch.Tensor]
+            The conditioning features for the encoder of the batch of nodes.
 
         Returns
         -------
@@ -156,10 +161,10 @@ class VQNiche_Encoder(pl.LightningModule):
             h_latent = h_mlp
 
         # forward pass of the conditioning module
-        if self.conditioning_module is not None and batch_conditioning_features is not None:
+        if self.conditioning_module is not None:
             h_latent = self.conditioning_module(
-                h_latent,
-                batch_conditioning_features
+                x=h_latent,
+                conditions=batch_encoder_conditions,
             )
 
         # VQ-encode the node embeddings

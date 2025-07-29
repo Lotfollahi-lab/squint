@@ -56,15 +56,20 @@ def initialize_dataset_blob(
                     )
     feature_names = config['dataset']['feature_names']
     label_name = config['dataset']['label_name']
-    conditioning_sources = config['dataset'].get(
-                            'conditioning_sources',
-                            [],
-                        )
+    
+    encoder_condition_list = config['model']['encoder_params'].get(
+                                'conditioning_params',
+                                {},
+                            ).get(
+                                'condition_list',
+                                [],
+                            )
+    
     ExperimentDataKeys = SetExperimentDataKeys(
                             feature_names=feature_names,
                             label_name=label_name,
                             edge_index_name=edge_index_name,
-                            conditioning_sources=conditioning_sources
+                            encoder_condition_list=encoder_condition_list,
                         )
 
     # 3. train transforms: e.g. random node split, etc.
