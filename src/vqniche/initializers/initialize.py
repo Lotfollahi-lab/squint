@@ -62,7 +62,7 @@ def initialize_dataset_blob(
                                 {},
                             ).get(
                                 'condition_list',
-                                [],
+                                None,
                             )
     
     ExperimentDataKeys = SetExperimentDataKeys(

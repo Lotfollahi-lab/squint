@@ -196,7 +196,7 @@ class SetExperimentDataKeys(T.BaseTransform):
             feature_names: List[Literal['X', 'U_lm_eigvecs', 'U_deepwalk', 'U_gosh']] = ['X'],
             label_name: str = 'cell_types',
             edge_index_name: str = 'spatial-delaunay',
-            encoder_condition_list: List[str] = []
+            encoder_condition_list: Optional[List[str]] = None
         ):
         """
         Set data.x, data.y, and data.edge_index keys for the PyG Data object from Experiment keys.
