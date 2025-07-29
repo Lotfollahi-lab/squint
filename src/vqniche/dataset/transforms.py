@@ -356,8 +356,10 @@ class SetExperimentDataKeys(T.BaseTransform):
                 data=data,
                 condition_list=self.encoder_condition_list,
             )
+            data.encoder_condition_dim = data.encoder_conditions.shape[1]
         else:
             data.encoder_conditions = None
+            data.encoder_condition_dim = 0
         
         data.num_features = data.x.shape[1]
         data.num_classes = data.y.shape[1]

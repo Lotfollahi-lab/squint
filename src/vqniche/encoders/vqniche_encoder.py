@@ -85,6 +85,7 @@ class VQNiche_Encoder(pl.LightningModule):
     def _init_conditioning_module(
             self,
             in_channels: int,
+            condition_dim: int,
             condition_list: Optional[List[str]] = [],
             conditioning_module_name: Optional[Literal['FiLM']] = None,
             conditioning_kwargs: Optional[dict] = {},
@@ -97,6 +98,7 @@ class VQNiche_Encoder(pl.LightningModule):
         
             return Conditioning_Module(
                 in_channels=in_channels,
+                condition_dim=condition_dim,
                 condition_list=condition_list,
                 **conditioning_kwargs,
             )

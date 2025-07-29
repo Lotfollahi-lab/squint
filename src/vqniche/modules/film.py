@@ -12,6 +12,7 @@ class FiLM(pl.LightningModule):
     def __init__(
             self,
             in_channels: int,
+            condition_dim: int,
             condition_list: List[str] = [],
             use_bias: bool = True,
             use_dropout: bool = False,
@@ -26,6 +27,8 @@ class FiLM(pl.LightningModule):
         ----------
         in_channels : int
             Number of input channels/features to be modulated
+        condition_dim : int
+            Dimension of the conditioning input
         condition_list : List[str], optional
             List of condition names to be used for conditioning
         use_bias : bool, optional
@@ -43,6 +46,7 @@ class FiLM(pl.LightningModule):
         
         self.name = 'FiLM'
         self.in_channels = in_channels
+        self.condition_dim = condition_dim
         self.condition_list = condition_list
         self.use_bias = use_bias
         self.use_dropout = use_dropout
@@ -50,32 +54,17 @@ class FiLM(pl.LightningModule):
         self.residual_weight = residual_weight
         
         self.film_param_dim = in_channels * (2 if use_bias else 1)
-        self.param_generator = None  # Will be initialized in setup()
-
-        if use_dropout:
-            self.dropout = nn.Dropout(p=dropout_prob)
-
-
-    def setup(
-            self,
-            condition_dim: int,
-        ) -> None:
-        """
-        Initialize the parameter generator once condition_dim is known.
-        
-        Parameters
-        ----------
-        condition_dim : int
-            Dimension of the conditioning input
-        """
         self.param_generator = nn.Linear(
-            condition_dim,
+            self.condition_dim,
             self.film_param_dim,
-        ).to(self.device)
+        )
 
         # Initialize parameters to perform identity transformation
         nn.init.ones_(self.param_generator.weight)
         nn.init.zeros_(self.param_generator.bias)
+
+        if use_dropout:
+            self.dropout = nn.Dropout(p=dropout_prob)
 
 
     def forward(
@@ -98,9 +87,6 @@ class FiLM(pl.LightningModule):
         torch.Tensor
             FiLM-modulated features (N, in_channels)
         """
-        if self.param_generator is None:
-            self.setup(conditions.shape[-1])
-        
         film_params = self.param_generator(conditions)
 
         if self.use_bias:

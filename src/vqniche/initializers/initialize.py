@@ -128,6 +128,7 @@ def initialize_databatch(
     # TODO: fix this hard-coding
     data_batch.num_features = int(data_batch.num_features)
     data_batch.num_classes = int(data_batch.num_classes)
+    data_batch.encoder_condition_dim = int(data_batch.encoder_condition_dim)
 
     print(f"Batch ID(s): {adata_batch_idx}")
     print(f"Data Batch: {data_batch}")
