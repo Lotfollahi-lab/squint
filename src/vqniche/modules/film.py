@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, List
 
 import torch
 import torch.nn as nn
@@ -12,6 +12,7 @@ class FiLM(pl.LightningModule):
     def __init__(
             self,
             in_channels: int,
+            condition_list: List[str] = [],
             use_bias: bool = True,
             use_dropout: bool = False,
             dropout_prob: float = 0.1,
@@ -25,6 +26,8 @@ class FiLM(pl.LightningModule):
         ----------
         in_channels : int
             Number of input channels/features to be modulated
+        condition_list : List[str], optional
+            List of condition names to be used for conditioning
         use_bias : bool, optional
             Whether to include a bias (beta) term in the FiLM transformation
         use_dropout : bool, optional
@@ -40,6 +43,7 @@ class FiLM(pl.LightningModule):
         
         self.name = 'FiLM'
         self.in_channels = in_channels
+        self.condition_list = condition_list
         self.use_bias = use_bias
         self.use_dropout = use_dropout
         self.use_residual = use_residual
