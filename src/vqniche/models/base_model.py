@@ -192,6 +192,14 @@ class BaseModel(pl.LightningModule):
                 loss_fn = bce_adjacency_reconstruction_loss
 
                 loss_fn_data_keys = ['batch_size', 'h_adj', 'batch_edge_index']
+                
+                edge_sampling_ratio = loss_kwargs.get('edge_sampling_ratio')
+                if edge_sampling_ratio is not None:
+                    loss_fn_params['edge_sampling_ratio'] = edge_sampling_ratio
+
+                use_pos_weight = loss_kwargs.get('use_pos_weight')
+                if use_pos_weight is not None:
+                    loss_fn_params['use_pos_weight'] = use_pos_weight
 
                 estimate_adj_kwargs = loss_kwargs.get('estimate_adj_kwargs')
                 if estimate_adj_kwargs is not None:
