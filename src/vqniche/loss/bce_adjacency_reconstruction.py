@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+from torch_geometric.utils import negative_sampling
 
 from vqniche.utils.type_conversions import edge_index_to_adjacency_tensor
 from vqniche.utils.adjacency_reconstruction import reconstruct_adjacency_matrix as construct_real_valued_adjacency_matrix
@@ -90,7 +91,48 @@ def bce_adjacency_reconstruction_loss(
             pos_weight = None
         
     else:
-        raise NotImplementedError("Sampling is not implemented yet.")
+        # number of positive edges in the total number of edges in the induced subgraph of the batch
+        # batch_edge_index is a tensor of shape (2, num_edges_in_batch)
+        n_pos_edges = batch_edge_index.shape[1]
+        
+        # sample negative edges
+        # batch_non_edge_index is a tensor of shape approximately (2, n_pos_edges * edge_sampling_ratio)
+        # method is a memory/runtime trade-off. `sparse` will use less memory but is slower. `dense` will use more memory but is faster.
+        # force_undirected is used to ensure that the negative edges are undirected
+        batch_non_edge_index = negative_sampling(
+            edge_index=batch_edge_index,
+            num_neg_samples=int(n_pos_edges * edge_sampling_ratio),
+            method='sparse',
+            force_undirected=True,
+        )
+        # this sets the exact number of sampled negative edges
+        n_neg_edges = batch_non_edge_index.shape[1]
+        
+        edge_non_edge_index = torch.cat(
+            [batch_edge_index, batch_non_edge_index],
+            dim=1
+        )
+        
+        # adj_batch is a tensor of shape (n_pos_edges + n_neg_edges)
+        adj_batch = torch.cat([
+            torch.ones(n_pos_edges),
+            torch.zeros(n_neg_edges),
+        ]).to(h_adj.device)
+        
+        # construct a quantized real-valued adjacency matrix from the decoded node-wise vectors
+        adj_quantized = F.cosine_similarity(
+            x1=h_adj[edge_non_edge_index[0]],
+            x2=h_adj[edge_non_edge_index[1]],
+            dim=1
+        ).to(h_adj.device)
+
+        # compute the positive weight for the BCE loss
+        # this is the ratio of negative to positive edges in the batch
+        # we use this to balance the BCE loss so that the model learns to predict the correct number of positive edges
+        if use_pos_weight:
+            pos_weight = torch.tensor(n_neg_edges / n_pos_edges).to(h_adj.device)
+        else:
+            pos_weight = None
 
     # compute the mean root squared error between the quantized adjacency matrix and the original adjacency matrix
     bce_adj_reconstr_loss = F.binary_cross_entropy_with_logits(
