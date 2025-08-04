@@ -56,10 +56,20 @@ def initialize_dataset_blob(
                     )
     feature_names = config['dataset']['feature_names']
     label_name = config['dataset']['label_name']
+    
+    encoder_condition_list = config['model']['encoder_params'].get(
+                                'conditioning_params',
+                                {},
+                            ).get(
+                                'condition_list',
+                                None,
+                            )
+    
     ExperimentDataKeys = SetExperimentDataKeys(
                             feature_names=feature_names,
                             label_name=label_name,
-                            edge_index_name=edge_index_name
+                            edge_index_name=edge_index_name,
+                            encoder_condition_list=encoder_condition_list,
                         )
 
     # 3. train transforms: e.g. random node split, etc.
@@ -118,6 +128,7 @@ def initialize_databatch(
     # TODO: fix this hard-coding
     data_batch.num_features = int(data_batch.num_features)
     data_batch.num_classes = int(data_batch.num_classes)
+    data_batch.encoder_condition_dim = int(data_batch.encoder_condition_dim)
 
     print(f"Batch ID(s): {adata_batch_idx}")
     print(f"Data Batch: {data_batch}")

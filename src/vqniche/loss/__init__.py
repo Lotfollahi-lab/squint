@@ -9,6 +9,7 @@ from .cross_entropy import cross_entropy_loss
 from .mse_attribute_reconstruction import mse_attribute_reconstruction_loss
 from .nb_attribute_reconstruction import nb_attribute_reconstruction_loss
 from .mse_adjacency_reconstruction import mse_adjacency_reconstruction_loss
+from .bce_adjacency_reconstruction import bce_adjacency_reconstruction_loss
 from .codebook_losses import (
     mse_commit_loss,
     mse_code_loss
@@ -24,6 +25,7 @@ __all__ = [
     "mse_attribute_reconstruction_loss", 
     "nb_attribute_reconstruction_loss",
     "mse_adjacency_reconstruction_loss",
+    "bce_adjacency_reconstruction_loss",
     "mse_commit_loss",
     "mse_code_loss",
     "mse_joint_code_commit_loss",

@@ -195,7 +195,8 @@ class SetExperimentDataKeys(T.BaseTransform):
             self,
             feature_names: List[Literal['X', 'U_lm_eigvecs', 'U_deepwalk', 'U_gosh']] = ['X'],
             label_name: str = 'cell_types',
-            edge_index_name: str = 'spatial-delaunay'
+            edge_index_name: str = 'spatial-delaunay',
+            encoder_condition_list: Optional[List[str]] = None
         ):
         """
         Set data.x, data.y, and data.edge_index keys for the PyG Data object from Experiment keys.
@@ -209,6 +210,8 @@ class SetExperimentDataKeys(T.BaseTransform):
             The key for the node labels to set.
         - edge_index_name: Literal['spatial-delaunay']
             The key for the edge index to set.
+        - encoder_condition_list: List[str]
+            List of condition names to be used for conditioning the encoder.
 
         Notes:
         -----
@@ -219,6 +222,8 @@ class SetExperimentDataKeys(T.BaseTransform):
         self.feature_names = feature_names
         self.label_name = label_name
         self.edge_index_name = edge_index_name
+        self.encoder_condition_list = encoder_condition_list
+
 
     def set_node_attributes(
             self,
@@ -257,6 +262,7 @@ class SetExperimentDataKeys(T.BaseTransform):
             )
         return x
 
+
     def set_node_labels(
             self,
             data: Data,
@@ -268,6 +274,7 @@ class SetExperimentDataKeys(T.BaseTransform):
             return getattr(data, f"y_{self.label_name}")
         else:
             raise ValueError(f"Label key {self.label_name} not found in data.")
+
 
     def set_edge_index(
             self,
@@ -281,6 +288,58 @@ class SetExperimentDataKeys(T.BaseTransform):
         else:
             raise ValueError(f"Edge index key {self.edge_index_name} not found in data.")
 
+
+    def set_conditioning_features(
+            self,
+            data: Data,
+            condition_list: List[str] = [],
+        ) -> torch.Tensor:
+        """
+        Set the conditioning features in the data object given the a list of condition names.
+        """
+        conditioning_features = []
+
+        for source in condition_list:
+            if source == 'absolute_xy':
+                conditioning_features.append(data.xy_coordinates)
+
+            elif source == 'fourier_xy':
+                conditioning_features.append(
+                    fourier_encode(
+                        data.xy_coordinates,
+                    )
+                )
+
+            elif source == 'relative_xy':
+                centroid = data.xy_coordinates.mean(dim=0, keepdim=True)
+                rel_coords = data.xy_coordinates - centroid
+                conditioning_features.append(rel_coords)
+
+            elif source == 'rbf_distances':
+                # Compute distance from centroid
+                centroid = data.xy_coordinates.mean(dim=0, keepdim=True)
+                dists = torch.norm(data.xy_coordinates - centroid, dim=1)  # (N,)
+                centers = torch.linspace(dists.min(), dists.max(), steps=8).to(dists.device)
+                rbf_feats = rbf_encode(dists, centers, gamma=10.0)
+                conditioning_features.append(rbf_feats)
+                
+            elif source == 'cell_types':
+                conditioning_features.append(data.y)
+
+            elif source == 'U_lm_eigvecs':
+                conditioning_features.append(getattr(data, f"U_lm_eigvecs_{self.edge_index_name}"))
+
+            elif source == 'U_deepwalk':
+                conditioning_features.append(getattr(data, f"U_deepwalk_{self.edge_index_name}"))
+
+            elif source == 'U_gosh':
+                conditioning_features.append(getattr(data, f"U_gosh_{self.edge_index_name}"))
+
+        conditioning_features = torch.cat(conditioning_features, dim=-1)
+
+        return conditioning_features
+
+
     def forward(
             self,
             data: Data
@@ -292,6 +351,16 @@ class SetExperimentDataKeys(T.BaseTransform):
         data.y = self.set_node_labels(data)
         data.edge_index = self.set_edge_index(data)
 
+        if self.encoder_condition_list is not None:
+            data.encoder_conditions = self.set_conditioning_features(
+                data=data,
+                condition_list=self.encoder_condition_list,
+            )
+            data.encoder_condition_dim = data.encoder_conditions.shape[1]
+        else:
+            data.encoder_conditions = None
+            data.encoder_condition_dim = 0
+        
         data.num_features = data.x.shape[1]
         data.num_classes = data.y.shape[1]
         data.num_nodes = data.x.shape[0]
@@ -303,3 +372,27 @@ class SetExperimentDataKeys(T.BaseTransform):
                 delattr(data, key)
 
         return data
+    
+    
+def fourier_encode(coords, num_freqs=6):
+    """
+    Sinusoidal positional encoding of 2D coordinates.
+    coords: Tensor of shape (N, 2)
+    returns: (N, 4 * num_freqs)
+    """
+    freq_bands = 2 ** torch.arange(num_freqs, device=coords.device) * torch.pi
+    coords = coords.unsqueeze(-1)  # (N, 2, 1)
+    sin = torch.sin(freq_bands * coords)  # (N, 2, F)
+    cos = torch.cos(freq_bands * coords)  # (N, 2, F)
+    enc = torch.cat([sin, cos], dim=-1)   # (N, 2, 2F)
+    return enc.view(coords.size(0), -1)   # (N, 4F)
+
+def rbf_encode(distances, centers, gamma):
+    """
+    RBF encoding: Gaussian basis functions centered at given values.
+    distances: (N, )
+    centers: (R, )
+    returns: (N, R)
+    """
+    diff = distances.unsqueeze(1) - centers.view(1, -1)
+    return torch.exp(-gamma * (diff ** 2))

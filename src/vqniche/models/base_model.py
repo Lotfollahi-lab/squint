@@ -15,6 +15,7 @@ from vqniche.loss import (
     mse_attribute_reconstruction_loss,
     nb_attribute_reconstruction_loss,
     mse_adjacency_reconstruction_loss,
+    bce_adjacency_reconstruction_loss,
     mse_joint_code_commit_loss,
     mse_commit_loss,
     mse_code_loss,
@@ -176,6 +177,19 @@ class BaseModel(pl.LightningModule):
 
             elif loss_fn_name == 'mse_adjacency_reconstruction_loss':
                 loss_fn = mse_adjacency_reconstruction_loss
+
+                loss_fn_data_keys = ['batch_size', 'h_adj', 'batch_edge_index']
+
+                estimate_adj_kwargs = loss_kwargs.get('estimate_adj_kwargs')
+                if estimate_adj_kwargs is not None:
+                    loss_fn_params['estimate_adj_kwargs'] = estimate_adj_kwargs
+
+                wt_adj_reconstr = loss_kwargs.get('wt_adj_reconstr')
+                if wt_adj_reconstr is not None:
+                    loss_fn_params['wt_adj_reconstr'] = wt_adj_reconstr
+
+            elif loss_fn_name == 'bce_adjacency_reconstruction_loss':
+                loss_fn = bce_adjacency_reconstruction_loss
 
                 loss_fn_data_keys = ['batch_size', 'h_adj', 'batch_edge_index']
 
@@ -596,6 +610,18 @@ class BaseModel(pl.LightningModule):
             inference_data = self.collect_inference_data(
                 self.trainer.datamodule.infer_dataloader()
             )
+
+            if self.model_name == 'VQNiche':
+                codebook_utilization = 1.0 * len(set(inference_data['Indices'].cpu().numpy())) / self.encoder.vq.codebook.shape[0]
+
+                self.log(
+                    name='codebook_utilization',
+                    value=codebook_utilization,
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
 
             # convert the inference data to an AnnData object
             adata = inference_data_dict_to_adata(

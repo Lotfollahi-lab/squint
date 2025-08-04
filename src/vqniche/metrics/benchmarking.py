@@ -46,7 +46,8 @@ def compute_benchmarking_metrics(
         fully_connected: bool=False,
         nonlinearity: Literal['min-max', 'sigmoid', 'softmax', 'relu-clamp'] = 'relu-clamp',
         k: int=8,
-        seed: int=0
+        seed: int=0,
+        codebook_size: int = 5000,
     ) -> dict:
     """
     Compute all specified benchmarking metrics.
@@ -80,6 +81,9 @@ def compute_benchmarking_metrics(
     k:
         The number of top-k values to use to reconstruct a binary adjacency matrix.
         Default: 8
+    codebook_size:
+        The size of the codebook.
+        Default: 5000
     seed:
         Random seed for reproducibility.
 
@@ -91,6 +95,13 @@ def compute_benchmarking_metrics(
     start_time = time.time()
 
     benchmarking_dict = {}
+
+    # ------------------------------------------------------------------------
+    # Compute codebook metrics
+    # ------------------------------------------------------------------------
+    if "codebook_utilization" in metrics:
+        print("Computing codebook utilization...")
+        benchmarking_dict["codebook_utilization"] = 1.0 * len(set(adata.obs['Indices'].values)) / codebook_size
 
     # ------------------------------------------------------------------------
     # Compute attribute imputation metrics

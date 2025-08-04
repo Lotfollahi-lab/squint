@@ -11,7 +11,7 @@ The Predictor builds the logits for the label prediction task using the quantize
 
 The implementation is based on the paper: VQNiche: Rethinking Graph Representation Space for Bridging GNNs and MLPs.
 """
-from typing import Literal, List
+from typing import Literal, List, Optional
 
 import torch
 import torch_geometric
@@ -125,7 +125,8 @@ class VQNiche(BaseModel):
             self,
             batch_x: torch.Tensor,
             batch_edge_index: torch.Tensor,
-            batch_xy_coordinates: torch.Tensor
+            batch_xy_coordinates: torch.Tensor,
+            batch_encoder_conditions: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         """
         Forward pass of the VQNiche model.
@@ -138,6 +139,8 @@ class VQNiche(BaseModel):
             The edge index tensor of the batch of nodes.
         - batch_xy_coordinates: torch.Tensor
             The spatial coordinates of the batch of nodes.
+        - batch_encoder_conditions: torch.Tensor
+            The conditioning features for the encoder of the batch of nodes.
 
         Returns
         -------
@@ -165,7 +168,8 @@ class VQNiche(BaseModel):
         indices \
             = self.encoder(
                             batch_x,
-                            batch_edge_index
+                            batch_edge_index,
+                            batch_encoder_conditions,
                         )
 
         if self.attribute_decoder.use_xy_coordinates:
@@ -209,7 +213,8 @@ class VQNiche(BaseModel):
         - train_loss: torch.Tensor
             The computed loss for this batch.
         """
-        # execute the forward of the VQNiche model
+        train_encoder_conditions = getattr(train_batch, 'encoder_conditions', None)
+
         h_latent, \
         h_quantized, \
         indices, \
@@ -217,10 +222,11 @@ class VQNiche(BaseModel):
         h_adj_batch, \
         unnormalized_logits_batch \
             = self(
-                    train_batch.x,
-                    train_batch.edge_index,
-                    train_batch.xy_coordinates,
-                )
+                batch_x=train_batch.x,
+                batch_edge_index=train_batch.edge_index,
+                batch_xy_coordinates=train_batch.xy_coordinates,
+                batch_encoder_conditions=train_encoder_conditions,
+            )
 
         # prepare dictionary of data required for computing loss
         # This slicing is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the target nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of target nodes is equal to the batch size. The remaining entries of the forward output are the logits for the sampled neighbors of the target nodes.
@@ -266,6 +272,8 @@ class VQNiche(BaseModel):
             The computed loss for this batch.
         """
         # execute the forward of the VQNiche model
+        val_encoder_conditions = getattr(val_batch, 'encoder_conditions', None)
+
         h_latent, \
         h_quantized, \
         indices, \
@@ -273,10 +281,11 @@ class VQNiche(BaseModel):
         h_adj_batch, \
         unnormalized_logits_batch \
             = self(
-                    val_batch.x,
-                    val_batch.edge_index,
-                    val_batch.xy_coordinates,
-                )
+                batch_x=val_batch.x,
+                batch_edge_index=val_batch.edge_index,
+                batch_xy_coordinates=val_batch.xy_coordinates,
+                batch_encoder_conditions=val_encoder_conditions,
+            )
 
         # prepare dictionary of data required for computing loss
         batch_size = val_batch.batch_size
@@ -321,6 +330,8 @@ class VQNiche(BaseModel):
             The computed loss for this batch.
         """
         # execute the forward of the VQNiche model
+        test_encoder_conditions = getattr(test_batch, 'encoder_conditions', None)
+
         _, \
         _, \
         _, \
@@ -328,10 +339,11 @@ class VQNiche(BaseModel):
         _, \
         _ \
             = self(
-                    test_batch.x,
-                    test_batch.edge_index,
-                    test_batch.xy_coordinates,
-                )
+                batch_x=test_batch.x,
+                batch_edge_index=test_batch.edge_index,
+                batch_xy_coordinates=test_batch.xy_coordinates,
+                batch_encoder_conditions=test_encoder_conditions,
+            )
 
         return torch.tensor(0.0)
 
@@ -368,16 +380,22 @@ class VQNiche(BaseModel):
             Y_niche_types.append(batch.y_niche_types[:batch_size])
             XY_coordinates.append(batch.xy_coordinates[:batch_size])
 
+            if hasattr(batch, 'encoder_conditions'):
+                batch_encoder_conditions = batch.encoder_conditions.to(self.device)
+            else:
+                batch_encoder_conditions = None
+
             h_latent, \
             h_quantized, \
             indices, \
             xhat, \
             h_adj, \
             logits = self(
-                    batch.x.to(self.device),
-                    batch.edge_index.to(self.device),
-                    batch.xy_coordinates.to(self.device)
-                )
+                batch_x=batch.x.to(self.device),
+                batch_edge_index=batch.edge_index.to(self.device),
+                batch_xy_coordinates=batch.xy_coordinates.to(self.device),
+                batch_encoder_conditions=batch_encoder_conditions,
+            )
 
             H_latent.append(h_latent[:batch_size])
             H_quantized.append(h_quantized[:batch_size])

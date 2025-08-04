@@ -1,10 +1,11 @@
-from typing import Literal, Optional
+from typing import Literal, Optional, List
 
 import torch
 import pytorch_lightning as pl
 
 from ..modules.mlp import MLP as MLP_Module
 from ..modules.gnn import init_gnn_module
+from ..modules.film import FiLM
 from ..modules.vq import get_vq_class, get_valid_params
 
 
@@ -16,6 +17,7 @@ class VQNiche_Encoder(pl.LightningModule):
             mlp_params: dict = {},
             gnn_name: Optional[Literal['SAGEConv', 'GATv2Conv', 'GINConv']] = None,
             gnn_params: dict = {},
+            conditioning_params: dict = {},
             vq_params: dict = {},
         ):
         """
@@ -31,6 +33,8 @@ class VQNiche_Encoder(pl.LightningModule):
             The name of the GNN module.
         - gnn_params: dict
             Keyword arguments for the GNN module.
+        - conditioning_params: dict
+            Keyword arguments for the conditioning module.
         - vq_params: dict
             Keyword arguments for the VQ module.
         """
@@ -64,12 +68,42 @@ class VQNiche_Encoder(pl.LightningModule):
 
         assert self.mlp_layers > 0 or self.gnn_layers > 0, "Both MLP and GNN modules have 0 layers. Please set at least one of the num_layers to a positive integer."
 
+        # initialize the conditioning module
+        self.conditioning_module = self._init_conditioning_module(
+            in_channels=vq_params['dim'],
+            **conditioning_params,
+        )
+
         # initialize the vq module
         self.vq = self._init_vq_module(
                     vq_params_dict=vq_params
                     )
 
         self.dim = vq_params['dim']
+
+
+    def _init_conditioning_module(
+            self,
+            in_channels: int,
+            condition_dim: int,
+            condition_list: Optional[List[str]] = [],
+            conditioning_module_name: Optional[Literal['FiLM']] = None,
+            conditioning_kwargs: Optional[dict] = {},
+        ):
+        if condition_list is not None:
+            if conditioning_module_name == 'FiLM':
+                Conditioning_Module = FiLM
+            else:
+                raise ValueError(f"Conditioning module {conditioning_module_name} not found.")
+        
+            return Conditioning_Module(
+                in_channels=in_channels,
+                condition_dim=condition_dim,
+                condition_list=condition_list,
+                **conditioning_kwargs,
+            )
+        else:
+            return None
 
 
     def _init_vq_module(
@@ -89,7 +123,8 @@ class VQNiche_Encoder(pl.LightningModule):
     def forward(
             self,
             batch_x: torch.Tensor,
-            batch_edge_index: torch.Tensor
+            batch_edge_index: torch.Tensor,
+            batch_encoder_conditions: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         """
         Forward pass of the VQGraph_Encoder model.
@@ -100,6 +135,8 @@ class VQNiche_Encoder(pl.LightningModule):
             The input features of the batch of nodes.
         - batch_edge_index: torch.Tensor
             The edge index tensor of the batch of nodes.
+        - batch_encoder_conditions: Optional[torch.Tensor]
+            The conditioning features for the encoder of the batch of nodes.
 
         Returns
         -------
@@ -124,6 +161,13 @@ class VQNiche_Encoder(pl.LightningModule):
             )
         else:
             h_latent = h_mlp
+
+        # forward pass of the conditioning module
+        if self.conditioning_module is not None:
+            h_latent = self.conditioning_module(
+                x=h_latent,
+                conditions=batch_encoder_conditions,
+            )
 
         # VQ-encode the node embeddings
         h_quantized, \

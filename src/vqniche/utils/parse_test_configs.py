@@ -4,6 +4,7 @@ import os
 import yaml
 import argparse
 from pathlib import Path
+
 import numpy as np
 
 
@@ -32,6 +33,12 @@ def parse_test_arguments() -> argparse.Namespace:
                         type=str,
                         default='max',
                         help='Mode to find the best checkpoint')
+    parser.add_argument('--compute_metrics',
+                        action='store_true',
+                        help='Compute metrics')
+    parser.add_argument('--plot_figures',
+                        action='store_true',
+                        help='Plot figures')
     parser.add_argument('--override',
                         nargs='+',
                         help='Override parameters in the config file')
@@ -80,6 +87,8 @@ def collect_test_configs(
     # write wandb_run_directory and model_ckpt_fname to config
     config['experiment']['wandb_run_dir'] = wandb_run_dir
     config['model']['model_ckpt_fname'] = config['model']['model_ckpt_fname']
+    config['experiment']['compute_metrics'] = args.compute_metrics if args is not None else False
+    config['experiment']['plot_figures'] = args.plot_figures if args is not None else False
 
     return config
 

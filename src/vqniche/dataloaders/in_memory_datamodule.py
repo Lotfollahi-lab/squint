@@ -175,19 +175,30 @@ class InMemoryDataModule(LightningNodeData):
         self.sample_neighbors_for_inference = sample_neighbors_for_inference
         print(f"Sample Neighbors for Inference: {self.sample_neighbors_for_inference}")
 
-        # subset the data to exclude metadata such as cell-ids (strings) which cause errors
-        # Nice-To-Have: Add functionality to allow for the inclusion of metadata
-        data_for_loader = Data(
-                            x=data.x,
-                            edge_index=data.edge_index,
-                            y=data.y,
-                            y_cell_types=data.y_cell_types,
-                            y_niche_types=data.y_niche_types,
-                            xy_coordinates=data.xy_coordinates,
-                            train_mask=data.train_mask,
-                            val_mask=data.val_mask,
-                            test_mask=data.test_mask,
-                        )
+        # build the data dictionary for the loader after data transforms
+        base_data = {
+            'x': data.x,
+            'y': data.y,
+            'edge_index': data.edge_index,
+            'xy_coordinates': data.xy_coordinates,
+            'train_mask': data.train_mask,
+            'val_mask': data.val_mask,
+            'test_mask': data.test_mask,
+        }
+        
+        optional_data_keys = [
+            'y_cell_types',
+            'y_niche_types',
+            'encoder_conditions',
+        ]
+        
+        data_dict_for_loader = {
+            **base_data,
+            **{attr: getattr(data, attr) for attr in optional_data_keys if getattr(data, attr, None) is not None}
+        }
+        
+        data_for_loader = Data(**data_dict_for_loader)
+
         # keep all other keys that start with 'y_'
         for key in list(data.keys()):
             if key.startswith('y_'):
