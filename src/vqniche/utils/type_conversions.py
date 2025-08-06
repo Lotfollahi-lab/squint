@@ -272,7 +272,7 @@ def inference_data_dict_to_adata(
         adata.obsm['H_quantized'] = inference_data['H_quantized'].cpu().numpy()
     
     if 'Indices' in inference_data:
-        adata.uns['Indices'] = inference_data['Indices'].cpu().numpy()
+        adata.uns['Indices'] = inference_data['Indices']
 
     if 'codebook_size' in inference_data:
         adata.uns['codebook_size'] = inference_data['codebook_size']
