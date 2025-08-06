@@ -29,6 +29,7 @@ from .mlami import compute_mlami
 from .nasw import compute_nasw
 from .pearson_correlation import compute_pearson_correlation
 from .mmd import compute_mmd_score, degree_histogram, eigenvalues_pmf
+from .codebook_utilization import compute_codebook_utilization
 
 
 def compute_benchmarking_metrics(
@@ -101,7 +102,12 @@ def compute_benchmarking_metrics(
     # ------------------------------------------------------------------------
     if "codebook_utilization" in metrics:
         print("Computing codebook utilization...")
-        benchmarking_dict["codebook_utilization"] = 1.0 * len(set(adata.obs['Indices'].values)) / codebook_size
+        benchmarking_dict["codebook_utilization"] = compute_codebook_utilization(
+            indices=adata.uns['Indices'],
+            codebook_size=adata.uns['codebook_size'],
+            separate=adata.uns['separate'],
+            num_heads=adata.uns['num_heads'],
+        )
 
     # ------------------------------------------------------------------------
     # Compute attribute imputation metrics
