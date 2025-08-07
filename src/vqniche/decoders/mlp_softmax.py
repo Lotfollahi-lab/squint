@@ -2,15 +2,14 @@ import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 
-from ..modules.mlp import MLP as MLP_Module
+from vqniche.modules.mlp import MLP as MLP_Module
 
 
 class MLPSoftmax(pl.LightningModule):
     def __init__(
             self,
-            name: str = 'MLPSoftmax',
-            in_channels: int = None,
-            out_channels: int = None,
+            in_channels: int,
+            out_channels: int,
             mlp_params: dict = {},
         ):
         """
@@ -18,8 +17,6 @@ class MLPSoftmax(pl.LightningModule):
 
         Parameters
         ----------
-        - name: str
-            The name of the decoder.
         - in_channels: int
             The number of input channels.
         - out_channels: int
@@ -28,11 +25,13 @@ class MLPSoftmax(pl.LightningModule):
             The parameters for the MLP.
         """
         super().__init__()
-        self.name = name
+
+        # set parameters of the MLPSoftmax decoder
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.mlp_params = mlp_params
-        self.in_channels = in_channels
+
+        # initialize the MLP module
         self.mlp_module = MLP_Module(
                                 in_channels=self.in_channels,
                                 out_channels=self.out_channels,

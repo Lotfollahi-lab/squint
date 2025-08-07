@@ -95,12 +95,15 @@ class VQNiche(BaseModel):
         print(f"1. VQNiche Encoder: {encoder_name} that transforms {in_channels} input features to {self.encoder.dim} quantized features.")
 
         # Initialize the attribute decoder.
+        # the input dimension of the attribute decoder is the dimension of the quantized node embeddings.
+        # the output dimension of the attribute decoder is the dimension of the input features.
         self.attribute_decoder = self._init_attribute_decoder(
+            in_channels=self.encoder.dim,
             out_channels=in_channels,
             attribute_decoder_name=attribute_decoder_name,
             attribute_decoder_params=attribute_decoder_params,
         )
-        print(f"2. Attribute Decoder: {attribute_decoder_name} that decodes {self.encoder.dim} latent features to {in_channels} input features.")
+        print(f"2. Attribute Decoder: {attribute_decoder_name} that decodes quantized latent embeddings of dimension {self.encoder.dim} to input features of dimension {in_channels}.")
 
         # Initialize the decoder module for the adjacency matrix
         # Currently, the decoder is hard-coded to be a simple linear layer.

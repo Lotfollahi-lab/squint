@@ -322,8 +322,8 @@ class BaseModel(pl.LightningModule):
 
     def _init_attribute_decoder(
             self,
-            in_channels: int = None,
-            out_channels: int = None,
+            in_channels: int,
+            out_channels: int,
             attribute_decoder_name: Literal['MLPSoftmax'] = 'MLPSoftmax',
             attribute_decoder_params: dict = {}
         ) -> pl.LightningModule:
@@ -350,7 +350,6 @@ class BaseModel(pl.LightningModule):
             return MLPSoftmax(
                 in_channels=in_channels,
                 out_channels=out_channels,
-                name=attribute_decoder_name,
                 mlp_params=attribute_decoder_params['mlp_params'],
             )
 

@@ -92,11 +92,12 @@ class VanillaMLP(BaseModel):
 
         # Initialize the attribute decoder.
         self.attribute_decoder = self._init_attribute_decoder(
+            in_channels=self.encoder.channel_list[-1],
             out_channels=in_channels,
             attribute_decoder_name=attribute_decoder_name,
             attribute_decoder_params=attribute_decoder_params,
         )
-        print(f"2. Attribute Decoder: {attribute_decoder_name} that decodes {self.encoder.channel_list[-1]} latent features to {in_channels} input features.")
+        print(f"2. Attribute Decoder: {attribute_decoder_name} that decodes latent embeddings of dimension {self.encoder.channel_list[-1]} to input features of dimension {in_channels}.")
 
         # Initialize the adjacency decoder.
         self.adjacency_decoder = self._init_adjacency_decoder(
