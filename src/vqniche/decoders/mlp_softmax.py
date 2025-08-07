@@ -5,6 +5,7 @@ import pytorch_lightning as pl
 from vqniche.modules.mlp import MLP as MLP_Module
 
 
+
 class MLPSoftmax(pl.LightningModule):
     def __init__(
             self,
@@ -18,26 +19,26 @@ class MLPSoftmax(pl.LightningModule):
         Parameters
         ----------
         - in_channels: int
-            The number of input channels.
+            The number of input channels representing the number of dimensions of the latent embeddings from the encoder.
         - out_channels: int
-            The number of output channels.
+            The number of output channels representing the number of dimensions of the input features to be reconstructed.
+        
         - mlp_params: dict
-            The parameters for the MLP.
+            MLP-related hyperparameters such as `hidden_channels` (number of hidden channels representing the number of dimensions of the hidden features in the intermediate layers of the MLP), `dropout` (dropout rate), `act` (activation function), and `norm` (normalization function).
         """
         super().__init__()
 
         # set parameters of the MLPSoftmax decoder
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.mlp_params = mlp_params
-
-        # initialize the MLP module
+        
         self.mlp_module = MLP_Module(
-                                in_channels=self.in_channels,
-                                out_channels=self.out_channels,
-                                mlp_params=self.mlp_params,
-                            )
-
+            in_channels=in_channels,
+            out_channels=out_channels,
+            **mlp_params,
+            plain_last=True,
+        )
+        
 
     def forward(
             self,

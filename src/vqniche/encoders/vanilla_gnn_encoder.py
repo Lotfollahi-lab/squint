@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Optional
 
 import torch
 import pytorch_lightning as pl
@@ -6,13 +6,14 @@ import pytorch_lightning as pl
 from ..modules.mlp import MLP as MLP_Module
 from ..modules.gnn import init_gnn_module
 
+
 class VanillaGNN_Encoder(pl.LightningModule):
 
     def __init__(
             self,
             in_channels: int,
             gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv'] = 'SAGEConv',
-            mlp_params: dict = {},
+            mlp_params: Optional[dict] = None,
             gnn_params: dict = {},
         ):
         """
@@ -24,24 +25,33 @@ class VanillaGNN_Encoder(pl.LightningModule):
             The number of input channels.
         - gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv']
             The name of the GNN module.
-        - mlp_params: dict
+        - mlp_params: Optional[dict]
             Keyword arguments for the MLP module.
+            Default: None. If None, the MLP module will not be used.
         - gnn_params: dict
             Keyword arguments for the GNN module.
+            Default: {}. If empty, GNN module is initialized with default parameters.
         """
         super().__init__()
 
-        if mlp_params['hidden_channels'] is None:
-            gnn_in_channels = in_channels
+        # if mlp_params is not provided, the MLP module will not be used
+        if mlp_params is None:
             self.mlp_module = None
+
+            # the GNN module will use the input channels as the input channels
+            gnn_in_channels = in_channels
+
             self.mlp_layers = 0
         else:
-            gnn_in_channels = mlp_params['hidden_channels'][-1]
             self.mlp_module = MLP_Module(
                 in_channels=in_channels,
-                mlp_params=mlp_params,
+                **mlp_params,
             )
-            self.mlp_layers = len(self.mlp_module.lins)
+            
+            # the GNN module will use the output channels of the MLP module as the input channels
+            gnn_in_channels = self.mlp_module.out_channels
+            
+            self.mlp_layers = self.mlp_module.num_layers
 
         # initialize the GNN module
         self.gnn_module = init_gnn_module(

@@ -350,15 +350,16 @@ class BaseModel(pl.LightningModule):
             return MLPSoftmax(
                 in_channels=in_channels,
                 out_channels=out_channels,
-                mlp_params=attribute_decoder_params['mlp_params'],
+                **attribute_decoder_params,
             )
 
 
     def _init_adjacency_decoder(
             self,
             in_channels: int,
+            out_channels: int = 600,
             adjacency_decoder_name: Literal['MLP_AdjacencyDecoder'] = 'MLP_AdjacencyDecoder',
-            adjacency_decoder_params: dict = {}
+            mlp_params: dict = {}
         ) -> torch.nn.Module:
         """
         Initialize the adjacency decoder module.
@@ -369,8 +370,8 @@ class BaseModel(pl.LightningModule):
             The input dimension of the adjacency decoder module.
         - adjacency_decoder_name: Literal['MLP_AdjacencyDecoder']
             The name of the adjacency decoder module.
-        - adjacency_decoder_params: dict
-            The parameters for the adjacency decoder module.
+        - mlp_params: dict
+            The parameters for the MLP module.
 
         Returns
         -------
@@ -378,12 +379,10 @@ class BaseModel(pl.LightningModule):
             The adjacency decoder module.
         """
         if adjacency_decoder_name == 'MLP_AdjacencyDecoder':
-            if 'out_channels' not in adjacency_decoder_params:
-                adjacency_decoder_params['out_channels'] = in_channels
             return MLP_AdjacencyDecoder(
                 in_channels=in_channels,
-                out_channels=adjacency_decoder_params['out_channels'],
-                mlp_params=adjacency_decoder_params['mlp_params'],
+                out_channels=out_channels,
+                **mlp_params,
             )
 
 

@@ -86,7 +86,7 @@ class VanillaMLP(BaseModel):
         # Initialize an MLP module as the encoder.
         self.encoder = MLP_Encoder(
             in_channels=in_channels,
-            mlp_params=encoder_params['mlp_params'],
+            **encoder_params['mlp_params'],
         )
         print(f"1. MLP Encoder: {self.encoder.num_layers} Linear layer(s) that transform {self.encoder.channel_list[0]} input features to {self.encoder.channel_list[-1]} latent features.")
 
@@ -103,9 +103,9 @@ class VanillaMLP(BaseModel):
         self.adjacency_decoder = self._init_adjacency_decoder(
             in_channels=self.encoder.channel_list[-1],
             adjacency_decoder_name=adjacency_decoder_name,
-            adjacency_decoder_params=adjacency_decoder_params,
+            **adjacency_decoder_params,
         )
-        print(f"3. Adjacency Decoder: {adjacency_decoder_name} that decodes {self.encoder.channel_list[-1]} latent features to {self.encoder.channel_list[-1]} adjacency features.")
+        print(f"3. Adjacency Decoder: {adjacency_decoder_name} that decodes {self.adjacency_decoder.in_channels} latent features to {self.adjacency_decoder.out_channels} adjacency features.")
 
         # Initialize the predictor.
         # Currently, the predictor is hardcoded to be a simple linear layer.

@@ -111,9 +111,9 @@ class VanillaGNN(BaseModel):
         self.adjacency_decoder = self._init_adjacency_decoder(
             in_channels=self.encoder.dim,
             adjacency_decoder_name=adjacency_decoder_name,
-            adjacency_decoder_params=adjacency_decoder_params,
+            **adjacency_decoder_params,
         )
-        print(f"3. Adjacency Decoder: {adjacency_decoder_name} that decodes {self.encoder.dim} latent features to {self.encoder.dim} adjacency features.")
+        print(f"3. Adjacency Decoder: {adjacency_decoder_name} that decodes {self.adjacency_decoder.in_channels} latent features to {self.adjacency_decoder.out_channels} adjacency features.")
 
         # Initialize the predictor.
         # Currently, the predictor is hardcoded to be a simple linear layer.
