@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
@@ -45,7 +43,7 @@ class MLPSoftmax(pl.LightningModule):
     def forward(
             self,
             x: torch.Tensor,
-            read_depth: Optional[torch.Tensor] = None
+            read_depth: torch.Tensor
         ) -> torch.Tensor:
         """
         Forward pass of the decoder.
