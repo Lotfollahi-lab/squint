@@ -351,7 +351,6 @@ class BaseModel(pl.LightningModule):
                 in_channels=in_channels,
                 out_channels=out_channels,
                 name=attribute_decoder_name,
-                use_xy_coordinates=attribute_decoder_params['use_xy_coordinates'],
                 mlp_params=attribute_decoder_params['mlp_params'],
             )
 

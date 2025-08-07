@@ -172,16 +172,10 @@ class VQNiche(BaseModel):
                             batch_encoder_conditions,
                         )
 
-        if self.attribute_decoder.use_xy_coordinates:
-            xhat = self.attribute_decoder(
-                        x=torch.cat([h_quantized, batch_xy_coordinates], dim=-1),
-                        read_depth=batch_x.sum(dim=-1)
-                    )
-        else:
-            xhat = self.attribute_decoder(
-                        x=h_quantized,
-                        read_depth=batch_x.sum(dim=-1)
-                    )
+        xhat = self.attribute_decoder(
+                    x=h_quantized,
+                    read_depth=batch_x.sum(dim=-1)
+                )
 
         # decode the VQ-encoded edge embeddings to recover the adjacency matrix
         h_adj = self.adjacency_decoder(h_quantized)
