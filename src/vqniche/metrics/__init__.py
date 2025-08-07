@@ -47,6 +47,10 @@ from .accuracy_score import (
     accuracy_score,
 )
 
+from .codebook_utilization import (
+    compute_codebook_utilization,
+)
+
 # Define __all__ to specify what should be imported with "from vqniche.metrics import *"
 __all__ = [
     # Benchmarking function
@@ -66,6 +70,8 @@ __all__ = [
     "cosine_similarity",
     # Label functions
     "accuracy_score",
+    # Codebook utilization
+    "compute_codebook_utilization",
     # Utils functions
     "compute_knn_graph_connectivities_and_distances",
 ]

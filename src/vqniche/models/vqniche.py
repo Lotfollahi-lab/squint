@@ -427,4 +427,7 @@ class VQNiche(BaseModel):
             'Logits': Logits,
             'H_quantized': H_quantized,
             'Indices': Indices,
+            'codebook_size': self.encoder.vq.codebook_size,
+            'separate': self.encoder.vq.separate_codebook_per_head,
+            'num_heads': self.encoder.vq.heads,
         }
