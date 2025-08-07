@@ -3,10 +3,10 @@ from typing import Literal, Optional, List
 import torch
 import pytorch_lightning as pl
 
-from ..modules.mlp import MLP as MLP_Module
-from ..modules.gnn import init_gnn_module
-from ..modules.film import FiLM
-from ..modules.vq import get_vq_class, get_valid_params
+from vqniche.modules import MLP as MLP_Module
+from vqniche.modules import init_gnn_module
+from vqniche.modules import FiLM
+from vqniche.modules import get_vq_class, get_valid_params
 
 
 class VQNiche_Encoder(pl.LightningModule):

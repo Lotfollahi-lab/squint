@@ -8,7 +8,7 @@ import torch_geometric
 import pytorch_lightning as pl
 from torch_geometric.nn.dense.linear import Linear
 
-from ..modules.mlp import MLP as MLP_AdjacencyDecoder
+from vqniche.modules.mlp import MLP as MLP_AdjacencyDecoder
 from ..decoders.mlp_softmax import MLPSoftmax
 from vqniche.loss import (
     cross_entropy_loss,
