@@ -125,7 +125,6 @@ class VQNiche(BaseModel):
             self,
             batch_x: torch.Tensor,
             batch_edge_index: torch.Tensor,
-            batch_xy_coordinates: torch.Tensor,
             batch_encoder_conditions: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         """
@@ -137,8 +136,6 @@ class VQNiche(BaseModel):
             The input features of the batch of nodes.
         - batch_edge_index: torch.Tensor
             The edge index tensor of the batch of nodes.
-        - batch_xy_coordinates: torch.Tensor
-            The spatial coordinates of the batch of nodes.
         - batch_encoder_conditions: torch.Tensor
             The conditioning features for the encoder of the batch of nodes.
 
@@ -218,7 +215,6 @@ class VQNiche(BaseModel):
             = self(
                 batch_x=train_batch.x,
                 batch_edge_index=train_batch.edge_index,
-                batch_xy_coordinates=train_batch.xy_coordinates,
                 batch_encoder_conditions=train_encoder_conditions,
             )
 
@@ -277,7 +273,6 @@ class VQNiche(BaseModel):
             = self(
                 batch_x=val_batch.x,
                 batch_edge_index=val_batch.edge_index,
-                batch_xy_coordinates=val_batch.xy_coordinates,
                 batch_encoder_conditions=val_encoder_conditions,
             )
 
@@ -335,7 +330,6 @@ class VQNiche(BaseModel):
             = self(
                 batch_x=test_batch.x,
                 batch_edge_index=test_batch.edge_index,
-                batch_xy_coordinates=test_batch.xy_coordinates,
                 batch_encoder_conditions=test_encoder_conditions,
             )
 
@@ -387,7 +381,6 @@ class VQNiche(BaseModel):
             logits = self(
                 batch_x=batch.x.to(self.device),
                 batch_edge_index=batch.edge_index.to(self.device),
-                batch_xy_coordinates=batch.xy_coordinates.to(self.device),
                 batch_encoder_conditions=batch_encoder_conditions,
             )
 
