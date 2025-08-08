@@ -1,111 +1,84 @@
-from typing import Literal, List
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
-import pytorch_lightning as pl
 
 
-class FiLM(pl.LightningModule):
+class FiLM(nn.Module):
     """
-    Feature-wise Linear Modulation (FiLM) module with optional dropout and residual connection.
+    Feature-wise Linear Modulation (FiLM) layer with optional dropout and residual connection.
+    Supports (N, C) tensors. Optionally supports (N, C, H, W) if broadcast_spatial=True.
     """
     def __init__(
-            self,
-            in_channels: int,
-            condition_dim: int,
-            condition_list: List[str] = [],
-            use_bias: bool = True,
-            use_dropout: bool = False,
-            dropout_prob: float = 0.1,
-            use_residual: bool = False,
-            residual_weight: float = 1.0,
-        ):
-        """
-        Initialize the FiLM module.
-        
-        Parameters
-        ----------
-        in_channels : int
-            Number of input channels/features to be modulated
-        condition_dim : int
-            Dimension of the conditioning input
-        condition_list : List[str], optional
-            List of condition names to be used for conditioning
-        use_bias : bool, optional
-            Whether to include a bias (beta) term in the FiLM transformation
-        use_dropout : bool, optional
-            Whether to apply dropout to gamma and beta
-        dropout_prob : float, optional
-            Dropout probability (only used if use_dropout is True)
-        use_residual : bool, optional
-            Whether to add residual connection from input x
-        residual_weight : float, optional
-            Weight of the FiLM-transformed term in the residual sum
-        """
+        self,
+        in_channels: int,
+        condition_dim: int,
+        condition_list: Optional[List[str]] = None,
+        use_bias: bool = True,          # include beta term
+        use_dropout: bool = False,      # dropout on generated params
+        dropout_prob: float = 0.1,
+        use_residual: bool = False,     # add x + residual_weight * FiLM(x)
+        residual_weight: float = 1.0,
+        broadcast_spatial: bool = False # if True, accepts (N, C, H, W)
+    ):
         super().__init__()
-        
-        self.name = 'FiLM'
+
         self.in_channels = in_channels
         self.condition_dim = condition_dim
-        self.condition_list = condition_list
+        self.condition_list = condition_list or []
         self.use_bias = use_bias
         self.use_dropout = use_dropout
         self.use_residual = use_residual
         self.residual_weight = residual_weight
-        
-        self.film_param_dim = in_channels * (2 if use_bias else 1)
-        self.param_generator = nn.Linear(
-            self.condition_dim,
-            self.film_param_dim,
-        )
+        self.broadcast_spatial = broadcast_spatial
 
-        # Initialize parameters to perform identity transformation
-        nn.init.ones_(self.param_generator.weight)
-        nn.init.zeros_(self.param_generator.bias)
+        out_dim = in_channels * (2 if use_bias else 1)
+        self.param_generator = nn.Linear(condition_dim, out_dim)
 
-        if use_dropout:
-            self.dropout = nn.Dropout(p=dropout_prob)
+        # Proper identity initialization:
+        # Make output independent of conditions at init (weights=0),
+        # and set bias so that gamma=1, beta=0 (or gamma=1 if no beta).
+        nn.init.zeros_(self.param_generator.weight)
+        if use_bias:
+            with torch.no_grad():
+                bias = torch.zeros(out_dim)
+                bias[:in_channels] = 1.0   # gamma = 1
+                bias[in_channels:] = 0.0   # beta  = 0
+                self.param_generator.bias.copy_(bias)
+        else:
+            nn.init.ones_(self.param_generator.bias)  # gamma = 1
 
+        self.dropout = nn.Dropout(p=dropout_prob) if use_dropout else None
 
-    def forward(
-            self,
-            x: torch.Tensor,
-            conditions: torch.Tensor,
-        ) -> torch.Tensor:
-        """
-        Apply FiLM transformation to the input features.
-        
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input features to be modulated (N, in_channels)
-        conditions : torch.Tensor
-            Conditioning inputs (N, condition_dim)
-            
-        Returns
-        -------
-        torch.Tensor
-            FiLM-modulated features (N, in_channels)
-        """
-        film_params = self.param_generator(conditions)
-
+    def _split_params(self, film_params):
         if self.use_bias:
             gamma, beta = torch.chunk(film_params, 2, dim=-1)
         else:
-            gamma = film_params
-            beta = None
+            gamma, beta = film_params, None
+        return gamma, beta
 
-        if self.use_dropout:
+    def forward(self, x: torch.Tensor, conditions: torch.Tensor) -> torch.Tensor:
+        """
+        x: (N, C) or (N, C, H, W) if broadcast_spatial=True
+        conditions: (N, condition_dim)
+        """
+        film_params = self.param_generator(conditions)   # (N, C) or (N, 2C)
+        gamma, beta = self._split_params(film_params)
+
+        if self.use_dropout and self.training:
             gamma = self.dropout(gamma)
             if beta is not None:
                 beta = self.dropout(beta)
 
+        if self.broadcast_spatial:
+            # reshape to (N, C, 1, 1) to broadcast over H, W
+            shape = [x.size(0), self.in_channels] + [1] * (x.dim() - 2)
+            gamma = gamma.view(*shape)
+            if beta is not None:
+                beta = beta.view(*shape)
+
         x_conditioned = gamma * x
-        if self.use_bias:
+        if beta is not None:
             x_conditioned = x_conditioned + beta
 
-        if self.use_residual:
-            # Combine original and conditioned features
-            return x + self.residual_weight * x_conditioned
-        else:
-            return x_conditioned
+        return x + self.residual_weight * x_conditioned if self.use_residual else x_conditioned

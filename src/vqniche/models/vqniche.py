@@ -129,6 +129,8 @@ class VQNiche(BaseModel):
             batch_x: torch.Tensor,
             batch_edge_index: torch.Tensor,
             batch_encoder_conditions: Optional[torch.Tensor] = None,
+            batch_attr_decoder_conditions: Optional[torch.Tensor] = None,
+            batch_adj_decoder_conditions: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         """
         Forward pass of the VQNiche model.
@@ -141,6 +143,10 @@ class VQNiche(BaseModel):
             The edge index tensor of the batch of nodes.
         - batch_encoder_conditions: torch.Tensor
             The conditioning features for the encoder of the batch of nodes.
+        - batch_attr_decoder_conditions: torch.Tensor
+            The conditioning features for the attribute decoder of the batch of nodes.
+        - batch_adj_decoder_conditions: torch.Tensor
+            The conditioning features for the adjacency decoder of the batch of nodes.
 
         Returns
         -------
@@ -174,7 +180,8 @@ class VQNiche(BaseModel):
 
         xhat = self.attribute_decoder(
                     x=h_quantized,
-                    read_depth=batch_x.sum(dim=-1)
+                    read_depth=batch_x.sum(dim=-1),
+                    conditions=batch_attr_decoder_conditions,
                 )
 
         # decode the VQ-encoded edge embeddings to recover the adjacency matrix
@@ -208,6 +215,8 @@ class VQNiche(BaseModel):
             The computed loss for this batch.
         """
         train_encoder_conditions = getattr(train_batch, 'encoder_conditions', None)
+        train_attr_decoder_conditions = getattr(train_batch, 'attr_decoder_conditions', None)
+        train_adj_decoder_conditions = getattr(train_batch, 'adj_decoder_conditions', None)
 
         h_latent, \
         h_quantized, \
@@ -219,6 +228,8 @@ class VQNiche(BaseModel):
                 batch_x=train_batch.x,
                 batch_edge_index=train_batch.edge_index,
                 batch_encoder_conditions=train_encoder_conditions,
+                batch_attr_decoder_conditions=train_attr_decoder_conditions,
+                batch_adj_decoder_conditions=train_adj_decoder_conditions,
             )
 
         # prepare dictionary of data required for computing loss
@@ -266,6 +277,8 @@ class VQNiche(BaseModel):
         """
         # execute the forward of the VQNiche model
         val_encoder_conditions = getattr(val_batch, 'encoder_conditions', None)
+        val_attr_decoder_conditions = getattr(val_batch, 'attr_decoder_conditions', None)
+        val_adj_decoder_conditions = getattr(val_batch, 'adj_decoder_conditions', None)
 
         h_latent, \
         h_quantized, \
@@ -277,6 +290,8 @@ class VQNiche(BaseModel):
                 batch_x=val_batch.x,
                 batch_edge_index=val_batch.edge_index,
                 batch_encoder_conditions=val_encoder_conditions,
+                batch_attr_decoder_conditions=val_attr_decoder_conditions,
+                batch_adj_decoder_conditions=val_adj_decoder_conditions,
             )
 
         # prepare dictionary of data required for computing loss
@@ -323,7 +338,8 @@ class VQNiche(BaseModel):
         """
         # execute the forward of the VQNiche model
         test_encoder_conditions = getattr(test_batch, 'encoder_conditions', None)
-
+        test_attr_decoder_conditions = getattr(test_batch, 'attr_decoder_conditions', None)
+        test_adj_decoder_conditions = getattr(test_batch, 'adj_decoder_conditions', None)
         _, \
         _, \
         _, \
@@ -334,6 +350,8 @@ class VQNiche(BaseModel):
                 batch_x=test_batch.x,
                 batch_edge_index=test_batch.edge_index,
                 batch_encoder_conditions=test_encoder_conditions,
+                batch_attr_decoder_conditions=test_attr_decoder_conditions,
+                batch_adj_decoder_conditions=test_adj_decoder_conditions,
             )
 
         return torch.tensor(0.0)
@@ -376,6 +394,16 @@ class VQNiche(BaseModel):
             else:
                 batch_encoder_conditions = None
 
+            if hasattr(batch, 'attr_decoder_conditions'):
+                batch_attr_decoder_conditions = batch.attr_decoder_conditions.to(self.device)
+            else:
+                batch_attr_decoder_conditions = None
+
+            if hasattr(batch, 'adj_decoder_conditions'):
+                batch_adj_decoder_conditions = batch.adj_decoder_conditions.to(self.device)
+            else:
+                batch_adj_decoder_conditions = None
+
             h_latent, \
             h_quantized, \
             indices, \
@@ -385,6 +413,8 @@ class VQNiche(BaseModel):
                 batch_x=batch.x.to(self.device),
                 batch_edge_index=batch.edge_index.to(self.device),
                 batch_encoder_conditions=batch_encoder_conditions,
+                batch_attr_decoder_conditions=batch_attr_decoder_conditions,
+                batch_adj_decoder_conditions=batch_adj_decoder_conditions,
             )
 
             H_latent.append(h_latent[:batch_size])

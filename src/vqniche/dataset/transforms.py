@@ -196,7 +196,9 @@ class SetExperimentDataKeys(T.BaseTransform):
             feature_names: List[Literal['X', 'U_lm_eigvecs', 'U_deepwalk', 'U_gosh']] = ['X'],
             label_name: str = 'cell_types',
             edge_index_name: str = 'spatial-delaunay',
-            encoder_condition_list: Optional[List[str]] = None
+            encoder_condition_list: Optional[List[str]] = None,
+            attr_decoder_condition_list: Optional[List[str]] = None,
+            adj_decoder_condition_list: Optional[List[str]] = None,
         ):
         """
         Set data.x, data.y, and data.edge_index keys for the PyG Data object from Experiment keys.
@@ -212,6 +214,10 @@ class SetExperimentDataKeys(T.BaseTransform):
             The key for the edge index to set.
         - encoder_condition_list: List[str]
             List of condition names to be used for conditioning the encoder.
+        - attr_decoder_condition_list: List[str]
+            List of condition names to be used for conditioning the attribute decoder.
+        - adj_decoder_condition_list: List[str]
+            List of condition names to be used for conditioning the adjacency decoder.
 
         Notes:
         -----
@@ -223,6 +229,8 @@ class SetExperimentDataKeys(T.BaseTransform):
         self.label_name = label_name
         self.edge_index_name = edge_index_name
         self.encoder_condition_list = encoder_condition_list
+        self.attr_decoder_condition_list = attr_decoder_condition_list
+        self.adj_decoder_condition_list = adj_decoder_condition_list
 
 
     def set_node_attributes(
@@ -360,7 +368,27 @@ class SetExperimentDataKeys(T.BaseTransform):
         else:
             data.encoder_conditions = None
             data.encoder_condition_dim = 0
+            
+        if self.attr_decoder_condition_list is not None:
+            data.attr_decoder_conditions = self.set_conditioning_features(
+                data=data,
+                condition_list=self.attr_decoder_condition_list,
+            )
+            data.attr_decoder_condition_dim = data.attr_decoder_conditions.shape[1]
+        else:
+            data.attr_decoder_conditions = None
+            data.attr_decoder_condition_dim = 0
         
+        if self.adj_decoder_condition_list is not None:
+            data.adj_decoder_conditions = self.set_conditioning_features(
+                data=data,
+                condition_list=self.adj_decoder_condition_list,
+            )
+            data.adj_decoder_condition_dim = data.adj_decoder_conditions.shape[1]
+        else:
+            data.adj_decoder_conditions = None
+            data.adj_decoder_condition_dim = 0
+
         data.num_features = data.x.shape[1]
         data.num_classes = data.y.shape[1]
         data.num_nodes = data.x.shape[0]

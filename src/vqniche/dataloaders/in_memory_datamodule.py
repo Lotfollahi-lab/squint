@@ -190,6 +190,8 @@ class InMemoryDataModule(LightningNodeData):
             'y_cell_types',
             'y_niche_types',
             'encoder_conditions',
+            'attr_decoder_conditions',
+            'adj_decoder_conditions',
         ]
         
         data_dict_for_loader = {

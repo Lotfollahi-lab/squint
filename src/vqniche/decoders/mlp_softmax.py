@@ -1,9 +1,11 @@
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 
 from vqniche.modules.mlp import MLP as MLP_Module
-
+from vqniche.modules.film import FiLM
 
 
 class MLPSoftmax(pl.LightningModule):
@@ -12,6 +14,7 @@ class MLPSoftmax(pl.LightningModule):
             in_channels: int,
             out_channels: int,
             mlp_params: dict = {},
+            conditioning_params: dict = {},
         ):
         """
         Initialize the LinearSoftmax decoder.
@@ -39,11 +42,20 @@ class MLPSoftmax(pl.LightningModule):
             plain_last=True,
         )
         
+        if 'condition_list' in conditioning_params:
+            self.conditioning_module = FiLM(
+                in_channels=in_channels,
+                **conditioning_params,
+            )
+        else:
+            self.conditioning_module = None
+
 
     def forward(
             self,
             x: torch.Tensor,
-            read_depth: torch.Tensor
+            read_depth: torch.Tensor,
+            conditions: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         """
         Forward pass of the decoder.
@@ -56,12 +68,21 @@ class MLPSoftmax(pl.LightningModule):
         - read_depth: torch.Tensor
             The read depth tensor.
             Dimensions: (batch_size, 1)
+        - conditions: Optional[torch.Tensor]
+            The conditions tensor.
+            Dimensions: (batch_size, condition_dim)
 
         Returns:
         -------
         - torch.Tensor:
             Output of the MLP followed by a softmax and a multiplication with the read depth.
         """
+        if self.conditioning_module is not None:
+            x = self.conditioning_module(
+                    x=x,
+                    conditions=conditions,
+                )
+
         xhat = self.mlp_module(x)
         xhat = F.softmax(xhat, dim=-1)
         xhat = xhat * read_depth.unsqueeze(-1)

@@ -325,7 +325,7 @@ class BaseModel(pl.LightningModule):
             in_channels: int,
             out_channels: int,
             attribute_decoder_name: Literal['MLPSoftmax'] = 'MLPSoftmax',
-            attribute_decoder_params: dict = {}
+            attribute_decoder_params: dict = {},
         ) -> pl.LightningModule:
         """
         Initialize the attribute decoder module.
@@ -359,7 +359,7 @@ class BaseModel(pl.LightningModule):
             in_channels: int,
             out_channels: int = 600,
             adjacency_decoder_name: Literal['MLP_AdjacencyDecoder'] = 'MLP_AdjacencyDecoder',
-            mlp_params: dict = {}
+            mlp_params: dict = {},
         ) -> torch.nn.Module:
         """
         Initialize the adjacency decoder module.
@@ -372,6 +372,8 @@ class BaseModel(pl.LightningModule):
             The name of the adjacency decoder module.
         - mlp_params: dict
             The parameters for the MLP module.
+        - conditioning_params: dict
+            The parameters for the conditioning module.
 
         Returns
         -------
