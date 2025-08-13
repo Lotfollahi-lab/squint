@@ -77,10 +77,13 @@ class VQNiche_Encoder(pl.LightningModule):
         assert self.mlp_layers > 0 or self.gnn_layers > 0, "Both MLP and GNN modules have 0 layers. Please set at least one of the num_layers to a positive integer."
 
         # initialize the conditioning module
-        self.conditioning_module = self._init_conditioning_module(
-            in_channels=vq_params['dim'],
-            **conditioning_params,
-        )
+        if 'condition_list' in conditioning_params:
+            self.conditioning_module = FiLM(
+                in_channels=vq_params['dim'],
+                **conditioning_params,
+            )
+        else:
+            self.conditioning_module = None
 
         # initialize the vq module
         self.vq = self._init_vq_module(
@@ -88,30 +91,6 @@ class VQNiche_Encoder(pl.LightningModule):
                     )
 
         self.dim = vq_params['dim']
-
-
-    def _init_conditioning_module(
-            self,
-            in_channels: int,
-            condition_dim: Optional[int] = None,
-            condition_list: Optional[List[str]] = None,
-            conditioning_module_name: Optional[Literal['FiLM']] = None,
-            conditioning_kwargs: Optional[dict] = {},
-        ):
-        if condition_list is not None:
-            if conditioning_module_name == 'FiLM':
-                Conditioning_Module = FiLM
-            else:
-                raise ValueError(f"Conditioning module {conditioning_module_name} not found.")
-        
-            return Conditioning_Module(
-                in_channels=in_channels,
-                condition_dim=condition_dim,
-                condition_list=condition_list,
-                **conditioning_kwargs,
-            )
-        else:
-            return None
 
 
     def _init_vq_module(
