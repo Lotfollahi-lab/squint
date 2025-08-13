@@ -6,6 +6,7 @@ import pytorch_lightning as pl
 
 from vqniche.modules.mlp import MLP as MLP_Module
 from vqniche.modules.film import FiLM
+from .temperature_annealer import TemperatureAnnealer
 
 
 class MLPSoftmax(pl.LightningModule):
@@ -15,6 +16,7 @@ class MLPSoftmax(pl.LightningModule):
             out_channels: int,
             mlp_params: dict = {},
             conditioning_params: dict = {},
+            temperature_annealer_params: Optional[dict] = None,
         ):
         """
         Initialize the LinearSoftmax decoder.
@@ -28,6 +30,9 @@ class MLPSoftmax(pl.LightningModule):
         
         - mlp_params: dict
             MLP-related hyperparameters such as `hidden_channels` (number of hidden channels representing the number of dimensions of the hidden features in the intermediate layers of the MLP), `dropout` (dropout rate), `act` (activation function), and `norm` (normalization function).
+            
+        - temperature_annealer_params: dict
+            Temperature annealer-related hyperparameters such as `start_temp` (initial temperature), `end_temp` (final temperature), `total_steps` (number of steps over which to anneal), and `mode` (mode of temperature annealing).
         """
         super().__init__()
 
@@ -41,6 +46,11 @@ class MLPSoftmax(pl.LightningModule):
             **mlp_params,
             plain_last=True,
         )
+        
+        if temperature_annealer_params is not None:
+            self.temperature_annealer = TemperatureAnnealer(
+                **temperature_annealer_params,
+            )
         
         if 'condition_list' in conditioning_params:
             self.conditioning_module = FiLM(
@@ -84,6 +94,13 @@ class MLPSoftmax(pl.LightningModule):
                 )
 
         xhat = self.mlp_module(x)
-        xhat = F.softmax(xhat, dim=-1)
+        
+        if hasattr(self, 'temperature_annealer'):
+            temp = self.temperature_annealer.step()
+        else:
+            temp = 1.0
+        xhat = F.softmax(xhat / temp, dim=-1)
+
         xhat = xhat * read_depth.unsqueeze(-1)
+
         return xhat
