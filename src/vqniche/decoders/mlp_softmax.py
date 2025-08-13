@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 
 from vqniche.modules.mlp import MLP as MLP_Module
+from vqniche.modules.mlp import ConditionalMLP as ConditionalMLP_Module
 from vqniche.modules.film import FiLM
 from .temperature_annealer import TemperatureAnnealer
 
@@ -15,8 +16,7 @@ class MLPSoftmax(pl.LightningModule):
             in_channels: int,
             out_channels: int,
             mlp_params: dict = {},
-            conditioning_params: dict = {},
-            temperature_annealer_params: Optional[dict] = None,
+            conditioning_params: Optional[dict] = None,
         ):
         """
         Initialize the LinearSoftmax decoder.
@@ -31,34 +31,24 @@ class MLPSoftmax(pl.LightningModule):
         - mlp_params: dict
             MLP-related hyperparameters such as `hidden_channels` (number of hidden channels representing the number of dimensions of the hidden features in the intermediate layers of the MLP), `dropout` (dropout rate), `act` (activation function), and `norm` (normalization function).
             
-        - temperature_annealer_params: dict
-            Temperature annealer-related hyperparameters such as `start_temp` (initial temperature), `end_temp` (final temperature), `total_steps` (number of steps over which to anneal), and `mode` (mode of temperature annealing).
+        - conditioning_params: Optional[dict]
+            Conditioning-related hyperparameters such as `condition_list` (list of condition names), `use_bias` (whether to use a bias term), `use_residual` (whether to use a residual connection), `residual_weight` (weight of the residual connection), and `init_mode` (initialization mode).
         """
         super().__init__()
 
         # set parameters of the MLPSoftmax decoder
         self.in_channels = in_channels
         self.out_channels = out_channels
-        
-        self.mlp_module = MLP_Module(
+
+        self.mlp_module = ConditionalMLP_Module(
             in_channels=in_channels,
             out_channels=out_channels,
             **mlp_params,
             plain_last=True,
+            conditioning_params=conditioning_params,
+            apply_to_last=False,
+            film_position='post_norm',
         )
-        
-        if temperature_annealer_params is not None:
-            self.temperature_annealer = TemperatureAnnealer(
-                **temperature_annealer_params,
-            )
-        
-        if 'condition_list' in conditioning_params:
-            self.conditioning_module = FiLM(
-                in_channels=in_channels,
-                **conditioning_params,
-            )
-        else:
-            self.conditioning_module = None
 
 
     def forward(
@@ -87,19 +77,11 @@ class MLPSoftmax(pl.LightningModule):
         - torch.Tensor:
             Output of the MLP followed by a softmax and a multiplication with the read depth.
         """
-        if self.conditioning_module is not None:
-            x = self.conditioning_module(
-                    x=x,
-                    conditions=conditions,
-                )
-
-        xhat = self.mlp_module(x)
-        
-        if hasattr(self, 'temperature_annealer'):
-            temp = self.temperature_annealer.step()
-        else:
-            temp = 1.0
-        xhat = F.softmax(xhat / temp, dim=-1)
+        xhat = self.mlp_module(
+            x=x,
+            conditions=conditions,
+        )
+        xhat = F.softmax(xhat, dim=-1)
 
         xhat = xhat * read_depth.unsqueeze(-1)
 
