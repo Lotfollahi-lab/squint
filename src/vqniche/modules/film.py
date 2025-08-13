@@ -103,6 +103,7 @@ class FiLM(nn.Module):
             in_channels: int,
             condition_dim: int,
             condition_list: Optional[List[str]] = None,
+            generator_hidden: Optional[List[int]] = None,
             use_bias: bool = True,          # include beta term
             use_dropout: bool = False,      # dropout on generated params
             dropout_prob: float = 0.1,
@@ -121,6 +122,7 @@ class FiLM(nn.Module):
 
         self.in_channels = in_channels
         self.condition_dim = condition_dim
+        self.generator_hidden = generator_hidden
         self.condition_list = condition_list or []
         self.use_bias = use_bias
         self.use_dropout = use_dropout
@@ -138,10 +140,22 @@ class FiLM(nn.Module):
         self.small_random_std = small_random_std
 
         out_dim = in_channels * (2 if use_bias else 1)
-        self.param_generator = nn.Linear(condition_dim, out_dim)
+        # in __init__, replace single Linear with optional MLP
+        if self.generator_hidden and len(self.generator_hidden) > 0:
+            layers = []
+            dim = condition_dim
+            for h in self.generator_hidden:
+                layers += [nn.Linear(dim, h), nn.GELU()]
+                dim = h
+            layers += [nn.Linear(dim, out_dim)]
+            self.param_generator = nn.Sequential(*layers)
+            last = self.param_generator[-1]
+        else:
+            self.param_generator = nn.Linear(condition_dim, out_dim)
+            last = self.param_generator
 
         # ---- Initialization per mode (for a single Linear head) ----
-        last = self.param_generator  # alias
+        # keep the existing init logic using `last`
 
         if self.init_mode == "identity" or self.init_mode == "mlp_zero_last":
             # Independent of conditions at init; γ=1, β=0 via bias
