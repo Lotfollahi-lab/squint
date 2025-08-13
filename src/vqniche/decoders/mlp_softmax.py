@@ -64,7 +64,7 @@ class MLPSoftmax(pl.LightningModule):
         ----------
         - x: torch.Tensor
             The input tensor.
-            Dimensions: (batch_size, in_channels)
+            Dimensions: (batch_size, hidden_channels)
         - read_depth: torch.Tensor
             The read depth tensor.
             Dimensions: (batch_size, 1)
