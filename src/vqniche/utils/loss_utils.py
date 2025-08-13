@@ -50,3 +50,48 @@ def aggregate_1hop_neighbor_features(
         X_nbr = X_nbr / deg
 
     return X_nbr
+
+
+def compute_neighbor_codebook_counts(
+        indices: torch.Tensor,
+        edge_index: torch.Tensor,
+        codebook_size: int = 5000,
+    ) -> torch.Tensor:
+    """
+    Compute count vector of codebook indices from 1-hop neighbors for each node.
+    
+    Parameters
+    ----------
+    - indices: torch.Tensor
+        The codebook indices assigned to each node.
+        Dimensions: (num_nodes,)
+    - edge_index: torch.Tensor
+        The edge index of the graph.
+        Dimensions: (2, num_edges)
+    - codebook_size: int
+        Total number of codebook entries (default: 5000)
+        
+    Returns
+    -------
+    - neighbor_counts: torch.Tensor
+        Count vector of neighbor codebook indices for each node.
+        Dimensions: (num_nodes, codebook_size)
+    """
+    num_nodes = indices.shape[0]
+    device = indices.device
+    
+    # edge_index[0]: source nodes (j), edge_index[1]: target nodes (i) 
+    row, col = edge_index
+    
+    # Initialize count matrix
+    neighbor_counts = torch.zeros(num_nodes, codebook_size, device=device, dtype=torch.float)
+    
+    # For each edge, increment the count of the source node's codebook index 
+    # in the target node's neighbor count vector
+    source_indices = indices[row]  # codebook indices of source nodes
+    
+    # Use scatter_add to accumulate counts - we need to expand for proper scatter
+    neighbor_counts.index_add_(0, col, 
+                              torch.nn.functional.one_hot(source_indices, num_classes=codebook_size).float())
+    
+    return neighbor_counts
