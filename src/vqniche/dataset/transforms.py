@@ -65,33 +65,44 @@ def init_gene_count_transforms(
 
 
 def init_train_transforms(
-        train_transform_names: List[Literal['RandomNodeSplit', 'SpatialNodeSplit']] = ['RandomNodeSplit'],
+        train_transform_names: List[Literal['RandomNodeSplit', 'SpatialNodeSplit', 'SpatialBatchSplit']] = ['RandomNodeSplit'],
         val_ratio: float = 0.1,
         test_ratio: float = 0.1,
         # New parameters for spatial split
         val_region: dict = None,
         test_region: dict = None,
-        xy_key: str = 'xy_coordinates'
+        xy_key: str = 'xy_coordinates',
+        # New parameters for batch split
+        region: dict = None,
+        train_batches: Optional[list] = None,
+        val_batches: Optional[list] = None,
+        test_batches: Optional[list] = None
     ) -> List[T.BaseTransform]:
     """
     Initialize a list of training-related PyG transforms to be applied to the Data object.
 
     Parameters:
     ----------
-    - train_transform_names: List[Literal['RandomNodeSplit', 'SpatialNodeSplit']]
+    - train_transform_names: List[Literal['RandomNodeSplit', 'SpatialNodeSplit', 'BatchSplit']]
         The list of PyG transforms to initialize.
     - val_ratio: float
         Fraction of the data to set aside for validation (used with RandomNodeSplit).
     - test_ratio: float
         Fraction of the data to set aside for testing (used with RandomNodeSplit).
-    - train_region: dict
-        Spatial region for training (used with SpatialNodeSplit).
     - val_region: dict
         Spatial region for validation (used with SpatialNodeSplit).
     - test_region: dict
         Spatial region for testing (used with SpatialNodeSplit).
     - xy_key: str
         Attribute name for coordinates (used with SpatialNodeSplit).
+    - region: dict
+        Spatial region for training (used with SpatialBatchSplit).
+    - train_batches: list
+        List of batch indices for training (used with BatchSplit).
+    - val_batches: list
+        List of batch indices for validation (used with BatchSplit).
+    - test_batches: list
+        List of batch indices for testing (used with BatchSplit).
     """
     train_transforms = []
     
@@ -111,6 +122,17 @@ def init_train_transforms(
                 val_region=val_region,
                 test_region=test_region,
                 xy_key=xy_key
+            )
+        )
+    
+    if 'SpatialBatchSplit' in train_transform_names:
+        train_transforms.append(
+            SpatialBatchSplit(
+                region=region,
+                xy_key=xy_key,
+                train_batches=train_batches,
+                val_batches=val_batches,
+                test_batches=test_batches
             )
         )
     
@@ -194,6 +216,74 @@ class SpatialNodeSplit(T.BaseTransform):
         print(f"SpatialNodeSplit: Train={train_mask.sum()}, Val={val_mask.sum()}, Test={test_mask.sum()}")
         print(f"Total nodes assigned: {(train_mask | val_mask | test_mask).sum()}/{num_nodes}")
         
+        return data
+
+
+class SpatialBatchSplit(T.BaseTransform):
+    def __init__(
+            self,
+            region: Optional[dict] = None,
+            xy_key: str = 'xy_coordinates',
+            train_batches: Optional[list] = None,
+            val_batches: Optional[list] = None,
+            test_batches: Optional[list] = None
+        ):
+        """
+        Split nodes based on batch information. Useful when you have multiple tissue sections
+        and want to use entire batches/sections for different splits.
+        
+        Test batches are automatically assigned as all remaining batches after train and val.
+        
+        Parameters:
+        ----------
+        - region: dict
+            Dictionary with keys 'x_min', 'x_max', 'y_min', 'y_max' defining the region
+        - xy_key: str
+            The attribute name in the data object containing the xy coordinates
+        - train_batches: list
+            List of batch indices to assign to training. If None, all unassigned batches go to training.
+        - val_batches: list
+            List of batch indices to assign to validation.
+        - test_batches: list
+            List of batch indices to assign to testing.
+        """
+        self.region = region
+        self.xy_key = xy_key
+        self.train_batches = train_batches
+        self.val_batches = val_batches
+        self.test_batches = test_batches
+        
+    def _is_in_region(self, coords, region):
+        """Check if coordinates are within the specified region."""
+        if region is None:
+            return torch.zeros(coords.shape[0], dtype=torch.bool)
+            
+        x_coords = coords[:, 0]
+        y_coords = coords[:, 1]
+        
+        x_mask = (x_coords >= region['x_min']) & (x_coords <= region['x_max'])
+        y_mask = (y_coords >= region['y_min']) & (y_coords <= region['y_max'])
+        
+        return x_mask & y_mask
+    
+    def forward(self, data: Data) -> Data:
+        num_nodes = data.x.shape[0]
+        
+        if data.adata_batch_id in self.train_batches:
+            data.train_mask = torch.ones(num_nodes, dtype=torch.bool)
+            data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+            data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+
+        elif data.adata_batch_id in self.val_batches:
+            data.val_mask = self._is_in_region(data.xy_coordinates, self.region)
+            data.train_mask = ~data.val_mask
+            data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+            
+        elif data.adata_batch_id in self.test_batches:
+            data.test_mask = self._is_in_region(data.xy_coordinates, self.region)
+            data.train_mask = ~data.test_mask
+            data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+
         return data
 
 
