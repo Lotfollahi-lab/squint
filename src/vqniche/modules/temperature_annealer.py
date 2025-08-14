@@ -1,17 +1,16 @@
-import torch
-import torch.nn.functional as F
+from typing import Literal
 
 
 class TemperatureAnnealer:
     def __init__(
             self,
-            start_temp: float,
-            end_temp: float,
-            total_steps: int,
-            mode: str = "linear",
+            start_temp: float = 1.0,
+            end_temp: float = 0.01,
+            total_steps: int = 1000,
+            mode: Literal["linear", "exp"] = "linear",
         ):
         """
-        Anneals temperature from start_temp to end_temp over total_steps.
+        Anneals temperature from start_temp to end_temp over total_steps. Higher temperature leads to more uniform distribution while lower temperature leads to more peaked distribution.
 
         Parameters
         ----------
@@ -35,15 +34,14 @@ class TemperatureAnnealer:
     def step(self) -> float:
         """Advance one step and return current temperature."""
         self.step_count += 1
-        return self.get_temp()
 
 
     def get_temp(self) -> float:
         """Get current temperature without stepping."""
         progress = min(self.step_count / max(1, self.total_steps), 1.0)
-        if self.mode == "linear":
+        if self.mode == "linear":  # linear
             temp = self.start_temp + (self.end_temp - self.start_temp) * progress
-        else:  # exponential
+        elif self.mode == "exp":  # exponential
             decay_rate = (self.end_temp / self.start_temp) ** progress
             temp = self.start_temp * decay_rate
         return temp

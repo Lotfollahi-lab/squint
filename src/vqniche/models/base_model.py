@@ -558,6 +558,16 @@ class BaseModel(pl.LightningModule):
         for loss_term_name in logged_value_types['val']:
                 print(f"{loss_term_name}: {self.trainer.callback_metrics[loss_term_name]}")
         print("--------------------------------------------\n")
+        
+        print(f"----------------Test-----------------")
+        for test_metric_name in logged_value_types['test']:
+            print(f"{test_metric_name}: {self.trainer.callback_metrics[test_metric_name]}")
+        print("--------------------------------------------\n")
+        
+        # print(f"----------------Other-----------------")
+        # for other_metric_name in logged_value_types['other']:
+        #     print(f"{other_metric_name}: {self.trainer.callback_metrics[other_metric_name]}")
+        # print("--------------------------------------------\n")
 
         print(f"--------------------------------End of Epoch {self.current_epoch}--------------------------------------\n\n")
         
@@ -730,6 +740,7 @@ class BaseModel(pl.LightningModule):
         # compute and log metrics for the entire tissue section using the model in evaluation mode
         self.log_metrics(mode='train')
         self.log_metrics(mode='val')
+        self.log_metrics(mode='test')
         
         # call the parent class method to complete default behavior
         return super().on_validation_epoch_end()
