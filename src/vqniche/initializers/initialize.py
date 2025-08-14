@@ -16,6 +16,7 @@ from ..dataloaders.in_memory_datamodule import InMemoryDataModule
 from ..models.vanilla_mlp import VanillaMLP
 from ..models.vanilla_gnn import VanillaGNN
 from ..models.vqniche import VQNiche
+from .utils import safe_int_conversion
 
 
 def initialize_logger(
@@ -140,13 +141,14 @@ def initialize_databatch(
                         pin_memory=True,
                         drop_last=False,
                     ).collate_fn(data_list)
+    print(data_batch)
 
     # TODO: fix this hard-coding
-    data_batch.num_features = int(data_batch.num_features)
-    data_batch.num_classes = int(data_batch.num_classes)
-    data_batch.encoder_condition_dim = int(data_batch.encoder_condition_dim)
-    data_batch.attr_decoder_condition_dim = int(data_batch.attr_decoder_condition_dim)
-    data_batch.adj_decoder_condition_dim = int(data_batch.adj_decoder_condition_dim)
+    data_batch.num_features = safe_int_conversion(data_batch.num_features)
+    data_batch.num_classes = safe_int_conversion(data_batch.num_classes)
+    data_batch.encoder_condition_dim = safe_int_conversion(data_batch.encoder_condition_dim)
+    data_batch.attr_decoder_condition_dim = safe_int_conversion(data_batch.attr_decoder_condition_dim)
+    data_batch.adj_decoder_condition_dim = safe_int_conversion(data_batch.adj_decoder_condition_dim)
 
     print(f"Batch ID(s): {adata_batch_idx}")
     print(f"Data Batch: {data_batch}")
