@@ -8,7 +8,7 @@ import torch_geometric
 import pytorch_lightning as pl
 from torch_geometric.nn.dense.linear import Linear
 
-from ..modules.mlp import MLP as MLP_AdjacencyDecoder
+from vqniche.modules.mlp import MLP as MLP_AdjacencyDecoder
 from ..decoders.mlp_softmax import MLPSoftmax
 from vqniche.loss import (
     cross_entropy_loss,
@@ -322,10 +322,10 @@ class BaseModel(pl.LightningModule):
 
     def _init_attribute_decoder(
             self,
-            in_channels: int = None,
-            out_channels: int = None,
+            in_channels: int,
+            out_channels: int,
             attribute_decoder_name: Literal['MLPSoftmax'] = 'MLPSoftmax',
-            attribute_decoder_params: dict = {}
+            attribute_decoder_params: dict = {},
         ) -> pl.LightningModule:
         """
         Initialize the attribute decoder module.
@@ -350,17 +350,16 @@ class BaseModel(pl.LightningModule):
             return MLPSoftmax(
                 in_channels=in_channels,
                 out_channels=out_channels,
-                name=attribute_decoder_name,
-                use_xy_coordinates=attribute_decoder_params['use_xy_coordinates'],
-                mlp_params=attribute_decoder_params['mlp_params'],
+                **attribute_decoder_params,
             )
 
 
     def _init_adjacency_decoder(
             self,
             in_channels: int,
+            out_channels: int = 600,
             adjacency_decoder_name: Literal['MLP_AdjacencyDecoder'] = 'MLP_AdjacencyDecoder',
-            adjacency_decoder_params: dict = {}
+            mlp_params: dict = {},
         ) -> torch.nn.Module:
         """
         Initialize the adjacency decoder module.
@@ -371,8 +370,10 @@ class BaseModel(pl.LightningModule):
             The input dimension of the adjacency decoder module.
         - adjacency_decoder_name: Literal['MLP_AdjacencyDecoder']
             The name of the adjacency decoder module.
-        - adjacency_decoder_params: dict
-            The parameters for the adjacency decoder module.
+        - mlp_params: dict
+            The parameters for the MLP module.
+        - conditioning_params: dict
+            The parameters for the conditioning module.
 
         Returns
         -------
@@ -380,12 +381,10 @@ class BaseModel(pl.LightningModule):
             The adjacency decoder module.
         """
         if adjacency_decoder_name == 'MLP_AdjacencyDecoder':
-            if 'out_channels' not in adjacency_decoder_params:
-                adjacency_decoder_params['out_channels'] = in_channels
             return MLP_AdjacencyDecoder(
                 in_channels=in_channels,
-                out_channels=adjacency_decoder_params['out_channels'],
-                mlp_params=adjacency_decoder_params['mlp_params'],
+                out_channels=out_channels,
+                **mlp_params,
             )
 
 
@@ -535,32 +534,40 @@ class BaseModel(pl.LightningModule):
         """
         # print logged values during the current epoch segregated by loss terms and metrics
         logged_value_types = {
-            'train_loss': [],
-            'val_loss': [],
-            'metrics': [],
+            'train': [],
+            'val': [],
+            'test': [],
+            'other': [],
             }
         for logged_value_name in self.trainer.callback_metrics.keys():
             if logged_value_name.startswith('train'):
-                logged_value_types['train_loss'].append(logged_value_name)
+                logged_value_types['train'].append(logged_value_name)
             elif logged_value_name.startswith('val'):
-                logged_value_types['val_loss'].append(logged_value_name)
+                logged_value_types['val'].append(logged_value_name)
+            elif logged_value_name.startswith('test'):
+                logged_value_types['test'].append(logged_value_name)
             else:
-                logged_value_types['metrics'].append(logged_value_name)
+                logged_value_types['other'].append(logged_value_name)
 
-        print(f"----------------Train Loss-----------------")        
-        for loss_term_name in logged_value_types['train_loss']:
+        print(f"----------------Train-----------------")        
+        for loss_term_name in logged_value_types['train']:
                 print(f"{loss_term_name}: {self.trainer.callback_metrics[loss_term_name]}")
         print("--------------------------------------------\n")
         
-        print(f"----------------Validation Loss-----------------")        
-        for loss_term_name in logged_value_types['val_loss']:
+        print(f"----------------Validation-----------------")        
+        for loss_term_name in logged_value_types['val']:
                 print(f"{loss_term_name}: {self.trainer.callback_metrics[loss_term_name]}")
         print("--------------------------------------------\n")
         
-        print(f"----------------Metrics-----------------")
-        for metric_name in logged_value_types['metrics']:
-            print(f"{metric_name}: {self.trainer.callback_metrics[metric_name]}")
+        print(f"----------------Test-----------------")
+        for test_metric_name in logged_value_types['test']:
+            print(f"{test_metric_name}: {self.trainer.callback_metrics[test_metric_name]}")
         print("--------------------------------------------\n")
+        
+        # print(f"----------------Other-----------------")
+        # for other_metric_name in logged_value_types['other']:
+        #     print(f"{other_metric_name}: {self.trainer.callback_metrics[other_metric_name]}")
+        # print("--------------------------------------------\n")
 
         print(f"--------------------------------End of Epoch {self.current_epoch}--------------------------------------\n\n")
         
@@ -606,9 +613,8 @@ class BaseModel(pl.LightningModule):
         - This method is called at the end of validation which ensures that the model is in evaluation mode.
         TODO: fix this to work for train, val, test, and infer dataloaders
         """
-        if mode in ['train', 'val', 'test']:
-            raise NotImplementedError('log_metrics not implemented for nodes segregated by training, validation, and test sets')
-        
+        dataloader = getattr(self.trainer.datamodule, f'{mode}_dataloader')()        
+
         assert self.eval(), 'Model must be in evaluation mode to log metrics'
 
         # log metrics for nodes in the entire tissue section using the model in evaluation mode (infer_dataloader())
@@ -616,7 +622,7 @@ class BaseModel(pl.LightningModule):
             # collect the raw input data and model embeddings for the entire tissue section
             # child classes should implement this method with torch.no_grad() decorator
             inference_data = self.collect_inference_data(
-                self.trainer.datamodule.infer_dataloader()
+                dataloader=dataloader,
             )
 
             # convert the inference data to an AnnData object
@@ -635,7 +641,7 @@ class BaseModel(pl.LightningModule):
             # log metrics
             for key, value in metrics_dict.items():
                 self.log(
-                    name=key,
+                    name=f'{mode}_{key}',
                     value=value,
                     prog_bar=False,
                     on_step=False,
@@ -732,7 +738,9 @@ class BaseModel(pl.LightningModule):
         - We use this hook to compute and log metrics for the entire tissue section using the model in eval mode on the infer_dataloader().
         """
         # compute and log metrics for the entire tissue section using the model in evaluation mode
-        self.log_metrics(mode='infer')
+        self.log_metrics(mode='train')
+        self.log_metrics(mode='val')
+        self.log_metrics(mode='test')
         
         # call the parent class method to complete default behavior
         return super().on_validation_epoch_end()

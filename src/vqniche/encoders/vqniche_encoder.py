@@ -3,10 +3,10 @@ from typing import Literal, Optional, List
 import torch
 import pytorch_lightning as pl
 
-from ..modules.mlp import MLP as MLP_Module
-from ..modules.gnn import init_gnn_module
-from ..modules.film import FiLM
-from ..modules.vq import get_vq_class, get_valid_params
+from vqniche.modules import MLP as MLP_Module
+from vqniche.modules import init_gnn_module
+from vqniche.modules import FiLM
+from vqniche.modules import get_vq_class, get_valid_params
 
 
 class VQNiche_Encoder(pl.LightningModule):
@@ -14,7 +14,7 @@ class VQNiche_Encoder(pl.LightningModule):
     def __init__(
             self,
             in_channels: int = None,
-            mlp_params: dict = {},
+            mlp_params: Optional[dict] = None,
             gnn_name: Optional[Literal['SAGEConv', 'GATv2Conv', 'GINConv']] = None,
             gnn_params: dict = {},
             conditioning_params: dict = {},
@@ -27,8 +27,9 @@ class VQNiche_Encoder(pl.LightningModule):
         ----------
         - in_channels: int
             The number of input channels.
-        - mlp_params: dict
+        - mlp_params: Optional[dict]
             Keyword arguments for the MLP module.
+            Default: None. If None, the MLP module will not be used.
         - gnn_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv']
             The name of the GNN module.
         - gnn_params: dict
@@ -40,17 +41,24 @@ class VQNiche_Encoder(pl.LightningModule):
         """
         super().__init__()
 
-        if mlp_params['hidden_channels'] is None:
-            gnn_in_channels = in_channels
+        # if mlp_params is not provided, the MLP module will not be used
+        if mlp_params is None:
             self.mlp_module = None
+
+            # the GNN module will use the input channels as the input channels
+            gnn_in_channels = in_channels
+            
             self.mlp_layers = 0
         else:
-            gnn_in_channels = mlp_params['hidden_channels'][-1]
             self.mlp_module = MLP_Module(
                 in_channels=in_channels,
-                mlp_params=mlp_params,
+                **mlp_params,
             )
-            self.mlp_layers = len(self.mlp_module.lins)
+
+            # the GNN module will use the output channels of the MLP module as the input channels
+            gnn_in_channels = self.mlp_module.out_channels
+
+            self.mlp_layers = self.mlp_module.num_layers
 
         # initialize the GNN module
         if gnn_params['num_layers'] == 0:
@@ -69,10 +77,13 @@ class VQNiche_Encoder(pl.LightningModule):
         assert self.mlp_layers > 0 or self.gnn_layers > 0, "Both MLP and GNN modules have 0 layers. Please set at least one of the num_layers to a positive integer."
 
         # initialize the conditioning module
-        self.conditioning_module = self._init_conditioning_module(
-            in_channels=vq_params['dim'],
-            **conditioning_params,
-        )
+        if 'condition_list' in conditioning_params:
+            self.conditioning_module = FiLM(
+                in_channels=vq_params['dim'],
+                **conditioning_params,
+            )
+        else:
+            self.conditioning_module = None
 
         # initialize the vq module
         self.vq = self._init_vq_module(
@@ -80,30 +91,6 @@ class VQNiche_Encoder(pl.LightningModule):
                     )
 
         self.dim = vq_params['dim']
-
-
-    def _init_conditioning_module(
-            self,
-            in_channels: int,
-            condition_dim: Optional[int] = None,
-            condition_list: Optional[List[str]] = None,
-            conditioning_module_name: Optional[Literal['FiLM']] = None,
-            conditioning_kwargs: Optional[dict] = {},
-        ):
-        if condition_list is not None:
-            if conditioning_module_name == 'FiLM':
-                Conditioning_Module = FiLM
-            else:
-                raise ValueError(f"Conditioning module {conditioning_module_name} not found.")
-        
-            return Conditioning_Module(
-                in_channels=in_channels,
-                condition_dim=condition_dim,
-                condition_list=condition_list,
-                **conditioning_kwargs,
-            )
-        else:
-            return None
 
 
     def _init_vq_module(

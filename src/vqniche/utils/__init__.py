@@ -24,6 +24,7 @@ from .adjacency_reconstruction import (
 # Loss utilities
 from .loss_utils import (
     aggregate_1hop_neighbor_features,
+    compute_neighbor_codebook_counts,
 )
 
 # Configuration parsing utilities
@@ -62,6 +63,7 @@ __all__ = [
     
     # Loss utilities
     "aggregate_1hop_neighbor_features",
+    "compute_neighbor_codebook_counts",
     
     # Configuration parsing
     "parse_train_arguments",

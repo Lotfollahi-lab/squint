@@ -95,21 +95,24 @@ class VQNiche(BaseModel):
         print(f"1. VQNiche Encoder: {encoder_name} that transforms {in_channels} input features to {self.encoder.dim} quantized features.")
 
         # Initialize the attribute decoder.
+        # the input dimension of the attribute decoder is the dimension of the quantized node embeddings.
+        # the output dimension of the attribute decoder is the dimension of the input features.
         self.attribute_decoder = self._init_attribute_decoder(
+            in_channels=self.encoder.dim,
             out_channels=in_channels,
             attribute_decoder_name=attribute_decoder_name,
             attribute_decoder_params=attribute_decoder_params,
         )
-        print(f"2. Attribute Decoder: {attribute_decoder_name} that decodes {self.encoder.dim} latent features to {in_channels} input features.")
+        print(f"2. Attribute Decoder: {attribute_decoder_name} that decodes quantized latent embeddings of dimension {self.encoder.dim} to input features of dimension {in_channels}.")
 
         # Initialize the decoder module for the adjacency matrix
-        # Currently, the decoder is hard-coded to be a simple linear layer.
+        # the 
         self.adjacency_decoder = self._init_adjacency_decoder(
             in_channels=self.encoder.dim,
             adjacency_decoder_name=adjacency_decoder_name,
-            adjacency_decoder_params=adjacency_decoder_params,
+            **adjacency_decoder_params,
         )
-        print(f"3. Adjacency Decoder: {adjacency_decoder_name} that decodes {self.encoder.dim} latent features to {self.encoder.dim} adjacency features.")
+        print(f"3. Adjacency Decoder: {adjacency_decoder_name} that decodes {self.adjacency_decoder.in_channels} latent features to {self.adjacency_decoder.out_channels} adjacency features.")
 
         # Initialize the predictor.
         # Currently, the predictor is hardcoded to be a simple linear layer.
@@ -125,8 +128,9 @@ class VQNiche(BaseModel):
             self,
             batch_x: torch.Tensor,
             batch_edge_index: torch.Tensor,
-            batch_xy_coordinates: torch.Tensor,
             batch_encoder_conditions: Optional[torch.Tensor] = None,
+            batch_attr_decoder_conditions: Optional[torch.Tensor] = None,
+            batch_adj_decoder_conditions: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         """
         Forward pass of the VQNiche model.
@@ -137,10 +141,12 @@ class VQNiche(BaseModel):
             The input features of the batch of nodes.
         - batch_edge_index: torch.Tensor
             The edge index tensor of the batch of nodes.
-        - batch_xy_coordinates: torch.Tensor
-            The spatial coordinates of the batch of nodes.
         - batch_encoder_conditions: torch.Tensor
             The conditioning features for the encoder of the batch of nodes.
+        - batch_attr_decoder_conditions: torch.Tensor
+            The conditioning features for the attribute decoder of the batch of nodes.
+        - batch_adj_decoder_conditions: torch.Tensor
+            The conditioning features for the adjacency decoder of the batch of nodes.
 
         Returns
         -------
@@ -172,16 +178,11 @@ class VQNiche(BaseModel):
                             batch_encoder_conditions,
                         )
 
-        if self.attribute_decoder.use_xy_coordinates:
-            xhat = self.attribute_decoder(
-                        x=torch.cat([h_quantized, batch_xy_coordinates], dim=-1),
-                        read_depth=batch_x.sum(dim=-1)
-                    )
-        else:
-            xhat = self.attribute_decoder(
-                        x=h_quantized,
-                        read_depth=batch_x.sum(dim=-1)
-                    )
+        xhat = self.attribute_decoder(
+                    x=h_quantized,
+                    read_depth=batch_x.sum(dim=-1),
+                    conditions=batch_attr_decoder_conditions,
+                )
 
         # decode the VQ-encoded edge embeddings to recover the adjacency matrix
         h_adj = self.adjacency_decoder(h_quantized)
@@ -214,6 +215,8 @@ class VQNiche(BaseModel):
             The computed loss for this batch.
         """
         train_encoder_conditions = getattr(train_batch, 'encoder_conditions', None)
+        train_attr_decoder_conditions = getattr(train_batch, 'attr_decoder_conditions', None)
+        train_adj_decoder_conditions = getattr(train_batch, 'adj_decoder_conditions', None)
 
         h_latent, \
         h_quantized, \
@@ -224,8 +227,9 @@ class VQNiche(BaseModel):
             = self(
                 batch_x=train_batch.x,
                 batch_edge_index=train_batch.edge_index,
-                batch_xy_coordinates=train_batch.xy_coordinates,
                 batch_encoder_conditions=train_encoder_conditions,
+                batch_attr_decoder_conditions=train_attr_decoder_conditions,
+                batch_adj_decoder_conditions=train_adj_decoder_conditions,
             )
 
         # prepare dictionary of data required for computing loss
@@ -273,6 +277,8 @@ class VQNiche(BaseModel):
         """
         # execute the forward of the VQNiche model
         val_encoder_conditions = getattr(val_batch, 'encoder_conditions', None)
+        val_attr_decoder_conditions = getattr(val_batch, 'attr_decoder_conditions', None)
+        val_adj_decoder_conditions = getattr(val_batch, 'adj_decoder_conditions', None)
 
         h_latent, \
         h_quantized, \
@@ -283,8 +289,9 @@ class VQNiche(BaseModel):
             = self(
                 batch_x=val_batch.x,
                 batch_edge_index=val_batch.edge_index,
-                batch_xy_coordinates=val_batch.xy_coordinates,
                 batch_encoder_conditions=val_encoder_conditions,
+                batch_attr_decoder_conditions=val_attr_decoder_conditions,
+                batch_adj_decoder_conditions=val_adj_decoder_conditions,
             )
 
         # prepare dictionary of data required for computing loss
@@ -331,7 +338,8 @@ class VQNiche(BaseModel):
         """
         # execute the forward of the VQNiche model
         test_encoder_conditions = getattr(test_batch, 'encoder_conditions', None)
-
+        test_attr_decoder_conditions = getattr(test_batch, 'attr_decoder_conditions', None)
+        test_adj_decoder_conditions = getattr(test_batch, 'adj_decoder_conditions', None)
         _, \
         _, \
         _, \
@@ -341,8 +349,9 @@ class VQNiche(BaseModel):
             = self(
                 batch_x=test_batch.x,
                 batch_edge_index=test_batch.edge_index,
-                batch_xy_coordinates=test_batch.xy_coordinates,
                 batch_encoder_conditions=test_encoder_conditions,
+                batch_attr_decoder_conditions=test_attr_decoder_conditions,
+                batch_adj_decoder_conditions=test_adj_decoder_conditions,
             )
 
         return torch.tensor(0.0)
@@ -385,6 +394,16 @@ class VQNiche(BaseModel):
             else:
                 batch_encoder_conditions = None
 
+            if hasattr(batch, 'attr_decoder_conditions'):
+                batch_attr_decoder_conditions = batch.attr_decoder_conditions.to(self.device)
+            else:
+                batch_attr_decoder_conditions = None
+
+            if hasattr(batch, 'adj_decoder_conditions'):
+                batch_adj_decoder_conditions = batch.adj_decoder_conditions.to(self.device)
+            else:
+                batch_adj_decoder_conditions = None
+
             h_latent, \
             h_quantized, \
             indices, \
@@ -393,8 +412,9 @@ class VQNiche(BaseModel):
             logits = self(
                 batch_x=batch.x.to(self.device),
                 batch_edge_index=batch.edge_index.to(self.device),
-                batch_xy_coordinates=batch.xy_coordinates.to(self.device),
                 batch_encoder_conditions=batch_encoder_conditions,
+                batch_attr_decoder_conditions=batch_attr_decoder_conditions,
+                batch_adj_decoder_conditions=batch_adj_decoder_conditions,
             )
 
             H_latent.append(h_latent[:batch_size])

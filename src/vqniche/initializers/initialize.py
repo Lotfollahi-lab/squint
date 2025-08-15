@@ -16,6 +16,7 @@ from ..dataloaders.in_memory_datamodule import InMemoryDataModule
 from ..models.vanilla_mlp import VanillaMLP
 from ..models.vanilla_gnn import VanillaGNN
 from ..models.vqniche import VQNiche
+from .utils import safe_int_conversion
 
 
 def initialize_logger(
@@ -64,12 +65,28 @@ def initialize_dataset_blob(
                                 'condition_list',
                                 None,
                             )
+    attr_decoder_condition_list = config['model']['attribute_decoder_params'].get(
+                                    'conditioning_params',
+                                    {},
+                                ).get(
+                                    'condition_list',
+                                    None,
+                                )
+    adj_decoder_condition_list = config['model']['adjacency_decoder_params'].get(
+                                    'conditioning_params',
+                                    {},
+                                ).get(
+                                    'condition_list',
+                                    None,
+                                )
     
     ExperimentDataKeys = SetExperimentDataKeys(
                             feature_names=feature_names,
                             label_name=label_name,
                             edge_index_name=edge_index_name,
                             encoder_condition_list=encoder_condition_list,
+                            attr_decoder_condition_list=attr_decoder_condition_list,
+                            adj_decoder_condition_list=adj_decoder_condition_list,
                         )
 
     # 3. train transforms: e.g. random node split, etc.
@@ -124,11 +141,14 @@ def initialize_databatch(
                         pin_memory=True,
                         drop_last=False,
                     ).collate_fn(data_list)
+    print(data_batch)
 
     # TODO: fix this hard-coding
-    data_batch.num_features = int(data_batch.num_features)
-    data_batch.num_classes = int(data_batch.num_classes)
-    data_batch.encoder_condition_dim = int(data_batch.encoder_condition_dim)
+    data_batch.num_features = safe_int_conversion(data_batch.num_features)
+    data_batch.num_classes = safe_int_conversion(data_batch.num_classes)
+    data_batch.encoder_condition_dim = safe_int_conversion(data_batch.encoder_condition_dim)
+    data_batch.attr_decoder_condition_dim = safe_int_conversion(data_batch.attr_decoder_condition_dim)
+    data_batch.adj_decoder_condition_dim = safe_int_conversion(data_batch.adj_decoder_condition_dim)
 
     print(f"Batch ID(s): {adata_batch_idx}")
     print(f"Data Batch: {data_batch}")
