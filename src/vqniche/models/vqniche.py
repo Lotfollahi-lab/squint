@@ -109,7 +109,7 @@ class VQNiche(BaseModel):
 
         if self.mask_strategy == 'learnable_parameter':
             self.mask_token = torch.nn.Parameter(torch.empty(self.in_channels))
-            torch.nn.init.normal_(self.mask_token, mean=10.0,std=1.0)
+            torch.nn.init.normal_(self.mask_token, mean=2.0,std=1.0)
 
         # Initialize VQNiche encoder module.
         # This module either an MLP module or a GNN module or an MLP followed by a GNN module to build latent node embeddings.
@@ -224,11 +224,10 @@ class VQNiche(BaseModel):
             unnormalized_logits_batch
 
 
-
     def prepare_masked_input(
             self,
             batch_x: torch.Tensor,
-            mask_idx: torch.BoolTensor,
+            mask_idx: torch.LongTensor,
         ) -> torch.Tensor:
         """
         Mask the input features based on the mask indices.
@@ -237,7 +236,7 @@ class VQNiche(BaseModel):
         ----------
         - batch_x: torch.Tensor
             The input features of the batch of nodes.
-        - mask_idx: torch.BoolTensor
+        - mask_idx: torch.LongTensor
             The indices of the nodes to mask.
 
         Returns
@@ -312,7 +311,7 @@ class VQNiche(BaseModel):
             mask_ratio = 0.0
         
         # 2) Choose which source nodes to mask
-        mask_idx: torch.BoolTensor = set_mask_indices(
+        mask_idx: torch.LongTensor = set_mask_indices(
             N=train_batch.x.size(0),
             batch_size=batch_size,
             mask_ratio=mask_ratio,
@@ -387,8 +386,6 @@ class VQNiche(BaseModel):
         elif not self.loss_kwargs['only_masked']:
             pred_attr = pred_attr[:batch_size]
             target_attr = target_attr[:batch_size]
-
-        # print(f"{pred_attr.shape=} | {target_attr.shape=}")
 
         # prepare dictionary of data required for computing loss
         # This slicing is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the target nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of target nodes is equal to the batch size. The remaining entries of the forward output are the logits for the sampled neighbors of the target nodes.
@@ -603,7 +600,7 @@ class VQNiche(BaseModel):
                 # do not mask any nodes
                 mask_ratio = 0.0
             
-            mask_idx: torch.BoolTensor = set_mask_indices(
+            mask_idx: torch.LongTensor = set_mask_indices(
                 N=batch.x.size(0),
                 batch_size=batch_size,
                 mask_ratio=mask_ratio,

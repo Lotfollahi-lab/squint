@@ -50,7 +50,7 @@ def set_mask_indices(
         batch_size: int,
         mask_ratio: float,
         deterministic: bool = False
-    ) -> torch.BoolTensor:
+    ) -> torch.LongTensor:
     """
     Mask a subset of the first `batch_size` nodes (source nodes of the batch).
     
@@ -68,12 +68,12 @@ def set_mask_indices(
 
     Returns:
     -------
-    - mask_idx: torch.BoolTensor
-        Boolean mask tensor of shape [N] with True for masked nodes and False for unmasked nodes
+    - mask_idx: torch.LongTensor
+        Long tensor of shape [N] with 1 for masked nodes and 0 for unmasked nodes
     """
     assert mask_ratio >= 0.0 and mask_ratio <= 1.0, "Mask ratio must be between 0 and 1"
     
-    # initialize mask indices to false for all nodes
+    # initialize mask indices to 0 for all nodes
     mask_idx = torch.zeros(N, dtype=torch.long)
 
     # if mask ratio is 0, return all nodes as not masked
