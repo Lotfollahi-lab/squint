@@ -265,6 +265,8 @@ def inference_data_dict_to_adata(
     # Store edge index
     adata.uns['X'] = inference_data['X'].cpu()
     adata.uns['X_hat'] = inference_data['X_hat'].cpu()
+    adata.uns['X_nbr'] = inference_data['X_nbr'].cpu()
+    adata.uns['X_hat_nbr'] = inference_data['X_hat_nbr'].cpu()
     adata.uns['edge_index'] = inference_data['edge_index'].cpu()
     
     # Add H_quantized and Indices only if they exist

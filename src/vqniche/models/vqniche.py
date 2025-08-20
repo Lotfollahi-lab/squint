@@ -560,6 +560,7 @@ class VQNiche(BaseModel):
             Dictionary containing inference data with keys: X, edge_index, H_latent, X_hat, H_adj, H_quantized, Indices
         """
         X = []
+        X_nbr = []
         Y_cell_types = []
         Y_niche_types = []
         XY_coordinates = []
@@ -567,6 +568,7 @@ class VQNiche(BaseModel):
         H_quantized = []
         Indices = []
         X_hat = []
+        X_hat_nbr = []
         H_adj = []
         Logits = []
         
@@ -632,6 +634,17 @@ class VQNiche(BaseModel):
             H_adj.append(h_adj[:batch_size])
             Logits.append(logits[:batch_size])
 
+            X_nbr.append(aggregate_1hop_neighbor_features(
+                X=batch.x.to(self.device),
+                edge_index=batch.edge_index.to(self.device),
+                return_mean=True,
+            )[:batch_size].to(self.device))
+            X_hat_nbr.append(aggregate_1hop_neighbor_features(
+                X=xhat.to(self.device),
+                edge_index=batch.edge_index.to(self.device),
+                return_mean=True,
+            )[:batch_size].to(self.device))
+
         X = torch.cat(X, dim=0)
         Y_cell_types = torch.cat(Y_cell_types, dim=0)
         Y_niche_types = torch.cat(Y_niche_types, dim=0)
@@ -642,6 +655,9 @@ class VQNiche(BaseModel):
         X_hat = torch.cat(X_hat, dim=0)
         H_adj = torch.cat(H_adj, dim=0)
         Logits = torch.cat(Logits, dim=0)
+        
+        X_nbr = torch.cat(X_nbr, dim=0)
+        X_hat_nbr = torch.cat(X_hat_nbr, dim=0)
         
         return {
             'X': X,
@@ -658,4 +674,6 @@ class VQNiche(BaseModel):
             'codebook_size': self.encoder.vq.codebook_size,
             'separate': self.encoder.vq.separate_codebook_per_head,
             'num_heads': self.encoder.vq.heads,
+            'X_nbr': X_nbr,
+            'X_hat_nbr': X_hat_nbr,
         }
