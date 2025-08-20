@@ -111,31 +111,6 @@ class BaseModel(pl.LightningModule):
         self.loss_kwargs = loss_kwargs
         self.dispersion = torch.nn.Parameter(torch.randn(self.in_channels))
         self.loss_fn_tuples = self.set_loss_fn_tuples(loss_names, loss_kwargs)
-        
-        self.learnable_parameter = torch.nn.Parameter(torch.empty(self.in_channels))
-        torch.nn.init.normal_(self.learnable_parameter, mean=2.0,std=1.0)
-
-
-        # Codebook of K learnable tokens (replaces single learnable_mask parameter)
-        K_tokens = 4
-        # Codebook (tokens)
-        self.learnable_embedding = nn.Embedding(K_tokens, in_channels)
-        nn.init.normal_(self.learnable_embedding.weight, mean=10.0, std=10.0)
-        # tiny selector: masked-node context -> logits over tokens
-        # (keep it very small; you can swap to Linear(in_channels, K_tokens) if you prefer)
-        self.mask_selector = nn.Sequential(
-            nn.Linear(in_channels, 2 * in_channels), nn.ReLU(),
-            nn.Linear(2 * in_channels, K_tokens)
-        )
-
-        # light normalization for the selector input
-        self.mask_pre = nn.LayerNorm(in_channels)
-
-        # temperature for softmax (use a constant or anneal in your loop)
-        self.register_buffer("mask_soft_tau", torch.tensor(1.0))
-
-        # same jitter knob you used before (applied to final embedding)        
-        self.mask_token_sigma = 0.1
 
         self.save_hyperparameters()
 

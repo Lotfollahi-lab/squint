@@ -200,40 +200,33 @@ def initialize_model(
         in_channels: int,
         out_channels: int,
     ) -> pl.LightningModule:
-    # set model class
-    Model = set_model_class(model_name=config['model']['model_name'])
-
-    # get model, optimizer, loss, and task parameters
+    # --------------------- Set Model Parameters ---------------------
     model_name = config['model']['model_name']
-    encoder_name = config['model']['encoder_name']
-    attribute_decoder_name = config['model']['attribute_decoder_name']
-    adjacency_decoder_name = config['model']['adjacency_decoder_name']
-    predictor_name = config['model']['predictor_name']
-    train_metrics_list = config['model']['train_metrics_list']
-    encoder_params = config['model']['encoder_params']
-    attribute_decoder_params = config['model']['attribute_decoder_params']
-    adjacency_decoder_params = config['model']['adjacency_decoder_params']
-    optimizer_params = config['model']['optimizer_params']
-    loss_params = config['model']['loss_params']
+    model_param_dict = {
+        'model_name': model_name,
+        'encoder_name': config['model']['encoder_name'],
+        'attribute_decoder_name': config['model']['attribute_decoder_name'],
+        'adjacency_decoder_name': config['model']['adjacency_decoder_name'],
+        'predictor_name': config['model']['predictor_name'],
+        'train_metrics_list': config['model']['train_metrics_list'],
+        'in_channels': in_channels,
+        'out_channels': out_channels,
+        'encoder_params': config['model']['encoder_params'],
+        'attribute_decoder_params': config['model']['attribute_decoder_params'],
+        'adjacency_decoder_params': config['model']['adjacency_decoder_params'],
+        'optimizer_params': config['model']['optimizer_params'],
+        'loss_params': config['model']['loss_params'],
+    }
 
-    imputation_params = config['model'].get('imputation_params', {})
+    if model_name == 'VQNiche':
+        model_param_dict['imputation_params'] = config['model']['imputation_params']
 
-    # initialize model
+    # --------------------- Initialize Model ---------------------
+    Model = set_model_class(model_name=model_name)
     model = Model(
-                model_name=model_name,
-                imputation_params=imputation_params,
-                encoder_name=encoder_name,
-                attribute_decoder_name=attribute_decoder_name,
-                adjacency_decoder_name=adjacency_decoder_name,
-                predictor_name=predictor_name,
+                **model_param_dict,
                 in_channels=in_channels,
                 out_channels=out_channels,
-                encoder_params=encoder_params,
-                train_metrics_list=train_metrics_list,
-                attribute_decoder_params=attribute_decoder_params,
-                adjacency_decoder_params=adjacency_decoder_params,
-                optimizer_params=optimizer_params,
-                loss_params=loss_params,
             )
     return model
 

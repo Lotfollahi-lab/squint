@@ -21,13 +21,11 @@ class VanillaGNN(BaseModel):
     def __init__(
             self,
             model_name: Literal['GraphSAGE', 'GATv2', 'GIN'] = 'GraphSAGE',
-            imputation_params: dict = {},
             encoder_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv'] = 'SAGEConv',
             attribute_decoder_name: Literal['Linear', 'LinearSoftmax'] = 'Linear',
             adjacency_decoder_name: Literal['MLP_AdjacencyDecoder'] = 'MLP_AdjacencyDecoder',
             predictor_name: Literal['Linear'] = 'Linear',
             in_channels: int = None,
-            condition_dim: int = 0,
             out_channels: int = None,
             train_metrics_list: List[str] = [],
             encoder_params: dict = {},
@@ -43,8 +41,6 @@ class VanillaGNN(BaseModel):
         ----------
         - model_name: Literal['GraphSAGE', 'GATv2', 'GIN']
             The name of the model.
-        - imputation_params: dict
-            The parameters for the imputation module.
         - encoder_name: Literal['SAGEConv', 'GATv2Conv', 'GINConv']
             The name of the encoder module.
         - attribute_decoder_name: Literal['Linear', 'LinearSoftmax']
@@ -56,8 +52,6 @@ class VanillaGNN(BaseModel):
 
         - in_channels: int
             The number of input features.
-        - condition_dim: int
-            The number of conditioning features.
         - out_channels: int
             The number of output features.
 
@@ -90,8 +84,6 @@ class VanillaGNN(BaseModel):
             **optimizer_params,
             **loss_params,
         )
-
-        self.imputation_params = imputation_params
 
         # Initialize a VanillaGNN_Encoder.
         # This module applies either a GNN module or an MLP followed by a GNN module to build latent node embeddings.
@@ -344,18 +336,11 @@ class VanillaGNN(BaseModel):
             Y_niche_types.append(batch.y_niche_types[:batch_size])
             XY_coordinates.append(batch.xy_coordinates[:batch_size])
 
-            mask_x = self.set_mask(
-                batch_x=batch.x,
-                batch_edge_index=batch.edge_index,
-                batch_size=batch_size,
-                mask_strategy=self.imputation_params['mask_strategy'],
-            )
-
             h_latent, \
             xhat_batch, \
             h_adj, \
             logits = self(
-                        mask_x.to(self.device),
+                        batch.x.to(self.device),
                         batch.edge_index.to(self.device)
                     )
 
