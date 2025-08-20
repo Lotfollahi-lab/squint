@@ -7,6 +7,8 @@ import torch
 import torch_geometric
 import pytorch_lightning as pl
 from torch_geometric.nn.dense.linear import Linear
+import torch.nn as nn
+import torch.nn.functional as F
 
 from vqniche.modules.mlp import MLP as MLP_AdjacencyDecoder
 from ..decoders.mlp_softmax import MLPSoftmax
@@ -39,6 +41,7 @@ class BaseModel(pl.LightningModule):
             optimizer_name: str = 'adam',
             lr: float = 0.01,
             weight_decay: float = 0.0,
+            mask_lr_scale: float = 1.0,
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'mean'},
         ) -> None:
@@ -72,6 +75,8 @@ class BaseModel(pl.LightningModule):
             The learning rate.
         - weight_decay: float
             The weight decay.
+        - mask_lr_scale: float
+            The learning rate scale for the learnable mask.
 
         - loss_names: List[str]
             The loss function names.
@@ -100,11 +105,37 @@ class BaseModel(pl.LightningModule):
         self.optimizer_name = optimizer_name
         self.lr = lr
         self.weight_decay = weight_decay
+        self.mask_lr_scale = mask_lr_scale
 
         # Loss parameters
         self.loss_kwargs = loss_kwargs
         self.dispersion = torch.nn.Parameter(torch.randn(self.in_channels))
         self.loss_fn_tuples = self.set_loss_fn_tuples(loss_names, loss_kwargs)
+        
+        self.learnable_parameter = torch.nn.Parameter(torch.empty(self.in_channels))
+        torch.nn.init.normal_(self.learnable_parameter, mean=2.0,std=1.0)
+
+
+        # Codebook of K learnable tokens (replaces single learnable_mask parameter)
+        K_tokens = 4
+        # Codebook (tokens)
+        self.learnable_embedding = nn.Embedding(K_tokens, in_channels)
+        nn.init.normal_(self.learnable_embedding.weight, mean=10.0, std=10.0)
+        # tiny selector: masked-node context -> logits over tokens
+        # (keep it very small; you can swap to Linear(in_channels, K_tokens) if you prefer)
+        self.mask_selector = nn.Sequential(
+            nn.Linear(in_channels, 2 * in_channels), nn.ReLU(),
+            nn.Linear(2 * in_channels, K_tokens)
+        )
+
+        # light normalization for the selector input
+        self.mask_pre = nn.LayerNorm(in_channels)
+
+        # temperature for softmax (use a constant or anneal in your loop)
+        self.register_buffer("mask_soft_tau", torch.tensor(1.0))
+
+        # same jitter knob you used before (applied to final embedding)        
+        self.mask_token_sigma = 0.1
 
         self.save_hyperparameters()
 
@@ -433,10 +464,20 @@ class BaseModel(pl.LightningModule):
         """
         # TODO: Add support for multiple optimizers
         if self.optimizer_name == 'adam':
+            mask_params, other_params = [], []
+            for name, param in self.named_parameters():
+                (mask_params if name.endswith("learnable_mask") else other_params).append(param)
+            
+            # return torch.optim.Adam(
+            #     [
+            #         {"params": other_params, "lr": self.lr, "weight_decay": self.weight_decay},
+            #         {"params": mask_params, "lr": self.lr * self.mask_lr_scale, "weight_decay": 0.0},
+            #     ]
+            # )
             return torch.optim.Adam(
-                params=self.parameters(),
+                self.parameters(),
                 lr=self.lr,
-                weight_decay=self.weight_decay
+                weight_decay=self.weight_decay,
             )
         else:
             raise NotImplementedError(f'Optimizer {self.optimizer_name} not implemented')
@@ -506,6 +547,181 @@ class BaseModel(pl.LightningModule):
         raise NotImplementedError('Forward pass should be implemented by the subclass')
 
 
+
+    @torch.no_grad()
+    def _center_nodes_bool(
+            self,
+            N: int,
+            batch_size: int,
+            device: torch.device
+        ) -> torch.BoolTensor:
+        """
+        Create a boolean mask for the center nodes.
+        """
+        m = torch.zeros(N, dtype=torch.long, device=device)
+        m[:batch_size] = True
+        return m
+
+
+    def _neighbor_mean_for_masked(
+            self,
+            x: torch.Tensor,
+            edge_index: torch.Tensor,
+            mask: torch.Tensor,   # [N] bool for masked rows
+            known: torch.Tensor,  # [N] bool for KNOWN rows (>= batch_size)
+        ) -> torch.Tensor:
+        """Compute mean of KNOWN neighbors for masked nodes (undirected), shape-safe on CUDA."""
+        # Work in float for stable division even if x stores counts as int
+        x_f = x.to(dtype=torch.float32)
+        N, f = x_f.size()
+
+        # Indices of masked rows
+        rows = mask.nonzero(as_tuple=False).squeeze(1)  # [M]
+        M = int(rows.numel())
+        if M == 0:
+            return x_f.new_zeros((0, f))
+
+        src, dst = edge_index
+
+        # known -> masked in both directions (treat as undirected)
+        a = mask[dst] & known[src]
+        b = mask[src] & known[dst]
+
+        val_idx   = torch.cat([dst[a], src[b]], dim=0)   # masked row indices (global)
+        known_idx = torch.cat([src[a], dst[b]], dim=0)   # corresponding KNOWN neighbor rows
+
+        # Accumulate sums/counts per *masked* row (indexed by global indices)
+        counts = x_f.new_zeros(N)            # float
+        sums   = x_f.new_zeros(N, f)         # float
+        ones   = torch.ones_like(val_idx, dtype=x_f.dtype)
+        counts.scatter_add_(0, val_idx, ones)
+        sums.scatter_add_(0, val_idx.unsqueeze(-1).expand(-1, f), x_f[known_idx])
+
+        # Gather for masked subset
+        m_counts = counts.index_select(0, rows)   # [M]
+        m_sums   = sums.index_select(0, rows)     # [M, f]
+        means    = x_f.new_zeros((M, f))         # [M, f]
+
+        has_nb = m_counts > 0
+        if has_nb.any():
+            good_rows = has_nb.nonzero(as_tuple=False).squeeze(1)           # [G]
+            means.index_copy_(0, good_rows, m_sums[good_rows] / m_counts[good_rows].unsqueeze(-1))
+
+        if (~has_nb).any():
+            # Fallback: global mean of KNOWN nodes (or all nodes if none are known)
+            if known.any():
+                gmean = x_f[known].mean(dim=0)          # [F]
+            else:
+                gmean = x_f.mean(dim=0)                 # [F]
+            bad_rows = (~has_nb).nonzero(as_tuple=False).squeeze(1)         # [K]
+            means.index_copy_(0, bad_rows, gmean.unsqueeze(0).expand(bad_rows.numel(), f))
+
+        return means  # [M, f], float32
+    
+
+    def set_mask(
+            self,
+            batch_x: torch.Tensor,
+            batch_edge_index: torch.Tensor,
+            batch_size: int,
+            mask_strategy: Literal['original', 'zeros', 'mean', 'learnable_parameter', 'learnable_embedding'] = 'original',
+            mask_idx: Optional[torch.Tensor]=None,  # bool or long; default: all index nodes
+        ) -> torch.Tensor:
+        """
+        Set the mask for the input features.
+        """
+        N, f = batch_x.size()
+        device = batch_x.device
+
+        # resolve which nodes to mask
+        if mask_idx is None:
+            mask = self._center_nodes_bool(N, batch_size, device)  # mask all index nodes
+        else:
+            if mask_idx.dtype == torch.bool:
+                mask = mask_idx.to(device=device, dtype=torch.long)
+            else:
+                mask = torch.zeros(N, dtype=torch.long, device=device)
+                mask[mask_idx.to(device)] = True        
+        
+        if mask_strategy == 'original':
+            return batch_x
+
+        elif mask_strategy == 'zeros':
+            mask_x = batch_x.clone()
+            zeros = torch.zeros(f, dtype=batch_x.dtype, device=device)
+            mask_x.index_copy(0, mask, zeros.unsqueeze(0).expand(mask.numel(), -1))
+            return mask_x
+
+        elif mask_strategy == 'mean':
+            # clone to avoid mutating caller tensor
+            mask_x = batch_x.clone()
+            src, dst = batch_edge_index  # [2, E]
+            f = batch_x.size(1)
+
+            # consider edges in BOTH directions:
+            # case A: dst is a val node, src is known
+            a = (dst < batch_size) & (src >= batch_size)
+            # case B: src is a val node, dst is known
+            b = (src < batch_size) & (dst >= batch_size)
+
+            val_idx   = torch.cat([dst[a], src[b]], dim=0)           # indices in [0, batch_size)
+            known_idx = torch.cat([src[a], dst[b]], dim=0)           # indices in [batch_size, ...)
+
+            neighbor_counts = torch.zeros(batch_size, device=batch_x.device, dtype=batch_x.dtype)
+            neighbor_sums   = torch.zeros(batch_size, f, device=batch_x.device, dtype=batch_x.dtype)
+
+            # accumulate counts and sums
+            neighbor_counts.scatter_add_(0, val_idx, torch.ones_like(val_idx, dtype=batch_x.dtype))
+            neighbor_sums.scatter_add_(0,
+                                    val_idx.unsqueeze(-1).expand(-1, f),
+                                    batch_x[known_idx])
+
+            # means where neighbors exist
+            has_neighbors = neighbor_counts > 0
+            neighbor_means = torch.zeros(batch_size, f, device=batch_x.device, dtype=batch_x.dtype)
+            neighbor_means[has_neighbors] = neighbor_sums[has_neighbors] / neighbor_counts[has_neighbors].unsqueeze(-1)
+
+            # Fallback for isolated validation nodes: global mean of known nodes (non-constant across features)
+            if (~has_neighbors).any():
+                # if there are no known nodes at all, fall back to overall feature mean
+                if batch_x.size(0) > batch_size:
+                    global_known_mean = batch_x[batch_size:].mean(dim=0, keepdim=True)
+                else:
+                    global_known_mean = batch_x.mean(dim=0, keepdim=True)
+                neighbor_means[~has_neighbors] = global_known_mean
+
+            # (optional) tiny jitter to avoid pathological exact-constant vectors
+            neighbor_means = neighbor_means + 1e-8 * torch.randn_like(neighbor_means)
+
+            # assign to validation nodes
+            mask_x[:batch_size] = neighbor_means
+            return mask_x
+        
+        elif mask_strategy == 'learnable_parameter':
+            mask_x = batch_x.clone()
+            learnable_mask = self.learnable_parameter.to(dtype=batch_x.dtype)
+            if self.training:
+                # small jitter; don’t go too large or you’ll destabilize training
+                learnable_mask = learnable_mask + getattr(self, "mask_token_sigma", 0.01) * torch.randn_like(learnable_mask)
+            
+            mask_x.index_copy(0, mask, learnable_mask.unsqueeze(0).expand(mask.numel(), -1))
+            
+            return mask_x
+
+        elif mask_strategy == 'learnable_embedding':
+            mask_x = batch_x.clone()
+
+            rows = mask.nonzero(as_tuple=False).squeeze(1)          # [M]
+            K = self.learnable_embedding.num_embeddings
+
+            # simple deterministic mapping: token_id = gid % K
+            # token_idx = (n_id % K).to(torch.long)
+            # emb = self.learnable_embedding(token_idx)                  # [M, F]
+            # mask_x.index_copy_(0, rows, emb)
+
+            return mask_x
+
+        
     @torch.no_grad()
     def collect_inference_data(
             self,

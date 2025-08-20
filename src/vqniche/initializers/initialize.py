@@ -216,9 +216,12 @@ def initialize_model(
     optimizer_params = config['model']['optimizer_params']
     loss_params = config['model']['loss_params']
 
+    imputation_params = config['model'].get('imputation_params', {})
+
     # initialize model
     model = Model(
                 model_name=model_name,
+                imputation_params=imputation_params,
                 encoder_name=encoder_name,
                 attribute_decoder_name=attribute_decoder_name,
                 adjacency_decoder_name=adjacency_decoder_name,

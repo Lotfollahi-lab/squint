@@ -61,20 +61,20 @@ def nb_attribute_reconstruction_loss(
     - NicheCompass --> https://github.com/Lotfollahi-lab/nichecompass/blob/main/src/nichecompass/modules/losses.py
     - scvi-tools --> https://github.com/scverse/scvi-tools/blob/main/src/scvi/module/_vae.py#L205
     """
-    if k_hop_nb_loss == 1:
-        pred_attr = aggregate_1hop_neighbor_features(
-                        X=pred_attr,
-                        edge_index=edge_index,
-                        return_mean=False,
-                    )
-        target_attr = aggregate_1hop_neighbor_features(
-                        X=target_attr,
-                        edge_index=edge_index,
-                        return_mean=False,
-                    )
+    # if k_hop_nb_loss == 1:
+    #     pred_attr = aggregate_1hop_neighbor_features(
+    #                     X=pred_attr,
+    #                     edge_index=edge_index,
+    #                     return_mean=False,
+    #                 )
+    #     target_attr = aggregate_1hop_neighbor_features(
+    #                     X=target_attr,
+    #                     edge_index=edge_index,
+    #                     return_mean=False,
+    #                 )
 
-    pred_attr = pred_attr[:batch_size]
-    target_attr = target_attr[:batch_size]
+    # pred_attr = pred_attr[:batch_size]
+    # target_attr = target_attr[:batch_size]
 
     log_theta_mu_eps = torch.log(dispersion + pred_attr + 1e-8).detach()
     log_likelihood_nb = (
