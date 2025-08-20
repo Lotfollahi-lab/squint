@@ -223,11 +223,7 @@ def initialize_model(
 
     # --------------------- Initialize Model ---------------------
     Model = set_model_class(model_name=model_name)
-    model = Model(
-                **model_param_dict,
-                in_channels=in_channels,
-                out_channels=out_channels,
-            )
+    model = Model(**model_param_dict)
     return model
 
 

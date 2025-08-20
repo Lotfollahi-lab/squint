@@ -15,19 +15,21 @@ from typing import Literal, List, Optional
 
 import torch
 import torch_geometric
-import torch.nn.functional as F
 
 from .base_model import BaseModel
 from ..encoders.vqniche_encoder import VQNiche_Encoder
 from vqniche.utils.loss_utils import aggregate_1hop_neighbor_features
-
+from vqniche.utils.mask import (
+    set_mask_ratio,
+    set_mask_indices,
+    print_masked_input_diversity_stats,
+)
 
 
 class VQNiche(BaseModel):
     def __init__(
             self,
             model_name: Literal['VQNiche'] = 'VQNiche',
-            imputation_params: dict = {},
             encoder_name: Literal['VQNiche_Encoder'] = 'VQNiche_Encoder',
             attribute_decoder_name: Literal['MLPSoftmax'] = 'MLPSoftmax',
             adjacency_decoder_name: Literal['MLP_AdjacencyDecoder'] = 'MLP_AdjacencyDecoder',
@@ -35,6 +37,7 @@ class VQNiche(BaseModel):
             train_metrics_list: List[str] = [],
             in_channels: int = None,
             out_channels: int = None,
+            imputation_params: dict = {},
             encoder_params: dict = {},
             attribute_decoder_params: dict = {},
             adjacency_decoder_params: dict = {},
@@ -67,6 +70,8 @@ class VQNiche(BaseModel):
         - train_metrics_list: List[str]
             The list of metrics to compute during training.
 
+        - imputation_params: dict
+            The parameters for the imputation module.
         - encoder_params: dict
             The parameters for the MLP module.
         - attribute_decoder_params: dict
@@ -90,7 +95,23 @@ class VQNiche(BaseModel):
             **loss_params,
         )
 
-        self.imputation_params = imputation_params
+        # Initialize imputation parameters
+        print(f"Setting imputation parameters:")
+        for key, value in imputation_params.items():
+            print(f"{key}: {value}")
+        self.mask_strategy = imputation_params['mask_strategy']
+        self.base_mask_ratio = imputation_params['base_mask_ratio']
+        self.final_mask_ratio = imputation_params['final_mask_ratio']
+        self.warmup_epochs = imputation_params['warmup_epochs']
+        self.deterministic_masking = imputation_params['deterministic_masking']
+        self.compute_mask_input_diversity = imputation_params['compute_mask_input_diversity']
+        self.mask_token_eps = imputation_params['mask_token_eps']
+
+        if self.mask_strategy == 'zeros':
+            self.mask_token = torch.zeros(self.in_channels)
+        elif self.mask_strategy == 'learnable_parameter':
+            self.mask_token = torch.nn.Parameter(torch.empty(self.in_channels))
+            torch.nn.init.normal_(self.mask_token, mean=10.0,std=1.0)
 
         # Initialize VQNiche encoder module.
         # This module either an MLP module or a GNN module or an MLP followed by a GNN module to build latent node embeddings.
@@ -205,6 +226,60 @@ class VQNiche(BaseModel):
             unnormalized_logits_batch
 
 
+
+    def prepare_masked_input(
+            self,
+            batch_x: torch.Tensor,
+            mask_idx: torch.BoolTensor,
+        ) -> torch.Tensor:
+        """
+        Mask the input features based on the mask indices.
+
+        Parameters
+        ----------
+        - batch_x: torch.Tensor
+            The input features of the batch of nodes.
+        - mask_idx: torch.BoolTensor
+            The indices of the nodes to mask.
+
+        Returns
+        -------
+        - mask_x: torch.Tensor
+            The masked input features.
+        """
+        # clone the input features to avoid modifying the original features
+        masked_x = batch_x.clone()
+        
+        # if the mask strategy is zeros or learnable_parameter, mask the input features of the source nodes where mask_idx is True with the mask token
+        if self.mask_strategy in ['zeros', 'learnable_parameter']:
+            # nonzero() returns indices of the `True` elements in the mask_idx tensor
+            # squeeze(1) ensures that the index tensor is 1D
+            index = mask_idx.to(masked_x.device).nonzero().squeeze(1)
+            
+            # during training, add a small jitter to the mask token
+            if self.training:
+                mask = self.mask_token + torch.randn_like(self.mask_token) * self.mask_token_eps
+            else:
+                mask = self.mask_token
+            mask = mask.to(dtype=masked_x.dtype, device=masked_x.device)
+            
+            # unsqueeze(0) adds a second dimension to the mask token tensor
+            # numel() returns the number of elements in the index tensor
+            # i.e. numel() is the number of source nodes to mask
+            # expand() replicates the mask token tensor to match the number of source nodes to mask
+            mask = mask.unsqueeze(0).expand(index.numel(), -1)
+
+            # index_copy_() copies the mask tensor to the masked_x tensor at the specified indices
+            # index[i] == j => the i-th row of mask is copied to the j-th row (dim=0) of masked_x
+            masked_x.index_copy_(
+                dim=0,
+                index=index,
+                source=mask,
+            )
+            
+        return masked_x
+
+
     def training_step(
             self,
             train_batch: torch_geometric.data.Data,
@@ -222,46 +297,49 @@ class VQNiche(BaseModel):
         - train_loss: torch.Tensor
             The computed loss for this batch.
         """
+        batch_size = train_batch.batch_size
+        
+        # --------------------- Prepare Inputs for VQNiche's Forward Pass ---------------------
+        # 1) Set ratio of source nodes to mask
+        if self.mask_strategy in ['zeros', 'learnable_parameter']:
+            # linearly increase mask ratio across epochs
+            mask_ratio: float = set_mask_ratio(
+                            epoch=self.current_epoch,
+                            base_ratio=self.base_mask_ratio,
+                            final_ratio=self.final_mask_ratio,
+                            warmup_epochs=self.warmup_epochs,
+                        )
+        elif self.mask_strategy == 'original':
+            # do not mask any nodes
+            mask_ratio = 0.0
+        
+        # 2) Choose which source nodes to mask
+        mask_idx: torch.BoolTensor = set_mask_indices(
+            N=train_batch.x.size(0),
+            batch_size=batch_size,
+            mask_ratio=mask_ratio,
+            deterministic=self.deterministic_masking
+        )
+
+        # 3) Set the mask over the input features based on the mask strategy and mask indices
+        masked_x = self.prepare_masked_input(
+            batch_x=train_batch.x,
+            mask_idx=mask_idx,
+        )
+
+        if self.compute_mask_input_diversity:
+            print_masked_input_diversity_stats(
+                x_in=masked_x,
+                batch_size=train_batch.batch_size,
+                mask_idx=mask_idx,
+            )
+
+        # 3) Prepare conditioning features for the encoder, attribute decoder, and adjacency decoder
         train_encoder_conditions = getattr(train_batch, 'encoder_conditions', None)
         train_attr_decoder_conditions = getattr(train_batch, 'attr_decoder_conditions', None)
         train_adj_decoder_conditions = getattr(train_batch, 'adj_decoder_conditions', None)
 
-        if self.imputation_params['mask_strategy'] in ['zeros', 'learnable_parameter', 'learnable_embedding']:
-        # if self.imputation_params['mask_strategy'] in ['learnable_parameter']:
-            # 1) Annealed masking ratio for learnable token
-            ratio = self.linear_anneal_mask_ratio(
-                epoch=self.current_epoch,
-                final_ratio=self.imputation_params['final_mask_ratio'],
-                warmup_epochs=self.imputation_params['warmup_epochs'],
-            )
-            # Get deterministic flag from imputation params, default to False for backward compatibility
-            deterministic = self.imputation_params.get('deterministic_masking', False)
-            mask_idx = self.sample_center_mask(
-                N=train_batch.x.size(0),
-                batch_size=train_batch.batch_size,
-                ratio=ratio,
-                device=train_batch.x.device,
-                deterministic=deterministic
-            )  # only among center nodes
-        else:
-            mask_idx = None
-
-        # 2) Prepare masked input (LEARNABLE)
-        mask_x = self.set_mask(
-            batch_x=train_batch.x,
-            batch_edge_index=train_batch.edge_index,
-            batch_size=train_batch.batch_size,
-            mask_strategy=self.imputation_params['mask_strategy'],
-            mask_idx=mask_idx,
-        )
-        
-        # stats = self.masked_input_diversity(
-        #     x_in=mask_x,
-        #     batch_size=train_batch.batch_size,
-        #     mask_idx=mask_idx,
-        # )
-        # print(stats)
-
+        # --------------------- Execute VQNiche's Forward Pass ---------------------
         h_latent, \
         h_quantized, \
         indices, \
@@ -269,19 +347,53 @@ class VQNiche(BaseModel):
         h_adj_batch, \
         unnormalized_logits_batch \
             = self(
-                batch_x=mask_x,
+                batch_x=masked_x,
                 batch_edge_index=train_batch.edge_index,
                 batch_encoder_conditions=train_encoder_conditions,
                 batch_attr_decoder_conditions=train_attr_decoder_conditions,
                 batch_adj_decoder_conditions=train_adj_decoder_conditions,
             )
 
-        pred_attr = xhat_batch[mask_idx]
-        target_attr = train_batch.x[mask_idx]
+        # --------------------- Prepare Data for Loss Computation ---------------------
+        # 1) If k_hop_nb_loss is 1, compute loss over aggregate neighbor features
+        if self.loss_kwargs['k_hop_nb_loss'] == 1:
+            pred_attr = aggregate_1hop_neighbor_features(
+                X=xhat_batch,
+                edge_index=train_batch.edge_index,
+                return_mean=True,
+            )
+            target_attr = aggregate_1hop_neighbor_features(
+                X=train_batch.x,
+                edge_index=train_batch.edge_index,
+                return_mean=True,
+            )
+        # 2) If k_hop_nb_loss is 0, compute loss over individual node features
+        elif self.loss_kwargs['k_hop_nb_loss'] == 0:
+            pred_attr = xhat_batch
+            target_attr = train_batch.x
+        else:
+            raise ValueError(f"Invalid k_hop_nb_loss: {self.loss_kwargs['k_hop_nb_loss']}")
+        
+        # 3) If only_masked is True, compute loss over masked nodes only
+        if self.loss_kwargs['only_masked']:
+            # if only_masked is True and there are masked nodes, compute loss over masked nodes only
+            if mask_idx.sum() > 0:
+                pred_attr = pred_attr[mask_idx==1]
+                target_attr = target_attr[mask_idx==1]
+            # if only_masked is True and there are no masked nodes, compute loss over all nodes
+            # this is to handle the case where the mask ratio is 0 in a given epochfor zeros and learnable_parameter mask strategies
+            else:
+                pred_attr = pred_attr[:batch_size]
+                target_attr = target_attr[:batch_size]
+        # 4) If only_masked is False, compute loss over all nodes
+        elif not self.loss_kwargs['only_masked']:
+            pred_attr = pred_attr[:batch_size]
+            target_attr = target_attr[:batch_size]
+
+        # print(f"{pred_attr.shape=} | {target_attr.shape=}")
 
         # prepare dictionary of data required for computing loss
         # This slicing is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the target nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of target nodes is equal to the batch size. The remaining entries of the forward output are the logits for the sampled neighbors of the target nodes.
-        batch_size = train_batch.batch_size
         train_loss_data = {
                         'quantizer_input': h_latent[:batch_size], # code and commit loss
                         'quantizer_output': h_quantized[:batch_size], # code and commit loss
@@ -296,6 +408,7 @@ class VQNiche(BaseModel):
                         'labels': train_batch.y[:batch_size], # label prediction loss
                         }
 
+        # --------------------- Compute Loss ---------------------
         train_loss = self.common_step(
             batch_loss_data=train_loss_data,
             batch_size=batch_size,
@@ -326,6 +439,40 @@ class VQNiche(BaseModel):
         val_encoder_conditions = getattr(val_batch, 'encoder_conditions', None)
         val_attr_decoder_conditions = getattr(val_batch, 'attr_decoder_conditions', None)
         val_adj_decoder_conditions = getattr(val_batch, 'adj_decoder_conditions', None)
+
+        # option 3: set the input features of the val nodes as mean of the input features of its neighbors using the edge_index
+        # Initialize output tensor with zeros for validation nodes and original features for remaining nodes
+        mask_x = torch.zeros_like(val_batch.x)
+        mask_x[val_batch.batch_size:] = val_batch.x[val_batch.batch_size:]
+        
+        # Get source and target nodes from edge_index
+        src, dst = val_batch.edge_index
+        
+        # Only consider edges where dst is a validation node (< batch_size) and src is not (>= batch_size)
+        valid_edges = (dst < val_batch.batch_size) & (src >= val_batch.batch_size)
+        valid_src = src[valid_edges]
+        valid_dst = dst[valid_edges]
+        
+        if len(valid_dst) > 0:  # Only proceed if we have valid edges
+            # Count neighbors for validation nodes
+            neighbor_counts = torch.zeros(val_batch.batch_size, device=val_batch.x.device)
+            neighbor_counts.scatter_add_(0, valid_dst, torch.ones_like(valid_dst, dtype=torch.float))
+            
+            # Sum up neighbor features for validation nodes
+            neighbor_sums = torch.zeros(val_batch.batch_size, val_batch.x.shape[1], device=val_batch.x.device)
+            # Get features from source nodes
+            src_features = val_batch.x[valid_src]
+            # For each feature dimension, scatter add the source features to their respective destinations
+            for i in range(val_batch.x.shape[1]):
+                neighbor_sums[:, i].scatter_add_(0, valid_dst, src_features[:, i])
+            
+            # Compute means (avoiding division by zero)
+            neighbor_counts = neighbor_counts.unsqueeze(-1).expand(-1, val_batch.x.shape[1])
+            neighbor_counts = torch.where(neighbor_counts == 0, torch.ones_like(neighbor_counts), neighbor_counts)
+            neighbor_means = neighbor_sums / neighbor_counts
+            
+            # Update only validation nodes with neighbor means
+            mask_x[:val_batch.batch_size] = neighbor_means
 
         h_latent, \
         h_quantized, \
@@ -451,20 +598,32 @@ class VQNiche(BaseModel):
             else:
                 batch_adj_decoder_conditions = None
 
-            mask_x = self.set_mask(
-                batch_x=batch.x.to(self.device),
-                batch_edge_index=batch.edge_index.to(self.device),
+            if self.mask_strategy in ['zeros', 'learnable_parameter']:
+                # mask all source nodes
+                mask_ratio: float = 1.0
+            elif self.mask_strategy == 'original':
+                # do not mask any nodes
+                mask_ratio = 0.0
+            
+            mask_idx: torch.BoolTensor = set_mask_indices(
+                N=batch.x.size(0),
                 batch_size=batch_size,
-                mask_strategy=self.imputation_params['mask_strategy'],
-            )
+                mask_ratio=mask_ratio,
+                deterministic=False,
+            ).to(self.device)
 
+            masked_x = self.prepare_masked_input(
+                batch_x=batch.x,
+                mask_idx=mask_idx,
+            ).to(self.device)
+            
             h_latent, \
             h_quantized, \
             indices, \
             xhat, \
             h_adj, \
             logits = self(
-                batch_x=mask_x.to(self.device),
+                batch_x=masked_x,
                 batch_edge_index=batch.edge_index.to(self.device),
                 batch_encoder_conditions=batch_encoder_conditions,
                 batch_attr_decoder_conditions=batch_attr_decoder_conditions,
@@ -504,105 +663,4 @@ class VQNiche(BaseModel):
             'codebook_size': self.encoder.vq.codebook_size,
             'separate': self.encoder.vq.separate_codebook_per_head,
             'num_heads': self.encoder.vq.heads,
-        }
-        
-
-    def linear_anneal_mask_ratio(
-            self,
-            epoch: int,
-            final_ratio: float = 0.2,
-            warmup_epochs: int = 10
-        ) -> float:
-        """Linearly increase mask ratio from 0.0 to final_ratio over warmup_epochs."""
-        if warmup_epochs <= 0:
-            return final_ratio
-        return float(0.3 + final_ratio * min(epoch / warmup_epochs, 1.0))
-
-
-    def sample_center_mask(
-            self,
-            N: int,
-            batch_size: int,
-            ratio: float,
-            device: torch.device,
-            deterministic: bool = False
-        ) -> torch.BoolTensor:
-        """Mask a subset of the FIRST batch_size nodes (center nodes).
-        
-        Args:
-            N: Total number of nodes
-            batch_size: Number of center nodes to consider for masking
-            ratio: Fraction of nodes to mask
-            device: Device to place tensors on
-            deterministic: If True, uses deterministic stride-based masking.
-                         If False, uses random masking (default).
-        """
-        m = torch.zeros(N, dtype=torch.bool, device=device)
-        if ratio <= 0 or batch_size == 0:
-            return m
-            
-        k = max(1, int(round(ratio * batch_size)))
-        
-        if deterministic:
-            # Calculate stride to evenly space the masked nodes
-            stride = max(1, batch_size // k)
-            # Take evenly spaced indices up to k nodes
-            idx = torch.arange(0, min(k * stride, batch_size), stride, device=device)
-        else:
-            # Random masking
-            idx = torch.randperm(batch_size, device=device)[:k]
-            
-        m[idx] = True
-        return m
-    
-    
-    @torch.no_grad()
-    def masked_input_diversity(
-            self,
-            x_in: torch.Tensor,
-            batch_size: int,
-            mask_idx: torch.Tensor | None = None,
-            round_decimals: int = 6
-        ) -> dict:
-        """
-        Quick diagnostics for input diversity among masked nodes.
-        Returns a dict of simple stats; low values (or high cosine) indicate collapse.
-        """
-        N = x_in.size(0)
-        if mask_idx is None:
-            mask = torch.zeros(N, dtype=torch.bool, device=x_in.device)
-            mask[:batch_size] = True           # NeighborLoader: centers are first `batch_size`
-        else:
-            mask = mask_idx if mask_idx.dtype == torch.bool else torch.zeros(
-                N, dtype=torch.bool, device=x_in.device).scatter_(0, mask_idx.to(x_in.device), True)
-
-        X = x_in[mask]                         # [M, F] masked inputs
-        M = X.size(0)
-        if M <= 1:
-            return {"masked_count": int(M), "mean_feat_std": float('nan'),
-                    "unique_row_frac": 1.0, "mean_pair_cos": float('nan'),
-                    "p95_pair_cos": float('nan')}
-
-        # 1) Per-feature std across masked nodes (0 => identical per feature)
-        per_feat_std = X.std(dim=0)
-        mean_feat_std = per_feat_std.mean().item()
-
-        # 2) Unique rows fraction (≈0 if all rows equal)
-        Xr = torch.round(X * (10**round_decimals)) / (10**round_decimals)
-        unique_rows = torch.unique(Xr, dim=0).size(0)
-        unique_row_frac = float(unique_rows) / float(M)
-
-        # 3) Pairwise cosine similarity among masked rows (≈1 if identical)
-        Xn = F.normalize(X, dim=1)
-        cos = Xn @ Xn.T
-        off = cos[~torch.eye(M, dtype=torch.bool, device=X.device)]
-        mean_pair_cos = off.mean().item()
-        p95_pair_cos = off.quantile(0.95).item()
-
-        return {
-            "masked_count": int(M),
-            "mean_feat_std": mean_feat_std,
-            "unique_row_frac": unique_row_frac,
-            "mean_pair_cos": mean_pair_cos,
-            "p95_pair_cos": p95_pair_cos,
         }
