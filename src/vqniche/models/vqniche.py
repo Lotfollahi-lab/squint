@@ -107,9 +107,7 @@ class VQNiche(BaseModel):
         self.compute_mask_input_diversity = imputation_params['compute_mask_input_diversity']
         self.mask_token_eps = imputation_params['mask_token_eps']
 
-        if self.mask_strategy == 'zeros':
-            self.mask_token = torch.zeros(self.in_channels)
-        elif self.mask_strategy == 'learnable_parameter':
+        if self.mask_strategy == 'learnable_parameter':
             self.mask_token = torch.nn.Parameter(torch.empty(self.in_channels))
             torch.nn.init.normal_(self.mask_token, mean=10.0,std=1.0)
 
@@ -251,7 +249,7 @@ class VQNiche(BaseModel):
         masked_x = batch_x.clone()
         
         # if the mask strategy is zeros or learnable_parameter, mask the input features of the source nodes where mask_idx is True with the mask token
-        if self.mask_strategy in ['zeros', 'learnable_parameter']:
+        if self.mask_strategy == 'learnable_parameter':
             # nonzero() returns indices of the `True` elements in the mask_idx tensor
             # squeeze(1) ensures that the index tensor is 1D
             index = mask_idx.to(masked_x.device).nonzero().squeeze(1)
@@ -301,7 +299,7 @@ class VQNiche(BaseModel):
         
         # --------------------- Prepare Inputs for VQNiche's Forward Pass ---------------------
         # 1) Set ratio of source nodes to mask
-        if self.mask_strategy in ['zeros', 'learnable_parameter']:
+        if self.mask_strategy == 'learnable_parameter':
             # linearly increase mask ratio across epochs
             mask_ratio: float = set_mask_ratio(
                             epoch=self.current_epoch,
@@ -598,7 +596,7 @@ class VQNiche(BaseModel):
             else:
                 batch_adj_decoder_conditions = None
 
-            if self.mask_strategy in ['zeros', 'learnable_parameter']:
+            if self.mask_strategy == 'learnable_parameter':
                 # mask all source nodes
                 mask_ratio: float = 1.0
             elif self.mask_strategy == 'original':
