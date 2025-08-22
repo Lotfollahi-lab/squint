@@ -1,6 +1,93 @@
 import torch
 
 
+def batch_pred_attr_and_target_attr(
+            batch_x: torch.Tensor,
+            batch_xhat: torch.Tensor,
+            edge_index: torch.Tensor,
+            batch_size: int,
+            mask_idx: torch.Tensor,
+            aggregate_1hop_neighbor_features: bool = False,
+            only_masked: bool = False,
+        ) -> torch.Tensor:
+        """
+        Prepare the predicted and target attributes for the loss computation.
+
+        Parameters
+        ----------
+        - batch_x: torch.Tensor
+            The original attributes of the batch.
+            Dimensions: (num_nodes_in_batch, num_features)
+        - batch_xhat: torch.Tensor
+            The predicted attributes of the batch.
+            Dimensions: (num_nodes_in_batch, num_features)
+        - edge_index: torch.Tensor
+            The edge index of the graph.
+            Dimensions: (2, num_edges_in_batch)
+        - batch_size: int
+            The number of source nodes of the batch.
+        - mask_idx: torch.Tensor
+            The mask indices of the batch.
+            Dimensions: (num_nodes_in_batch,)
+        - aggregate_1hop_neighbor_features: bool
+            Whether to aggregate the 1-hop neighbor features.
+        - only_masked: bool
+            Whether to only compute the loss over the masked nodes.
+
+        Returns
+        -------
+        - pred_attr: torch.Tensor
+            The predicted attributes of the batch.
+            Dimensions: (batch_size, num_features) if only_masked is False, otherwise (mask_idx.sum(), num_features)
+        - target_attr: torch.Tensor
+            The target attributes of the batch.
+            Dimensions: (batch_size, num_features) if only_masked is False, otherwise (mask_idx.sum(), num_features)
+
+        Notes
+        -----
+        - This function is used to prepare the predicted and target attributes for the loss computation.
+        - If aggregate_1hop_neighbor_features is True, the 1-hop neighbor features are aggregated.
+        - If only_masked is True, the loss is computed over the masked nodes only.
+        - If only_masked is False, the loss is computed over all nodes.
+        """
+        # 1) If aggregate_1hop_neighbor_features is True, use the 1-hop cell-wise micro-environment features
+        if aggregate_1hop_neighbor_features:
+            # 1.1) Imputed attributes from the decoder
+            pred_attr = aggregate_1hop_neighbor_features(
+                X=batch_xhat,
+                edge_index=edge_index,
+                return_mean=True,
+            )
+            # 1.2) Original attributes from the batch
+            target_attr = aggregate_1hop_neighbor_features(
+                X=batch_x,
+                edge_index=edge_index,
+                return_mean=True,
+            )
+        # 2) If aggregate_1hop_neighbor_features is False, use the cell-wise attributes
+        else:
+            pred_attr = batch_xhat
+            target_attr = batch_x
+        
+        # 3) If only_masked is True, compute loss over masked nodes only
+        if only_masked:
+            # 3.1) If there are masked nodes, compute loss over masked nodes only
+            if mask_idx.sum() > 0:
+                pred_attr = pred_attr[mask_idx==1]
+                target_attr = target_attr[mask_idx==1]
+            # 3.2) If there are no masked nodes, compute loss over all nodes
+            # this is to handle the case where the mask ratio is 0 in a given epochfor zeros and learnable_parameter mask strategies
+            else:
+                pred_attr = pred_attr[:batch_size]
+                target_attr = target_attr[:batch_size]
+        # 4) If only_masked is False, compute loss over all nodes
+        elif not only_masked:
+            pred_attr = pred_attr[:batch_size]
+            target_attr = target_attr[:batch_size]
+
+        return pred_attr, target_attr
+
+
 def aggregate_1hop_neighbor_features(
         X: torch.Tensor,
         edge_index: torch.Tensor,

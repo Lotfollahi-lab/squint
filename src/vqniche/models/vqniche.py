@@ -18,7 +18,11 @@ import torch_geometric
 
 from .base_model import BaseModel
 from ..encoders.vqniche_encoder import VQNiche_Encoder
-from vqniche.utils.loss_utils import aggregate_1hop_neighbor_features
+from vqniche.utils.loss_utils import (
+    batch_pred_attr_and_target_attr,
+    aggregate_1hop_neighbor_features,
+)
+
 from vqniche.utils.mask import (
     set_mask_ratio,
     set_mask_indices,
@@ -352,40 +356,14 @@ class VQNiche(BaseModel):
             )
 
         # --------------------- Prepare Data for Loss Computation ---------------------
-        # 1) If k_hop_nb_loss is 1, compute loss over aggregate neighbor features
-        if self.loss_kwargs['k_hop_nb_loss'] == 1:
-            pred_attr = aggregate_1hop_neighbor_features(
-                X=xhat_batch,
-                edge_index=train_batch.edge_index,
-                return_mean=True,
-            )
-            target_attr = aggregate_1hop_neighbor_features(
-                X=train_batch.x,
-                edge_index=train_batch.edge_index,
-                return_mean=True,
-            )
-        # 2) If k_hop_nb_loss is 0, compute loss over individual node features
-        elif self.loss_kwargs['k_hop_nb_loss'] == 0:
-            pred_attr = xhat_batch
-            target_attr = train_batch.x
-        else:
-            raise ValueError(f"Invalid k_hop_nb_loss: {self.loss_kwargs['k_hop_nb_loss']}")
-        
-        # 3) If only_masked is True, compute loss over masked nodes only
-        if self.loss_kwargs['only_masked']:
-            # if only_masked is True and there are masked nodes, compute loss over masked nodes only
-            if mask_idx.sum() > 0:
-                pred_attr = pred_attr[mask_idx==1]
-                target_attr = target_attr[mask_idx==1]
-            # if only_masked is True and there are no masked nodes, compute loss over all nodes
-            # this is to handle the case where the mask ratio is 0 in a given epochfor zeros and learnable_parameter mask strategies
-            else:
-                pred_attr = pred_attr[:batch_size]
-                target_attr = target_attr[:batch_size]
-        # 4) If only_masked is False, compute loss over all nodes
-        elif not self.loss_kwargs['only_masked']:
-            pred_attr = pred_attr[:batch_size]
-            target_attr = target_attr[:batch_size]
+        # 1) Prepare the predicted and target attributes for the Attribute Reconstruction Loss (negative binomial)
+        pred_attr, target_attr = batch_pred_attr_and_target_attr(
+            batch_x=train_batch.x,
+            batch_xhat=xhat_batch,
+            edge_index=train_batch.edge_index,
+            batch_size=batch_size,
+            mask_idx=mask_idx,
+        )
 
         # prepare dictionary of data required for computing loss
         # This slicing is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the target nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of target nodes is equal to the batch size. The remaining entries of the forward output are the logits for the sampled neighbors of the target nodes.

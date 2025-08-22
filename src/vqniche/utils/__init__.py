@@ -23,6 +23,7 @@ from .adjacency_reconstruction import (
 
 # Loss utilities
 from .loss_utils import (
+    batch_pred_attr_and_target_attr,
     aggregate_1hop_neighbor_features,
     compute_neighbor_codebook_counts,
 )
@@ -69,6 +70,7 @@ __all__ = [
     "reconstruct_adjacency_matrix",
     
     # Loss utilities
+    "batch_pred_attr_and_target_attr",
     "aggregate_1hop_neighbor_features",
     "compute_neighbor_codebook_counts",
     
