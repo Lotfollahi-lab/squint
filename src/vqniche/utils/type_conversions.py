@@ -252,22 +252,33 @@ def inference_data_dict_to_adata(
             labels.index = adata.obs.index
             adata.obs[label_name] = labels
     
-    adata.uns['Y_cell_types'] = inference_data['Y_cell_types']
-    adata.uns['Y_niche_types'] = inference_data['Y_niche_types']
-    adata.uns['Logits'] = inference_data['Logits']
+    if 'Y_cell_types' in inference_data:
+        adata.uns['Y_cell_types'] = inference_data['Y_cell_types']
+    if 'Y_niche_types' in inference_data:
+        adata.uns['Y_niche_types'] = inference_data['Y_niche_types']
+    if 'Logits' in inference_data:
+        adata.uns['Logits'] = inference_data['Logits']
 
-    adata.obsm['spatial'] = inference_data['XY_coordinates'].cpu().numpy()
+    if 'XY_coordinates' in inference_data:
+        adata.obsm['spatial'] = inference_data['XY_coordinates'].cpu().numpy()
     
     # Store embeddings in obsm
-    adata.obsm['H_latent'] = inference_data['H_latent'].cpu().numpy()
-    adata.obsm['H_adj'] = inference_data['H_adj'].cpu().numpy()
+    if 'H_latent' in inference_data:
+        adata.obsm['H_latent'] = inference_data['H_latent'].cpu().numpy()
+    if 'H_adj' in inference_data:
+        adata.obsm['H_adj'] = inference_data['H_adj'].cpu().numpy()
     
     # Store edge index
-    adata.uns['X'] = inference_data['X'].cpu()
-    adata.uns['X_hat'] = inference_data['X_hat'].cpu()
-    adata.uns['X_nbr'] = inference_data['X_nbr'].cpu()
-    adata.uns['X_hat_nbr'] = inference_data['X_hat_nbr'].cpu()
-    adata.uns['edge_index'] = inference_data['edge_index'].cpu()
+    if 'X' in inference_data:
+        adata.uns['X'] = inference_data['X'].cpu()
+    if 'X_hat' in inference_data:
+        adata.uns['X_hat'] = inference_data['X_hat'].cpu()
+    if 'X_nbr' in inference_data:
+        adata.uns['X_nbr'] = inference_data['X_nbr'].cpu()
+    if 'X_hat_nbr' in inference_data:
+        adata.uns['X_hat_nbr'] = inference_data['X_hat_nbr'].cpu()
+    if 'edge_index' in inference_data:
+        adata.uns['edge_index'] = inference_data['edge_index'].cpu()
     
     # Add H_quantized and Indices only if they exist
     if 'H_quantized' in inference_data:

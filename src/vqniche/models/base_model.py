@@ -674,6 +674,14 @@ class BaseModel(pl.LightningModule):
         -----
         - We use this hook to print the start of the current training epoch.
         """
+        # build a cache for validation step outputs
+        self.val_inference_data_cache = {}
+        self.val_inference_data_cache['X'] = []
+        self.val_inference_data_cache['X_hat'] = []
+        self.val_inference_data_cache['X_nbr'] = []
+        self.val_inference_data_cache['X_hat_nbr'] = []
+        self.val_inference_data_cache['Indices'] = []
+        
         print(f"--------------------------------Start of Epoch {self.current_epoch}--------------------------------------")
 
         # call the parent class method to complete default behavior
@@ -753,6 +761,25 @@ class BaseModel(pl.LightningModule):
         -----
         - We use this hook to compute and log metrics for the entire tissue section using the model in eval mode on the infer_dataloader().
         """
+        for key in ['X', 'X_hat', 'X_nbr', 'X_hat_nbr', 'Indices']:
+            self.val_inference_data_cache[key] = torch.cat(self.val_inference_data_cache[key], dim=0)
+        
+        # convert the inference data to an AnnData object
+        adata = inference_data_dict_to_adata(
+            inference_data=self.val_inference_data_cache,
+                label_categories_dict=None,
+            )
+
+        # compute the benchmarking metrics
+        metrics_dict = compute_benchmarking_metrics(
+            adata=adata,
+            metrics=self.train_metrics_list,
+            **self.loss_kwargs['estimate_adj_kwargs'],
+        )
+        for key, value in metrics_dict.items():
+            print(f"{key}: {value}")
+        
+        
         # compute and log metrics for the entire tissue section using the model in evaluation mode
         self.log_metrics(mode='train')
         self.log_metrics(mode='val')

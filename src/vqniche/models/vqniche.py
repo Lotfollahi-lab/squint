@@ -271,7 +271,7 @@ class VQNiche(BaseModel):
             mask = mask.unsqueeze(0).expand(index.numel(), -1)
 
             # index_copy_() copies the mask tensor to the masked_x tensor at the specified indices
-            # index[i] == j => the i-th row of mask is copied to the j-th row (dim=0) of masked_x
+            # index[i] = j => the i-th row of mask is copied to the j-th row (dim=0) of masked_x
             masked_x.index_copy_(
                 dim=0,
                 index=index,
@@ -300,10 +300,10 @@ class VQNiche(BaseModel):
         """
         batch_size = train_batch.batch_size
         
-        # --------------------- Prepare Inputs for VQNiche's Forward Pass ---------------------
+        # --------------------- Prepare Inputs for Training Forward Pass ---------------------
         # 1) Set ratio of source nodes to mask
         if self.mask_strategy == 'learnable_parameter':
-            # linearly increase mask ratio across epochs
+            # set number of source nodes to mask based on the mask strategy and mask ratio
             mask_ratio: float = set_mask_ratio(
                             epoch=self.current_epoch,
                             base_ratio=self.base_mask_ratio,
@@ -314,7 +314,7 @@ class VQNiche(BaseModel):
             # do not mask any nodes
             mask_ratio = 0.0
         
-        # 2) Choose which source nodes to mask
+        # 2) Set mask indices for the source nodes of the batch
         mask_idx: torch.LongTensor = set_mask_indices(
             N=train_batch.x.size(0),
             batch_size=batch_size,
@@ -323,11 +323,13 @@ class VQNiche(BaseModel):
         )
 
         # 3) Set the mask over the input features based on the mask strategy and mask indices
+        # sampled neighbors of the source nodes are not masked
         masked_x = self.prepare_masked_input(
             batch_x=train_batch.x,
             mask_idx=mask_idx,
         )
 
+        # TODO: remove this after model is working
         if self.compute_mask_input_diversity:
             print_masked_input_diversity_stats(
                 x_in=masked_x,
@@ -335,12 +337,13 @@ class VQNiche(BaseModel):
                 mask_idx=mask_idx,
             )
 
-        # 3) Prepare conditioning features for the encoder, attribute decoder, and adjacency decoder
+        # 4) Prepare conditioning features for the encoder, attribute decoder, and adjacency decoder
         train_encoder_conditions = getattr(train_batch, 'encoder_conditions', None)
         train_attr_decoder_conditions = getattr(train_batch, 'attr_decoder_conditions', None)
         train_adj_decoder_conditions = getattr(train_batch, 'adj_decoder_conditions', None)
 
-        # --------------------- Execute VQNiche's Forward Pass ---------------------
+        # --------------------- Execute Forward Pass ---------------------
+        # 5) Execute the forward pass of the VQNiche model
         h_latent, \
         h_quantized, \
         indices, \
@@ -356,17 +359,19 @@ class VQNiche(BaseModel):
             )
 
         # --------------------- Prepare Data for Loss Computation ---------------------
-        # 1) Prepare the predicted and target attributes for the Attribute Reconstruction Loss (negative binomial)
+        # 6) Prepare the predicted and target attributes for the Attribute Reconstruction Loss (negative binomial)
         pred_attr, target_attr = batch_pred_attr_and_target_attr(
             batch_x=train_batch.x,
             batch_xhat=xhat_batch,
             edge_index=train_batch.edge_index,
             batch_size=batch_size,
             mask_idx=mask_idx,
+            k_hop_nb_loss=self.loss_kwargs['k_hop_nb_loss'],
+            only_masked=self.loss_kwargs['only_masked'],
         )
 
-        # prepare dictionary of data required for computing loss
-        # This slicing is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the target nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of target nodes is equal to the batch size. The remaining entries of the forward output are the logits for the sampled neighbors of the target nodes.
+        # 7) Prepare dictionary of data required for computing loss
+        # Slicing the first batch_size entries is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the source nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of source nodes is equal to the batch size. The remaining entries of the forward output correspond to the sampled neighbors of the source nodes.
         train_loss_data = {
                         'quantizer_input': h_latent[:batch_size], # code and commit loss
                         'quantizer_output': h_quantized[:batch_size], # code and commit loss
@@ -408,45 +413,46 @@ class VQNiche(BaseModel):
         - val_loss: torch.Tensor
             The computed loss for this batch.
         """
-        # execute the forward of the VQNiche model
+        batch_size = val_batch.batch_size
+        
+        # --------------------- Prepare Inputs for Validation Forward Pass ---------------------
+        # 1) Set ratio of source nodes to mask
+        if self.mask_strategy == 'learnable_parameter':
+            # mask all source nodes
+            mask_ratio: float = 1.0
+        elif self.mask_strategy == 'original':
+            # do not mask any nodes
+            mask_ratio = 0.0
+        
+        # 2) Choose which source nodes to mask
+        mask_idx: torch.LongTensor = set_mask_indices(
+            N=val_batch.x.size(0),
+            batch_size=batch_size,
+            mask_ratio=mask_ratio,
+            deterministic=self.deterministic_masking
+        )
+
+        # 3) Set the mask over the input features based on the mask strategy and mask indices
+        masked_x = self.prepare_masked_input(
+            batch_x=val_batch.x,
+            mask_idx=mask_idx,
+        )
+
+        # TODO: remove this after model is working
+        if self.compute_mask_input_diversity:
+            print_masked_input_diversity_stats(
+                x_in=masked_x,
+                batch_size=val_batch.batch_size,
+                mask_idx=mask_idx,
+            )
+
+        # 4) Prepare conditioning features for the encoder, attribute decoder, and adjacency decoder
         val_encoder_conditions = getattr(val_batch, 'encoder_conditions', None)
         val_attr_decoder_conditions = getattr(val_batch, 'attr_decoder_conditions', None)
         val_adj_decoder_conditions = getattr(val_batch, 'adj_decoder_conditions', None)
-
-        # option 3: set the input features of the val nodes as mean of the input features of its neighbors using the edge_index
-        # Initialize output tensor with zeros for validation nodes and original features for remaining nodes
-        mask_x = torch.zeros_like(val_batch.x)
-        mask_x[val_batch.batch_size:] = val_batch.x[val_batch.batch_size:]
         
-        # Get source and target nodes from edge_index
-        src, dst = val_batch.edge_index
-        
-        # Only consider edges where dst is a validation node (< batch_size) and src is not (>= batch_size)
-        valid_edges = (dst < val_batch.batch_size) & (src >= val_batch.batch_size)
-        valid_src = src[valid_edges]
-        valid_dst = dst[valid_edges]
-        
-        if len(valid_dst) > 0:  # Only proceed if we have valid edges
-            # Count neighbors for validation nodes
-            neighbor_counts = torch.zeros(val_batch.batch_size, device=val_batch.x.device)
-            neighbor_counts.scatter_add_(0, valid_dst, torch.ones_like(valid_dst, dtype=torch.float))
-            
-            # Sum up neighbor features for validation nodes
-            neighbor_sums = torch.zeros(val_batch.batch_size, val_batch.x.shape[1], device=val_batch.x.device)
-            # Get features from source nodes
-            src_features = val_batch.x[valid_src]
-            # For each feature dimension, scatter add the source features to their respective destinations
-            for i in range(val_batch.x.shape[1]):
-                neighbor_sums[:, i].scatter_add_(0, valid_dst, src_features[:, i])
-            
-            # Compute means (avoiding division by zero)
-            neighbor_counts = neighbor_counts.unsqueeze(-1).expand(-1, val_batch.x.shape[1])
-            neighbor_counts = torch.where(neighbor_counts == 0, torch.ones_like(neighbor_counts), neighbor_counts)
-            neighbor_means = neighbor_sums / neighbor_counts
-            
-            # Update only validation nodes with neighbor means
-            mask_x[:val_batch.batch_size] = neighbor_means
-
+        # --------------------- Execute Forward Pass ---------------------
+        # 5) Execute the forward pass of the VQNiche model
         h_latent, \
         h_quantized, \
         indices, \
@@ -454,20 +460,31 @@ class VQNiche(BaseModel):
         h_adj_batch, \
         unnormalized_logits_batch \
             = self(
-                batch_x=val_batch.x,
+                batch_x=masked_x,
                 batch_edge_index=val_batch.edge_index,
                 batch_encoder_conditions=val_encoder_conditions,
                 batch_attr_decoder_conditions=val_attr_decoder_conditions,
                 batch_adj_decoder_conditions=val_adj_decoder_conditions,
             )
+        
+        # --------------------- Prepare Data for Loss Computation ---------------------
+        # 6) Prepare the predicted and target attributes for the Attribute Reconstruction Loss (negative binomial)
+        pred_attr, target_attr = batch_pred_attr_and_target_attr(
+            batch_x=val_batch.x,
+            batch_xhat=xhat_batch,
+            edge_index=val_batch.edge_index,
+            batch_size=batch_size,
+            mask_idx=mask_idx,
+            k_hop_nb_loss=self.loss_kwargs['k_hop_nb_loss'],
+            only_masked=False, # False and True are equivalent for validation
+        )
 
-        # prepare dictionary of data required for computing loss
-        batch_size = val_batch.batch_size
+        # 7) Prepare dictionary of data required for computing loss
         val_loss_data = {
                         'quantizer_input': h_latent[:batch_size],
                         'quantizer_output': h_quantized[:batch_size],
-                        'pred_attr': xhat_batch,
-                        'target_attr': val_batch.x,
+                        'pred_attr': pred_attr,
+                        'target_attr': target_attr,
                         'edge_index': val_batch.edge_index,
                         'batch_size': batch_size,
                         'dispersion': torch.exp(self.dispersion),
@@ -477,12 +494,37 @@ class VQNiche(BaseModel):
                         'labels': val_batch.y[:batch_size],
                         }
 
+        # --------------------- Compute Loss ---------------------
         val_loss = self.common_step(
             batch_loss_data=val_loss_data,
             batch_size=batch_size,
             mode='val',
         )
-
+        
+        # 8) Cache inference data
+        self.val_inference_data_cache['X'].append(val_batch.x[:batch_size])
+        self.val_inference_data_cache['X_hat'].append(xhat_batch[:batch_size])
+        self.val_inference_data_cache['X_nbr'].append(
+            aggregate_1hop_neighbor_features(
+                X=val_batch.x,
+                edge_index=val_batch.edge_index,
+                return_mean=True,
+                batch_size=batch_size,
+            )
+        )
+        self.val_inference_data_cache['X_hat_nbr'].append( 
+            aggregate_1hop_neighbor_features(
+                X=xhat_batch,
+                edge_index=val_batch.edge_index,
+                return_mean=True,
+                batch_size=batch_size,
+            )
+        )
+        self.val_inference_data_cache['Indices'].append(indices[:batch_size])
+        self.val_inference_data_cache['codebook_size'] = self.encoder.vq.codebook_size
+        self.val_inference_data_cache['separate'] = self.encoder.vq.separate_codebook_per_head
+        self.val_inference_data_cache['num_heads'] = self.encoder.vq.heads
+        
         return val_loss
 
 
