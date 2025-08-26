@@ -27,7 +27,7 @@ def parse_test_arguments() -> argparse.Namespace:
                         help='Optional model checkpoint file name')
     parser.add_argument('--metric_name',
                         type=str,
-                        default='pearson_1hop_nbr',
+                        default='val_pearson_cell_wise',
                         help='Metric name to find the best checkpoint')
     parser.add_argument('--mode',
                         type=str,
@@ -82,7 +82,11 @@ def collect_test_configs(
     elif model_ckpt_fname is not None:
         config['model']['model_ckpt_fname'] = model_ckpt_fname
     else:
-        config['model']['model_ckpt_fname'] = find_best_checkpoint(wandb_run_dir)
+        config['model']['model_ckpt_fname'] = find_best_checkpoint(
+                                                    wandb_run_dir,
+                                                    mode=args.mode,
+                                                    metric_name=args.metric_name,
+                                                )
 
     # write wandb_run_directory and model_ckpt_fname to config
     config['experiment']['wandb_run_dir'] = wandb_run_dir
