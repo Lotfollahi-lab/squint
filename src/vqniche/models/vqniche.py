@@ -330,7 +330,7 @@ class VQNiche(BaseModel):
             self,
             batch_size: int,
             batch_x: torch.Tensor,
-            step: Literal['train', 'val', 'test'] = 'train',
+            step: Literal['train', 'val', 'test', 'predict'] = 'train',
         ) -> torch.Tensor:
         """
         Prepare the masked input for the specified step.
@@ -466,7 +466,6 @@ class VQNiche(BaseModel):
         # --------------------- Cache Inference Data ---------------------
         # 7) Cache inference data
         self._cache_inference_data(
-            cache_dict=self.train_inference_data_cache,
             batch=train_batch,
             batch_size=batch_size,
             h_latent=h_latent.detach(),
@@ -475,6 +474,7 @@ class VQNiche(BaseModel):
             indices=indices.detach(),
             xhat_batch=xhat_batch.detach(),
             unnormalized_logits_batch=unnormalized_logits_batch.detach(),
+            cache_dict=self.train_inference_data_cache,
         )
         
         return train_loss
@@ -566,7 +566,6 @@ class VQNiche(BaseModel):
         # --------------------- Cache Inference Data ---------------------
         # 7) Cache inference data
         self._cache_inference_data(
-            cache_dict=self.val_inference_data_cache,
             batch=val_batch,
             batch_size=batch_size,
             h_latent=h_latent,
@@ -575,6 +574,7 @@ class VQNiche(BaseModel):
             indices=indices,
             xhat_batch=xhat_batch,
             unnormalized_logits_batch=unnormalized_logits_batch,
+            cache_dict=self.val_inference_data_cache,
         )
         
         return val_loss
@@ -633,7 +633,6 @@ class VQNiche(BaseModel):
         # --------------------- Cache Inference Data ---------------------
         # 4) Cache inference data
         self._cache_inference_data(
-            cache_dict=self.test_inference_data_cache,
             batch=test_batch,
             batch_size=batch_size,
             h_latent=h_latent,
@@ -642,6 +641,7 @@ class VQNiche(BaseModel):
             indices=indices,
             xhat_batch=xhat_batch,
             unnormalized_logits_batch=unnormalized_logits_batch,
+            cache_dict=self.test_inference_data_cache,
         )
         
         return None
@@ -649,7 +649,6 @@ class VQNiche(BaseModel):
 
     def _cache_inference_data(
             self,
-            cache_dict: dict,
             batch: torch_geometric.data.Data,
             batch_size: int,
             h_latent: torch.Tensor,
@@ -658,6 +657,7 @@ class VQNiche(BaseModel):
             indices: torch.Tensor,
             xhat_batch: torch.Tensor,
             unnormalized_logits_batch: torch.Tensor,
+            cache_dict: Optional[dict] = None,
         ) -> None:
         """
         Helper function to cache inference data during training, validation, and test steps.
@@ -683,6 +683,9 @@ class VQNiche(BaseModel):
         unnormalized_logits_batch : torch.Tensor
             Unnormalized logits from the predictor
         """
+        if cache_dict is None:
+            cache_dict = {key: [] for key in self.cache_keys}
+            
         cache_dict['X'].append(batch.x[:batch_size])
         cache_dict['X_nbr'].append(
             aggregate_1hop_neighbor_features(
@@ -711,3 +714,71 @@ class VQNiche(BaseModel):
             )
         )
         cache_dict['Logits'].append(unnormalized_logits_batch[:batch_size])
+        
+        return cache_dict
+        
+        
+    def on_predict_model_eval(self) -> None:
+        """
+        Pytorch Lightning hook that is executed before the predict steps are called.
+        """
+        return super().on_predict_model_eval()
+    
+    
+    def predict_step(
+            self,
+            predict_batch: torch_geometric.data.Data,
+        ) -> torch.Tensor:
+        """
+        Definition of a single predict step of the VQNiche model on the current batch of nodes received from the predict dataloader at the current training epoch.
+        """
+        batch_size = predict_batch.batch_size
+        
+        # --------------------- Prepare Inputs for Test Forward Pass ---------------------
+        # 1) Mask the input attributes based on the mask strategy and mask indices
+        _, masked_x = self.prepare_masked_input(
+                                batch_size=batch_size,
+                                batch_x=predict_batch.x,
+                                step='predict',
+                            )
+
+        # 2) Prepare conditioning features for the encoder, attribute decoder, and adjacency decoder
+        predict_encoder_conditions = getattr(predict_batch, 'encoder_conditions', None)
+        predict_attr_decoder_conditions = getattr(predict_batch, 'attr_decoder_conditions', None)
+        predict_adj_decoder_conditions = getattr(predict_batch, 'adj_decoder_conditions', None)
+        
+        # --------------------- Execute Forward Pass ---------------------
+        # 3) Execute the forward pass of the VQNiche model
+        h_latent, \
+        h_quantized, \
+        indices, \
+        xhat_batch, \
+        h_adj_batch, \
+        unnormalized_logits_batch \
+            = self(
+                batch_x=masked_x,
+                batch_edge_index=predict_batch.edge_index,
+                batch_encoder_conditions=predict_encoder_conditions,
+                batch_attr_decoder_conditions=predict_attr_decoder_conditions,
+                batch_adj_decoder_conditions=predict_adj_decoder_conditions,
+            )
+
+        # --------------------- Cache Inference Data ---------------------
+        # 4) Cache inference data
+        return self._cache_inference_data(
+            batch=predict_batch,
+            batch_size=batch_size,
+            h_latent=h_latent,
+            h_quantized=h_quantized,
+            h_adj_batch=h_adj_batch,
+            indices=indices,
+            xhat_batch=xhat_batch,
+            unnormalized_logits_batch=unnormalized_logits_batch,
+        )
+        
+    
+    def on_predict_epoch_end(self) -> None:
+        """
+        Pytorch Lightning hook that is executed after all predict steps are completed.
+        """
+        super().on_predict_epoch_end()
