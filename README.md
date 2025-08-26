@@ -4,9 +4,7 @@ Tokenization for Tissue Sections
 
 ## Installation
 
-You need to have Python 3.10 or newer installed on your system.
-
-To install the latest development version, first activate your Python Environment and `cd` to the directory where this repository is stored. Then, execute the following:
+This is tested with Python 3.10. To install the latest development version, first activate your Python Environment and install this package in editable mode as follows:
 
 ```bash
 pip install -e .
@@ -14,7 +12,7 @@ pip install -e .
 
 ## Usage
 
-The model trainingpipeline consists of the following steps:
+The model training pipeline consists of the following steps:
 1. Build the dataset (see vqniche.dataset.in_memory_dataset_blob.py).
 2. Initialize the DataModule (see vqniche.dataloaders.in_memory_datamodule.py).
 3. Initialize the Model (see vqniche.models.vqgraph.py).
@@ -24,4 +22,4 @@ The model trainingpipeline consists of the following steps:
 
 ## Contact
 
-For questions and help requests, you can reach out to am84@sanger.ac.uk or ls34@sanger.ac.uk.
+For questions and issues, please reach out to am84@sanger.ac.uk.
