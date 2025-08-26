@@ -469,12 +469,12 @@ class VQNiche(BaseModel):
             cache_dict=self.train_inference_data_cache,
             batch=train_batch,
             batch_size=batch_size,
-            h_latent=h_latent,
-            h_quantized=h_quantized,
-            h_adj_batch=h_adj_batch,
-            indices=indices,
-            xhat_batch=xhat_batch,
-            unnormalized_logits_batch=unnormalized_logits_batch,
+            h_latent=h_latent.detach(),
+            h_quantized=h_quantized.detach(),
+            h_adj_batch=h_adj_batch.detach(),
+            indices=indices.detach(),
+            xhat_batch=xhat_batch.detach(),
+            unnormalized_logits_batch=unnormalized_logits_batch.detach(),
         )
         
         return train_loss
