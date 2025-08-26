@@ -716,11 +716,13 @@ class BaseModel(pl.LightningModule):
 
         Notes
         -----
-        - We use this hook to compute and log metrics for the entire tissue section using the model in eval mode on the infer_dataloader().
+        - We use this hook to compute and log metrics for the nodes in the validation set.
+        - This 
         """
-        # compute and log metrics for the nodes in the training and validation sets based on cached data
-        # self.log_metrics(mode='train')
+        # compute metrics for the nodes in the validation set based on cached data
         metrics_dict = self.compute_metrics(mode='val')
+        
+        # log the metrics for the nodes in the validation set
         for key, value in metrics_dict.items():
             self.log(
                 name=f'val_{key}',
@@ -731,7 +733,6 @@ class BaseModel(pl.LightningModule):
                 sync_dist=True,
             )
 
-        
         # call the parent class method to complete default behavior
         return super().on_validation_epoch_end()
 
@@ -745,6 +746,17 @@ class BaseModel(pl.LightningModule):
         - We use this hook to print the loss terms and metrics for the current epoch.
         - We also use this hook to update the on_train_epoch_end_logs_df dataframe which is used to store the loss terms and metrics for all epochs.
         """
+        metrics_dict = self.compute_metrics(mode='train')
+        for key, value in metrics_dict.items():
+            self.log(
+                name=f'train_{key}',
+                value=value,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
         # print the epoch stats to the console
         self._print_epoch_stats()
         
@@ -813,14 +825,10 @@ class BaseModel(pl.LightningModule):
         Pytorch Lightning hook that is executed after all test steps are completed.
         """
         metrics_dict = self.compute_metrics(mode='test')
-        # for key, value in metrics_dict.items():
-        #     self.log(
-        #         name=f'test_{key}',
-        #         value=value,
-        #         prog_bar=False,
-        #         on_step=False,
-        #         on_epoch=False,
-        #         sync_dist=True,
-        #     )
+        
+        print("--------------------------------Test Metrics--------------------------------")
+        for key, value in metrics_dict.items():
+            print(f"{key}: {value}")
+        print("----------------------------------------------------------------")
         
         return super().on_test_model_train()
