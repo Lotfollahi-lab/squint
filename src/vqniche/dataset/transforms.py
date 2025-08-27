@@ -535,6 +535,9 @@ class SetExperimentDataKeys(T.BaseTransform):
 
             elif source == 'U_gosh':
                 conditioning_features.append(getattr(data, f"U_gosh_{self.edge_index_name}"))
+                
+            elif source == 'cell_batch_id':
+                conditioning_features.append(torch.empty(0))
 
         conditioning_features = torch.cat(conditioning_features, dim=-1)
 
@@ -553,31 +556,43 @@ class SetExperimentDataKeys(T.BaseTransform):
         data.edge_index = self.set_edge_index(data)
 
         if self.encoder_condition_list is not None:
+            print(f"Setting section-level conditioning features for encoder.")
             data.encoder_conditions = self.set_conditioning_features(
                 data=data,
                 condition_list=self.encoder_condition_list,
             )
-            data.encoder_condition_dim = data.encoder_conditions.shape[1]
+            if data.encoder_conditions.dim() > 1:
+                data.encoder_condition_dim = data.encoder_conditions.shape[1]
+            else:
+                data.encoder_condition_dim = 0
         else:
             data.encoder_conditions = None
             data.encoder_condition_dim = 0
             
         if self.attr_decoder_condition_list is not None:
+            print(f"Setting section-level conditioning features for attribute decoder.")
             data.attr_decoder_conditions = self.set_conditioning_features(
                 data=data,
                 condition_list=self.attr_decoder_condition_list,
             )
-            data.attr_decoder_condition_dim = data.attr_decoder_conditions.shape[1]
+            if data.attr_decoder_conditions.dim() > 1:
+                data.attr_decoder_condition_dim = data.attr_decoder_conditions.shape[1]
+            else:
+                data.attr_decoder_condition_dim = 0
         else:
             data.attr_decoder_conditions = None
             data.attr_decoder_condition_dim = 0
         
         if self.adj_decoder_condition_list is not None:
+            print(f"Setting section-level conditioning features for adjacency decoder.")
             data.adj_decoder_conditions = self.set_conditioning_features(
                 data=data,
                 condition_list=self.adj_decoder_condition_list,
             )
-            data.adj_decoder_condition_dim = data.adj_decoder_conditions.shape[1]
+            if data.adj_decoder_conditions.dim() > 1:
+                data.adj_decoder_condition_dim = data.adj_decoder_conditions.shape[1]
+            else:
+                data.adj_decoder_condition_dim = 0
         else:
             data.adj_decoder_conditions = None
             data.adj_decoder_condition_dim = 0

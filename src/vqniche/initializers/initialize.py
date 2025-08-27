@@ -1,8 +1,10 @@
 import os
+import re
 import yaml
 from pathlib import Path
-from typing import Dict, Optional, Literal
+from typing import Dict, Optional, Literal, List, Tuple
 
+import torch
 import pytorch_lightning as pl
 from torch_geometric.data import Data, Batch
 import torch_geometric.transforms as T
@@ -17,6 +19,53 @@ from ..models.vanilla_mlp import VanillaMLP
 from ..models.vanilla_gnn import VanillaGNN
 from ..models.vqniche import VQNiche
 from .utils import safe_int_conversion
+
+
+def build_batch_one_hot(
+        cell_ids: List[List[str]], max_batch: int = 38,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Given a nested list of cell_ids, return a tuple of tensors containing
+    batch IDs and one-hot encodings of batch IDs (0..max_batch).
+    
+    Parameters
+    ----------
+    cell_ids : List[List[str]]
+        Nested list of cell identifiers, e.g. [['1_batch1_0', '1_batch1_1'], ...]
+        num_cells = \sum_{i=1}^{len(cell_ids)} |cell_ids[i]|
+    max_batch : int
+        Maximum batch index (default 38 → makes one-hot vectors of length 39).
+    
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        A tuple containing:
+        - Batch ID tensor of shape (num_cells,)
+        - One-hot tensor of shape (num_cells, max_batch + 1)
+    """
+    batch_ids = []
+    batch_one_hot = []
+    for group in cell_ids:
+        group_ids = []
+        group_tensor = []
+        for cid in group:
+            # extract the batch number from pattern "batchX"
+            match = re.search(r"batch(\d+)", cid)
+            if not match:
+                raise ValueError(f"Could not parse batch from id: {cid}")
+            b = int(match.group(1))
+            
+            one_hot = torch.zeros(max_batch + 1, dtype=torch.float)
+            one_hot[b] = 1.0
+            group_ids.append(b)
+            group_tensor.append(one_hot)
+        batch_ids.extend(group_ids)
+        batch_one_hot.append(torch.stack(group_tensor))
+    
+    batch_ids = torch.tensor(batch_ids, dtype=torch.long)
+    batch_one_hot = torch.cat(batch_one_hot, dim=0)
+
+    return batch_ids, batch_one_hot
 
 
 def initialize_logger(
@@ -141,14 +190,52 @@ def initialize_databatch(
                         pin_memory=True,
                         drop_last=False,
                     ).collate_fn(data_list)
-    print(data_batch)
 
     # TODO: fix this hard-coding
     data_batch.num_features = safe_int_conversion(data_batch.num_features)
     data_batch.num_classes = safe_int_conversion(data_batch.num_classes)
+
+    # --------------------- Set Section-Level Conditioning Features ---------------------
+    encoder_condition_list = config['model']['encoder_params'].get(
+                                'conditioning_params',
+                                {},
+                            ).get(
+                                'condition_list',
+                                None,
+                            )
+    attr_decoder_condition_list = config['model']['attribute_decoder_params'].get(
+                                    'conditioning_params',
+                                    {},
+                                ).get(
+                                    'condition_list',
+                                    None,
+                                )
+
+    batch_ids, batch_conditions = build_batch_one_hot(
+                                            cell_ids=data_batch.cell_id,
+                                            max_batch=len(dataset_blob),
+                                        )
+    data_batch.adata_batch_ids = batch_ids
+
+    if 'cell_batch_id' in encoder_condition_list:
+        data_batch.encoder_conditions = torch.cat(
+                                            [data_batch.encoder_conditions, batch_conditions],
+                                            dim=-1,
+                                        )
+        data_batch.encoder_condition_dim = data_batch.encoder_conditions.shape[1]
+    if 'cell_batch_id' in attr_decoder_condition_list:
+        data_batch.attr_decoder_conditions = torch.cat(
+                                                [data_batch.attr_decoder_conditions, batch_conditions],
+                                                dim=-1,
+                                            )
+        data_batch.attr_decoder_condition_dim = data_batch.attr_decoder_conditions.shape[1]
+
     data_batch.encoder_condition_dim = safe_int_conversion(data_batch.encoder_condition_dim)
     data_batch.attr_decoder_condition_dim = safe_int_conversion(data_batch.attr_decoder_condition_dim)
     data_batch.adj_decoder_condition_dim = safe_int_conversion(data_batch.adj_decoder_condition_dim)
+
+    # --------------------- Print Data Batch ---------------------
+    print(data_batch)
 
     print(f"Batch ID(s): {adata_batch_idx}")
     print(f"Data Batch: {data_batch}")
