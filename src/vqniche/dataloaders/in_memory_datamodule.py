@@ -184,6 +184,7 @@ class InMemoryDataModule(LightningNodeData):
             'train_mask': data.train_mask,
             'val_mask': data.val_mask,
             'test_mask': data.test_mask,
+            'adata_batch_ids': data.adata_batch_ids,
         }
         
         optional_data_keys = [

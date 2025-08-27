@@ -184,7 +184,7 @@ class VQNiche(BaseModel):
         This includes setting up the data structure and adding VQ encoder metadata.
         """
         # Define cache keys for input data and model outputs
-        data_keys = ['X', 'X_nbr', 'XY_coordinates', 'Y_cell_types', 'Y_niche_types']
+        data_keys = ['X', 'X_nbr', 'XY_coordinates', 'Y_cell_types', 'Y_niche_types', 'adata_batch_ids']
         model_output_keys = ['H_latent', 'H_quantized', 'H_adj', 'Indices', 'X_hat', 'X_hat_nbr', 'Logits']
         self.cache_keys = data_keys + model_output_keys
 
@@ -698,6 +698,7 @@ class VQNiche(BaseModel):
         cache_dict['Y_cell_types'].append(batch.y[:batch_size])
         cache_dict['Y_niche_types'].append(batch.y_niche_types[:batch_size])
         cache_dict['XY_coordinates'].append(batch.xy_coordinates[:batch_size])
+        cache_dict['adata_batch_ids'].append(batch.adata_batch_ids[:batch_size])
 
         # Cache model outputs
         cache_dict['H_latent'].append(h_latent[:batch_size])
