@@ -374,7 +374,7 @@ class InMemoryDataModule(LightningNodeData):
             return test_loader
 
 
-    def infer_dataloader(self):
+    def predict_dataloader(self):
         """
         This method returns a DataLoader object for all the nodes in the graph.
         This is required for looping over all the nodes in the graph for inference.
@@ -383,7 +383,7 @@ class InMemoryDataModule(LightningNodeData):
         ------
         - If `sample_neighbors_for_inference` is set to True, the neighbors are sampled during inference.
         - If `sample_neighbors_for_inference` is set to False, the neighbors are not sampled during inference.
-        - `infer_dataloader` loops over all the nodes in the graph.
+        - `predict_dataloader` loops over all the nodes in the graph.
         """
         # reuse user-defined sampler parameters
         sampler_params = self.sampler_params

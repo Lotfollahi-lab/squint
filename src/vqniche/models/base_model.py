@@ -7,6 +7,8 @@ import torch
 import torch_geometric
 import pytorch_lightning as pl
 from torch_geometric.nn.dense.linear import Linear
+import torch.nn as nn
+import torch.nn.functional as F
 
 from vqniche.modules.mlp import MLP as MLP_AdjacencyDecoder
 from ..decoders.mlp_softmax import MLPSoftmax
@@ -39,6 +41,7 @@ class BaseModel(pl.LightningModule):
             optimizer_name: str = 'adam',
             lr: float = 0.01,
             weight_decay: float = 0.0,
+            mask_lr_scale: float = 1.0,
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'mean'},
         ) -> None:
@@ -72,6 +75,8 @@ class BaseModel(pl.LightningModule):
             The learning rate.
         - weight_decay: float
             The weight decay.
+        - mask_lr_scale: float
+            The learning rate scale for the learnable mask.
 
         - loss_names: List[str]
             The loss function names.
@@ -100,6 +105,7 @@ class BaseModel(pl.LightningModule):
         self.optimizer_name = optimizer_name
         self.lr = lr
         self.weight_decay = weight_decay
+        self.mask_lr_scale = mask_lr_scale
 
         # Loss parameters
         self.loss_kwargs = loss_kwargs
@@ -433,10 +439,20 @@ class BaseModel(pl.LightningModule):
         """
         # TODO: Add support for multiple optimizers
         if self.optimizer_name == 'adam':
+            # mask_params, other_params = [], []
+            # for name, param in self.named_parameters():
+            #     (mask_params if name.endswith("learnable_mask") else other_params).append(param)
+            
+            # return torch.optim.Adam(
+            #     [
+            #         {"params": other_params, "lr": self.lr, "weight_decay": self.weight_decay},
+            #         {"params": mask_params, "lr": self.lr * self.mask_lr_scale, "weight_decay": 0.0},
+            #     ]
+            # )
             return torch.optim.Adam(
-                params=self.parameters(),
+                self.parameters(),
                 lr=self.lr,
-                weight_decay=self.weight_decay
+                weight_decay=self.weight_decay,
             )
         else:
             raise NotImplementedError(f'Optimizer {self.optimizer_name} not implemented')
@@ -506,28 +522,6 @@ class BaseModel(pl.LightningModule):
         raise NotImplementedError('Forward pass should be implemented by the subclass')
 
 
-    @torch.no_grad()
-    def collect_inference_data(
-            self,
-            dataloader: torch.utils.data.DataLoader
-        ) -> dict:
-        """
-        Get inference data for computing training epoch stats.
-        Child classes should override this method to provide the required data.
-
-        Parameters
-        ----------
-        - dataloader: torch.utils.data.DataLoader
-            The dataloader to collect inference data from.
-
-        Returns
-        -------
-        - inference_data: dict
-            Dictionary containing inference data with keys: X, edge_index, H_latent, X_hat, H_adj
-        """
-        raise NotImplementedError('collect_inference_data should be implemented by the subclass')
-
-
     def _print_epoch_stats(self) -> None:
         """
         Print the epoch stats for the current epoch.
@@ -536,7 +530,6 @@ class BaseModel(pl.LightningModule):
         logged_value_types = {
             'train': [],
             'val': [],
-            'test': [],
             'other': [],
             }
         for logged_value_name in self.trainer.callback_metrics.keys():
@@ -544,8 +537,6 @@ class BaseModel(pl.LightningModule):
                 logged_value_types['train'].append(logged_value_name)
             elif logged_value_name.startswith('val'):
                 logged_value_types['val'].append(logged_value_name)
-            elif logged_value_name.startswith('test'):
-                logged_value_types['test'].append(logged_value_name)
             else:
                 logged_value_types['other'].append(logged_value_name)
 
@@ -559,16 +550,12 @@ class BaseModel(pl.LightningModule):
                 print(f"{loss_term_name}: {self.trainer.callback_metrics[loss_term_name]}")
         print("--------------------------------------------\n")
         
-        print(f"----------------Test-----------------")
-        for test_metric_name in logged_value_types['test']:
-            print(f"{test_metric_name}: {self.trainer.callback_metrics[test_metric_name]}")
-        print("--------------------------------------------\n")
+        if len(logged_value_types['other']) > 0:
+            print(f"----------------Other-----------------")        
+            for loss_term_name in logged_value_types['other']:
+                print(f"{loss_term_name}: {self.trainer.callback_metrics[loss_term_name]}")
+            print("--------------------------------------------\n")
         
-        # print(f"----------------Other-----------------")
-        # for other_metric_name in logged_value_types['other']:
-        #     print(f"{other_metric_name}: {self.trainer.callback_metrics[other_metric_name]}")
-        # print("--------------------------------------------\n")
-
         print(f"--------------------------------End of Epoch {self.current_epoch}--------------------------------------\n\n")
         
         return
@@ -595,59 +582,53 @@ class BaseModel(pl.LightningModule):
         return
 
 
-    def log_metrics(
+    def compute_metrics(
         self,
-        mode: Literal['train', 'val', 'test', 'infer'] = 'infer',
+        mode: Literal['train', 'val', 'test'] = 'val',
     ) -> None:
         """
-        Log metrics for a given mode. The mode determines the dataloader used to compute the metrics.
+        Compute metrics for a given mode. The mode determines the dataloader and inference data cache used to compute the metrics.
 
         Parameters
         ----------
-        - mode: Literal['train', 'val', 'test', 'infer']
-            The mode of the fit process (train, val, test, infer).
-            
-        Notes
-        -----
-        - Currently, this only supports infer_dataloader(), i.e. the full graph (tissue section).
-        - This method is called at the end of validation which ensures that the model is in evaluation mode.
-        TODO: fix this to work for train, val, test, and infer dataloaders
+        - mode: Literal['train', 'val', 'test']
+            The mode of the fit process (train, val, test).
         """
-        dataloader = getattr(self.trainer.datamodule, f'{mode}_dataloader')()        
+        # 1) Get the dataloader for the given mode
+        dataloader = getattr(self.trainer.datamodule, f'{mode}_dataloader')()
 
-        assert self.eval(), 'Model must be in evaluation mode to log metrics'
+        # 2) Get the data and model outputs cached during the steps of the given mode
+        inference_data_cache = getattr(self, f'{mode}_inference_data_cache')
 
-        # log metrics for nodes in the entire tissue section using the model in evaluation mode (infer_dataloader())
+        # self.train_metrics_list is a list of metrics specified in the train config file
+        # this is used to track the model performance at the end of each epoch
+        # currently, the trainer.validate() and trainer.test() methods also use this list
+        # a fuller list of metrics must be manually computed separately
+        # TODO: Add support for computing this full list
         if len(self.train_metrics_list) > 0:
-            # collect the raw input data and model embeddings for the entire tissue section
-            # child classes should implement this method with torch.no_grad() decorator
-            inference_data = self.collect_inference_data(
-                dataloader=dataloader,
-            )
+            # 3) Concatenate the inference data cache
+            for key in self.cache_keys:
+                inference_data_cache[key] = torch.cat(inference_data_cache[key], dim=0)
+            inference_data_cache['edge_index'] = dataloader.data.edge_index
 
-            # convert the inference data to an AnnData object
+            # 4) Convert the inference data to an AnnData object
             adata = inference_data_dict_to_adata(
-                inference_data=inference_data,
+                inference_data=inference_data_cache,
                 label_categories_dict=None,
             )
 
-            # compute the benchmarking metrics
+            # 5) Compute the benchmarking metrics
             metrics_dict = compute_benchmarking_metrics(
                 adata=adata,
                 metrics=self.train_metrics_list,
                 **self.loss_kwargs['estimate_adj_kwargs'],
             )
+            
+            # 6) Clear the inference data cache
+            for key in self.cache_keys:
+                inference_data_cache[key] = []
 
-            # log metrics
-            for key, value in metrics_dict.items():
-                self.log(
-                    name=f'{mode}_{key}',
-                    value=value,
-                    prog_bar=False,
-                    on_step=False,
-                    on_epoch=True,
-                    sync_dist=True,
-                )
+            return metrics_dict
 
 
     def on_train_epoch_start(self) -> None:
@@ -657,7 +638,7 @@ class BaseModel(pl.LightningModule):
         Notes
         -----
         - We use this hook to print the start of the current training epoch.
-        """
+        """        
         print(f"--------------------------------Start of Epoch {self.current_epoch}--------------------------------------")
 
         # call the parent class method to complete default behavior
@@ -735,13 +716,23 @@ class BaseModel(pl.LightningModule):
 
         Notes
         -----
-        - We use this hook to compute and log metrics for the entire tissue section using the model in eval mode on the infer_dataloader().
+        - We use this hook to compute and log metrics for the nodes in the validation set.
+        - This 
         """
-        # compute and log metrics for the entire tissue section using the model in evaluation mode
-        self.log_metrics(mode='train')
-        self.log_metrics(mode='val')
-        self.log_metrics(mode='test')
+        # compute metrics for the nodes in the validation set based on cached data
+        metrics_dict = self.compute_metrics(mode='val')
         
+        # log the metrics for the nodes in the validation set
+        for key, value in metrics_dict.items():
+            self.log(
+                name=f'val_{key}',
+                value=value,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
         # call the parent class method to complete default behavior
         return super().on_validation_epoch_end()
 
@@ -755,6 +746,17 @@ class BaseModel(pl.LightningModule):
         - We use this hook to print the loss terms and metrics for the current epoch.
         - We also use this hook to update the on_train_epoch_end_logs_df dataframe which is used to store the loss terms and metrics for all epochs.
         """
+        metrics_dict = self.compute_metrics(mode='train')
+        for key, value in metrics_dict.items():
+            self.log(
+                name=f'train_{key}',
+                value=value,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
         # print the epoch stats to the console
         self._print_epoch_stats()
         
@@ -784,6 +786,13 @@ class BaseModel(pl.LightningModule):
         return super().on_fit_end()
     
     
+    def on_test_model_eval(self) -> None:
+        """
+        Pytorch Lightning hook that is executed before the test steps are called.
+        """        
+        return super().on_test_model_eval()
+
+
     def test_step(
             self,
             test_batch: torch_geometric.data.Data,
@@ -809,3 +818,17 @@ class BaseModel(pl.LightningModule):
         - We use this hook to define the test step for the model. This is expected to be implemented by the child class.
         """
         raise NotImplementedError('Test step not implemented')
+    
+    
+    def on_test_model_train(self) -> None:
+        """
+        Pytorch Lightning hook that is executed after all test steps are completed.
+        """
+        metrics_dict = self.compute_metrics(mode='test')
+        
+        print("--------------------------------Test Metrics--------------------------------")
+        for key, value in metrics_dict.items():
+            print(f"{key}: {value}")
+        print("----------------------------------------------------------------")
+        
+        return super().on_test_model_train()

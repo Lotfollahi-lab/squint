@@ -26,7 +26,6 @@ class VanillaGNN(BaseModel):
             adjacency_decoder_name: Literal['MLP_AdjacencyDecoder'] = 'MLP_AdjacencyDecoder',
             predictor_name: Literal['Linear'] = 'Linear',
             in_channels: int = None,
-            condition_dim: int = 0,
             out_channels: int = None,
             train_metrics_list: List[str] = [],
             encoder_params: dict = {},
@@ -53,8 +52,6 @@ class VanillaGNN(BaseModel):
 
         - in_channels: int
             The number of input features.
-        - condition_dim: int
-            The number of conditioning features.
         - out_channels: int
             The number of output features.
 
@@ -307,6 +304,7 @@ class VanillaGNN(BaseModel):
             )
 
         return torch.tensor(0.0)
+
 
     @torch.no_grad()
     def collect_inference_data(

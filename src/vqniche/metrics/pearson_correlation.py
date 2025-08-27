@@ -12,6 +12,7 @@ def compute_pearson_correlation(
         X_key: str = 'X',
         X_hat_key: str = 'X_hat',
         nbr_key: Optional[str] = None,
+        compare_genes: Optional[bool] = False,
     ) -> float:
     """
     Compute the Pearson correlation between original and reconstructed gene expressions.
@@ -28,6 +29,10 @@ def compute_pearson_correlation(
     - nbr_key: Optional[str]
         The key in adata.obsm where the edge index is stored.
         If provided, the Pearson correlation is computed between the 1-hop neighbor-wise gene expressions.
+    - compare_genes: Optional[bool]
+        Whether to compare the genes of the two matrices.
+        If True, the Pearson correlation is computed between the genes of the two matrices.
+        If False, the Pearson correlation is computed between the cells of the two matrices.
 
     Returns
     -------
@@ -55,14 +60,14 @@ def compute_pearson_correlation(
         return pearson_correlation(
             X=X_nbr,
             X_hat=X_hat_nbr,
-            compare_genes=False,
+            compare_genes=compare_genes,
             mean=True,
         )
     else:
         return pearson_correlation(
             X=adata.uns[X_key],
             X_hat=adata.uns[X_hat_key],
-            compare_genes=False,
+            compare_genes=compare_genes,
             mean=True,
         )
 

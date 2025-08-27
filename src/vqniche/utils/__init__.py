@@ -1,7 +1,7 @@
 """
 VQNiche utilities package.
 
-This package contains various utility functions and classes for the VQNiche project, including type conversions, adjacency reconstruction, and configuration parsing.
+This package contains various utility functions and classes for the VQNiche project, including type conversions, adjacency reconstruction, loss utilities, masking for imputation, and configuration parsing.
 """
 
 # Type conversion utilities
@@ -23,8 +23,16 @@ from .adjacency_reconstruction import (
 
 # Loss utilities
 from .loss_utils import (
+    batch_pred_attr_and_target_attr,
     aggregate_1hop_neighbor_features,
     compute_neighbor_codebook_counts,
+)
+
+# Masking utilities
+from .mask import (
+    set_mask_ratio,
+    set_mask_indices,
+    print_masked_input_diversity_stats,
 )
 
 # Configuration parsing utilities
@@ -62,8 +70,14 @@ __all__ = [
     "reconstruct_adjacency_matrix",
     
     # Loss utilities
+    "batch_pred_attr_and_target_attr",
     "aggregate_1hop_neighbor_features",
     "compute_neighbor_codebook_counts",
+    
+    # Masking utilities
+    "set_mask_ratio",
+    "set_mask_indices",
+    "print_masked_input_diversity_stats",
     
     # Configuration parsing
     "parse_train_arguments",

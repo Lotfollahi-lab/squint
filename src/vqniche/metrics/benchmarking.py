@@ -124,10 +124,28 @@ def compute_benchmarking_metrics(
         print("Computing Pearson correlation (1-hop neighbor-wise)...")
         benchmarking_dict["pearson_1hop_nbr"] = compute_pearson_correlation(
             adata=adata,
+            X_key='X_nbr',
+            X_hat_key='X_hat_nbr',
+        )
+        
+    if "pearson_gene_wise" in metrics:
+        print("Computing Pearson correlation (gene-wise)...")
+        benchmarking_dict["pearson_gene_wise"] = compute_pearson_correlation(
+            adata=adata,
             X_key='X',
             X_hat_key='X_hat',
-            nbr_key='edge_index',
+            compare_genes=True,
         )
+    
+    if "pearson_gene_wise_1hop_nbr" in metrics:
+        print("Computing Pearson correlation (gene-wise, 1-hop neighbor-wise)...")
+        benchmarking_dict["pearson_gene_wise_1hop_nbr"] = compute_pearson_correlation(
+            adata=adata,
+            X_key='X_nbr',
+            X_hat_key='X_hat_nbr',
+            compare_genes=True,
+        )
+    
     elapsed_time = time.time() - start_time
     minutes = int(elapsed_time // 60)
     seconds = int(elapsed_time % 60)
