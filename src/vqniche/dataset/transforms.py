@@ -538,6 +538,9 @@ class SetExperimentDataKeys(T.BaseTransform):
                 
             elif source == 'cell_batch_id':
                 conditioning_features.append(torch.empty(0))
+                
+            elif source == 'timepoint_id':
+                conditioning_features.append(torch.empty(0))
 
         conditioning_features = torch.cat(conditioning_features, dim=-1)
 

@@ -68,6 +68,43 @@ def build_batch_one_hot(
     return batch_ids, batch_one_hot
 
 
+def build_timepoint_one_hot(
+        batch_ids: torch.Tensor,
+        max_timepoint: int = 4,
+        batch_timepoint_map: Dict[int, int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Given a tensor of batch IDs, return a tuple of tensors containing
+    timepoint IDs and one-hot encodings of timepoint IDs (0..max_timepoint).
+
+    Parameters
+    ----------
+    batch_ids : torch.Tensor
+        Tensor of batch IDs
+    max_timepoint : int
+        Maximum timepoint index (default 4 → makes one-hot vectors of length 5).
+    batch_timepoint_map : Dict[int, int]
+        Dictionary mapping batch IDs to timepoint IDs.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        A tuple containing:
+        - Timepoint ID tensor of shape (num_cells,)
+        - One-hot tensor of shape (num_cells, max_timepoint)
+    """
+    timepoint_ids = []
+    timepoint_one_hot = []
+    for batch_id in batch_ids:
+        timepoint_id = batch_timepoint_map[batch_id.item()]
+        timepoint_ids.append(timepoint_id)
+        timepoint_one_hot.append(torch.zeros(max_timepoint, dtype=torch.float))
+        timepoint_one_hot[-1][timepoint_id] = 1.0
+    timepoint_ids = torch.tensor(timepoint_ids, dtype=torch.long)
+    timepoint_one_hot = torch.stack(timepoint_one_hot)
+    return timepoint_ids, timepoint_one_hot
+
+
 def initialize_logger(
         config: Dict,
     ) -> WandbLogger:
@@ -211,6 +248,7 @@ def initialize_databatch(
                                     None,
                                 )
 
+    # TODO: clean up this multi-section conditioning code
     batch_ids, batch_conditions = build_batch_one_hot(
                                             cell_ids=data_batch.cell_id,
                                             max_batch=len(dataset_blob),
@@ -223,9 +261,30 @@ def initialize_databatch(
                                             dim=-1,
                                         )
         data_batch.encoder_condition_dim = data_batch.encoder_conditions.shape[1]
+    if 'timepoint_id' in encoder_condition_list:
+        _, timepoint_conditions = build_timepoint_one_hot(
+                                        batch_ids=batch_ids,
+                                        **config['dataset']['batch_timepoint'],
+                                    )
+        data_batch.encoder_conditions = torch.cat(
+                                                [data_batch.encoder_conditions, timepoint_conditions],
+                                                dim=-1,
+                                            )
+        data_batch.encoder_condition_dim = data_batch.encoder_conditions.shape[1]
+
     if 'cell_batch_id' in attr_decoder_condition_list:
         data_batch.attr_decoder_conditions = torch.cat(
                                                 [data_batch.attr_decoder_conditions, batch_conditions],
+                                                dim=-1,
+                                            )
+        data_batch.attr_decoder_condition_dim = data_batch.attr_decoder_conditions.shape[1]
+    if 'timepoint_id' in attr_decoder_condition_list:
+        _, timepoint_conditions = build_timepoint_one_hot(
+                                        batch_ids=batch_ids,
+                                        **config['dataset']['batch_timepoint'],
+                                    )
+        data_batch.attr_decoder_conditions = torch.cat(
+                                                [data_batch.attr_decoder_conditions, timepoint_conditions],
                                                 dim=-1,
                                             )
         data_batch.attr_decoder_condition_dim = data_batch.attr_decoder_conditions.shape[1]
