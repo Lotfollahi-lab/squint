@@ -208,17 +208,26 @@ def inference_data_dict_to_adata(
     Parameters
     ----------
     inference_data : Dict
-        Dictionary containing inference results with keys:
+        Dictionary containing inference results with data + model output keys + metadata:
         - 'X': Input features (torch.Tensor)
+        - 'X_nbr': 1-hop neighbor features (torch.Tensor)
         - 'Y_cell_types': Cell type labels as one-hot vectors (torch.Tensor)
         - 'Y_niche_types': Niche type labels as one-hot vectors (torch.Tensor)
+        - 'XY_coordinates': Spatial coordinates (torch.Tensor)
+        - 'adata_batch_ids': Batch IDs (torch.Tensor)
         - 'edge_index': Edge indices (torch.Tensor)
+
         - 'H_latent': Latent representations (torch.Tensor)
-        - 'X_hat': Reconstructed features (torch.Tensor)
-        - 'H_adj': Adjacency representations (torch.Tensor)
-        - 'Logits': Logits (torch.Tensor)
         - 'H_quantized': Quantized representations (torch.Tensor, optional)
+        - 'H_adj': Adjacency representations (torch.Tensor)
         - 'Indices': Quantization indices (torch.Tensor, optional)
+        - 'X_hat': Reconstructed features (torch.Tensor)
+        - 'X_hat_nbr': 1-hop neighbor reconstructed features (torch.Tensor)
+        - 'Logits': Logits (torch.Tensor)
+        
+        - 'codebook_size': Codebook size (int)
+        - 'separate': Whether to separate the data into batches (bool)
+        - 'num_heads': Number of heads (int)
     label_categories_dict : Optional[Dict]
         If provided, a dictionary containing 'cell_types' and 'niche_types' as keys and label categories as values.
         For example, {'cell_types': ['cell_type_1', 'cell_type_2', 'cell_type_3'], 'niche_types': ['niche_type_1', 'niche_type_2', 'niche_type_3']}.
@@ -236,6 +245,10 @@ def inference_data_dict_to_adata(
     """
     # Create AnnData object with input features
     adata = ad.AnnData(X=inference_data['X'].cpu().numpy())
+    if 'X' in inference_data:
+        adata.uns['X'] = inference_data['X'].cpu()
+    if 'X_nbr' in inference_data:
+        adata.uns['X_nbr'] = inference_data['X_nbr'].cpu()
     
     # Convert one-hot labels to category labels
     for label_name in ['cell_types', 'niche_types']:
@@ -256,43 +269,35 @@ def inference_data_dict_to_adata(
         adata.uns['Y_cell_types'] = inference_data['Y_cell_types']
     if 'Y_niche_types' in inference_data:
         adata.uns['Y_niche_types'] = inference_data['Y_niche_types']
-    if 'Logits' in inference_data:
-        adata.uns['Logits'] = inference_data['Logits']
-
     if 'XY_coordinates' in inference_data:
         adata.obsm['spatial'] = inference_data['XY_coordinates'].cpu().numpy()
+    if 'adata_batch_ids' in inference_data:
+        adata.obs['adata_batch_ids'] = inference_data['adata_batch_ids'].cpu().numpy()
+    if 'edge_index' in inference_data:
+        adata.uns['edge_index'] = inference_data['edge_index'].cpu()
     
     # Store embeddings in obsm
     if 'H_latent' in inference_data:
         adata.obsm['H_latent'] = inference_data['H_latent'].cpu().numpy()
-    if 'H_adj' in inference_data:
-        adata.obsm['H_adj'] = inference_data['H_adj'].cpu().numpy()
-    
-    # Store edge index
-    if 'X' in inference_data:
-        adata.uns['X'] = inference_data['X'].cpu()
-    if 'X_hat' in inference_data:
-        adata.uns['X_hat'] = inference_data['X_hat'].cpu()
-    if 'X_nbr' in inference_data:
-        adata.uns['X_nbr'] = inference_data['X_nbr'].cpu()
-    if 'X_hat_nbr' in inference_data:
-        adata.uns['X_hat_nbr'] = inference_data['X_hat_nbr'].cpu()
-    if 'edge_index' in inference_data:
-        adata.uns['edge_index'] = inference_data['edge_index'].cpu()
-    
-    # Add H_quantized and Indices only if they exist
     if 'H_quantized' in inference_data:
         adata.obsm['H_quantized'] = inference_data['H_quantized'].cpu().numpy()
-    
+    if 'H_adj' in inference_data:
+        adata.obsm['H_adj'] = inference_data['H_adj'].cpu().numpy()
     if 'Indices' in inference_data:
         adata.uns['Indices'] = inference_data['Indices']
+    
+    # Store edge index
+    if 'X_hat' in inference_data:
+        adata.uns['X_hat'] = inference_data['X_hat'].cpu()
+    if 'X_hat_nbr' in inference_data:
+        adata.uns['X_hat_nbr'] = inference_data['X_hat_nbr'].cpu()
+    if 'Logits' in inference_data:
+        adata.uns['Logits'] = inference_data['Logits']    
 
     if 'codebook_size' in inference_data:
         adata.uns['codebook_size'] = inference_data['codebook_size']
-
     if 'separate' in inference_data:
         adata.uns['separate'] = inference_data['separate']
-
     if 'num_heads' in inference_data:
         adata.uns['num_heads'] = inference_data['num_heads']
 
