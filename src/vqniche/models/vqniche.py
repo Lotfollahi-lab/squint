@@ -474,6 +474,12 @@ class VQNiche(BaseModel):
                         'h_spatial_prior': h_spatial_prior, # spatial prior loss
                         'indices_one_hot': indices_one_hot, # spatial prior loss
                         }
+        
+        # Add mask token to train loss data if using learnable parameter strategy
+        if self.mask_strategy == 'learnable_parameter':
+            train_loss_data.update({
+                'mask_token': self.mask_token,
+            })
 
         # --------------------- Compute Loss ---------------------
         # 6) Compute the loss
@@ -584,6 +590,12 @@ class VQNiche(BaseModel):
                         'h_spatial_prior': h_spatial_prior, # spatial prior loss
                         'indices_one_hot': indices_one_hot, # spatial prior loss
                         }
+
+        # Add mask token to val loss data if using learnable parameter strategy
+        if self.mask_strategy == 'learnable_parameter':
+            val_loss_data.update({
+                'mask_token': self.mask_token,
+            })
 
         # --------------------- Compute Loss ---------------------
         # 6) Compute the loss
