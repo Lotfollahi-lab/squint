@@ -472,7 +472,7 @@ class VQNiche(BaseModel):
                         'logits': unnormalized_logits_batch[:batch_size], # label prediction loss
                         'labels': train_batch.y[:batch_size], # label prediction loss
                         'h_spatial_prior': h_spatial_prior, # spatial prior loss
-                        'indices': indices_one_hot, # spatial prior loss
+                        'indices_one_hot': indices_one_hot, # spatial prior loss
                         }
 
         # --------------------- Compute Loss ---------------------
@@ -582,7 +582,7 @@ class VQNiche(BaseModel):
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': val_batch.y[:batch_size],
                         'h_spatial_prior': h_spatial_prior, # spatial prior loss
-                        'indices': indices_one_hot, # spatial prior loss
+                        'indices_one_hot': indices_one_hot, # spatial prior loss
                         }
 
         # --------------------- Compute Loss ---------------------

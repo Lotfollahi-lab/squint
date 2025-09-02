@@ -19,6 +19,7 @@ from vqniche.loss import (
     mse_adjacency_reconstruction_loss,
     bce_adjacency_reconstruction_loss,
     mse_joint_code_commit_loss,
+    ce_spatial_prior_loss,
     mse_commit_loss,
     mse_code_loss,
     l2_codebook_orthogonal_regularization_loss
@@ -223,6 +224,15 @@ class BaseModel(pl.LightningModule):
                 wt_joint_code_commit = loss_kwargs.get('wt_joint_code_commit')
                 if wt_joint_code_commit is not None:
                     loss_fn_params['wt_joint_code_commit'] = wt_joint_code_commit
+                    
+            elif loss_fn_name == 'ce_spatial_prior_loss':
+                loss_fn = ce_spatial_prior_loss
+
+                loss_fn_data_keys = ['h_spatial_prior', 'indices_one_hot']
+
+                wt_spatial_prior = loss_kwargs.get('wt_spatial_prior')
+                if wt_spatial_prior is not None:
+                    loss_fn_params['wt_spatial_prior'] = wt_spatial_prior
 
             elif loss_fn_name == 'mse_commit_loss':
                 loss_fn = mse_commit_loss
