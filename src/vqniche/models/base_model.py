@@ -21,7 +21,8 @@ from vqniche.loss import (
     mse_joint_code_commit_loss,
     mse_commit_loss,
     mse_code_loss,
-    l2_codebook_orthogonal_regularization_loss
+    l2_codebook_orthogonal_regularization_loss,
+    mask_token_regularization
 )
 from vqniche.utils.type_conversions import inference_data_dict_to_adata
 from vqniche.metrics import compute_benchmarking_metrics
@@ -258,6 +259,15 @@ class BaseModel(pl.LightningModule):
                 codebook_reg_max_codes = loss_kwargs.get('codebook_reg_max_codes')
                 if codebook_reg_max_codes is not None:
                     loss_fn_params['codebook_reg_max_codes'] = codebook_reg_max_codes
+
+            elif loss_fn_name == 'mask_token_regularization':
+                loss_fn = mask_token_regularization
+
+                loss_fn_data_keys = ['mask_token']
+
+                wt_mask_token_regularization = loss_kwargs.get('wt_mask_token_regularization')
+                if wt_mask_token_regularization is not None:
+                    loss_fn_params['wt_mask_token_regularization'] = wt_mask_token_regularization
 
             else:
                 raise NotImplementedError(f'{loss_fn_name} Loss not implemented')

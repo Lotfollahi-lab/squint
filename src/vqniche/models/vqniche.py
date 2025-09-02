@@ -454,6 +454,12 @@ class VQNiche(BaseModel):
                         'logits': unnormalized_logits_batch[:batch_size], # label prediction loss
                         'labels': train_batch.y[:batch_size], # label prediction loss
                         }
+        
+        # Add mask token to train loss data if using learnable parameter strategy
+        if self.mask_strategy == 'learnable_parameter':
+            train_loss_data.update({
+                'mask_token': self.mask_token,
+            })
 
         # --------------------- Compute Loss ---------------------
         # 6) Compute the loss
@@ -554,6 +560,12 @@ class VQNiche(BaseModel):
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': val_batch.y[:batch_size],
                         }
+
+        # Add mask token to val loss data if using learnable parameter strategy
+        if self.mask_strategy == 'learnable_parameter':
+            val_loss_data.update({
+                'mask_token': self.mask_token,
+            })
 
         # --------------------- Compute Loss ---------------------
         # 6) Compute the loss

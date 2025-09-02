@@ -18,6 +18,7 @@ from .vqgraph_codebook_loss import (
     mse_joint_code_commit_loss,
     l2_codebook_orthogonal_regularization_loss
 )
+from .mask_token_regularization import mask_token_regularization
 from .utils import compute_dispersion
 
 __all__ = [
@@ -30,5 +31,6 @@ __all__ = [
     "mse_code_loss",
     "mse_joint_code_commit_loss",
     "l2_codebook_orthogonal_regularization_loss",
+    "mask_token_regularization",
     "compute_dispersion"
 ] 
