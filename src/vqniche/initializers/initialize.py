@@ -255,39 +255,41 @@ def initialize_databatch(
                                         )
     data_batch.adata_batch_ids = batch_ids
 
-    if 'cell_batch_id' in encoder_condition_list:
-        data_batch.encoder_conditions = torch.cat(
-                                            [data_batch.encoder_conditions, batch_conditions],
-                                            dim=-1,
+    if encoder_condition_list is not None:
+        if 'cell_batch_id' in encoder_condition_list:
+            data_batch.encoder_conditions = torch.cat(
+                                                [data_batch.encoder_conditions, batch_conditions],
+                                                dim=-1,
+                                            )
+            data_batch.encoder_condition_dim = data_batch.encoder_conditions.shape[1]
+        if 'timepoint_id' in encoder_condition_list:
+            _, timepoint_conditions = build_timepoint_one_hot(
+                                            batch_ids=batch_ids,
+                                            **config['dataset']['batch_timepoint'],
                                         )
-        data_batch.encoder_condition_dim = data_batch.encoder_conditions.shape[1]
-    if 'timepoint_id' in encoder_condition_list:
-        _, timepoint_conditions = build_timepoint_one_hot(
-                                        batch_ids=batch_ids,
-                                        **config['dataset']['batch_timepoint'],
-                                    )
-        data_batch.encoder_conditions = torch.cat(
-                                                [data_batch.encoder_conditions, timepoint_conditions],
-                                                dim=-1,
-                                            )
-        data_batch.encoder_condition_dim = data_batch.encoder_conditions.shape[1]
+            data_batch.encoder_conditions = torch.cat(
+                                                    [data_batch.encoder_conditions, timepoint_conditions],
+                                                    dim=-1,
+                                                )
+            data_batch.encoder_condition_dim = data_batch.encoder_conditions.shape[1]
 
-    if 'cell_batch_id' in attr_decoder_condition_list:
-        data_batch.attr_decoder_conditions = torch.cat(
-                                                [data_batch.attr_decoder_conditions, batch_conditions],
-                                                dim=-1,
-                                            )
-        data_batch.attr_decoder_condition_dim = data_batch.attr_decoder_conditions.shape[1]
-    if 'timepoint_id' in attr_decoder_condition_list:
-        _, timepoint_conditions = build_timepoint_one_hot(
-                                        batch_ids=batch_ids,
-                                        **config['dataset']['batch_timepoint'],
-                                    )
-        data_batch.attr_decoder_conditions = torch.cat(
-                                                [data_batch.attr_decoder_conditions, timepoint_conditions],
-                                                dim=-1,
-                                            )
-        data_batch.attr_decoder_condition_dim = data_batch.attr_decoder_conditions.shape[1]
+    if attr_decoder_condition_list is not None:
+        if 'cell_batch_id' in attr_decoder_condition_list:
+            data_batch.attr_decoder_conditions = torch.cat(
+                                                    [data_batch.attr_decoder_conditions, batch_conditions],
+                                                    dim=-1,
+                                                )
+            data_batch.attr_decoder_condition_dim = data_batch.attr_decoder_conditions.shape[1]
+        if 'timepoint_id' in attr_decoder_condition_list:
+            _, timepoint_conditions = build_timepoint_one_hot(
+                                            batch_ids=batch_ids,
+                                            **config['dataset']['batch_timepoint'],
+                                        )
+            data_batch.attr_decoder_conditions = torch.cat(
+                                                    [data_batch.attr_decoder_conditions, timepoint_conditions],
+                                                    dim=-1,
+                                                )
+            data_batch.attr_decoder_condition_dim = data_batch.attr_decoder_conditions.shape[1]
 
     data_batch.encoder_condition_dim = safe_int_conversion(data_batch.encoder_condition_dim)
     data_batch.attr_decoder_condition_dim = safe_int_conversion(data_batch.attr_decoder_condition_dim)
