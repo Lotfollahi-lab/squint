@@ -15,6 +15,7 @@ from typing import Literal, List, Optional
 
 import torch
 import torch_geometric
+import torch.nn.functional as F
 
 from .base_model import BaseModel
 from ..encoders.vqniche_encoder import VQNiche_Encoder
@@ -205,6 +206,7 @@ class VQNiche(BaseModel):
             batch_x: torch.Tensor,
             batch_edge_index: torch.Tensor,
             batch_encoder_conditions: Optional[torch.Tensor] = None,
+            batch_spatial_prior_features: Optional[torch.Tensor] = None,
             batch_attr_decoder_conditions: Optional[torch.Tensor] = None,
             batch_adj_decoder_conditions: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
@@ -219,6 +221,8 @@ class VQNiche(BaseModel):
             The edge index tensor of the batch of nodes.
         - batch_encoder_conditions: torch.Tensor
             The conditioning features for the encoder of the batch of nodes.
+        - batch_spatial_prior_features: torch.Tensor
+            The spatial prior features for the encoder of the batch of nodes.
         - batch_attr_decoder_conditions: torch.Tensor
             The conditioning features for the attribute decoder of the batch of nodes.
         - batch_adj_decoder_conditions: torch.Tensor
@@ -238,6 +242,8 @@ class VQNiche(BaseModel):
             The decoded adjacency embeddings from the Adjacency Decoder.
         - unnormalized_logits_batch: torch.Tensor
             Unnormalized logits for the batch of nodes from the Predictor.
+        - h_spatial_prior: torch.Tensor
+            The spatial prior features for the encoder of the batch of nodes.
 
         Notes
         -----
@@ -247,11 +253,13 @@ class VQNiche(BaseModel):
         # execute the forward of the VQNiche_Encoder module
         h_latent, \
         h_quantized, \
-        indices \
+        indices, \
+        h_spatial_prior \
             = self.encoder(
                             batch_x,
                             batch_edge_index,
                             batch_encoder_conditions,
+                            batch_spatial_prior_features,
                         )
 
         xhat = self.attribute_decoder(
@@ -270,7 +278,8 @@ class VQNiche(BaseModel):
             indices, \
             xhat, \
             h_adj, \
-            unnormalized_logits_batch
+            unnormalized_logits_batch, \
+            h_spatial_prior
 
 
     def apply_mask_to_attributes(
@@ -408,6 +417,7 @@ class VQNiche(BaseModel):
 
         # 2) Prepare conditioning features for the encoder, attribute decoder, and adjacency decoder
         train_encoder_conditions = getattr(train_batch, 'encoder_conditions', None)
+        train_spatial_prior_features = getattr(train_batch, 'spatial_prior_features', None)
         train_attr_decoder_conditions = getattr(train_batch, 'attr_decoder_conditions', None)
         train_adj_decoder_conditions = getattr(train_batch, 'adj_decoder_conditions', None)
 
@@ -418,11 +428,13 @@ class VQNiche(BaseModel):
         indices, \
         xhat_batch, \
         h_adj_batch, \
-        unnormalized_logits_batch \
+        unnormalized_logits_batch, \
+        h_spatial_prior \
             = self(
                 batch_x=masked_x,
                 batch_edge_index=train_batch.edge_index,
                 batch_encoder_conditions=train_encoder_conditions,
+                batch_spatial_prior_features=train_spatial_prior_features,
                 batch_attr_decoder_conditions=train_attr_decoder_conditions,
                 batch_adj_decoder_conditions=train_adj_decoder_conditions,
             )
@@ -438,6 +450,12 @@ class VQNiche(BaseModel):
             k_hop_nb_loss=self.loss_kwargs['k_hop_nb_loss'],
             only_masked=self.loss_kwargs['only_masked'],
         )
+        
+        indices_one_hot = F.one_hot(
+                            indices,
+                            num_classes=self.encoder.vq.codebook_size,
+                        )
+        # print(f"{indices_one_hot.shape=} | {h_spatial_prior.shape=}")
 
         # 5) Prepare dictionary of data required for computing loss
         # Slicing the first batch_size entries is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the source nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of source nodes is equal to the batch size. The remaining entries of the forward output correspond to the sampled neighbors of the source nodes.
@@ -453,6 +471,8 @@ class VQNiche(BaseModel):
                         'batch_edge_index': train_batch.edge_index, # adjacency reconstruction loss
                         'logits': unnormalized_logits_batch[:batch_size], # label prediction loss
                         'labels': train_batch.y[:batch_size], # label prediction loss
+                        'h_spatial_prior': h_spatial_prior, # spatial prior loss
+                        'indices': indices_one_hot, # spatial prior loss
                         }
 
         # --------------------- Compute Loss ---------------------
@@ -509,6 +529,7 @@ class VQNiche(BaseModel):
 
         # 2) Prepare conditioning features for the encoder, attribute decoder, and adjacency decoder
         val_encoder_conditions = getattr(val_batch, 'encoder_conditions', None)
+        val_spatial_prior_features = getattr(val_batch, 'spatial_prior_features', None)
         val_attr_decoder_conditions = getattr(val_batch, 'attr_decoder_conditions', None)
         val_adj_decoder_conditions = getattr(val_batch, 'adj_decoder_conditions', None)
         
@@ -519,11 +540,13 @@ class VQNiche(BaseModel):
         indices, \
         xhat_batch, \
         h_adj_batch, \
-        unnormalized_logits_batch \
+        unnormalized_logits_batch, \
+        h_spatial_prior \
             = self(
                 batch_x=masked_x,
                 batch_edge_index=val_batch.edge_index,
                 batch_encoder_conditions=val_encoder_conditions,
+                batch_spatial_prior_features=val_spatial_prior_features,
                 batch_attr_decoder_conditions=val_attr_decoder_conditions,
                 batch_adj_decoder_conditions=val_adj_decoder_conditions,
             )
@@ -540,6 +563,11 @@ class VQNiche(BaseModel):
             only_masked=False, # False and True are equivalent for validation
         )
 
+        indices_one_hot = F.one_hot(
+                            indices,
+                            num_classes=self.encoder.vq.codebook_size,
+                        )
+
         # 5) Prepare dictionary of data required for computing loss
         val_loss_data = {
                         'quantizer_input': h_latent[:batch_size],
@@ -553,6 +581,8 @@ class VQNiche(BaseModel):
                         'batch_edge_index': val_batch.edge_index,
                         'logits': unnormalized_logits_batch[:batch_size],
                         'labels': val_batch.y[:batch_size],
+                        'h_spatial_prior': h_spatial_prior, # spatial prior loss
+                        'indices': indices_one_hot, # spatial prior loss
                         }
 
         # --------------------- Compute Loss ---------------------
@@ -619,7 +649,8 @@ class VQNiche(BaseModel):
         indices, \
         xhat_batch, \
         h_adj_batch, \
-        unnormalized_logits_batch \
+        unnormalized_logits_batch, \
+        _ \
             = self(
                 batch_x=masked_x,
                 batch_edge_index=test_batch.edge_index,
@@ -755,7 +786,8 @@ class VQNiche(BaseModel):
         indices, \
         xhat_batch, \
         h_adj_batch, \
-        unnormalized_logits_batch \
+        unnormalized_logits_batch, \
+        _ \
             = self(
                 batch_x=masked_x,
                 batch_edge_index=predict_batch.edge_index,

@@ -19,6 +19,7 @@ class VQNiche_Encoder(pl.LightningModule):
             gnn_params: dict = {},
             conditioning_params: dict = {},
             vq_params: dict = {},
+            spatial_prior_params: dict = {},
         ):
         """
         Initialize the VQGraph_Encoder.
@@ -38,6 +39,8 @@ class VQNiche_Encoder(pl.LightningModule):
             Keyword arguments for the conditioning module.
         - vq_params: dict
             Keyword arguments for the VQ module.
+        - spatial_prior_params: dict
+            Keyword arguments for the spatial prior module.
         """
         super().__init__()
 
@@ -91,6 +94,16 @@ class VQNiche_Encoder(pl.LightningModule):
                     )
 
         self.dim = vq_params['dim']
+        
+        if 'spatial_prior_feature' in spatial_prior_params:
+            self.spatial_prior = MLP_Module(
+                in_channels=spatial_prior_params['spatial_prior_feature_dim'],
+                out_channels=self.vq.codebook_size,
+                hidden_channels=spatial_prior_params['hidden_channels'],
+                act=spatial_prior_params['act'],
+            )
+        else:
+            self.spatial_prior = None
 
 
     def _init_vq_module(
@@ -112,6 +125,7 @@ class VQNiche_Encoder(pl.LightningModule):
             batch_x: torch.Tensor,
             batch_edge_index: torch.Tensor,
             batch_encoder_conditions: Optional[torch.Tensor] = None,
+            batch_spatial_prior_features: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         """
         Forward pass of the VQGraph_Encoder model.
@@ -124,6 +138,8 @@ class VQNiche_Encoder(pl.LightningModule):
             The edge index tensor of the batch of nodes.
         - batch_encoder_conditions: Optional[torch.Tensor]
             The conditioning features for the encoder of the batch of nodes.
+        - batch_spatial_prior_features: Optional[torch.Tensor]
+            The spatial prior features for the encoder of the batch of nodes.
 
         Returns
         -------
@@ -161,7 +177,14 @@ class VQNiche_Encoder(pl.LightningModule):
         indices, \
         _, \
             = self.vq(h_latent)
+            
+        # forward pass of the spatial prior module
+        if self.spatial_prior is not None:
+            h_spatial_prior = self.spatial_prior(batch_spatial_prior_features)
+        else:
+            h_spatial_prior = None
 
         return h_latent, \
             h_quantized, \
-            indices
+            indices, \
+            h_spatial_prior

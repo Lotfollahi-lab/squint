@@ -191,6 +191,7 @@ class InMemoryDataModule(LightningNodeData):
             'y_cell_types',
             'y_niche_types',
             'encoder_conditions',
+            'spatial_prior_features',
             'attr_decoder_conditions',
             'adj_decoder_conditions',
         ]

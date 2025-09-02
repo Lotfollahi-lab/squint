@@ -390,6 +390,7 @@ class SetExperimentDataKeys(T.BaseTransform):
             label_name: str = 'cell_types',
             edge_index_name: str = 'spatial-delaunay',
             encoder_condition_list: Optional[List[str]] = None,
+            spatial_prior_feature: Optional[str] = None,
             attr_decoder_condition_list: Optional[List[str]] = None,
             adj_decoder_condition_list: Optional[List[str]] = None,
         ):
@@ -407,6 +408,8 @@ class SetExperimentDataKeys(T.BaseTransform):
             The key for the edge index to set.
         - encoder_condition_list: List[str]
             List of condition names to be used for conditioning the encoder.
+        - spatial_prior_feature: str
+            Feature to be used for training the spatial prior for the codebook.
         - attr_decoder_condition_list: List[str]
             List of condition names to be used for conditioning the attribute decoder.
         - adj_decoder_condition_list: List[str]
@@ -422,6 +425,7 @@ class SetExperimentDataKeys(T.BaseTransform):
         self.label_name = label_name
         self.edge_index_name = edge_index_name
         self.encoder_condition_list = encoder_condition_list
+        self.spatial_prior_feature = spatial_prior_feature
         self.attr_decoder_condition_list = attr_decoder_condition_list
         self.adj_decoder_condition_list = adj_decoder_condition_list
 
@@ -547,6 +551,31 @@ class SetExperimentDataKeys(T.BaseTransform):
         return conditioning_features
 
 
+    def set_spatial_prior_features(
+            self,
+            data: Data,
+            feature_name: str = None,
+        ) -> torch.Tensor:
+        """
+        Set the spatial prior features in the data object given the feature name.
+        """
+        if feature_name == 'fourier_xy':
+            return fourier_encode(
+                    data.xy_coordinates,
+                )
+            
+        elif feature_name == 'rbf_distances':
+            # Compute distance from centroid
+            centroid = data.xy_coordinates.mean(dim=0, keepdim=True)
+            dists = torch.norm(data.xy_coordinates - centroid, dim=1)  # (N,)
+            centers = torch.linspace(dists.min(), dists.max(), steps=8).to(dists.device)
+            rbf_feats = rbf_encode(dists, centers, gamma=10.0)
+            return rbf_feats
+
+        else:
+            raise ValueError(f"Spatial prior feature {feature_name} not found in data.")
+
+
     def forward(
             self,
             data: Data
@@ -571,6 +600,17 @@ class SetExperimentDataKeys(T.BaseTransform):
         else:
             data.encoder_conditions = None
             data.encoder_condition_dim = 0
+            
+        if self.spatial_prior_feature is not None:
+            print(f"Setting spatial prior features for encoder.")
+            data.spatial_prior_features = self.set_spatial_prior_features(
+                data=data,
+                feature_name=self.spatial_prior_feature,
+            )
+            data.spatial_prior_feature_dim = data.spatial_prior_features.shape[1]
+        else:
+            data.spatial_prior_features = None
+            data.spatial_prior_feature_dim = 0
             
         if self.attr_decoder_condition_list is not None:
             print(f"Setting section-level conditioning features for attribute decoder.")
