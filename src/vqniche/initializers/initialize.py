@@ -151,6 +151,15 @@ def initialize_dataset_blob(
                                 'condition_list',
                                 None,
                             )
+    
+    spatial_prior_feature = config['model']['encoder_params'].get(
+                                    'spatial_prior_params',
+                                    {},
+                                ).get(
+                                    'spatial_prior_feature',
+                                    None,
+                                )
+    
     attr_decoder_condition_list = config['model']['attribute_decoder_params'].get(
                                     'conditioning_params',
                                     {},
@@ -171,6 +180,7 @@ def initialize_dataset_blob(
                             label_name=label_name,
                             edge_index_name=edge_index_name,
                             encoder_condition_list=encoder_condition_list,
+                            spatial_prior_feature=spatial_prior_feature,
                             attr_decoder_condition_list=attr_decoder_condition_list,
                             adj_decoder_condition_list=adj_decoder_condition_list,
                         )
@@ -292,6 +302,7 @@ def initialize_databatch(
             data_batch.attr_decoder_condition_dim = data_batch.attr_decoder_conditions.shape[1]
 
     data_batch.encoder_condition_dim = safe_int_conversion(data_batch.encoder_condition_dim)
+    data_batch.spatial_prior_feature_dim = safe_int_conversion(data_batch.spatial_prior_feature_dim)
     data_batch.attr_decoder_condition_dim = safe_int_conversion(data_batch.attr_decoder_condition_dim)
     data_batch.adj_decoder_condition_dim = safe_int_conversion(data_batch.adj_decoder_condition_dim)
 
