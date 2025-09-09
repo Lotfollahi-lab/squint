@@ -1,5 +1,6 @@
 from typing import Optional
 
+import torch
 import numpy as np
 from scipy.stats import pearsonr
 from anndata import AnnData
@@ -73,8 +74,8 @@ def compute_pearson_correlation(
 
 
 def pearson_correlation(
-        X: np.ndarray,
-        X_hat: np.ndarray,
+        X: torch.Tensor,
+        X_hat: torch.Tensor,
         compare_genes: Optional[bool] = False,
         mean: Optional[bool] = True
     ) -> float:
@@ -83,9 +84,9 @@ def pearson_correlation(
 
     Parameters
     ----------
-    - X: numpy.ndarray
+    - X: torch.Tensor
         The original cell-gene matrix.
-    - X_hat: numpy.ndarray
+    - X_hat: torch.Tensor
         The reconstructed cell-gene matrix.
     - compare_genes: bool
         Whether to compare the genes of the two matrices.
@@ -105,12 +106,34 @@ def pearson_correlation(
     assert X.shape == X_hat.shape
 
     if compare_genes:
-        correlations = [pearsonr(X[:, j], X_hat[:, j])[0] for j in range(X.shape[1])]
+        vecs = [(X[:, j], X_hat[:, j]) for j in range(X.shape[1])]
+        num_genes = X.shape[1]
     else:
-        correlations = [pearsonr(X[i, :], X_hat[i, :])[0] for i in range(X.shape[0])]
+        vecs = [(X[i, :], X_hat[i, :]) for i in range(X.shape[0])]
+        num_cells = X.shape[0]
+
+    correlations = []
+    num_constant_vectors = 0
+    for i, (x, x_hat) in enumerate(vecs):
+        if torch.all(x == x[0]):
+            num_constant_vectors += 1
+            # print(f"Constant vector of {x[0]=} detected for {i}th gene/cell. Skipping...")
+            continue
+        elif torch.all(x_hat == x_hat[0]):
+            num_constant_vectors += 1
+            # print(f"Constant vector of {x_hat[0]=} detected for {i}th gene/cell. Skipping...")
+            continue
+        else:
+            correlations.append(pearsonr(x, x_hat)[0])
+
     correlations = np.array(correlations)
 
+    if compare_genes and num_constant_vectors > 0:
+        print(f"Number of Constant Gene Vectors: {num_constant_vectors}/{num_genes}")
+    elif not compare_genes and num_constant_vectors > 0:
+        print(f"Number of Constant Cell Vectors: {num_constant_vectors}/{num_cells}")
+        
     if mean:
-        return correlations.mean()
+        return np.mean(correlations)
     else:
         return correlations
