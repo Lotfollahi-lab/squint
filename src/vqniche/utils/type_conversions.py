@@ -218,7 +218,8 @@ def inference_data_dict_to_adata(
         - 'edge_index': Edge indices (torch.Tensor)
 
         - 'H_latent': Latent representations (torch.Tensor)
-        - 'H_quantized': Quantized representations (torch.Tensor, optional)
+        - 'H_quantized': Quantized representations (torch.Tensor, optional) 
+            (cell c_i, i = cell, H_quantized = [N, D], each row is the code embedding for that cell i.)
         - 'H_adj': Adjacency representations (torch.Tensor)
         - 'Indices': Quantization indices (torch.Tensor, optional)
         - 'X_hat': Reconstructed features (torch.Tensor)

@@ -1,4 +1,4 @@
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Union
 
 import scanpy as sc
 import anndata as ad
@@ -222,7 +222,7 @@ class SpatialNodeSplit(T.BaseTransform):
 class SpatialBatchSplit(T.BaseTransform):
     def __init__(
             self,
-            region: Optional[dict] = None,
+            region: Optional[Union[dict, List[dict]]] = None,
             xy_key: str = 'xy_coordinates',
             train_batches: Optional[list] = None,
             val_batches: Optional[list] = None,
@@ -236,8 +236,9 @@ class SpatialBatchSplit(T.BaseTransform):
         
         Parameters:
         ----------
-        - region: dict
-            Dictionary with keys 'x_min', 'x_max', 'y_min', 'y_max' defining the region
+        - region: dict or list of dicts
+            Either a single region dict or a list of region dicts, where each region
+            has keys 'x_min', 'x_max', 'y_min', 'y_max' defining regions to split on
         - xy_key: str
             The attribute name in the data object containing the xy coordinates
         - train_batches: list
@@ -246,6 +247,17 @@ class SpatialBatchSplit(T.BaseTransform):
             List of batch indices to assign to validation.
         - test_batches: list
             List of batch indices to assign to testing.
+            
+        Example:
+        --------
+        # Single region
+        region = {'x_min': 100, 'x_max': 150, 'y_min': 0, 'y_max': 100}
+        
+        # Multiple regions
+        regions = [
+            {'x_min': 0, 'x_max': 10, 'y_min': -10, 'y_max': 0},
+            {'x_min': 15, 'x_max': 25, 'y_min': 5, 'y_max': 15}
+        ]
         """
         self.region = region
         self.xy_key = xy_key
@@ -253,8 +265,8 @@ class SpatialBatchSplit(T.BaseTransform):
         self.val_batches = val_batches
         self.test_batches = test_batches
         
-    def _is_in_region(self, coords, region):
-        """Check if coordinates are within the specified region."""
+    def _is_in_single_region(self, coords, region):
+        """Check if coordinates are within a single specified region."""
         if region is None:
             return torch.zeros(coords.shape[0], dtype=torch.bool)
             
@@ -265,6 +277,36 @@ class SpatialBatchSplit(T.BaseTransform):
         y_mask = (y_coords >= region['y_min']) & (y_coords <= region['y_max'])
         
         return x_mask & y_mask
+        
+    def _is_in_region(self, coords, regions):
+        """Check if coordinates are within any of the specified regions.
+        
+        Parameters:
+        ----------
+        coords : torch.Tensor
+            Tensor of shape (N, 2) containing x,y coordinates
+        regions : list or dict
+            Either a single region dict or a list of region dicts, where each region
+            has keys 'x_min', 'x_max', 'y_min', 'y_max'
+        
+        Returns:
+        -------
+        torch.Tensor
+            Boolean tensor of shape (N,) indicating if each point is in any region
+        """
+        if regions is None:
+            return torch.zeros(coords.shape[0], dtype=torch.bool)
+            
+        # Handle single region case
+        if isinstance(regions, dict):
+            return self._is_in_single_region(coords, regions)
+            
+        # Handle multiple regions case
+        mask = torch.zeros(coords.shape[0], dtype=torch.bool)
+        for region in regions:
+            mask |= self._is_in_single_region(coords, region)
+            
+        return mask
     
     def forward(self, data: Data) -> Data:
         num_nodes = data.x.shape[0]
