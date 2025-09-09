@@ -27,11 +27,11 @@ def parse_test_arguments() -> argparse.Namespace:
                         help='Optional model checkpoint file name')
     parser.add_argument('--metric_name',
                         type=str,
-                        default='val_pearson_cell_wise',
+                        default=None,
                         help='Metric name to find the best checkpoint')
     parser.add_argument('--mode',
                         type=str,
-                        default='max',
+                        default=None,
                         help='Mode to find the best checkpoint')
     parser.add_argument('--compute_metrics',
                         action='store_true',
@@ -77,16 +77,34 @@ def collect_test_configs(
         config = yaml.safe_load(f)
 
     # set model checkpoint file name from command line arguments if provided, otherwise from the model_ckpt_fname argument, else find best checkpoint from wandb run directory
-    if args is not None and args.model_ckpt_fname is not None:
-        config['model']['model_ckpt_fname'] = args.model_ckpt_fname
-    elif model_ckpt_fname is not None:
-        config['model']['model_ckpt_fname'] = model_ckpt_fname
+    if args is not None:
+        if args.model_ckpt_fname is not None:
+            config['model']['model_ckpt_fname'] = args.model_ckpt_fname
+        else:
+            if args.metric_name is not None:
+                metric_name = args.metric_name
+            else:
+                metric_name = config['trainer']['monitor']
+            if args.mode is not None:
+                mode = args.mode
+            else:
+                mode = config['trainer']['checkpoint_params']['mode']
+            config['model']['model_ckpt_fname'] = find_best_checkpoint(
+                                                        wandb_run_dir,
+                                                        mode=mode,
+                                                        metric_name=metric_name,
+                                                    )
     else:
-        config['model']['model_ckpt_fname'] = find_best_checkpoint(
-                                                    wandb_run_dir,
-                                                    mode=args.mode,
-                                                    metric_name=args.metric_name,
-                                                )
+        if model_ckpt_fname is not None:
+            config['model']['model_ckpt_fname'] = model_ckpt_fname
+        else:
+            mode = config['trainer']['checkpoint_params']['mode']
+            metric_name = config['trainer']['monitor']
+            config['model']['model_ckpt_fname'] = find_best_checkpoint(
+                                                        wandb_run_dir,
+                                                        mode=mode,
+                                                        metric_name=metric_name,
+                                                    )
 
     # write wandb_run_directory and model_ckpt_fname to config
     config['experiment']['wandb_run_dir'] = wandb_run_dir
