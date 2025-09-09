@@ -224,7 +224,11 @@ def initialize_databatch(
 
     # list of Data objects, one for each tissue section
     if isinstance(adata_batch_idx, int):
-        adata_batch_idx = [adata_batch_idx]
+        # -1 means use all batches
+        if adata_batch_idx == -1:
+            adata_batch_idx = list(range(len(dataset_blob)))
+        else:
+            adata_batch_idx = [adata_batch_idx]
     data_list = [dataset_blob[idx] for idx in adata_batch_idx]
 
     # collate the list of Data objects into a single Batch object
@@ -237,6 +241,12 @@ def initialize_databatch(
                         pin_memory=True,
                         drop_last=False,
                     ).collate_fn(data_list)
+    data_batch.adata_batch_id = torch.tensor(
+        [int(d.adata_batch_id if isinstance(d.adata_batch_id, int)
+              else d.adata_batch_id.view(-1)[0].item())
+         for d in data_list],
+        dtype=torch.long
+    )    
 
     # TODO: fix this hard-coding
     data_batch.num_features = safe_int_conversion(data_batch.num_features)
