@@ -743,11 +743,13 @@ class VQNiche(BaseModel):
         )
 
         # cache all labels
-        for attr in dir(batch):
-            if attr.startswith('y_'):
-                if attr not in cache_dict:
-                    cache_dict[attr] = []
-                cache_dict[attr].append(getattr(batch, attr)[:batch_size])
+        for key in batch.keys():
+            if key.startswith('y_'):
+                if key not in cache_dict:
+                    cache_dict[key] = []
+                    if key not in self.cache_keys:
+                        self.cache_keys.append(key)
+                cache_dict[key].append(getattr(batch, key)[:batch_size])
 
         cache_dict['XY_coordinates'].append(batch.xy_coordinates[:batch_size])
         cache_dict['adata_batch_ids'].append(batch.adata_batch_ids[:batch_size])
