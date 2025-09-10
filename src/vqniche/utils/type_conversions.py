@@ -252,24 +252,24 @@ def inference_data_dict_to_adata(
         adata.uns['X_nbr'] = inference_data['X_nbr'].cpu()
     
     # Convert one-hot labels to category labels
-    for label_name in ['cell_types', 'niche_types']:
-        if f'Y_{label_name}' in inference_data:
+    for attr in inference_data.keys():
+        if attr.startswith('y_'):
+            label_name = attr[2:]
             if label_categories_dict is not None:
-                label_categories = list(label_categories_dict[label_name])
+                if label_name in label_categories_dict:
+                    label_categories = label_categories_dict[label_name]
+                else:
+                    label_categories = None
             else:
                 label_categories = None
             
             labels = torch_one_hot_to_label_name(
-                        one_hot=inference_data[f'Y_{label_name}'],
+                        one_hot=inference_data[attr],
                         label_categories=label_categories
                     )
             labels.index = adata.obs.index
-            adata.obs[label_name] = labels
-    
-    if 'Y_cell_types' in inference_data:
-        adata.uns['Y_cell_types'] = inference_data['Y_cell_types']
-    if 'Y_niche_types' in inference_data:
-        adata.uns['Y_niche_types'] = inference_data['Y_niche_types']
+            adata.obs[label_name] = labels        
+        
     if 'XY_coordinates' in inference_data:
         adata.obsm['spatial'] = inference_data['XY_coordinates'].cpu().numpy()
     if 'adata_batch_ids' in inference_data:
