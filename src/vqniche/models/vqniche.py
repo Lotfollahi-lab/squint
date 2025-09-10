@@ -42,6 +42,7 @@ class VQNiche(BaseModel):
             train_metrics_list: List[str] = [],
             in_channels: int = None,
             out_channels: int = None,
+            label_name: str = None,
             imputation_params: dict = {},
             encoder_params: dict = {},
             attribute_decoder_params: dict = {},
@@ -71,6 +72,8 @@ class VQNiche(BaseModel):
             The number of input features.
         - out_channels: int
             The number of output features.
+        - label_name: str
+            The name of the label.
 
         - train_metrics_list: List[str]
             The list of metrics to compute during training.
@@ -185,7 +188,8 @@ class VQNiche(BaseModel):
         This includes setting up the data structure and adding VQ encoder metadata.
         """
         # Define cache keys for input data and model outputs
-        data_keys = ['X', 'X_nbr', 'XY_coordinates', 'Y_cell_types', 'Y_niche_types', 'adata_batch_ids']
+        data_keys = ['X', 'X_nbr', 'XY_coordinates', 'adata_batch_ids']
+        # data_keys = ['X', 'X_nbr', 'XY_coordinates', 'Y_cell_types', 'Y_niche_types', 'adata_batch_ids']
         model_output_keys = ['H_latent', 'H_quantized', 'H_adj', 'Indices', 'X_hat', 'X_hat_nbr', 'Logits']
         self.cache_keys = data_keys + model_output_keys
 
@@ -455,7 +459,6 @@ class VQNiche(BaseModel):
                             indices,
                             num_classes=self.encoder.vq.codebook_size,
                         )
-        # print(f"{indices_one_hot.shape=} | {h_spatial_prior.shape=}")
 
         # 5) Prepare dictionary of data required for computing loss
         # Slicing the first batch_size entries is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the source nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of source nodes is equal to the batch size. The remaining entries of the forward output correspond to the sampled neighbors of the source nodes.
@@ -738,8 +741,14 @@ class VQNiche(BaseModel):
                 batch_size=batch_size,
             )
         )
-        cache_dict['Y_cell_types'].append(batch.y[:batch_size])
-        cache_dict['Y_niche_types'].append(batch.y_niche_types[:batch_size])
+
+        # cache all labels
+        for attr in dir(batch):
+            if attr.startswith('y_'):
+                if attr not in cache_dict:
+                    cache_dict[attr] = []
+                cache_dict[attr].append(getattr(batch, attr)[:batch_size])
+
         cache_dict['XY_coordinates'].append(batch.xy_coordinates[:batch_size])
         cache_dict['adata_batch_ids'].append(batch.adata_batch_ids[:batch_size])
 
