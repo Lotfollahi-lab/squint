@@ -114,7 +114,15 @@ def initialize_logger(
             )
 
     # Save the complete original user-specified configuration
-    user_config_path = Path(logger.experiment.dir) / 'user_specified_config.yaml'
+    try:
+        user_config_path = Path(logger.experiment.dir) / 'user_specified_config.yaml'
+    except:
+        # TODO: when running a wandb sweep, logger.experiment.dir is a method for some reason
+        # the rest of the sweep runs correctly, but the start fails weirdly. 
+        # needs investigation.
+        print(logger.experiment.dir)
+        print(type(logger.experiment.dir))
+
     with open(user_config_path, 'w') as config_file:
         yaml.dump(config, config_file)
 
