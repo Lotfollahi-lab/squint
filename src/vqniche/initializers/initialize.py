@@ -407,7 +407,7 @@ def initialize_model(
 def set_wandb_experiment_dir(
         config: Dict,
         experiment_mode: Literal['sweep', 'standalone'] = 'standalone',
-        sweep_id: Optional[str] = None,
+        sweep_dir_name: Optional[str] = None,
     ) -> Path:
     # set root sweep directory
     exp_dir = Path(config['logging']['root_log_dir']) / config['dataset']['dataset_name'] / experiment_mode
@@ -429,7 +429,8 @@ def set_wandb_experiment_dir(
 
     # set experiment run directory
     if experiment_mode == 'sweep':
-        exp_dir = exp_dir / f"sweep-{sweep_id}"
+        assert sweep_dir_name is not None, "Sweep directory name is required for sweep mode."
+        exp_dir = exp_dir / sweep_dir_name
 
     # create experiment run directory
     exp_dir.mkdir(parents=True, exist_ok=True)
