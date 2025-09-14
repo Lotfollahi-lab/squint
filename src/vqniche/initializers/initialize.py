@@ -2,6 +2,7 @@ import os
 import re
 import yaml
 from pathlib import Path
+from datetime import datetime
 from typing import Dict, Optional, Literal, List, Tuple
 
 import torch
@@ -407,7 +408,7 @@ def initialize_model(
 def set_wandb_experiment_dir(
         config: Dict,
         experiment_mode: Literal['sweep', 'standalone'] = 'standalone',
-        sweep_dir_name: Optional[str] = None,
+        sweep_name: Optional[str] = None,
     ) -> Path:
     # set root sweep directory
     exp_dir = Path(config['logging']['root_log_dir']) / config['dataset']['dataset_name'] / experiment_mode
@@ -429,8 +430,10 @@ def set_wandb_experiment_dir(
 
     # set experiment run directory
     if experiment_mode == 'sweep':
-        assert sweep_dir_name is not None, "Sweep directory name is required for sweep mode."
-        exp_dir = exp_dir / sweep_dir_name
+        assert sweep_name is not None, "Sweep name is required for sweep mode."
+        today = datetime.now().strftime('%Y%m%d')
+        now = datetime.now().strftime('%H%M%S')
+        exp_dir = exp_dir / sweep_name / f"{today}-{now}"
 
     # create experiment run directory
     exp_dir.mkdir(parents=True, exist_ok=True)
