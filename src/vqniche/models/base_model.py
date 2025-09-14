@@ -796,7 +796,10 @@ class BaseModel(pl.LightningModule):
         - We use this hook to save the on_train_epoch_end_logs_df dataframe to a CSV file.
         """
         # save epoch-wise logged loss terms and metrics to a CSV file
-        on_train_epoch_end_logs_fname = Path(self.logger.experiment.dir) / 'on_train_epoch_end_logs.csv'
+        results_dir = Path(self.logger.experiment.dir) / 'results'
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        on_train_epoch_end_logs_fname = results_dir / 'on_train_epoch_end_logs.csv'
         self.on_train_epoch_end_logs_df.to_csv(
             path_or_buf=on_train_epoch_end_logs_fname,
             sep=',',
@@ -839,16 +842,22 @@ class BaseModel(pl.LightningModule):
         """
         raise NotImplementedError('Test step not implemented')
     
-    
-    def on_test_model_train(self) -> None:
+    def on_test_epoch_end(self) -> None:
         """
-        Pytorch Lightning hook that is executed after all test steps are completed.
+        Pytorch Lightning hook that is executed at the end of each test epoch.
         """
         metrics_dict = self.compute_metrics(mode='test')
-        
         print("--------------------------------Test Metrics--------------------------------")
         for key, value in metrics_dict.items():
-            print(f"{key}: {value}")
-        print("----------------------------------------------------------------")
-        
-        return super().on_test_model_train()
+            print(f"test_{key}: {value}")
+            self.log(
+                name=f'test_{key}',
+                value=value,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+        print("--------------------------------End of Test Metrics--------------------------------")
+
+        return super().on_test_epoch_end()
