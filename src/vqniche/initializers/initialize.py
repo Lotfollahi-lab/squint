@@ -114,7 +114,15 @@ def initialize_logger(
             )
 
     # Save the complete original user-specified configuration
-    user_config_path = Path(logger.experiment.dir) / 'user_specified_config.yaml'
+    try:
+        user_config_path = Path(logger.experiment.dir) / 'user_specified_config.yaml'
+    except:
+        # TODO: when running a wandb sweep, logger.experiment.dir is a method for some reason
+        # the rest of the sweep runs correctly, but the start fails weirdly. 
+        # needs investigation.
+        print(logger.experiment.dir)
+        print(type(logger.experiment.dir))
+
     with open(user_config_path, 'w') as config_file:
         yaml.dump(config, config_file)
 
@@ -399,7 +407,7 @@ def initialize_model(
 def set_wandb_experiment_dir(
         config: Dict,
         experiment_mode: Literal['sweep', 'standalone'] = 'standalone',
-        sweep_id: Optional[str] = None,
+        sweep_dir_name: Optional[str] = None,
     ) -> Path:
     # set root sweep directory
     exp_dir = Path(config['logging']['root_log_dir']) / config['dataset']['dataset_name'] / experiment_mode
@@ -421,7 +429,8 @@ def set_wandb_experiment_dir(
 
     # set experiment run directory
     if experiment_mode == 'sweep':
-        exp_dir = exp_dir / f"sweep-{sweep_id}"
+        assert sweep_dir_name is not None, "Sweep directory name is required for sweep mode."
+        exp_dir = exp_dir / sweep_dir_name
 
     # create experiment run directory
     exp_dir.mkdir(parents=True, exist_ok=True)

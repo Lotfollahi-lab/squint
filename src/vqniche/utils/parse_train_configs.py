@@ -20,6 +20,12 @@ def parse_train_arguments() -> argparse.Namespace:
     parser.add_argument('--sweep_config_files',
                         nargs='*',
                         help='Optional list of additional sweep config files')
+    parser.add_argument('--validate',
+                        action='store_true',
+                        help='Execute validation steps')
+    parser.add_argument('--test',
+                        action='store_true',
+                        help='Execute test steps')
     parser.add_argument('--override',
                         nargs='+',
                         help='Override parameters in the config file')
@@ -57,6 +63,12 @@ def collect_train_configs(
     else:
         base_config['experiment']['mode'] = 'standalone'
         sweep_config = {}
+
+    # --------------------- Process Validation and Test ---------------------
+    if args.validate:
+        base_config['experiment']['validate'] = True
+    if args.test:
+        base_config['experiment']['test'] = True
 
     # --------------------- Override Parameters ---------------------
     # Override parameters from command line
