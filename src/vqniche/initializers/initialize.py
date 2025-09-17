@@ -387,6 +387,7 @@ def initialize_model(
         'adjacency_decoder_name': config['model']['adjacency_decoder_name'],
         'predictor_name': config['model']['predictor_name'],
         'train_metrics_list': config['model']['train_metrics_list'],
+        'test_metrics_list': config['model']['test_metrics_list'],
         'in_channels': in_channels,
         'out_channels': out_channels,
         'encoder_params': config['model']['encoder_params'],

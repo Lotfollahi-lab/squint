@@ -14,6 +14,7 @@ from typing import Optional, Literal
 import numpy as np
 import scanpy as sc
 import scib_metrics
+from sklearn.decomposition import PCA
 import networkx as nx
 from anndata import AnnData
 import torch
@@ -144,6 +145,38 @@ def compute_benchmarking_metrics(
             X_key='X_nbr',
             X_hat_key='X_hat_nbr',
             compare_genes=True,
+        )
+    
+    if "mmd_1hop_nbr" in metrics:
+        print("Computing MMD (normalized 1-hop neighborhood cell-wise)...")
+
+        D = adata.uns['X_nbr'] / adata.uns['X_nbr'].sum(axis=1, keepdims=True)
+        D_hat = adata.uns['X_hat_nbr'] / adata.uns['X_hat_nbr'].sum(axis=1, keepdims=True)
+        D = D.numpy()
+        D_hat = D_hat.numpy()
+
+        benchmarking_dict["mmd_1hop_nbr"] = compute_mmd_score(
+            D=[row for row in D],
+            D_hat=[row for row in D_hat],
+            method='scipy',
+        )
+
+    if "mmd_pca_1hop_nbr" in metrics:
+        print("Computing MMD (PCA on 1-hop neighborhood cell-wise)...")
+
+        D = PCA(
+                n_components=16,
+                random_state=seed
+            ).fit_transform(adata.uns['X_nbr'].numpy())
+        D_hat = PCA(
+                n_components=16,
+                random_state=seed
+            ).fit_transform(adata.uns['X_hat_nbr'].numpy())
+
+        benchmarking_dict["mmd_pca_1hop_nbr"] = compute_mmd_score(
+            D=[row for row in D],
+            D_hat=[row for row in D_hat],
+            method='scipy',
         )
     
     elapsed_time = time.time() - start_time

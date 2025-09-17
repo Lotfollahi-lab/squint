@@ -40,6 +40,7 @@ class VQNiche(BaseModel):
             adjacency_decoder_name: Literal['MLP_AdjacencyDecoder'] = 'MLP_AdjacencyDecoder',
             predictor_name: Literal['Linear'] = 'Linear',
             train_metrics_list: List[str] = [],
+            test_metrics_list: List[str] = [],
             in_channels: int = None,
             out_channels: int = None,
             label_name: str = None,
@@ -77,6 +78,8 @@ class VQNiche(BaseModel):
 
         - train_metrics_list: List[str]
             The list of metrics to compute during training.
+        - test_metrics_list: List[str]
+            The list of metrics to compute during testing.
 
         - imputation_params: dict
             The parameters for the imputation module.
@@ -99,6 +102,7 @@ class VQNiche(BaseModel):
             in_channels=in_channels,
             out_channels=out_channels,
             train_metrics_list=train_metrics_list,
+            test_metrics_list=test_metrics_list,
             **optimizer_params,
             **loss_params,
         )

@@ -1,6 +1,7 @@
 from typing import Optional, Tuple, Literal, List
 
 import numpy as np
+from scipy.spatial.distance import cdist
 import networkx as nx
 import scipy.sparse as sp
 
@@ -10,6 +11,7 @@ import torch
 def compute_mmd_score(
         D: List[np.ndarray],
         D_hat: List[np.ndarray],
+        method: Optional[Literal['basic', 'scipy']] = 'scipy',
     ) -> float:
     """
     Compute the Maximum Mean Discrepancy (MMD) between two collections of distributions.
@@ -28,20 +30,55 @@ def compute_mmd_score(
     """
     assert len(D) == len(D_hat)
 
-    K_XX = total_discrepancy(
-        X=D,
-        Y=D,
-    )
-    K_YY = total_discrepancy(
-        X=D_hat,
-        Y=D_hat,
-    )
-    K_XY = total_discrepancy(
-        X=D,
-        Y=D_hat,
-    )
-    mmd = K_XX + K_YY - 2 * K_XY
+    if method == 'basic':
+        compute_total_discrepancy = total_discrepancy
+    elif method == 'scipy':
+        compute_total_discrepancy = scipy_total_discrepancy
+    
+    total_discrepancy_by_bandwidth = []
+    for bandwidth in [2, 1, 0.5, 0.01, 0.005]:
+        K_XX = compute_total_discrepancy(
+            X=D,
+            Y=D,
+            bandwidth=bandwidth,
+        )
+        K_YY = compute_total_discrepancy(
+            X=D_hat,
+            Y=D_hat,
+            bandwidth=bandwidth,
+        )
+        K_XY = compute_total_discrepancy(
+            X=D,
+            Y=D_hat,
+            bandwidth=bandwidth,
+        )
+        mmd_bandwidth = K_XX + K_YY - 2 * K_XY
+        total_discrepancy_by_bandwidth.append(mmd_bandwidth)
+
+    mmd = np.mean(total_discrepancy_by_bandwidth)
+
     return mmd
+
+
+def scipy_total_discrepancy(
+        X: List[np.ndarray],
+        Y: List[np.ndarray],
+        kernel: Optional[Literal['l1_gaussian_tv']] = 'l1_gaussian_tv',
+        bandwidth: float = 1.0,
+        dtype=np.float32,
+    ) -> float:
+    assert kernel == 'l1_gaussian_tv'
+    maxw = max(max(x.size for x in X), max(y.size for y in Y))
+    Xp = np.zeros((len(X), maxw), dtype=dtype)
+    Yp = np.zeros((len(Y), maxw), dtype=dtype)
+    for i, a in enumerate(X): Xp[i, :a.size] = a
+    for j, b in enumerate(Y): Yp[j, :b.size] = b
+
+    if kernel == 'l1_gaussian_tv':
+        D = cdist(Xp, Yp, metric='cityblock')          # L1 distances (n, m)
+        K = np.exp(-(D * D) / (2.0 * (bandwidth ** 2)))
+
+    return float(K.mean())
 
 
 def total_discrepancy(
@@ -99,9 +136,6 @@ def distribution_discrepancy(
     ----------
     - https://github.com/KarolisMart/SPECTRE/blob/main/util/dist_helper.py
     """
-    assert np.isclose(x.sum(), 1.0)
-    assert np.isclose(y.sum(), 1.0)
-
     x_support = x.size
     y_support = y.size
     support = max(x_support, y_support)
@@ -125,8 +159,6 @@ def distribution_discrepancy(
         discrepancy = np.exp(-distance * distance / (2.0 * bandwidth ** 2))
 
     return discrepancy
-
-
 
 
 def degree_histogram(
