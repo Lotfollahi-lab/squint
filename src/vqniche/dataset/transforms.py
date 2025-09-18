@@ -587,6 +587,9 @@ class SetExperimentDataKeys(T.BaseTransform):
                 
             elif source == 'timepoint_id':
                 conditioning_features.append(torch.empty(0))
+                
+            elif source == 'grade':
+                conditioning_features.append(data.y_grade)
 
         conditioning_features = torch.cat(conditioning_features, dim=-1)
 
