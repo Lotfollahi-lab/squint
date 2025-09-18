@@ -40,6 +40,7 @@ class BaseModel(pl.LightningModule):
             in_channels: int = None,
             out_channels: int = None,
             train_metrics_list: List[str] = [],
+            test_metrics_list: List[str] = [],
             optimizer_name: str = 'adam',
             lr: float = 0.01,
             weight_decay: float = 0.0,
@@ -70,6 +71,8 @@ class BaseModel(pl.LightningModule):
 
         - train_metrics_list: List[str]
             The list of metrics to compute during training.
+        - test_metrics_list: List[str]
+            The list of metrics to compute during testing.
 
         - optimizer_name: str
             The optimizer name.
@@ -100,6 +103,7 @@ class BaseModel(pl.LightningModule):
 
         # metrics to compute during training
         self.train_metrics_list = train_metrics_list
+        self.test_metrics_list = test_metrics_list
 
         self.on_train_epoch_end_logs_df = pd.DataFrame()
 
@@ -625,7 +629,12 @@ class BaseModel(pl.LightningModule):
         # currently, the trainer.validate() and trainer.test() methods also use this list
         # a fuller list of metrics must be manually computed separately
         # TODO: Add support for computing this full list
-        if len(self.train_metrics_list) > 0:
+        if mode == 'train' or mode == 'val':
+            metrics_list = self.train_metrics_list
+        elif mode == 'test':
+            metrics_list = self.test_metrics_list
+
+        if len(metrics_list) > 0:
             # 3) Concatenate the inference data cache
             for key in self.cache_keys:
                 inference_data_cache[key] = torch.cat(inference_data_cache[key], dim=0)
@@ -640,7 +649,7 @@ class BaseModel(pl.LightningModule):
             # 5) Compute the benchmarking metrics
             metrics_dict = compute_benchmarking_metrics(
                 adata=adata,
-                metrics=self.train_metrics_list,
+                metrics=metrics_list,
                 **self.loss_kwargs['estimate_adj_kwargs'],
             )
             
