@@ -159,6 +159,7 @@ def compute_benchmarking_metrics(
             D=[row for row in D],
             D_hat=[row for row in D_hat],
             method='scipy',
+            kernel='l1_gaussian_tv',
         )
 
     if "mmd_pca_1hop_nbr" in metrics:
@@ -177,8 +178,43 @@ def compute_benchmarking_metrics(
             D=[row for row in D],
             D_hat=[row for row in D_hat],
             method='scipy',
+            kernel='l1_gaussian_tv',
         )
     
+    if "energy_1hop_nbr" in metrics:
+        print("Computing Energy (normalized 1-hop neighborhood cell-wise)...")
+
+        D = adata.uns['X_nbr'] / adata.uns['X_nbr'].sum(axis=1, keepdims=True)
+        D_hat = adata.uns['X_hat_nbr'] / adata.uns['X_hat_nbr'].sum(axis=1, keepdims=True)
+        D = D.numpy()
+        D_hat = D_hat.numpy()
+
+        benchmarking_dict["energy_1hop_nbr"] = compute_mmd_score(
+            D=[row for row in D],
+            D_hat=[row for row in D_hat],
+            method='scipy',
+            kernel='energy',
+        )
+
+    if "energy_pca_1hop_nbr" in metrics:
+        print("Computing MMD (PCA on 1-hop neighborhood cell-wise)...")
+
+        D = PCA(
+                n_components=16,
+                random_state=seed
+            ).fit_transform(adata.uns['X_nbr'].numpy())
+        D_hat = PCA(
+                n_components=16,
+                random_state=seed
+            ).fit_transform(adata.uns['X_hat_nbr'].numpy())
+
+        benchmarking_dict["energy_pca_1hop_nbr"] = compute_mmd_score(
+            D=[row for row in D],
+            D_hat=[row for row in D_hat],
+            method='scipy',
+            kernel='energy',
+        )
+        
     elapsed_time = time.time() - start_time
     minutes = int(elapsed_time // 60)
     seconds = int(elapsed_time % 60)

@@ -12,6 +12,7 @@ def compute_mmd_score(
         D: List[np.ndarray],
         D_hat: List[np.ndarray],
         method: Optional[Literal['basic', 'scipy']] = 'scipy',
+        kernel: Optional[Literal['l1_gaussian_tv', 'energy']] = 'l1_gaussian_tv',  # Add 'energy' option
     ) -> float:
     """
     Compute the Maximum Mean Discrepancy (MMD) between two collections of distributions.
@@ -22,6 +23,10 @@ def compute_mmd_score(
         A collection of distributions.
     - D_hat: List[numpy.ndarray]
         A collection of distributions.
+    - method: Optional[Literal['basic', 'scipy']]
+        The method to use to compute the total discrepancy.
+    - kernel: Optional[Literal['l1_gaussian_tv', 'energy']]
+        The kernel to use to compute the total discrepancy.
 
     Returns
     -------
@@ -41,16 +46,19 @@ def compute_mmd_score(
             X=D,
             Y=D,
             bandwidth=bandwidth,
+            kernel=kernel,
         )
         K_YY = compute_total_discrepancy(
             X=D_hat,
             Y=D_hat,
             bandwidth=bandwidth,
+            kernel=kernel,
         )
         K_XY = compute_total_discrepancy(
             X=D,
             Y=D_hat,
             bandwidth=bandwidth,
+            kernel=kernel,
         )
         mmd_bandwidth = K_XX + K_YY - 2 * K_XY
         total_discrepancy_by_bandwidth.append(mmd_bandwidth)
@@ -63,11 +71,13 @@ def compute_mmd_score(
 def scipy_total_discrepancy(
         X: List[np.ndarray],
         Y: List[np.ndarray],
-        kernel: Optional[Literal['l1_gaussian_tv']] = 'l1_gaussian_tv',
+        kernel: Optional[Literal['l1_gaussian_tv', 'energy']] = 'l1_gaussian_tv',
         bandwidth: float = 1.0,
         dtype=np.float32,
     ) -> float:
-    assert kernel == 'l1_gaussian_tv'
+    """
+    Compute the total discrepancy using the specified kernel.
+    """
     maxw = max(max(x.size for x in X), max(y.size for y in Y))
     Xp = np.zeros((len(X), maxw), dtype=dtype)
     Yp = np.zeros((len(Y), maxw), dtype=dtype)
@@ -75,8 +85,11 @@ def scipy_total_discrepancy(
     for j, b in enumerate(Y): Yp[j, :b.size] = b
 
     if kernel == 'l1_gaussian_tv':
-        D = cdist(Xp, Yp, metric='cityblock')          # L1 distances (n, m)
+        D = cdist(Xp, Yp, metric='cityblock')  # L1 distances
         K = np.exp(-(D * D) / (2.0 * (bandwidth ** 2)))
+    elif kernel == 'energy':
+        D = cdist(Xp, Yp, metric='euclidean')  # Euclidean distances
+        K = -D  # Negative distance for energy kernel
 
     return float(K.mean())
 
