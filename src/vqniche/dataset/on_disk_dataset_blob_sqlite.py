@@ -6,12 +6,10 @@ Define `Data` to refer to a PyG Data object that is constructed from a single ba
 - `metadata_<metadata_name>`: Metadata (e.g., cell ids, batch ids, tissue, etc.)
 We construct these attributes from the AnnData object stored as an `.h5ad` file on disk.
 
-Next, define `Dataset` to refer to a PyG InMemoryDataset object comprising of collection of AnnData batches, i.e. `Data` objects. From an implementation perspective, we consider the Dataset to be a "blob" because we collate (combine) the individual Data objects (built previously from AnnData batches) into a single file called `dataset_blob.pt` before saving to disk. Currently, all Data objects in the Dataset have the same gene panel, meaning that the input feature dimensions are the same across all tissue sections.
-
-For example, consider creating a DatasetBlob for `xhs1000-39b_1p` (Xenium Human Skin | id = 1000 | 39 batches | 1 gene panel). When we first process this data, we create 39 Data objects, each an attributed graph representation of the corresponding batch of cells, and save them all into `dataset_blob.pt`. When we load the DatasetBlob, we load the `dataset_blob.pt` file and then access the individual Data objects as needed.
+Next, define `Dataset` to refer to a PyG OnDiskDataset object comprising a collection of AnnData batches, i.e. `Data` objects. From an implementation perspective, we save each individual Data object (built from AnnData batches) in sqlite database on disk. Currently, all Data objects in the Dataset have the same gene panel, meaning that the input feature dimensions are the same across all tissue sections.
 
 Usage:
->>> dataset_blob = InMemoryDatasetBlob(name='sss2-1b_1p.yaml',
+>>> dataset = OnDiskDatasetBlob(name='sss2-1b_1p.yaml',
                                         label_names=['cell_types'],
                                         graph_kwargs={'delaunay': True},
                                         data_directory_path='/path/to/data',
@@ -20,13 +18,10 @@ Usage:
 
 Tradeoffs:
 -------
-- One dataset_blob.pt across all tissue sections in the experiment folder vs one data.pt per tissue section in the experiment folder.
-- One dataset_blob.pt is easier to manage and load than multiple data.pt files. During training, we can load the entire dataset in one go and use one or more tissue sections per model as needed. This is useful because the subsequent subgraph sampling and batching can be done on the fly.
-- For each epoch, we subset the dataset_blob by batch(es) and then sample subgraphs from the batch(es) for training. This is more time efficient than sampling subgraphs from each batch separately, but requires more memory.
-- Memory usage is a concern because the entire dataset is loaded into memory at once. This is not a problem for small datasets but can be a bottleneck for large datasets.
-- For larger datasets, we have two options:
-    1. Create one dataset_blob.pt per batch of cells in the experiment folder. This is more memory efficient but increases time complexity because, if we have (say) T training epochs, each AnnData batch is loaded and removed from memory T times.
-    2. Create an OnDiskDatasetBlob that loads parallely in chunks.
+- Multiple entries in a sqlite database (one per batch) vs loading all data into memory at once (as in InMemoryDataset).
+- On-disk storage allows for larger datasets without memory constraints, as graphs are loaded on demand. This is more memory efficient but may be slower for frequent access.
+- During training, we can load specific batches as needed, enabling processing of large datasets that don't fit in memory.
+- For smaller datasets, an in-memory approach might be faster, but on-disk is better for scalability.
 """
 import os
 import copy
@@ -34,6 +29,7 @@ import pickle
 import subprocess
 from pathlib import Path
 import concurrent.futures
+import tracemalloc
 from typing import Optional, Callable, List, Tuple
 
 import numpy as np
@@ -43,7 +39,7 @@ from scipy.sparse.linalg import eigsh
 
 import torch
 from torch import Tensor
-from torch_geometric.data import InMemoryDataset, Data
+from torch_geometric.data import OnDiskDataset, Data
 from torch_geometric.utils import is_undirected
 from torch_geometric.utils.convert import from_scipy_sparse_matrix
 
@@ -51,179 +47,107 @@ from ..preprocessors.graph_constructors import set_edge_index_name, spatial_neig
 from ..utils.type_conversions import sparse_mx_to_float_tensor, pandas_to_torch_one_hot
 
 
-class InMemoryDatasetBlob(InMemoryDataset):
-    # In-memory dataset blob for storing multiple PyG Data objects.
-    # In-memory dataset blob is a single file that contains multiple PyG (PyTorch Geometric) Data objects.
-    # InMemoryDataset is the partent class / blob is the child class
+class OnDiskDatasetBlob(OnDiskDataset):
 
-    def __init__( # Initialize the child class (InMemoryDatasetBlob)
-                    # set up the parameters for creating the InMemoryDatasetBlob 
-            self,
-            name: str = "sss2-1b_1p",
-            feature_names: List['str'] = [],
-            label_names: List['str'] = [],
-            graph_kwargs: dict = {},
-            data_directory_path: Optional[ str | Path ] = "/lustre/scratch126/cellgen/team361/DATASETS",
-            transform: Optional[Callable] = None,
-            pre_transform: Optional[Callable] = None,
-            pre_filter: Optional[Callable] = None,
-            overwrite: bool = False,
-            software_paths: dict = {}
-        ) -> InMemoryDataset:
-        """
-        CustomInMemoryDataset class for loading PyG Data objects from AnnData files.
+    def __init__(
+        self,
+        name: str = "mmb0-4b_1p",
+        feature_names: List['str'] = [],
+        label_names: List['str'] = [],
+        graph_kwargs: dict = {},
+        data_directory_path: Optional[ str | Path ] = "/lustre/scratch126/cellgen/team361/DATASETS",
+        transform: Optional[Callable] = None,
+        pre_transform: Optional[Callable] = None,
+        pre_filter: Optional[Callable] = None,
+        overwrite: bool = False,
+        software_paths: dict = {},
+        num_graphs_to_load=0,
+    ):
 
-        Parameters:
-        ----------
-        - name: str
-            Name of the dataset.
-        - feature_names: List[str]
-            List of feature names to be constructed for the dataset.
-        - label_names: List[str]
-            List of label names to be constructed for the dataset.
-        - graph_kwargs: dict
-            Dictionary containing the keyword arguments for the graph construction.
-        - data_directory_path: str | Path
-            Path to the data directory which contains silver and gold data.
-            Silver data is the preprocessed, harmonized AnnData files.
-            Gold data is the processed, in-memory data ready for training and evaluation.
-        - transform: Optional[Callable]
-            A function/transform that takes in an pre-processed PyG Data object and returns a transformed version ready for training.
-        - pre_transform: Optional[Callable]
-            A function/transform that takes in an original PyG Data object and returns a pre-processed version.
-        - pre_filter: Optional[Callable]
-            A function that takes in an PyG Data object and returns True if the data object should be included in the final dataset.
-        - overwrite: bool
-            If True, the existing processed data is overwritten and then loaded. If False, the processed data is loaded from the processed directory.
-        - software_paths: dict
-            Dictionary containing the paths to the third-party software used to build the dataset.
-
-        Returns:
-        -------
-        - InMemoryDataset
-            A PyG InMemoryDataset object containing the processed PyG Data objects.
-        """
         self.name = name
-
+        
         self.feature_names = feature_names
-        self.label_names = [label_name.split('=')[0] for label_name in label_names]
-        self.label_keys = [label_name.split('=')[1] for label_name in label_names]
+        self.label_names = [x.split("=")[0] for x in label_names]
+        self.label_keys = [x.split("=")[1] for x in label_names]
         self.graph_kwargs = graph_kwargs
+        self.num_graphs_to_load = num_graphs_to_load
 
-        # path to the data directory which contains silver and gold data
-        # silver data is the preprocessed, harmonized AnnData files
-        # gold data is the processed, in-memory data ready for training and evaluation
         if isinstance(data_directory_path, str):
-            data_directory_path = Path(data_directory_path)  
-            # Convert string to Path object for safety
+            data_directory_path = Path(data_directory_path)
         self.data_directory_path = data_directory_path
 
-        self.software_paths = software_paths
+        # define root manually before calling the parent; do NOT assign
+        # to `processed_dir` because it is exposed as a @property below
+        # (assigning to it raises `AttributeError: can't set attribute`).
+        self.root = os.path.join(self.data_directory_path, "gold", "on-disk-PyG-dataset-blob", self.name)
 
-        # root = Root directory where the processed data is saved.
-        # rerun the self.process if the processed data is not found or if overwrite is set to True.
-        super().__init__( # run initialization of the parent class InMemoryDataset
-            root=self.processed_dir,
+        # store transforms/filters on the instance (some OnDiskDataset
+        # implementations don't accept pre_transform/pre_filter kwargs)
+        self.pre_transform = pre_transform
+        self.pre_filter = pre_filter
+
+        # call parent (do not forward pre_transform/pre_filter as kwargs)
+        super().__init__(
+            root=str(self.root),
             transform=transform,
-            pre_transform=pre_transform,
-            pre_filter=pre_filter,
-            force_reload=overwrite
+            backend='sqlite',
         )
 
-        # This index is set to 0 because there is only one processed data file.
-        self.load(self.processed_paths[0]) # loading fully processed data object from disk into memory 
+    # Required for safety:
+    def serialize(self, data):
+        return pickle.dumps(data)
 
+    def deserialize(self, data):
+        """Try to deserialize bytes stored in the DB.
 
-    def process(self) -> None:
-        # define process method (function) to create the InMemoryDatasetBlob from the raw data (self; silver AnnData files)
+        Some producer code in this repo used `torch.save(..., buffer)` to
+        write examples into sqlite (which produces a pickle stream that may
+        contain persistent ids). Other code used plain `pickle.dumps`.
+        Try pickle.loads first and fall back to torch.load on a BytesIO.
         """
-        Process the raw (silver) data and save it to the processed (gold) directory as a PyG InMemoryDataset. This method is called either when specifically `data.pt` is not found or when overwrite (force_reload) is set to True. Otherwise, `dataset_blob.pt` is loaded directly without calling this function.
+        # If `data` is already an object, return it directly
+        if not isinstance(data, (bytes, bytearray)):
+            return data
+
+        try:
+            return pickle.loads(data)
+        except Exception:
+            # Fall back to torch.load for tensors / storages written by torch.save
+            try:
+                import io as _io
+                buf = _io.BytesIO(data)
+                return torch.load(buf, map_location='cpu')
+            except Exception as e:
+                # Re-raise original error with context
+                raise RuntimeError(f"Failed to deserialize blob: {e}")
+    
+    def __iter__(self):
         """
-        # ----------------- First Pass over AnnData Batches -----------------
-        # This pass is used to collect gene panels and the unique categories for each label name across all batches.
-        # All batches must have the same gene panel. Multiple gene panels across tissue sections are not supported.
+        Stream dataset in chunks defined by num_graphs_to_load.
+        """
 
-        self.gene_panel = None
+        n = len(self)
+        print("Number of graphs on disk:", n)
+        print("ROOT:", self.root)
+        print("PROCESSED_DIR:", self.processed_dir)
 
-        # Collect the unique categories for each label name across all batches.
-        self.label_categories = {
-            label_name: set()
-            for label_name in self.label_names
-        }
+        for i in range(0, n, self.num_graphs_to_load):
+            end = min(i + self.num_graphs_to_load, n)
+            print(f"Loading graphs {i} to {end} from disk...", flush=True)
 
-        for adata_batch_file in self.raw_paths:
-            adata_batch = sc.read(adata_batch_file)
+            chunk = []
+            for j in range(i, end):
+                try:
+                    data = self.get(j)  # <-- lazy load from database
+                except Exception as e:
+                    print(f"Warning: failed to load index {j}: {e}", flush=True)
+                    continue
+                chunk.append(data)
 
-            if self.gene_panel is None:
-                # adata_batch.var is a pandas dataframe
-                # index is the gene name
-                # columns are the ensemble ids
-                self.gene_panel = adata_batch.var
-            else:
-                # check if the gene panel is the same across all batches
-                if not self.gene_panel.equals(adata_batch.var):
-                    raise ValueError("All batches must have the same gene panel")
+            for data in chunk:
+                yield data
 
-            for label_name, label_key in zip(self.label_names, self.label_keys):
-                self.label_categories[label_name].update(adata_batch.obs[label_key].unique())
-
-        print("All batches have the same gene panel.")
-
-        for label_name in self.label_names:
-            # sorting the categories for consistency across batches so that the one-hot encoding is consistent. e.g. when the one-hot encoding is [0, 1, 0], the label name is the second name in the sorted list of that label.
-            self.label_categories[label_name] = sorted(list(self.label_categories[label_name]))
-            print(f"Label Name: {label_name} | {self.label_categories[label_name]=}")
-
-        # save the label categories to disk
-        with open(Path(self.processed_dir) / "label_categories.pkl", "wb") as f:
-            pickle.dump(self.label_categories, f)
-
-        # save the gene panel to disk
-        with open(Path(self.processed_dir) / "gene_panel.pkl", "wb") as f:
-            pickle.dump(self.gene_panel, f)
-
-        # ----------------- Second Pass over AnnData Batches -----------------
-        # This pass is used to process each batch of AnnData into a PyG Data object.
-
-        # Process one batch of AnnData into one PyG Data object
-        data_batches = []
-
-        # parallelize the processing of each batch of AnnData
-        num_cores = int(os.environ.get("LSB_DJOB_NUMPROC", 1))
-        num_files = len(self.raw_paths)
-        max_workers = min(num_cores, num_files)
-        print(f"Number of Cores: {num_cores} | Number of Tissue Sections: {num_files}")
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for adata_batch_file in self.raw_paths:
-                print(f"Processing {adata_batch_file}...")
-                future = executor.submit(self.process_anndata_batch, adata_batch_file)
-                futures.append(future)
-
-            for future in concurrent.futures.as_completed(futures):
-                data_batch = future.result()
-                data_batches.append(copy.deepcopy(data_batch))
-                print("")
-
-                del data_batch
-
-        # sort the data batches by batch_idx
-        # batch_id = 0, 1, ..., N
-        # batch_idx = 0, 1, ..., N
-        # NOTE: If we have multiple dataset ids, this needs sorting by two keys simultaneously: dataset-id and batch-id.
-        data_batches = sorted(data_batches, key=lambda data_batch: data_batch.adata_batch_id)
-        for i, data_batch in enumerate(data_batches):
-            print(f"i: {i}, Batch: {data_batch.adata_batch_id}, Type: {type(data_batch.adata_batch_id)}")
-
-        # self.save internally collates all Data objects in data_list into a single blob.
-        # The index is set to 0 so that the collated object is stored at
-        # path "self.processed_dir/dataset_blob.pt".
-        self.save(
-            data_list=data_batches,
-            path=self.processed_paths[0],
-        )
-
-        del data_batches
+            del chunk
 
 
     def process_anndata_batch(
@@ -347,28 +271,28 @@ class InMemoryDatasetBlob(InMemoryDataset):
 
             # ----------------- Build Unsupervised Node Embeddings -----------------
             # if dimensions for lm_eigvecs are specified, build spectral embeddings
-            if 'k' in self.graph_kwargs and 'lm_eigvecs' in self.graph_kwargs['k']:
-                print(f"Computing {self.graph_kwargs['k']['lm_eigvecs']} eigenvectors of {edge_index_name}...")
-                batch_dict[f"U_lm_eigvecs_{edge_index_name}"] = self.build_lm_eigenvectors(
-                    A=adata_batch.obsp[f"{edge_index_name}_connectivities"],
-                )
-                print(f"U_lm_eigvecs_{edge_index_name}.shape: {batch_dict[f'U_lm_eigvecs_{edge_index_name}'].shape}")
+            # if 'lm_eigvecs' in self.graph_kwargs['k']:
+            #     print(f"Computing {self.graph_kwargs['k']['lm_eigvecs']} eigenvectors of {edge_index_name}...")
+            #     batch_dict[f"U_lm_eigvecs_{edge_index_name}"] = self.build_lm_eigenvectors(
+            #         A=adata_batch.obsp[f"{edge_index_name}_connectivities"],
+            #     )
+            #     print(f"U_lm_eigvecs_{edge_index_name}.shape: {batch_dict[f'U_lm_eigvecs_{edge_index_name}'].shape}")
 
-            # if dimensions for deepwalk are specified, build deepwalk embeddings
-            if 'k' in self.graph_kwargs and 'deepwalk' in self.graph_kwargs['k']:
-                batch_dict[f"U_deepwalk_{edge_index_name}"] = self.build_deepwalk_embeddings(
-                    batch_id=adata_batch.uns['batch'],
-                    edge_index_name=edge_index_name
-                )
-                print(f"U_deepwalk_{edge_index_name}.shape: {batch_dict[f'U_deepwalk_{edge_index_name}'].shape}")
+            # # if dimensions for deepwalk are specified, build deepwalk embeddings
+            # if 'deepwalk' in self.graph_kwargs['k']:
+            #     batch_dict[f"U_deepwalk_{edge_index_name}"] = self.build_deepwalk_embeddings(
+            #         batch_id=adata_batch.uns['batch'],
+            #         edge_index_name=edge_index_name
+            #     )
+            #     print(f"U_deepwalk_{edge_index_name}.shape: {batch_dict[f'U_deepwalk_{edge_index_name}'].shape}")
 
-            # if dimensions for gosh are specified, build gosh embeddings
-            if 'k' in self.graph_kwargs and 'gosh' in self.graph_kwargs['k']:
-                batch_dict[f"U_gosh_{edge_index_name}"] = self.build_gosh_embeddings(
-                    batch_id=adata_batch.uns['batch'],
-                    edge_index_name=edge_index_name
-                )
-                print(f"U_gosh_{edge_index_name}.shape: {batch_dict[f'U_gosh_{edge_index_name}'].shape}")
+            # # if dimensions for gosh are specified, build gosh embeddings
+            # if 'gosh' in self.graph_kwargs['k']:
+            #     batch_dict[f"U_gosh_{edge_index_name}"] = self.build_gosh_embeddings(
+            #         batch_id=adata_batch.uns['batch'],
+            #         edge_index_name=edge_index_name
+            #     )
+            #     print(f"U_gosh_{edge_index_name}.shape: {batch_dict[f'U_gosh_{edge_index_name}'].shape}")
 
         for key, value in batch_dict.items():
             print(f"{key}: {value.shape=}, {value.dtype=}, {type(value)=}")
@@ -382,7 +306,7 @@ class InMemoryDatasetBlob(InMemoryDataset):
         batch_dict['adata_batch_id'] = int(adata_batch.uns['batch'][5:])
         print(f"{batch_dict['adata_batch_id']=}, {adata_batch.uns['batch']=}")
 
-        # ----------------- Convert Data to PyG Data Object -----------------
+        # ----------------- Convert Data Dict to PyG Data Object -----------------
         data_batch = Data(**batch_dict)
 
         del adata_batch, batch_dict
@@ -395,6 +319,77 @@ class InMemoryDatasetBlob(InMemoryDataset):
 
         return data_batch
 
+    def process(self):
+        """
+        Reads all .h5ad batches for this dataset, builds PyG Data objects,
+        and saves each graph as a separate entry in the sqlite database in the processed_dir.
+        """
+        print("=== Starting OnDiskDatasetBlob.process() ===")
+        print("Writing dataset to:", self.processed_dir)
+
+        # Ensure processed directory exists
+        os.makedirs(self.processed_dir, exist_ok=True)
+
+        # Initialize gene panel and label categories
+        self.gene_panel = None
+        self.label_categories = {label_name: set() for label_name in self.label_names}
+
+        # Locate all silver .h5ad batches
+        silver_dir = self.data_directory_path / "silver" / self.name
+        if not silver_dir.exists():
+            raise FileNotFoundError(f"Silver directory not found: {silver_dir}")
+
+        batch_files = sorted(silver_dir.glob("*.h5ad"))
+        if len(batch_files) == 0:
+            print("No .h5ad files found. Nothing to process.")
+            return
+
+        print(f"Found {len(batch_files)} batches.")
+
+        # ----------------- First Pass -----------------
+        # Collect label categories and verify gene panel
+        for batch_file in batch_files:
+            adata_batch = sc.read(batch_file)
+
+            if self.gene_panel is None:
+                self.gene_panel = adata_batch.var
+            else:
+                if not self.gene_panel.equals(adata_batch.var):
+                    raise ValueError("All batches must have the same gene panel")
+
+            for label_name, label_key in zip(self.label_names, self.label_keys):
+                self.label_categories[label_name].update(adata_batch.obs[label_key].unique())
+
+        # Sort categories
+        for label_name in self.label_names:
+            self.label_categories[label_name] = sorted(list(self.label_categories[label_name]))
+            print(f"Label Name: {label_name} | {self.label_categories[label_name]=}")
+
+        # Save label categories and gene panel
+        with open(Path(self.processed_dir) / "label_categories.pkl", "wb") as f:
+            pickle.dump(self.label_categories, f)
+        with open(Path(self.processed_dir) / "gene_panel.pkl", "wb") as f:
+            pickle.dump(self.gene_panel, f)
+
+        print("Saved label categories and gene panel to disk.")
+
+        # ----------------- Second Pass -----------------
+        # Process each batch and append each graph to the database
+        for i, batch_file in enumerate(batch_files):
+            print(f"\n--- Processing batch {i+1}/{len(batch_files)} ---")
+            print("File:", batch_file)
+
+            data_batch = self.process_anndata_batch(batch_file)
+
+            # Append each graph to the database
+            self.append(data_batch)
+            print(f"Appended graph {i} to database")
+
+        print("Finished writing all graphs to database.")
+        print("Number of graphs in database:", len(self))
+
+
+    
     def build_lm_eigenvectors(
             self,
             A: sp.csr_matrix,
@@ -619,12 +614,6 @@ class InMemoryDatasetBlob(InMemoryDataset):
         Return the path to the processed data directory.
         """
         gold_data_path = self.data_directory_path / 'gold'
-        processed_dir = str(gold_data_path / 'in-memory-PyG-dataset-blob' / self.name)
+        processed_dir = str(gold_data_path / 'on-disk-PyG-dataset-blob' / self.name)
         return processed_dir
 
-    @property
-    def processed_file_names(self) -> List[Data]:
-        """
-        Return the list of processed file names.
-        """
-        return ['dataset_blob.pt']

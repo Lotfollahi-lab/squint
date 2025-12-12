@@ -579,12 +579,41 @@ class VectorQuantize(nn.Module):
         if need_transpose:
             x = rearrange(x, "b d n -> b n d")
 
-        x = self.project_in(x)
+        try:
+            x = self.project_in(x)
+        except Exception:
+            # Debug: print shapes to help diagnose matmul/linear shape mismatches
+            try:
+                import traceback
+                print("VectorQuantize.project_in raised an exception:")
+                print(f"  input x.shape = {getattr(x, 'shape', None)}")
+                proj = self.project_in
+                from torch import nn as _nn
+                if isinstance(proj, _nn.Linear):
+                    w = proj.weight
+                    b = proj.bias
+                    print(f"  project_in is nn.Linear with weight.shape={getattr(w, 'shape', None)} bias.shape={getattr(b, 'shape', None)}")
+                else:
+                    print(f"  project_in type: {type(proj)}")
+                traceback.print_exc()
+            except Exception:
+                pass
+            raise
         if is_multiheaded:
             ein_rhs_eq = "h b n d" if self.separate_codebook_per_head else "1 (b h) n d"
             x = rearrange(x, f"b n (h d) -> {ein_rhs_eq}", h=heads)
 
-        quantize, embed_ind, dist, embed = self._codebook(x)
+        try:
+            quantize, embed_ind, dist, embed = self._codebook(x)
+        except Exception:
+            try:
+                import traceback
+                print("VectorQuantize._codebook raised an exception:")
+                print(f"  x.shape = {getattr(x, 'shape', None)}")
+                traceback.print_exc()
+            except Exception:
+                pass
+            raise
         # print(embed)
         # print(quantize.shape, embed.shape)
         # print(self.training)
@@ -638,7 +667,25 @@ class VectorQuantize(nn.Module):
                 quantize = rearrange(quantize, "1 (b h) n d -> b n (h d)", h=heads)
                 embed_ind = rearrange(embed_ind, "1 (b h) n -> b n h", h=heads)
 
-        quantize = self.project_out(quantize)
+        try:
+            quantize = self.project_out(quantize)
+        except Exception:
+            try:
+                import traceback
+                print("VectorQuantize.project_out raised an exception:")
+                print(f"  quantize.shape = {getattr(quantize, 'shape', None)}")
+                proj = self.project_out
+                from torch import nn as _nn
+                if isinstance(proj, _nn.Linear):
+                    w = proj.weight
+                    b = proj.bias
+                    print(f"  project_out is nn.Linear with weight.shape={getattr(w, 'shape', None)} bias.shape={getattr(b, 'shape', None)}")
+                else:
+                    print(f"  project_out type: {type(proj)}")
+                traceback.print_exc()
+            except Exception:
+                pass
+            raise
 
         if need_transpose:
             quantize = rearrange(quantize, "b n d -> b d n")
