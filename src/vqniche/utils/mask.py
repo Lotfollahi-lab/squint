@@ -34,14 +34,20 @@ def set_mask_ratio(
     # if warmup_epochs is 0, return final_ratio
     if warmup_epochs == 0:
         return final_ratio
-    
-    # otherwise, linearly increase mask ratio from base_ratio to final_ratio over warmup_epochs
-    mask_ratio = float(base_ratio + final_ratio * min(epoch / warmup_epochs, 1.0))
-    
+
+    # FIX: previously this was
+    #   mask_ratio = base_ratio + final_ratio * progress
+    # which goes from base_ratio (e.g. 0.2) to base_ratio + final_ratio
+    # (e.g. 0.2 + 0.6 = 0.8) — overshooting the configured `final_ratio`.
+    # The intended schedule is to interpolate linearly from `base_ratio` to
+    # `final_ratio` over `warmup_epochs` epochs.
+    progress = min(epoch / warmup_epochs, 1.0)
+    mask_ratio = float(base_ratio + (final_ratio - base_ratio) * progress)
+
     # clamp mask ratio to 0.0 and 1.0
     mask_ratio = max(mask_ratio, 0.0)
     mask_ratio = min(mask_ratio, 1.0)
-    
+
     return mask_ratio
 
 

@@ -76,7 +76,12 @@ def nb_attribute_reconstruction_loss(
     # pred_attr = pred_attr[:batch_size]
     # target_attr = target_attr[:batch_size]
 
-    log_theta_mu_eps = torch.log(dispersion + pred_attr + 1e-8).detach()
+    # NOTE: do NOT detach this term — it is the only place where the gradient
+    # of the NB log-likelihood w.r.t. the predicted mean (mu) flows through the
+    # `dispersion * log(theta + mu)` component. Detaching it (previous code)
+    # silently dropped a gradient term and biased the loss. This matches the
+    # scvi-tools reference implementation of `log_nb_positive`.
+    log_theta_mu_eps = torch.log(dispersion + pred_attr + 1e-8)
     log_likelihood_nb = (
         dispersion * (torch.log(dispersion + 1e-8) - log_theta_mu_eps)
         + target_attr * (torch.log(pred_attr + 1e-8) - log_theta_mu_eps)

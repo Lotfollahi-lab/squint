@@ -350,6 +350,12 @@ class SubsetHVG(T.BaseTransform):
         ) -> Data:
         """
         This transform is applied to the raw gene counts matrix.
+
+        We also stash `data.hvg_indices` (LongTensor of length n_genes) — the
+        positions in the original `data.x_cell_gene_counts` columns that
+        survived HVG selection. Downstream code (e.g. predict()) can use this
+        together with the dataset blob's saved gene_panel.pkl to recover gene
+        names for the post-HVG feature matrix.
         """
         adata = ad.AnnData(data.x_cell_gene_counts.numpy())
         sc.pp.highly_variable_genes(
@@ -360,6 +366,12 @@ class SubsetHVG(T.BaseTransform):
         )
         # we manually set the data.x to the subsetted adata.X
         data.x = torch.from_numpy(adata.X)
+        # adata.var.index here is the integer positions (as strings) into the
+        # original x_cell_gene_counts columns, since we built the temp adata
+        # from a name-less ndarray.
+        data.hvg_indices = torch.tensor(
+            [int(v) for v in adata.var.index], dtype=torch.long
+        )
         print(f"SubsetHVG: Subsetted data to {data.num_features} features.")
         return data
 

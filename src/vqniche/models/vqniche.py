@@ -217,6 +217,7 @@ class VQNiche(BaseModel):
             batch_spatial_prior_features: Optional[torch.Tensor] = None,
             batch_attr_decoder_conditions: Optional[torch.Tensor] = None,
             batch_adj_decoder_conditions: Optional[torch.Tensor] = None,
+            read_depth: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         """
         Forward pass of the VQNiche model.
@@ -270,9 +271,18 @@ class VQNiche(BaseModel):
                             batch_spatial_prior_features,
                         )
 
+        # IMPORTANT: read_depth must be computed from the *un*masked input.
+        # `batch_x` here is the masked tensor (callers pass `masked_x`), so
+        # `batch_x.sum(dim=-1)` for masked source nodes equals the sum of the
+        # mask token (~mask_token_eps * num_genes), which is meaningless as a
+        # library size and breaks the NB target which is in raw counts.
+        # Callers should now pass the un-masked `read_depth`; we fall back to
+        # `batch_x.sum(dim=-1)` only for backward compatibility.
+        if read_depth is None:
+            read_depth = batch_x.sum(dim=-1)
         xhat = self.attribute_decoder(
                     x=h_quantized,
-                    read_depth=batch_x.sum(dim=-1),
+                    read_depth=read_depth,
                     conditions=batch_attr_decoder_conditions,
                 )
 
@@ -431,6 +441,10 @@ class VQNiche(BaseModel):
 
         # --------------------- Execute Forward Pass ---------------------
         # 3) Execute the forward pass of the VQNiche model
+        # NOTE: pass the *un*masked read depth (library size) to the decoder so
+        # that the softmax-by-read-depth decoder produces predictions with the
+        # correct scale for the NB target (which is in raw counts of the
+        # original, un-masked input).
         h_latent, \
         h_quantized, \
         indices, \
@@ -445,6 +459,7 @@ class VQNiche(BaseModel):
                 batch_spatial_prior_features=train_spatial_prior_features,
                 batch_attr_decoder_conditions=train_attr_decoder_conditions,
                 batch_adj_decoder_conditions=train_adj_decoder_conditions,
+                read_depth=train_batch.x.sum(dim=-1),
             )
 
         # --------------------- Prepare Data for Loss Computation ---------------------
@@ -548,6 +563,7 @@ class VQNiche(BaseModel):
         
         # --------------------- Execute Forward Pass ---------------------
         # 3) Execute the forward pass of the VQNiche model
+        # NOTE: pass the *un*masked read depth (library size) — see training_step.
         h_latent, \
         h_quantized, \
         indices, \
@@ -562,6 +578,7 @@ class VQNiche(BaseModel):
                 batch_spatial_prior_features=val_spatial_prior_features,
                 batch_attr_decoder_conditions=val_attr_decoder_conditions,
                 batch_adj_decoder_conditions=val_adj_decoder_conditions,
+                read_depth=val_batch.x.sum(dim=-1),
             )
         
         # --------------------- Prepare Data for Loss Computation ---------------------
@@ -663,6 +680,7 @@ class VQNiche(BaseModel):
         
         # --------------------- Execute Forward Pass ---------------------
         # 3) Execute the forward pass of the VQNiche model
+        # NOTE: pass the *un*masked read depth (library size) — see training_step.
         h_latent, \
         h_quantized, \
         indices, \
@@ -676,6 +694,7 @@ class VQNiche(BaseModel):
                 batch_encoder_conditions=test_encoder_conditions,
                 batch_attr_decoder_conditions=test_attr_decoder_conditions,
                 batch_adj_decoder_conditions=test_adj_decoder_conditions,
+                read_depth=test_batch.x.sum(dim=-1),
             )
 
         # Loss is not computed for test step
@@ -808,6 +827,7 @@ class VQNiche(BaseModel):
         
         # --------------------- Execute Forward Pass ---------------------
         # 3) Execute the forward pass of the VQNiche model
+        # NOTE: pass the *un*masked read depth (library size) — see training_step.
         h_latent, \
         h_quantized, \
         indices, \
@@ -821,6 +841,7 @@ class VQNiche(BaseModel):
                 batch_encoder_conditions=predict_encoder_conditions,
                 batch_attr_decoder_conditions=predict_attr_decoder_conditions,
                 batch_adj_decoder_conditions=predict_adj_decoder_conditions,
+                read_depth=predict_batch.x.sum(dim=-1),
             )
 
         # --------------------- Cache Inference Data ---------------------

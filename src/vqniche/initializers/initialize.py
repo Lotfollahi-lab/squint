@@ -23,46 +23,69 @@ from .utils import safe_int_conversion
 
 
 def build_batch_one_hot(
-        cell_ids: List[List[str]], max_batch: int = 38,
+        cell_ids: List[List[str]],
+        max_batch: int | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Given a nested list of cell_ids, return a tuple of tensors containing
-    batch IDs and one-hot encodings of batch IDs (0..max_batch).
-    
+    Given a nested list of cell_ids, return dense batch IDs + their one-hot encoding.
+
+    The function inspects every cell_id, parses its raw batch number out of the
+    "batchN" substring, and remaps the *unique* raw numbers to dense indices
+    [0, num_unique_batches) in sorted order.  The returned batch ID tensor and
+    one-hot encoding both use the dense indices, so the one-hot dimension equals
+    the number of distinct batches actually present in `cell_ids` — not the
+    maximum raw batch number.
+
+    Example: raw batch numbers {15, 82} are remapped to dense {0, 1}; one-hot
+    shape becomes (num_cells, 2) instead of (num_cells, 83).
+
     Parameters
     ----------
     cell_ids : List[List[str]]
         Nested list of cell identifiers, e.g. [['1_batch1_0', '1_batch1_1'], ...]
-        num_cells = \sum_{i=1}^{len(cell_ids)} |cell_ids[i]|
-    max_batch : int
-        Maximum batch index (default 38 → makes one-hot vectors of length 39).
-    
+        num_cells = \\sum_{i=1}^{len(cell_ids)} |cell_ids[i]|
+    max_batch : int, optional
+        Deprecated. Kept for backward compatibility; ignored.
+
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor]
         A tuple containing:
-        - Batch ID tensor of shape (num_cells,)
-        - One-hot tensor of shape (num_cells, max_batch + 1)
+        - Dense batch ID tensor of shape (num_cells,), values in [0, n_unique_batches).
+        - One-hot tensor of shape (num_cells, n_unique_batches).
     """
-    batch_ids = []
-    batch_one_hot = []
+    # Pass 1: collect raw batch numbers, build raw -> dense mapping.
+    raw_per_cell: list[int] = []
     for group in cell_ids:
-        group_ids = []
-        group_tensor = []
         for cid in group:
-            # extract the batch number from pattern "batchX"
             match = re.search(r"batch(\d+)", cid)
             if not match:
                 raise ValueError(f"Could not parse batch from id: {cid}")
-            b = int(match.group(1))
-            
-            one_hot = torch.zeros(max_batch + 1, dtype=torch.float)
-            one_hot[b] = 1.0
-            group_ids.append(b)
+            raw_per_cell.append(int(match.group(1)))
+
+    unique_raw = sorted(set(raw_per_cell))
+    raw_to_dense = {r: i for i, r in enumerate(unique_raw)}
+    n_classes = len(unique_raw)
+
+    # Pass 2: densify and build one-hot. Pass 1 already validated that every
+    # cid contains "batchN", so the regex below cannot match None — but we
+    # guard explicitly to fail loudly if Pass 1's invariants are broken.
+    batch_ids = []
+    batch_one_hot = []
+    for group in cell_ids:
+        group_tensor = []
+        for cid in group:
+            match = re.search(r"batch(\d+)", cid)
+            if not match:
+                raise ValueError(f"Could not parse batch from id: {cid}")
+            r = int(match.group(1))
+            d = raw_to_dense[r]
+            one_hot = torch.zeros(n_classes, dtype=torch.float)
+            one_hot[d] = 1.0
+            batch_ids.append(d)
             group_tensor.append(one_hot)
-        batch_ids.extend(group_ids)
         batch_one_hot.append(torch.stack(group_tensor))
-    
+
     batch_ids = torch.tensor(batch_ids, dtype=torch.long)
     batch_one_hot = torch.cat(batch_one_hot, dim=0)
 
@@ -278,9 +301,11 @@ def initialize_databatch(
                                 )
 
     # TODO: clean up this multi-section conditioning code
+    # `build_batch_one_hot` densifies raw batch numbers (e.g. {15, 82}) to
+    # contiguous indices [0, n_unique_batches), so `max_batch` is no longer
+    # needed and the one-hot dim matches the number of tissue sections.
     batch_ids, batch_conditions = build_batch_one_hot(
                                             cell_ids=data_batch.cell_id,
-                                            max_batch=len(dataset_blob),
                                         )
     data_batch.adata_batch_ids = batch_ids
 
