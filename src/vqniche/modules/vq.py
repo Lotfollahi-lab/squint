@@ -15,6 +15,9 @@ from vector_quantize_pytorch import (
     RandomProjectionQuantizer
 )
 
+# Local hierarchical / tree-structured VQ variants
+from .hierarchical_vq import ResidualVQ_Squint, ConditionalVQ
+
 
 def get_vq_class(
         vq_name: str,
@@ -47,7 +50,10 @@ def get_vq_class(
         'LFQ': LFQ,
         'ResidualLFQ': ResidualLFQ,
         'LatentQuantize': LatentQuantize,
-        'RandomProjectionQuantizer': RandomProjectionQuantizer
+        'RandomProjectionQuantizer': RandomProjectionQuantizer,
+        # Local hierarchical variants (in-tree, built atop VectorQuantize):
+        'ResidualVQ_Squint': ResidualVQ_Squint,   # RQ-VAE with per-level sizing
+        'ConditionalVQ':    ConditionalVQ,         # tree (level-1 routes to level-2)
     }
 
     if vq_name not in vq_classes:
@@ -82,7 +88,10 @@ def get_valid_params(
         'LFQ': [],  # Either dim or codebook_size must be specified
         'ResidualLFQ': ['dim', 'codebook_size', 'num_quantizers'],
         'LatentQuantize': ['levels', 'dim'],
-        'RandomProjectionQuantizer': ['dim', 'num_codebooks', 'codebook_dim', 'codebook_size']
+        'RandomProjectionQuantizer': ['dim', 'num_codebooks', 'codebook_dim', 'codebook_size'],
+        # Local hierarchical variants — required params match their __init__:
+        'ResidualVQ_Squint': ['dim', 'num_quantizers', 'codebook_size'],
+        'ConditionalVQ':    ['dim', 'codebook_size_l1', 'codebook_size_l2'],
     }
     class_name = cls.__name__
     init_signature = inspect.signature(cls.__init__)

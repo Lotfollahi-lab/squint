@@ -136,6 +136,12 @@ class InMemoryDatasetBlob(InMemoryDataset):
         # ----------------- First Pass over AnnData Batches -----------------
         # This pass is used to collect gene panels and the unique categories for each label name across all batches.
         # All batches must have the same gene panel. Multiple gene panels across tissue sections are not supported.
+        #
+        # We tolerate batches whose gene names appear in a *different order* than
+        # the first batch, as long as the gene SET matches and the per-gene `.var`
+        # metadata agrees once aligned. The first batch's gene order becomes the
+        # canonical order; the second pass (`process_anndata_batch`) reindexes
+        # every other batch to match it before building the PyG Data object.
 
         self.gene_panel = None
 
@@ -154,9 +160,25 @@ class InMemoryDatasetBlob(InMemoryDataset):
                 # columns are the ensemble ids
                 self.gene_panel = adata_batch.var
             else:
-                # check if the gene panel is the same across all batches
-                if not self.gene_panel.equals(adata_batch.var):
-                    raise ValueError("All batches must have the same gene panel")
+                # 1. Same set of genes?
+                if set(self.gene_panel.index) != set(adata_batch.var.index):
+                    raise ValueError(
+                        "All batches must have the same gene panel "
+                        "(the gene SETS differ between batches)."
+                    )
+                # 2. Reindex to canonical (first-batch) order, then compare.
+                #    This catches mismatches in `.var` columns / dtypes / values.
+                aligned_var = adata_batch.var.reindex(self.gene_panel.index)
+                if not self.gene_panel.equals(aligned_var):
+                    raise ValueError(
+                        "All batches must have the same gene panel "
+                        "(genes match but per-gene .var metadata differs)."
+                    )
+                if not self.gene_panel.index.equals(adata_batch.var.index):
+                    print(
+                        f"  -> {Path(adata_batch_file).name}: gene order differs "
+                        "from the first batch; will reindex in pass 2."
+                    )
 
             for label_name, label_key in zip(self.label_names, self.label_keys):
                 self.label_categories[label_name].update(adata_batch.obs[label_key].unique())
@@ -239,6 +261,17 @@ class InMemoryDatasetBlob(InMemoryDataset):
         """
         # Read the AnnData file from disk
         adata_batch = sc.read(adata_batch_file)
+
+        # ----------------- Align gene order to canonical panel -----------------
+        # The first pass set `self.gene_panel` from the first batch and required
+        # every subsequent batch to share the same gene SET (but not necessarily
+        # the same order). Here we reindex to the canonical order so that X /
+        # layers / varm / varp / obsp all line up with `self.gene_panel.index`.
+        if self.gene_panel is not None and not adata_batch.var.index.equals(self.gene_panel.index):
+            print(
+                f"  -> reindexing {Path(adata_batch_file).name} to canonical gene order."
+            )
+            adata_batch = adata_batch[:, self.gene_panel.index].copy()
 
         # ----------------- Build Neighborhood Graphs -----------------
         self.edge_index_names = []

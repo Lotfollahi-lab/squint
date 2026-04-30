@@ -16,6 +16,7 @@ from vqniche.loss import (
     cross_entropy_loss,
     mse_attribute_reconstruction_loss,
     nb_attribute_reconstruction_loss,
+    nb_nbr_attribute_reconstruction_loss,
     mse_adjacency_reconstruction_loss,
     bce_adjacency_reconstruction_loss,
     mse_joint_code_commit_loss,
@@ -115,7 +116,23 @@ class BaseModel(pl.LightningModule):
 
         # Loss parameters
         self.loss_kwargs = loss_kwargs
+
+        # Dispersion parameter for the NB likelihood.
+        # When `code_conditional_dispersion` is enabled (set later by the
+        # subclass after the encoder is built), we still keep this scalar
+        # parameter as a fallback for any code path that needs a global
+        # dispersion (e.g. inference paths that don't have a code yet).
+        # Subclasses that enable code-conditional dispersion will use
+        # `self.dispersion_head(h_quantized)` in lieu of `torch.exp(self.dispersion)`
+        # when assembling `loss_data['dispersion']`.
         self.dispersion = torch.nn.Parameter(torch.randn(self.in_channels))
+
+        # Whether the NB dispersion is conditioned on the quantized embedding
+        # (a small MLP head: z_q -> log(theta)). Default off; flipped on by
+        # the VQNiche subclass when `code_conditional_dispersion=True`.
+        self.code_conditional_dispersion = False
+        self.dispersion_head = None
+
         self.loss_fn_tuples = self.set_loss_fn_tuples(loss_names, loss_kwargs)
 
         self.save_hyperparameters()
@@ -186,6 +203,28 @@ class BaseModel(pl.LightningModule):
                 wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
                 if wt_attr_reconstr is not None:
                     loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
+
+            elif loss_fn_name == 'nb_attribute_reconstruction_loss_nbr':
+                # Second NB reconstruction term for recon_mode='both'.
+                # Uses nb_nbr_attribute_reconstruction_loss — a thin wrapper
+                # that accepts pred_attr_nbr / target_attr_nbr kwargs so the
+                # dispatcher's key-based lookup doesn't collide with the cell
+                # branch's pred_attr / target_attr keys.
+                loss_fn = nb_nbr_attribute_reconstruction_loss
+
+                loss_fn_data_keys = ['pred_attr_nbr', 'target_attr_nbr', 'edge_index', 'batch_size', 'dispersion']
+
+                # k_hop_nb_loss=0: aggregation was done upstream in
+                # training_step; the wrapper must NOT re-aggregate.
+                loss_fn_params['k_hop_nb_loss'] = 0
+
+                wt_attr_reconstr_nbr = loss_kwargs.get('wt_attr_reconstr_nbr')
+                if wt_attr_reconstr_nbr is not None:
+                    loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr_nbr
+                else:
+                    wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
+                    if wt_attr_reconstr is not None:
+                        loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
 
             elif loss_fn_name == 'mse_adjacency_reconstruction_loss':
                 loss_fn = mse_adjacency_reconstruction_loss

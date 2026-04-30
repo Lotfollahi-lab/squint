@@ -76,7 +76,12 @@ def nb_attribute_reconstruction_loss(
     # pred_attr = pred_attr[:batch_size]
     # target_attr = target_attr[:batch_size]
 
-    log_theta_mu_eps = torch.log(dispersion + pred_attr + 1e-8).detach()
+    # NOTE: do NOT detach this term — it is the only place where the gradient
+    # of the NB log-likelihood w.r.t. the predicted mean (mu) flows through the
+    # `dispersion * log(theta + mu)` component. Detaching it (previous code)
+    # silently dropped a gradient term and biased the loss. This matches the
+    # scvi-tools reference implementation of `log_nb_positive`.
+    log_theta_mu_eps = torch.log(dispersion + pred_attr + 1e-8)
     log_likelihood_nb = (
         dispersion * (torch.log(dispersion + 1e-8) - log_theta_mu_eps)
         + target_attr * (torch.log(pred_attr + 1e-8) - log_theta_mu_eps)
@@ -86,4 +91,39 @@ def nb_attribute_reconstruction_loss(
 
     nb_loss = torch.mean(-log_likelihood_nb.sum(-1))
 
-    return nb_loss * wt_attr_reconstr 
+    return nb_loss * wt_attr_reconstr
+
+
+def nb_nbr_attribute_reconstruction_loss(
+        pred_attr_nbr: torch.Tensor,
+        target_attr_nbr: torch.Tensor,
+        edge_index: torch.Tensor,
+        batch_size: int,
+        dispersion: torch.Tensor,
+        k_hop_nb_loss: int = 0,
+        wt_attr_reconstr: float = 0.1,
+    ) -> torch.Tensor:
+    """
+    Thin wrapper around `nb_attribute_reconstruction_loss` for the
+    neighbourhood branch when `recon_mode='both'`.
+
+    The loss dispatcher extracts tensors from the step's loss_data dict by
+    matching keyword names to dict keys.  The neighbourhood targets are stored
+    under `pred_attr_nbr` / `target_attr_nbr` to avoid colliding with the
+    per-cell keys (`pred_attr` / `target_attr`). This wrapper accepts those
+    suffixed names and forwards them to the canonical loss under the expected
+    positional names.
+
+    The upstream code (training_step / validation_step) already computes the
+    1-hop aggregation before storing the pair, so `k_hop_nb_loss` is always
+    passed as 0 by the dispatcher — the aggregation is NOT repeated here.
+    """
+    return nb_attribute_reconstruction_loss(
+        pred_attr=pred_attr_nbr,
+        target_attr=target_attr_nbr,
+        edge_index=edge_index,
+        batch_size=batch_size,
+        dispersion=dispersion,
+        k_hop_nb_loss=k_hop_nb_loss,
+        wt_attr_reconstr=wt_attr_reconstr,
+    )

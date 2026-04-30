@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from .base_model import BaseModel
 from ..encoders.vqniche_encoder import VQNiche_Encoder
+from ..modules import DispersionHead
 from vqniche.utils.loss_utils import (
     batch_pred_attr_and_target_attr,
     aggregate_1hop_neighbor_features,
@@ -144,6 +145,35 @@ class VQNiche(BaseModel):
                         )
         print(f"4. Predictor: {predictor_name} that transforms {self.encoder.dim} hidden features to {out_channels} dimensional logits.")
 
+        # ---- Code-conditional dispersion (optional) ------------------------
+        # When enabled, replace the global per-gene `dispersion` parameter
+        # (kept on BaseModel as a fallback) with a small MLP that maps the
+        # quantized embedding `z_q` to per-cell, per-gene log-dispersion.
+        # The flag is read from loss_params['loss_kwargs']; default False.
+        loss_kwargs = loss_params.get('loss_kwargs', {}) if loss_params else {}
+        ccd_cfg = loss_kwargs.get('code_conditional_dispersion', False)
+        if isinstance(ccd_cfg, bool):
+            ccd_enabled = ccd_cfg
+            ccd_hidden  = []
+        else:
+            # dict form: {'enabled': bool, 'hidden_channels': [..]}
+            ccd_enabled = bool(ccd_cfg.get('enabled', False))
+            ccd_hidden  = list(ccd_cfg.get('hidden_channels', []) or [])
+        self.code_conditional_dispersion = ccd_enabled
+        if ccd_enabled:
+            self.dispersion_head = DispersionHead(
+                in_channels=self.encoder.dim,
+                out_channels=in_channels,
+                hidden_channels=ccd_hidden,
+            )
+            print(
+                f"5. Dispersion Head: code-conditional NB dispersion ENABLED "
+                f"(z_q[{self.encoder.dim}] -> log_theta[{in_channels}]; hidden={ccd_hidden})."
+            )
+        else:
+            self.dispersion_head = None
+            print(f"5. Dispersion: GLOBAL per-gene parameter (code-conditional dispersion off).")
+
         # Initialize cache dicts for capturing data and model outputs during training, validation, and test steps
         self._init_inference_data_caches()
 
@@ -207,6 +237,13 @@ class VQNiche(BaseModel):
             cache['codebook_size'] = self.encoder.vq.codebook_size
             cache['separate'] = self.encoder.vq.separate_codebook_per_head
             cache['num_heads'] = self.encoder.vq.heads
+            # Multi-level VQ metadata. Default to single-level for back-compat
+            # with VectorQuantize and other lucidrains base classes.
+            cache['num_quantizers'] = int(getattr(self.encoder.vq, 'num_quantizers', 1))
+            # Per-level sizes (list); only set when the VQ exposes them.
+            cb_sizes = getattr(self.encoder.vq, 'codebook_sizes', None)
+            if cb_sizes is not None:
+                cache['codebook_sizes'] = list(cb_sizes)
 
 
     def forward(
@@ -217,6 +254,7 @@ class VQNiche(BaseModel):
             batch_spatial_prior_features: Optional[torch.Tensor] = None,
             batch_attr_decoder_conditions: Optional[torch.Tensor] = None,
             batch_adj_decoder_conditions: Optional[torch.Tensor] = None,
+            read_depth: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         """
         Forward pass of the VQNiche model.
@@ -270,9 +308,18 @@ class VQNiche(BaseModel):
                             batch_spatial_prior_features,
                         )
 
+        # IMPORTANT: read_depth must be computed from the *un*masked input.
+        # `batch_x` here is the masked tensor (callers pass `masked_x`), so
+        # `batch_x.sum(dim=-1)` for masked source nodes equals the sum of the
+        # mask token (~mask_token_eps * num_genes), which is meaningless as a
+        # library size and breaks the NB target which is in raw counts.
+        # Callers should now pass the un-masked `read_depth`; we fall back to
+        # `batch_x.sum(dim=-1)` only for backward compatibility.
+        if read_depth is None:
+            read_depth = batch_x.sum(dim=-1)
         xhat = self.attribute_decoder(
                     x=h_quantized,
-                    read_depth=batch_x.sum(dim=-1),
+                    read_depth=read_depth,
                     conditions=batch_attr_decoder_conditions,
                 )
 
@@ -288,6 +335,39 @@ class VQNiche(BaseModel):
             h_adj, \
             unnormalized_logits_batch, \
             h_spatial_prior
+
+
+    # ----- helpers shared by training/validation/test step ------------------
+
+    def _resolve_dispersion(self, h_quantized_seed: torch.Tensor) -> torch.Tensor:
+        """
+        Return the NB dispersion tensor for this batch.
+
+        - If `code_conditional_dispersion=True`: a small MLP head maps the
+          quantized embedding `z_q` (shape (B, D)) to per-cell, per-gene
+          dispersion of shape (B, n_genes).
+        - Otherwise: the legacy per-gene global parameter is exp'd to a
+          shape-(n_genes,) tensor that broadcasts against (B, n_genes).
+        """
+        if self.code_conditional_dispersion and self.dispersion_head is not None:
+            return self.dispersion_head(h_quantized_seed)
+        return torch.exp(self.dispersion)
+
+    def _safe_one_hot_indices(self, indices: torch.Tensor):
+        """
+        One-hot encode VQ indices for the spatial-prior loss.
+
+        Multi-level VQ (RVQ / ConditionalVQ) emits indices of shape
+        `(..., num_quantizers)` whose per-level codebooks have different
+        sizes — there is no single `num_classes` to encode against. The
+        spatial-prior loss is gated by `h_spatial_prior is not None`
+        downstream, which is only set when an explicit spatial prior MLP
+        is configured (none of the current ablation variants enable it),
+        so we safely pass `None` in the multi-level case.
+        """
+        if int(getattr(self.encoder.vq, 'num_quantizers', 1)) > 1:
+            return None
+        return F.one_hot(indices, num_classes=self.encoder.vq.codebook_size)
 
 
     def apply_mask_to_attributes(
@@ -431,6 +511,10 @@ class VQNiche(BaseModel):
 
         # --------------------- Execute Forward Pass ---------------------
         # 3) Execute the forward pass of the VQNiche model
+        # NOTE: pass the *un*masked read depth (library size) to the decoder so
+        # that the softmax-by-read-depth decoder produces predictions with the
+        # correct scale for the NB target (which is in raw counts of the
+        # original, un-masked input).
         h_latent, \
         h_quantized, \
         indices, \
@@ -445,35 +529,71 @@ class VQNiche(BaseModel):
                 batch_spatial_prior_features=train_spatial_prior_features,
                 batch_attr_decoder_conditions=train_attr_decoder_conditions,
                 batch_adj_decoder_conditions=train_adj_decoder_conditions,
+                read_depth=train_batch.x.sum(dim=-1),
             )
 
         # --------------------- Prepare Data for Loss Computation ---------------------
         # 4) Prepare the predicted and target attributes for the Attribute Reconstruction Loss (negative binomial)
-        pred_attr, target_attr = batch_pred_attr_and_target_attr(
-            batch_x=train_batch.x,
-            batch_xhat=xhat_batch,
-            edge_index=train_batch.edge_index,
-            batch_size=batch_size,
-            mask_idx=mask_idx,
-            k_hop_nb_loss=self.loss_kwargs['k_hop_nb_loss'],
-            only_masked=self.loss_kwargs['only_masked'],
-        )
-        
-        indices_one_hot = F.one_hot(
-                            indices,
-                            num_classes=self.encoder.vq.codebook_size,
-                        )
+        #
+        # `recon_mode` controls which NB target(s) are computed:
+        #   "cell" — per-cell counts (legacy default, equivalent to k_hop_nb_loss=0)
+        #   "nbr"  — 1-hop neighborhood mean counts (legacy k_hop_nb_loss=1)
+        #   "both" — both, for use with TWO loss-name dispatches in the same step:
+        #            `nb_attribute_reconstruction_loss` (uses pred_attr/target_attr,
+        #             which point to the cell pair) AND
+        #            `nb_attribute_reconstruction_loss_nbr` (uses
+        #             pred_attr_nbr/target_attr_nbr).
+        #
+        # For backward compat, if `recon_mode` is not specified we infer it from
+        # the legacy `k_hop_nb_loss` kwarg.
+        recon_mode = self.loss_kwargs.get('recon_mode')
+        if recon_mode is None:
+            recon_mode = 'nbr' if self.loss_kwargs.get('k_hop_nb_loss', 0) == 1 else 'cell'
+        if recon_mode not in ('cell', 'nbr', 'both'):
+            raise ValueError(
+                f"loss_kwargs['recon_mode'] must be one of "
+                f"{{'cell', 'nbr', 'both'}}, got {recon_mode!r}."
+            )
+
+        pred_attr_nbr = target_attr_nbr = None
+        if recon_mode in ('cell', 'both'):
+            pred_attr, target_attr = batch_pred_attr_and_target_attr(
+                batch_x=train_batch.x,
+                batch_xhat=xhat_batch,
+                edge_index=train_batch.edge_index,
+                batch_size=batch_size,
+                mask_idx=mask_idx,
+                k_hop_nb_loss=0,
+                only_masked=self.loss_kwargs['only_masked'],
+            )
+        if recon_mode in ('nbr', 'both'):
+            pred_attr_nbr, target_attr_nbr = batch_pred_attr_and_target_attr(
+                batch_x=train_batch.x,
+                batch_xhat=xhat_batch,
+                edge_index=train_batch.edge_index,
+                batch_size=batch_size,
+                mask_idx=mask_idx,
+                k_hop_nb_loss=1,
+                only_masked=self.loss_kwargs['only_masked'],
+            )
+        if recon_mode == 'nbr':
+            # Legacy keys (used by `nb_attribute_reconstruction_loss`) point at
+            # the neighborhood pair so existing variants that just set
+            # k_hop_nb_loss=1 continue to work without code changes.
+            pred_attr, target_attr = pred_attr_nbr, target_attr_nbr
+
+        indices_one_hot = self._safe_one_hot_indices(indices)
 
         # 5) Prepare dictionary of data required for computing loss
         # Slicing the first batch_size entries is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the source nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of source nodes is equal to the batch size. The remaining entries of the forward output correspond to the sampled neighbors of the source nodes.
         train_loss_data = {
                         'quantizer_input': h_latent[:batch_size], # code and commit loss
                         'quantizer_output': h_quantized[:batch_size], # code and commit loss
-                        'pred_attr': pred_attr, # attribute reconstruction loss
+                        'pred_attr': pred_attr, # attribute reconstruction loss (cell or nbr depending on recon_mode)
                         'target_attr': target_attr, # attribute reconstruction loss
                         'edge_index': train_batch.edge_index, # attribute reconstruction loss
                         'batch_size': batch_size, # attribute and adjacency reconstruction loss
-                        'dispersion': torch.exp(self.dispersion), # attribute reconstruction loss
+                        'dispersion': self._resolve_dispersion(h_quantized[:batch_size]), # attribute reconstruction loss
                         'h_adj': h_adj_batch, # adjacency reconstruction loss
                         'batch_edge_index': train_batch.edge_index, # adjacency reconstruction loss
                         'logits': unnormalized_logits_batch[:batch_size], # label prediction loss
@@ -481,6 +601,12 @@ class VQNiche(BaseModel):
                         'h_spatial_prior': h_spatial_prior, # spatial prior loss
                         'indices_one_hot': indices_one_hot, # spatial prior loss
                         }
+        if pred_attr_nbr is not None and recon_mode == 'both':
+            # Only expose the nbr keys when we want them dispatched as a SECOND
+            # loss term. In recon_mode='nbr' the nbr pair is already mapped onto
+            # the legacy pred_attr/target_attr keys above.
+            train_loss_data['pred_attr_nbr'] = pred_attr_nbr
+            train_loss_data['target_attr_nbr'] = target_attr_nbr
         
         # Add mask token to train loss data if using learnable parameter strategy
         if self.mask_strategy == 'learnable_parameter':
@@ -548,6 +674,7 @@ class VQNiche(BaseModel):
         
         # --------------------- Execute Forward Pass ---------------------
         # 3) Execute the forward pass of the VQNiche model
+        # NOTE: pass the *un*masked read depth (library size) — see training_step.
         h_latent, \
         h_quantized, \
         indices, \
@@ -562,24 +689,40 @@ class VQNiche(BaseModel):
                 batch_spatial_prior_features=val_spatial_prior_features,
                 batch_attr_decoder_conditions=val_attr_decoder_conditions,
                 batch_adj_decoder_conditions=val_adj_decoder_conditions,
+                read_depth=val_batch.x.sum(dim=-1),
             )
         
         # --------------------- Prepare Data for Loss Computation ---------------------
-        # 4) Prepare the predicted and target attributes for the Attribute Reconstruction Loss (negative binomial)
-        pred_attr, target_attr = batch_pred_attr_and_target_attr(
-            batch_x=val_batch.x,
-            batch_xhat=xhat_batch,
-            edge_index=val_batch.edge_index,
-            batch_size=batch_size,
-            mask_idx=mask_idx,
-            k_hop_nb_loss=self.loss_kwargs['k_hop_nb_loss'],
-            only_masked=False, # False and True are equivalent for validation
-        )
+        # 4) Prepare NB targets — mirrors the recon_mode logic in training_step.
+        recon_mode = self.loss_kwargs.get('recon_mode')
+        if recon_mode is None:
+            recon_mode = 'nbr' if self.loss_kwargs.get('k_hop_nb_loss', 0) == 1 else 'cell'
 
-        indices_one_hot = F.one_hot(
-                            indices,
-                            num_classes=self.encoder.vq.codebook_size,
-                        )
+        pred_attr_nbr = target_attr_nbr = None
+        if recon_mode in ('cell', 'both'):
+            pred_attr, target_attr = batch_pred_attr_and_target_attr(
+                batch_x=val_batch.x,
+                batch_xhat=xhat_batch,
+                edge_index=val_batch.edge_index,
+                batch_size=batch_size,
+                mask_idx=mask_idx,
+                k_hop_nb_loss=0,
+                only_masked=False,
+            )
+        if recon_mode in ('nbr', 'both'):
+            pred_attr_nbr, target_attr_nbr = batch_pred_attr_and_target_attr(
+                batch_x=val_batch.x,
+                batch_xhat=xhat_batch,
+                edge_index=val_batch.edge_index,
+                batch_size=batch_size,
+                mask_idx=mask_idx,
+                k_hop_nb_loss=1,
+                only_masked=False,
+            )
+        if recon_mode == 'nbr':
+            pred_attr, target_attr = pred_attr_nbr, target_attr_nbr
+
+        indices_one_hot = self._safe_one_hot_indices(indices)
 
         # 5) Prepare dictionary of data required for computing loss
         val_loss_data = {
@@ -589,7 +732,7 @@ class VQNiche(BaseModel):
                         'target_attr': target_attr,
                         'edge_index': val_batch.edge_index,
                         'batch_size': batch_size,
-                        'dispersion': torch.exp(self.dispersion),
+                        'dispersion': self._resolve_dispersion(h_quantized[:batch_size]),
                         'h_adj': h_adj_batch,
                         'batch_edge_index': val_batch.edge_index,
                         'logits': unnormalized_logits_batch[:batch_size],
@@ -597,6 +740,9 @@ class VQNiche(BaseModel):
                         'h_spatial_prior': h_spatial_prior, # spatial prior loss
                         'indices_one_hot': indices_one_hot, # spatial prior loss
                         }
+        if pred_attr_nbr is not None and recon_mode == 'both':
+            val_loss_data['pred_attr_nbr'] = pred_attr_nbr
+            val_loss_data['target_attr_nbr'] = target_attr_nbr
 
         # Add mask token to val loss data if using learnable parameter strategy
         if self.mask_strategy == 'learnable_parameter':
@@ -663,6 +809,7 @@ class VQNiche(BaseModel):
         
         # --------------------- Execute Forward Pass ---------------------
         # 3) Execute the forward pass of the VQNiche model
+        # NOTE: pass the *un*masked read depth (library size) — see training_step.
         h_latent, \
         h_quantized, \
         indices, \
@@ -676,6 +823,7 @@ class VQNiche(BaseModel):
                 batch_encoder_conditions=test_encoder_conditions,
                 batch_attr_decoder_conditions=test_attr_decoder_conditions,
                 batch_adj_decoder_conditions=test_adj_decoder_conditions,
+                read_depth=test_batch.x.sum(dim=-1),
             )
 
         # Loss is not computed for test step
@@ -808,6 +956,7 @@ class VQNiche(BaseModel):
         
         # --------------------- Execute Forward Pass ---------------------
         # 3) Execute the forward pass of the VQNiche model
+        # NOTE: pass the *un*masked read depth (library size) — see training_step.
         h_latent, \
         h_quantized, \
         indices, \
@@ -821,6 +970,7 @@ class VQNiche(BaseModel):
                 batch_encoder_conditions=predict_encoder_conditions,
                 batch_attr_decoder_conditions=predict_attr_decoder_conditions,
                 batch_adj_decoder_conditions=predict_adj_decoder_conditions,
+                read_depth=predict_batch.x.sum(dim=-1),
             )
 
         # --------------------- Cache Inference Data ---------------------

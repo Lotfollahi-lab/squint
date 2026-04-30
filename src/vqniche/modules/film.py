@@ -296,4 +296,15 @@ class FiLM(nn.Module):
         if beta is not None:
             x_conditioned = x_conditioned + beta
 
-        return x + self.residual_weight * x_conditioned if self.use_residual else x_conditioned
+        # FIX: residual mode previously returned `x + residual_weight * x_conditioned`,
+        # which with identity init (gamma=1, beta=0) yields
+        #   output = x + residual_weight * x = (1 + residual_weight) * x
+        # i.e. the layer is NOT the identity at init even though `init_mode='identity'`
+        # was supposed to make it so. We now return the *delta* relative to the
+        # identity, so the residual mixes only the modulation signal:
+        #   output = x + residual_weight * (x_conditioned - x)
+        # With identity init this correctly yields `output = x` regardless of
+        # `residual_weight`.
+        if self.use_residual:
+            return x + self.residual_weight * (x_conditioned - x)
+        return x_conditioned

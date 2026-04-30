@@ -301,6 +301,12 @@ def inference_data_dict_to_adata(
         adata.uns['separate'] = inference_data['separate']
     if 'num_heads' in inference_data:
         adata.uns['num_heads'] = inference_data['num_heads']
+    # Multi-level VQ metadata (RVQ / ConditionalVQ).
+    # Defaults to single-level when absent → propagated as 1 for back-compat.
+    if 'num_quantizers' in inference_data:
+        adata.uns['num_quantizers'] = inference_data['num_quantizers']
+    if 'codebook_sizes' in inference_data:
+        adata.uns['codebook_sizes'] = inference_data['codebook_sizes']
 
     return adata
 

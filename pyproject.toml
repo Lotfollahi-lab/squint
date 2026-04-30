@@ -1,3 +1,25 @@
+###############################################################################
+# Install with uv (recommended):
+#
+#   cd /nfs/team361/sb75/squint
+#   uv venv .venv --python 3.10           # create the venv
+#   source .venv/bin/activate
+#   uv sync                                # resolves + installs everything
+#
+# uv reads the [tool.uv.*] sections at the bottom of this file, which:
+#   - point torch / torchvision / torchaudio at PyTorch's CUDA-12.1 wheels
+#   - add data.pyg.org as a find-links source for the precompiled
+#     pyg-lib / torch-cluster / torch-scatter / torch-sparse / torch-spline-conv
+#     wheels that match torch 2.2.x + CUDA 12.1
+#
+# CPU-only install:
+#   - in [tool.uv] below, change find-links URL to torch-2.2.0+cpu.html
+#   - in [tool.uv.sources] below, change `pytorch-cu121` to `pytorch-cpu`
+#   - remove the pinned pyg-lib / torch-cluster / torch-scatter / torch-sparse /
+#     torch-spline-conv lines (those are optional companion libs that
+#     torch_geometric will fall back from in pure-Python).
+###############################################################################
+
 [build-system]
 build-backend = "hatchling.build"
 requires = [ "hatchling" ]
@@ -16,7 +38,7 @@ authors = [
   { name = "Lloyd Steele" },
   { name = "Arpit Merchant" },
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 classifiers = [
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.10",
@@ -24,13 +46,62 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-  "anndata",
-  "numpy",
-  "scanpy",
-  # for debug logging (referenced from the issue template)
-  "session-info",
-  "squidpy",
-  "wandb",
+    # ---- PyTorch (pinned to match the prebuilt PyG companion wheels) ----
+    "torch==2.2.0",
+    "torchvision==0.17.0",
+    "torchaudio==2.2.0",
+
+    # ---- PyTorch Lightning ----
+    "pytorch-lightning>=2.2,<2.5",
+    "torchmetrics>=1.2,<2.0",
+
+    # ---- PyTorch Geometric core + companion wheels ----
+    "torch-geometric>=2.5,<2.7",
+    "pyg-lib==0.4.0",
+    "torch-cluster==1.6.3",
+    "torch-scatter==2.1.2",
+    "torch-sparse==0.6.18",
+    "torch-spline-conv==1.2.2",
+
+    # ---- vector-quantize / einops ----
+    "vector-quantize-pytorch>=1.14",
+    "einops>=0.7",
+
+    # ---- single-cell + spatial ----
+    "anndata>=0.10",
+    "scanpy>=1.10",
+    "squidpy>=1.5",
+    "scib-metrics>=0.5",
+    "h5py>=3.10",
+    # scanpy.pp.highly_variable_genes(flavor="seurat_v3") loads this lazily.
+    "scikit-misc>=0.3",
+
+    # ---- general data science ----
+    "numpy>=1.24,<2",
+    "pandas>=2.0",
+    "scipy>=1.11",
+    "scikit-learn>=1.3",
+    "networkx>=3.0",
+
+    # ---- plotting ----
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    "umap-learn>=0.5",
+
+    # ---- experiment logging / IO ----
+    "wandb>=0.17",
+    "pyyaml>=6.0",
+    "tabulate>=0.9",
+    "tqdm>=4.66",
+    # for debug logging (referenced from the issue template)
+    "session-info>=1.0",
+
+    # `xarray_schema` (a transitive dep of spatialdata / squidpy) still does
+    # `from pkg_resources import ...`, which lives in setuptools. uv doesn't
+    # ship setuptools by default, AND recent setuptools (80+) has started
+    # omitting `pkg_resources` in some installs, so we pin to the version
+    # used by the original conda environment, which ships pkg_resources.
+    "setuptools>=68,<76",
 ]
 
 [project.optional-dependencies]
@@ -56,6 +127,47 @@ test = [
     "pytest",
     "coverage",
 ]
+# Extra packages used by the squint-reproducibility data-prep scripts only.
+data-prep = [
+    "pyensembl>=2.3",
+    "requests>=2.31",
+]
+# Optional baseline implementation imported by analysis/banksy_train.py.
+banksy = [
+    "banksy-py",
+]
+
+###############################################################################
+#                                  uv config
+###############################################################################
+
+[tool.uv]
+# data.pyg.org publishes a single HTML file per (torch, cuda) combination that
+# acts as a find-links index for the companion wheels. For CPU-only or a
+# different CUDA version, change the URL below to one of:
+#   https://data.pyg.org/whl/torch-2.2.0+cpu.html
+#   https://data.pyg.org/whl/torch-2.2.0+cu118.html
+#   https://data.pyg.org/whl/torch-2.2.0+cu121.html      <-- default
+find-links = ["https://data.pyg.org/whl/torch-2.2.0+cu121.html"]
+
+[tool.uv.sources]
+# Pull torch/torchvision/torchaudio from the PyTorch CUDA 12.1 index
+# (replace with `pytorch-cpu` for a CPU-only environment).
+torch       = [{ index = "pytorch-cu121" }]
+torchvision = [{ index = "pytorch-cu121" }]
+torchaudio  = [{ index = "pytorch-cu121" }]
+
+[[tool.uv.index]]
+name     = "pytorch-cu121"
+url      = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[[tool.uv.index]]
+name     = "pytorch-cpu"
+url      = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+###############################################################################
 
 [tool.coverage.run]
 source = ["vq-niche"]
