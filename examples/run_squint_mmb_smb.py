@@ -36,9 +36,19 @@ Training metrics are logged to wandb under the project "squint".
 
   # 2) train SQUINT on the WHOLE dataset (both batches, every cell).
   #    --variant <name>  picks the ablation. Use --list-variants to see all.
-  #      poc      = minimal Graph VQ-VAE baseline   (start here)
-  #      poc+nbr  = POC + 1-hop neighborhood NB reconstruction (first ablation)
-  #      full     = full SQUINT (FiLM + masking + adjacency loss + ...)
+  #
+  #    Key variants:
+  #      recon-cell        per-cell NB reconstruction only        (start here)
+  #      recon-nbr         neighbourhood NB reconstruction only
+  #      recon-both        per-cell + neighbourhood NB (two loss terms)
+  #      recon-cell+adj    cell NB + adjacency BCE
+  #      recon-nbr+adj     neighbourhood NB + adjacency BCE
+  #      recon-both+adj    both NB + adjacency BCE
+  #      recon-cell+film   cell NB + FiLM batch conditioning
+  #      recon-cell+mask   cell NB + MAE feature masking
+  #      recon-cell+mhvq   cell NB + multi-head VQ (10 heads, k=5000)
+  #      full              all components composed
+  #
   #    Output (flat run dir, ablation-aware):
   #      <ARTIFACTS_DIR>/<DATASET_NAME>/<VARIANT>/<YYYYMMDD_HHMMSS>/
   #          user_specified_config.yaml      <- full materialised config
@@ -46,8 +56,8 @@ Training metrics are logged to wandb under the project "squint".
   #          checkpoints/<best>.ckpt
   #          wandb/run-<id>/...              (wandb local cache; cloud logging
   #                                           still goes to project "squint")
-  python examples/run_squint_mmb_smb.py --train --variant poc
-  python examples/run_squint_mmb_smb.py --train --variant poc+nbr
+  python examples/run_squint_mmb_smb.py --train --variant recon-cell
+  python examples/run_squint_mmb_smb.py --train --variant recon-both+adj
 
   # 3) inference on a folder of .h5ad files. Returns a single AnnData with
   #    the SQUINT outputs in .obsm / .obs / .layers, saved as .h5ad under
@@ -197,13 +207,35 @@ def make_dataset_blob_config() -> dict:
 
 def make_train_config_poc() -> dict:
     """
-    Minimal Graph VQ-VAE: GraphSAGE encoder + per-cell NB reconstruction +
-    EMA codebook. No FiLM, no masking, no adjacency loss. Use this first to
-    verify the core mechanism trains on this data.
+    Right-sized Graph VQ-VAE baseline for 431-gene / ~100k-cell spatial data.
 
-    For now, train on the WHOLE dataset (both batches, every cell).
-    No held-out test/val set — evaluation/inference is done after training
-    via `predict()`, which loops over all nodes regardless of mask.
+    Design choices:
+    - No HVG subsetting (`apply_hvg=False`): the gene panel is already curated;
+      set apply_hvg=True (and adjust n_hvg) for larger multi-panel datasets.
+    - Encoder: 431 -> MLP[400,256] -> GNN[128, 1 layer, 8-NN] -> VQ[30 codes].
+      Latent dim = 128 keeps the VQ cosine-similarity manifold tractable for
+      30 codes.  A 30-code codebook with 400-dim embeddings is over-parametrised
+      and slows EMA convergence.
+    - Decoder: latent[128] -> MLP[400] -> softmax * read_depth -> NB mean.
+    - Adjacency decoder: kept at low capacity (128 -> MLP[64]) to avoid the
+      BCE adj loss dominating when it's added.
+    - Dropout: removed.  With a 30-code bottleneck the model has limited spare
+      capacity and dropout further destabilises VQ code assignment.
+    - Sampler: 1 hop, 8 neighbors — matches GNN num_layers=1.  Sampling 2 hops
+      for a 1-layer GNN is wasted compute.
+    - LR: 5e-4 (conservative; 1e-3 tends to cause sharp loss spikes on VQ init).
+    - Batch: 256.  ~100k cells -> ~390 batches/epoch, sufficient gradient
+      diversity for EMA codebook updates.
+    - Epochs: 80.  EMA VQ needs ~40-60 epochs to stabilise dead-code rate.
+    - Metrics: pearson_gene_wise_log1p is the primary checkpoint signal.
+      It is the metric reported by scVI-tools, NicheCompass, and spatial-
+      imputation papers (Tangram, SpaGE, STAGATE).  Per-gene Pearson on
+      log1p(counts) assigns equal weight to all genes and is insensitive to
+      the mean-count dominance that makes raw-count cell-wise Pearson decrease
+      early in training.  pearson_cell_wise_log1p and pearson_gene_wise are
+      tracked as secondary metrics.
+
+    recon_mode is injected by patch helpers and defaults to 'cell' here.
     """
     return {
         "experiment": {"seed": 0, "mode": "standalone"},
@@ -215,14 +247,18 @@ def make_train_config_poc() -> dict:
         },
         "dataset": {
             "dataset_name": DATASET_NAME,
-            # adata_batch_idx are *positions* in the sorted DatasetBlob, not
-            # the raw batch numbers. After sorting by adata_batch_id:
-            #   idx 0 -> batch15 (STARmap+)
-            #   idx 1 -> batch82 (MERFISH)
+            # adata_batch_idx are *positions* in the sorted DatasetBlob:
+            #   idx 0 -> batch15 (STARmap+)   idx 1 -> batch82 (MERFISH)
             "adata_batch_idx": [0, 1],
             "root_data_dir": str(DATA_ROOT),
-            "gene_count_transform_names": ["SubsetHVG"],
-            "gene_count_transform_params": {"n_genes": 1000},
+            # HVG subsetting — OFF for this dataset (431 curated genes).
+            # Switch apply_hvg=True and set n_hvg to a smaller number when
+            # running on larger multi-panel datasets where all genes are NOT
+            # equally informative.
+            "apply_hvg": False,
+            "n_hvg": 2000,                    # only used when apply_hvg=True
+            "gene_count_transform_names": [], # populated by train() based on apply_hvg
+            "gene_count_transform_params": {"n_genes": 2000},
             "graph_params": {
                 "spatial_key": "spatial",
                 "delaunay": False,
@@ -231,16 +267,6 @@ def make_train_config_poc() -> dict:
             },
             "feature_names": ["X"],
             "label_name": "cell_types",
-            # SpatialBatchSplit assigns train/val/test masks per cell. With
-            # both batches (15 and 82) listed in `train_batches` and nothing
-            # in val/test, every cell gets train_mask=True. The model trains
-            # on the WHOLE dataset. (`train_batches`, `val_batches`, and
-            # `test_batches` use actual batch IDs, not dataset indices.)
-            #
-            # Inference / evaluation is done after training via the predict
-            # entry point below, whose `predict_dataloader` loops over all
-            # nodes (input_nodes=None) regardless of mask — so we still get
-            # embeddings + reconstructions on every cell.
             "train_transform_names": ["SpatialBatchSplit"],
             "train_transform_params": {
                 "region": None,
@@ -252,9 +278,9 @@ def make_train_config_poc() -> dict:
         },
         "datamodule": {
             "loader_name": "NeighborLoader",
-            "loader_params": {"batch_size": 128},
+            "loader_params": {"batch_size": 256},
             "sampler_name": "NeighborSampler",
-            "sampler_params": {"num_neighbors": [8, 8]},
+            "sampler_params": {"num_neighbors": [8]},  # 1 hop = num_layers
             "inference_params": {"sample_neighbors_for_inference": False},
         },
         "model": {
@@ -264,7 +290,6 @@ def make_train_config_poc() -> dict:
             "adjacency_decoder_name": "MLP_AdjacencyDecoder",
             "predictor_name": "Linear",
             "imputation_params": {
-                # POC: NO masking
                 "mask_strategy": "original",
                 "base_mask_ratio": 0.0,
                 "final_mask_ratio": 0.0,
@@ -273,28 +298,66 @@ def make_train_config_poc() -> dict:
                 "compute_mask_input_diversity": False,
                 "mask_token_eps": 0.0001,
             },
-            "train_metrics_list": ["codebook_utilization", "pearson_cell_wise"],
+            # All Pearson metrics are reported on every variant.
+            # Neighbourhood metrics (1hop_nbr) are silently skipped when
+            # X_nbr / X_hat_nbr are absent (recon_mode='cell' variants).
+            # Primary monitor: pearson_gene_wise_log1p (literature standard).
+            "train_metrics_list": [
+                "codebook_utilization",
+                # cell branch — gene-wise
+                "pearson_gene_wise_log1p",
+                "pearson_gene_wise_log1p_median",
+                "pearson_gene_wise_hvg50_log1p",
+                "pearson_gene_wise_hvg50_log1p_median",
+                # cell branch — cell-wise
+                "pearson_cell_wise_log1p",
+                "pearson_cell_wise_log1p_median",
+                # neighbourhood branch — gene-wise
+                "pearson_gene_wise_1hop_nbr_log1p",
+                "pearson_gene_wise_1hop_nbr_log1p_median",
+                "pearson_gene_wise_hvg50_1hop_nbr_log1p",
+                "pearson_gene_wise_hvg50_1hop_nbr_log1p_median",
+                # neighbourhood branch — cell-wise
+                "pearson_cell_wise_1hop_nbr_log1p",
+                "pearson_cell_wise_1hop_nbr_log1p_median",
+                # legacy raw-count metrics
+                "pearson_gene_wise",
+            ],
             "test_metrics_list": [
-                "codebook_utilization", "pearson_cell_wise", "pearson_gene_wise",
+                "codebook_utilization",
+                "pearson_gene_wise_log1p",
+                "pearson_gene_wise_log1p_median",
+                "pearson_gene_wise_hvg50_log1p",
+                "pearson_gene_wise_hvg50_log1p_median",
+                "pearson_cell_wise_log1p",
+                "pearson_cell_wise_log1p_median",
+                "pearson_gene_wise_1hop_nbr_log1p",
+                "pearson_gene_wise_1hop_nbr_log1p_median",
+                "pearson_gene_wise_hvg50_1hop_nbr_log1p",
+                "pearson_gene_wise_hvg50_1hop_nbr_log1p_median",
+                "pearson_cell_wise_1hop_nbr_log1p",
+                "pearson_cell_wise_1hop_nbr_log1p_median",
+                "pearson_gene_wise",
+                "pearson_cell_wise",
             ],
             "encoder_params": {
                 "gnn_name": "SAGEConv",
                 "mlp_params": {
-                    "hidden_channels": [600, 400],
-                    "dropout": 0.1,
+                    "hidden_channels": [400, 256],
+                    "dropout": 0.0,
                     "act": "relu",
                     "norm": None,
                 },
                 "gnn_params": {
-                    "hidden_channels": 400,
+                    "hidden_channels": 128,
                     "num_layers": 1,
                     "act_first": True,
                     "activation": "relu",
                     "norm": None,
-                    "dropout": 0.1,
+                    "dropout": 0.0,
                     "init_method": "kaiming_uniform",
                 },
-                # POC: no FiLM conditioning -> conditioning_params block omitted
+                # POC: no FiLM conditioning
                 "vq_params": {
                     "vq_name": "VectorQuantize",
                     "freeze_codebook": False,
@@ -304,10 +367,6 @@ def make_train_config_poc() -> dict:
                     "threshold_ema_dead_code": 2,
                     "manual_in_place_optimizer_update": False,
                     "learnable_codebook": False,
-                    # 30 codes, single head -> each cell gets one index in [0, 30).
-                    # This is intentionally tight so the codebook acts like a
-                    # clustering and can be compared against an scVI/Leiden
-                    # partition of similar cardinality.
                     "codebook_size": 30,
                     "heads": 1,
                     "separate_codebook_per_head": False,
@@ -329,24 +388,24 @@ def make_train_config_poc() -> dict:
             "attribute_decoder_params": {
                 "apply_conditioning": None,
                 "mlp_params": {
-                    "hidden_channels": [600],
-                    "dropout": 0.1,
+                    "hidden_channels": [400],
+                    "dropout": 0.0,
                     "act": "gelu",
                     "norm": "layer_norm",
                 },
             },
             "adjacency_decoder_params": {
-                "out_channels": 600,
+                "out_channels": 128,
                 "mlp_params": {
-                    "hidden_channels": [400],
-                    "dropout": 0.2,
+                    "hidden_channels": [64],
+                    "dropout": 0.0,
                     "act": "relu",
                     "norm": "layer_norm",
                 },
             },
             "optimizer_params": {
                 "optimizer_name": "adam",
-                "lr": 0.001,
+                "lr": 0.0005,
                 "weight_decay": 0.001,
                 "mask_lr_scale": 1.0,
             },
@@ -356,22 +415,43 @@ def make_train_config_poc() -> dict:
                     "mse_commit_loss",
                 ],
                 "loss_kwargs": {
-                    "k_hop_nb_loss": 0,
+                    # recon_mode controls which NB targets are computed:
+                    #   "cell" -> per-cell (default baseline)
+                    #   "nbr"  -> 1-hop neighbourhood mean (niche-aware signal)
+                    #   "both" -> cell + neighbourhood (requires adding
+                    #             nb_attribute_reconstruction_loss_nbr to loss_names)
+                    "recon_mode": "cell",
                     "only_masked": False,
                     "edge_sampling_ratio": 2,
                     "use_pos_weight": True,
                     "estimate_adj_kwargs": {"nonlinearity": "sigmoid", "k": 8},
                     "wt_attr_reconstr": 1.0,
+                    "wt_attr_reconstr_nbr": 1.0,
                     "wt_commit": 1.0,
                 },
             },
         },
         "trainer": {
-            "monitor": "train_pearson_cell_wise",
+            "monitor": "train_pearson_gene_wise_log1p",
             "checkpoint_params": {"mode": "max", "save_top_k": 1, "save_last": True},
-            "max_epochs": 30,
+            "max_epochs": 80,
             "enable_checkpointing": True,
             "ckpt_path": "best",
+            # Early stopping: watch the NB reconstruction loss (the actual
+            # optimisation objective) rather than Pearson, which can plateau
+            # and oscillate while the loss still makes meaningful progress.
+            # patience=15 epochs: at batch_size=256 / ~100k cells that is
+            # roughly 6k gradient steps, enough to distinguish a true plateau
+            # from temporary stagnation after a codebook reshuffle.
+            # min_delta=0.1 on a loss in the ~140-170 range = ~0.07% relative
+            # improvement required per patience window.
+            "early_stopping_params": {
+                "enabled":    True,
+                "monitor":    "train_nb_attribute_reconstruction_loss",
+                "mode":       "min",
+                "patience":   15,
+                "min_delta":  0.1,
+            },
         },
     }
 
@@ -380,104 +460,15 @@ def make_train_config_poc() -> dict:
 # 2b. Training config — full SQUINT (FiLM + masking + adjacency)
 # ---------------------------------------------------------------------------
 
-def make_train_config_full() -> dict:
-    """
-    The full SQUINT recipe with FiLM conditioning on (rbf_distances,
-    cell_batch_id), MAE-style masking, BCE adjacency reconstruction, and
-    1-hop NB reconstruction. Only switch to this once the POC trains stably.
-    """
-    cfg = make_train_config_poc()
-
-    # ---- masking back on ----
-    cfg["model"]["imputation_params"] = {
-        "mask_strategy": "learnable_parameter",
-        "base_mask_ratio": 0.2,
-        "final_mask_ratio": 0.6,
-        "warmup_epochs": 5,
-        "deterministic_masking": False,
-        "compute_mask_input_diversity": False,
-        "mask_token_eps": 0.0001,
-    }
-    cfg["model"]["train_metrics_list"] = [
-        "codebook_utilization", "pearson_1hop_nbr",
-    ]
-    cfg["model"]["test_metrics_list"] = [
-        "codebook_utilization",
-        "pearson_cell_wise",
-        "pearson_1hop_nbr",
-        "mmd_1hop_nbr",
-        "mmd_pca_1hop_nbr",
-        "pearson_gene_wise",
-        "pearson_gene_wise_1hop_nbr",
-    ]
-
-    # ---- FiLM in encoder ----
-    cfg["model"]["encoder_params"]["conditioning_params"] = {
-        "condition_list": ["rbf_distances", "cell_batch_id"],
-        "use_bias": True,
-        "use_residual": False,
-        "residual_weight": 0.2,
-        "init_mode": "identity",
-    }
-
-    # ---- VQ scaled back up to SQUINT defaults ----
-    cfg["model"]["encoder_params"]["vq_params"].update({
-        "codebook_size": 5000,
-        "heads": 10,
-        "separate_codebook_per_head": False,
-        # threshold_ema_dead_code stays 2 — see literature_review.md §1.2.
-    })
-
-    # ---- FiLM in attribute decoder ----
-    cfg["model"]["attribute_decoder_params"]["apply_conditioning"] = "in-MLP"
-    cfg["model"]["attribute_decoder_params"]["conditioning_params"] = {
-        "condition_list": ["rbf_distances", "cell_batch_id"],
-        "use_bias": True,
-        "use_residual": False,
-        "residual_weight": 0.2,
-        "init_mode": "identity",
-    }
-
-    # ---- mask_lr_scale matters now that masking is on ----
-    cfg["model"]["optimizer_params"]["mask_lr_scale"] = 2.0
-
-    # ---- losses: full set ----
-    cfg["model"]["loss_params"]["loss_names"] = [
-        "nb_attribute_reconstruction_loss",
-        "bce_adjacency_reconstruction_loss",
-        "mse_commit_loss",
-        "mse_code_loss",
-        "mask_token_regularization",
-    ]
-    cfg["model"]["loss_params"]["loss_kwargs"].update({
-        "k_hop_nb_loss": 1,
-        "wt_cross_entropy": 1.0,
-        "wt_adj_reconstr": 1.0,
-        "wt_joint_code_commit": 1.0,
-        # Under EMA codebook, mse_code_loss is redundant with commit — keep 0.
-        "wt_code": 0.0,
-        # Squared-L2 mask-token reg has init magnitude ~5000 (1000-dim mask
-        # token ~ N(2,1)); scale weight down so it doesn't dominate.
-        "wt_mask_token_regularization": 0.001,
-    })
-
-    # ---- monitor uses 1-hop neighborhood Pearson now ----
-    cfg["trainer"]["monitor"] = "train_pearson_1hop_nbr"
-    cfg["trainer"]["max_epochs"] = 30
-    return cfg
-
-
 # ---------------------------------------------------------------------------
-# 2c. Ablation patches and variant registry
+# 2b. Ablation patch helpers
 # ---------------------------------------------------------------------------
-# Each ablation is expressed as a small "patch" function that mutates a copy
-# of the POC config in place and returns it. A patch should change ONE
-# component (one loss term, one architectural choice, one hyperparameter
-# group) so its effect can be isolated. New variants are added by composing
-# patches and registering them in VARIANTS below.
+# Each patch is a small function that mutates a DEEP COPY of a base config and
+# returns it. A patch changes ONE design component so its effect can be
+# isolated. Compose patches to build compound variants.
 #
-# The full resolved config is always saved to disk per run so reproducibility
-# does not depend on the patch helpers being preserved.
+# The full materialised config is always saved to disk per run, so
+# reproducibility does not depend on patch helpers being preserved.
 # ---------------------------------------------------------------------------
 
 def _copy(cfg: dict) -> dict:
@@ -485,66 +476,276 @@ def _copy(cfg: dict) -> dict:
     return copy.deepcopy(cfg)
 
 
-def _patch_khop_nb_loss(cfg: dict, k_hop: int = 1) -> dict:
-    """
-    Turn on k-hop neighborhood NB reconstruction. The model is now asked to
-    predict, for each cell, the mean expression of its k-hop neighborhood
-    (in addition to its own counts). Drives the latent toward niche-aware
-    structure rather than purely cell-intrinsic identity.
-    """
-    cfg["model"]["loss_params"]["loss_kwargs"]["k_hop_nb_loss"] = k_hop
-    metrics = cfg["model"]["train_metrics_list"]
-    if "pearson_1hop_nbr" not in metrics:
-        cfg["model"]["train_metrics_list"] = metrics + ["pearson_1hop_nbr"]
-    test_metrics = cfg["model"]["test_metrics_list"]
-    if "pearson_1hop_nbr" not in test_metrics:
-        cfg["model"]["test_metrics_list"] = test_metrics + ["pearson_1hop_nbr"]
-    cfg["trainer"]["monitor"] = "train_pearson_1hop_nbr"
+# ---- Reconstruction mode ---------------------------------------------------
+
+def _patch_recon_cell(cfg: dict) -> dict:
+    """Per-cell NB reconstruction only (baseline). Explicitly sets recon_mode."""
+    lk = cfg["model"]["loss_params"]["loss_kwargs"]
+    lk["recon_mode"] = "cell"
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    # Ensure only the cell loss is present, remove nbr branch if any.
+    if "nb_attribute_reconstruction_loss_nbr" in losses:
+        losses.remove("nb_attribute_reconstruction_loss_nbr")
+    if "nb_attribute_reconstruction_loss" not in losses:
+        losses.insert(0, "nb_attribute_reconstruction_loss")
+    cfg["trainer"]["monitor"] = "train_pearson_gene_wise_log1p"
     return cfg
 
 
-# Future patches to add as new ablations are introduced. Each one should be a
-# small standalone function so it can be composed independently.
-#
-# def _patch_adj_loss(cfg, weight=0.3):  ... # add bce_adjacency_reconstruction_loss
-# def _patch_film(cfg):                 ... # add encoder/decoder FiLM conditioning
-# def _patch_masking(cfg):              ... # MAE-style masking
-# def _patch_deeper_gnn(cfg, layers=2): ... # GraphSAGE -> 2-3 layers + matching neighbor sample sizes
-# def _patch_codebook_size(cfg, k):     ... # change vq.codebook_size
+def _patch_recon_nbr(cfg: dict) -> dict:
+    """
+    Neighbourhood-only NB reconstruction.
+    Per-cell NB is deactivated: recon_mode='nbr' makes training_step route
+    the 1-hop-aggregated pair through the legacy pred_attr/target_attr keys
+    so `nb_attribute_reconstruction_loss` computes NB on neighbourhood means.
+    Per-cell counts are not reconstructed in this variant.
+    """
+    lk = cfg["model"]["loss_params"]["loss_kwargs"]
+    lk["recon_mode"] = "nbr"
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    if "nb_attribute_reconstruction_loss_nbr" in losses:
+        losses.remove("nb_attribute_reconstruction_loss_nbr")
+    if "nb_attribute_reconstruction_loss" not in losses:
+        losses.insert(0, "nb_attribute_reconstruction_loss")
+    cfg["trainer"]["monitor"] = "train_pearson_gene_wise_1hop_nbr_log1p"
+    return cfg
+
+
+def _patch_recon_both(cfg: dict) -> dict:
+    """
+    Per-cell + 1-hop neighbourhood NB reconstruction simultaneously.
+    Uses TWO separate loss dispatches:
+      nb_attribute_reconstruction_loss     -> cell pair (pred_attr / target_attr)
+      nb_attribute_reconstruction_loss_nbr -> nbr pair  (pred_attr_nbr / target_attr_nbr)
+    Weighted equally by default (wt_attr_reconstr = wt_attr_reconstr_nbr = 1.0).
+    """
+    lk = cfg["model"]["loss_params"]["loss_kwargs"]
+    lk["recon_mode"] = "both"
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    if "nb_attribute_reconstruction_loss" not in losses:
+        losses.insert(0, "nb_attribute_reconstruction_loss")
+    if "nb_attribute_reconstruction_loss_nbr" not in losses:
+        idx = losses.index("nb_attribute_reconstruction_loss") + 1
+        losses.insert(idx, "nb_attribute_reconstruction_loss_nbr")
+    cfg["trainer"]["monitor"] = "train_pearson_gene_wise_log1p"
+    return cfg
+
+
+# ---- Adjacency reconstruction ----------------------------------------------
+
+def _patch_adj(cfg: dict, weight: float = 1.0) -> dict:
+    """
+    Add BCE adjacency reconstruction loss.
+    The adjacency decoder predicts which pairs of cells in the seed-node
+    induced subgraph are connected in the 8-NN spatial graph. Pushes the
+    H_adj latent toward encoding local spatial topology.
+    Does NOT change recon_mode — stack with a recon patch for combinations.
+    """
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    if "bce_adjacency_reconstruction_loss" not in losses:
+        losses.append("bce_adjacency_reconstruction_loss")
+    cfg["model"]["loss_params"]["loss_kwargs"]["wt_adj_reconstr"] = float(weight)
+    return cfg
+
+
+# ---- FiLM conditioning -----------------------------------------------------
+
+def _patch_film(cfg: dict) -> dict:
+    """
+    Add FiLM (feature-wise linear modulation) conditioning on
+    (rbf_distances, cell_batch_id) in both encoder and attribute decoder.
+    Enables the model to distinguish cells from different batches / spatial
+    scales without leaking batch identity into the VQ codebook.
+    """
+    film_params = {
+        "condition_list": ["rbf_distances", "cell_batch_id"],
+        "use_bias": True,
+        "use_residual": False,
+        "residual_weight": 0.2,
+        "init_mode": "identity",
+    }
+    cfg["model"]["encoder_params"]["conditioning_params"] = film_params.copy()
+    cfg["model"]["attribute_decoder_params"]["apply_conditioning"] = "in-MLP"
+    cfg["model"]["attribute_decoder_params"]["conditioning_params"] = film_params.copy()
+    cfg["model"]["optimizer_params"]["mask_lr_scale"] = 1.0  # unchanged here
+    return cfg
+
+
+# ---- MAE-style masking -----------------------------------------------------
+
+def _patch_masking(cfg: dict,
+                   base_ratio: float = 0.2,
+                   final_ratio: float = 0.6,
+                   warmup: int = 5) -> dict:
+    """
+    Enable MAE-style gene masking. A learnable mask token replaces a random
+    fraction of input genes; the model must reconstruct all genes from the
+    partial signal. Forces the encoder to propagate neighbourhood context
+    rather than copying the input. mask_lr_scale=2.0 gives the mask token
+    a higher LR so it moves fast relative to the rest of the network.
+    """
+    cfg["model"]["imputation_params"] = {
+        "mask_strategy": "learnable_parameter",
+        "base_mask_ratio": base_ratio,
+        "final_mask_ratio": final_ratio,
+        "warmup_epochs": warmup,
+        "deterministic_masking": False,
+        "compute_mask_input_diversity": False,
+        "mask_token_eps": 0.0001,
+    }
+    cfg["model"]["optimizer_params"]["mask_lr_scale"] = 2.0
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    if "mask_token_regularization" not in losses:
+        losses.append("mask_token_regularization")
+    cfg["model"]["loss_params"]["loss_kwargs"]["wt_mask_token_regularization"] = 0.001
+    return cfg
+
+
+# ---- Multi-head VQ ---------------------------------------------------------
+
+def _patch_multihead_vq(cfg: dict, heads: int = 10, codebook_size: int = 5000) -> dict:
+    """
+    Switch from a single 30-code codebook to a multi-head VQ with `heads`
+    parallel codebooks of size `codebook_size` each. Total number of
+    representable niche combinations = codebook_size^heads (exponential), but
+    the model learns to use a much smaller effective set. Used in full SQUINT.
+    """
+    cfg["model"]["encoder_params"]["vq_params"].update({
+        "codebook_size": codebook_size,
+        "heads": heads,
+        "separate_codebook_per_head": False,
+    })
+    return cfg
 
 
 # ---------------------------------------------------------------------------
-# Variant registry
+# 2c. Variant registry
 # ---------------------------------------------------------------------------
+# Naming convention: <recon-mode>[+<component>][+<component>...]
+#   recon-cell   per-cell NB only
+#   recon-nbr    neighbourhood NB only
+#   recon-both   per-cell + neighbourhood NB
+#   +adj         + adjacency reconstruction
+#   +film        + FiLM conditioning
+#   +mask        + MAE-style masking
+#   +mhvq        + multi-head VQ
+#   full         every component active
+# ---------------------------------------------------------------------------
+
+def _B():
+    """Shorthand: deep-copy of the base POC config."""
+    return _copy(make_train_config_poc())
+
 
 VARIANTS: dict = {
-    "poc": {
+    # ---- Reconstruction-mode ablations (all other components fixed) --------
+    "recon-cell": {
         "description": (
-            "Graph VQ-VAE baseline. Per-cell NB reconstruction only. "
-            "No neighborhood loss, no FiLM, no masking, no adjacency loss. "
-            "Codebook=30, heads=1."
+            "Baseline: per-cell NB reconstruction only. No neighbourhood "
+            "loss, no FiLM, no masking, no adjacency. recon_mode='cell'."
         ),
-        "patches": [],
-        "build": lambda: make_train_config_poc(),
+        "patches": ["recon_mode=cell"],
+        "build": lambda: _patch_recon_cell(_B()),
     },
-    "poc+nbr": {
+    "recon-nbr": {
         "description": (
-            "POC + 1-hop neighborhood NB reconstruction. First ablation: "
-            "tests whether forcing the model to predict the neighborhood "
-            "mean counts pushes codes toward CellCharter/BANKSY-style niche "
-            "clusters. Everything else identical to POC."
+            "Neighbourhood-only NB reconstruction. Per-cell counts are NOT "
+            "reconstructed; the NB target is the 1-hop neighbourhood mean "
+            "(including self-loop). recon_mode='nbr'. Tests whether a purely "
+            "niche-oriented signal produces spatially coherent codes."
         ),
-        "patches": ["k_hop_nb_loss=1", "monitor=train_pearson_1hop_nbr"],
-        "build": lambda: _patch_khop_nb_loss(_copy(make_train_config_poc()), k_hop=1),
+        "patches": ["recon_mode=nbr"],
+        "build": lambda: _patch_recon_nbr(_B()),
     },
+    "recon-both": {
+        "description": (
+            "Per-cell + neighbourhood NB reconstruction simultaneously. Two "
+            "separate loss dispatches: nb_attribute_reconstruction_loss (cell) "
+            "and nb_attribute_reconstruction_loss_nbr (nbr). recon_mode='both'. "
+            "Tests the additive contribution of the neighbourhood signal."
+        ),
+        "patches": ["recon_mode=both", "+nb_attribute_reconstruction_loss_nbr"],
+        "build": lambda: _patch_recon_both(_B()),
+    },
+    # ---- Adjacency ablations (cell recon base) ----------------------------
+    "recon-cell+adj": {
+        "description": (
+            "Per-cell NB + BCE adjacency reconstruction. Tests whether "
+            "predicting the 8-NN spatial graph connectivity improves "
+            "niche-aware code structure."
+        ),
+        "patches": ["recon_mode=cell", "+bce_adjacency_reconstruction_loss"],
+        "build": lambda: _patch_adj(_patch_recon_cell(_B())),
+    },
+    "recon-nbr+adj": {
+        "description": (
+            "Neighbourhood NB + BCE adjacency reconstruction. "
+            "Both losses drive the latent toward spatial structure."
+        ),
+        "patches": ["recon_mode=nbr", "+bce_adjacency_reconstruction_loss"],
+        "build": lambda: _patch_adj(_patch_recon_nbr(_B())),
+    },
+    "recon-both+adj": {
+        "description": (
+            "Per-cell + neighbourhood NB + BCE adjacency reconstruction. "
+            "Maximum spatial supervision without FiLM or masking."
+        ),
+        "patches": ["recon_mode=both", "+nb_attribute_reconstruction_loss_nbr",
+                    "+bce_adjacency_reconstruction_loss"],
+        "build": lambda: _patch_adj(_patch_recon_both(_B())),
+    },
+    # ---- FiLM ablation (cell recon base) ----------------------------------
+    "recon-cell+film": {
+        "description": (
+            "Per-cell NB + FiLM conditioning on (rbf_distances, cell_batch_id). "
+            "Tests batch-correction and spatial-scale conditioning without "
+            "neighbourhood or adjacency losses."
+        ),
+        "patches": ["recon_mode=cell", "+film(rbf_distances, cell_batch_id)"],
+        "build": lambda: _patch_film(_patch_recon_cell(_B())),
+    },
+    # ---- Masking ablation (cell recon base) -------------------------------
+    "recon-cell+mask": {
+        "description": (
+            "Per-cell NB + MAE-style gene masking (learnable_parameter, "
+            "0.2->0.6 over 5 warmup epochs). Forces the encoder to use "
+            "neighbourhood context rather than copying the input."
+        ),
+        "patches": ["recon_mode=cell", "+masking(base=0.2, final=0.6, warmup=5)"],
+        "build": lambda: _patch_masking(_patch_recon_cell(_B())),
+    },
+    # ---- Multi-head VQ ablation (cell recon base) -------------------------
+    "recon-cell+mhvq": {
+        "description": (
+            "Per-cell NB + multi-head VQ (heads=10, codebook_size=5000). "
+            "Tests the capacity gain of a larger, multi-head codebook while "
+            "holding all other components fixed."
+        ),
+        "patches": ["recon_mode=cell", "+mhvq(heads=10, codebook_size=5000)"],
+        "build": lambda: _patch_multihead_vq(_patch_recon_cell(_B()),
+                                             heads=10, codebook_size=5000),
+    },
+    # ---- Full SQUINT (all components) -------------------------------------
     "full": {
         "description": (
-            "Full SQUINT recipe: FiLM (rbf_distances + cell_batch_id) + "
-            "MAE-style masking + adjacency reconstruction + 1-hop NB "
-            "reconstruction + multi-head VQ (heads=10, codebook=5000)."
+            "Full SQUINT: recon-both + adjacency + FiLM + masking + "
+            "multi-head VQ (heads=10, codebook=5000). All design components "
+            "active. Run only after ablations confirm each component helps."
         ),
-        "patches": ["see make_train_config_full()"],
-        "build": lambda: make_train_config_full(),
+        "patches": [
+            "recon_mode=both",
+            "+nb_attribute_reconstruction_loss_nbr",
+            "+bce_adjacency_reconstruction_loss",
+            "+film(rbf_distances, cell_batch_id)",
+            "+masking(base=0.2, final=0.6, warmup=5)",
+            "+mhvq(heads=10, codebook_size=5000)",
+        ],
+        "build": lambda: _patch_multihead_vq(
+            _patch_masking(
+                _patch_film(
+                    _patch_adj(
+                        _patch_recon_both(_B())))),
+            heads=10, codebook_size=5000),
     },
 }
 
@@ -805,6 +1006,20 @@ def train(variant: str):
     print(f"  checkpoints: {ckpt_dir}")
     print(f"  archive:     {config_path_archive}")
 
+    # ---- Resolve HVG transform based on apply_hvg flag --------------------
+    # The config stores apply_hvg and n_hvg as first-class keys so variants
+    # can toggle them via a simple patch, without duplicating the full
+    # gene_count_transform_names list.  We materialise the transform list here
+    # just before handing the config to the initializers.
+    if cfg["dataset"].get("apply_hvg", False):
+        cfg["dataset"]["gene_count_transform_names"] = ["SubsetHVG"]
+        cfg["dataset"]["gene_count_transform_params"] = {
+            "n_genes": cfg["dataset"].get("n_hvg", 2000)
+        }
+    else:
+        cfg["dataset"]["gene_count_transform_names"] = []
+        cfg["dataset"]["gene_count_transform_params"] = {}
+
     # ---- Determinism (mirror train_model.train) ---------------------------
     pl.seed_everything(cfg["experiment"]["seed"])
 
@@ -856,21 +1071,50 @@ def train(variant: str):
     else:
         logger = False
 
-    # ---- Checkpoint callback: write directly to <run_dir>/checkpoints/ ----
+    # ---- Callbacks: checkpoint + early stopping ----------------------------
+    callbacks: list = []
+
     enable_checkpointing = cfg["trainer"]["enable_checkpointing"]
     if enable_checkpointing:
         monitor = cfg["trainer"]["monitor"]
         # filename templates known to ModelCheckpoint -> map monitor metric to
         # a filename pattern PL can format. Fall back to val_pearson_cell_wise.
         _filename_by_monitor = {
-            "val_pearson_cell_wise":           "{epoch}-{val_pearson_cell_wise:.2f}",
-            "val_pearson_1hop_nbr":            "{epoch}-{val_pearson_1hop_nbr:.2f}",
-            "val_pearson_gene_wise":           "{epoch}-{val_pearson_gene_wise:.2f}",
-            "val_pearson_gene_wise_1hop_nbr":  "{epoch}-{val_pearson_gene_wise_1hop_nbr:.2f}",
-            "train_pearson_cell_wise":         "{epoch}-{train_pearson_cell_wise:.2f}",
-            "train_pearson_1hop_nbr":          "{epoch}-{train_pearson_1hop_nbr:.2f}",
-            "train_pearson_gene_wise":         "{epoch}-{train_pearson_gene_wise:.2f}",
-            "train_pearson_gene_wise_1hop_nbr": "{epoch}-{train_pearson_gene_wise_1hop_nbr:.2f}",
+            "val_pearson_cell_wise":                    "{epoch}-{val_pearson_cell_wise:.2f}",
+            "val_pearson_1hop_nbr":                     "{epoch}-{val_pearson_1hop_nbr:.2f}",
+            "val_pearson_gene_wise":                    "{epoch}-{val_pearson_gene_wise:.2f}",
+            "val_pearson_gene_wise_1hop_nbr":           "{epoch}-{val_pearson_gene_wise_1hop_nbr:.2f}",
+            "train_pearson_cell_wise":                  "{epoch}-{train_pearson_cell_wise:.2f}",
+            "train_pearson_1hop_nbr":                   "{epoch}-{train_pearson_1hop_nbr:.2f}",
+            "train_pearson_gene_wise":                  "{epoch}-{train_pearson_gene_wise:.2f}",
+            "train_pearson_gene_wise_1hop_nbr":         "{epoch}-{train_pearson_gene_wise_1hop_nbr:.2f}",
+            # log1p variants — cell branch
+            "train_pearson_gene_wise_log1p":                    "{epoch}-{train_pearson_gene_wise_log1p:.3f}",
+            "train_pearson_gene_wise_log1p_median":             "{epoch}-{train_pearson_gene_wise_log1p_median:.3f}",
+            "train_pearson_gene_wise_hvg50_log1p":              "{epoch}-{train_pearson_gene_wise_hvg50_log1p:.3f}",
+            "train_pearson_gene_wise_hvg50_log1p_median":       "{epoch}-{train_pearson_gene_wise_hvg50_log1p_median:.3f}",
+            "train_pearson_cell_wise_log1p":                    "{epoch}-{train_pearson_cell_wise_log1p:.3f}",
+            "train_pearson_cell_wise_log1p_median":             "{epoch}-{train_pearson_cell_wise_log1p_median:.3f}",
+            # log1p variants — neighbourhood branch
+            "train_pearson_gene_wise_1hop_nbr_log1p":           "{epoch}-{train_pearson_gene_wise_1hop_nbr_log1p:.3f}",
+            "train_pearson_gene_wise_1hop_nbr_log1p_median":    "{epoch}-{train_pearson_gene_wise_1hop_nbr_log1p_median:.3f}",
+            "train_pearson_gene_wise_hvg50_1hop_nbr_log1p":     "{epoch}-{train_pearson_gene_wise_hvg50_1hop_nbr_log1p:.3f}",
+            "train_pearson_gene_wise_hvg50_1hop_nbr_log1p_median": "{epoch}-{train_pearson_gene_wise_hvg50_1hop_nbr_log1p_median:.3f}",
+            "train_pearson_cell_wise_1hop_nbr_log1p":           "{epoch}-{train_pearson_cell_wise_1hop_nbr_log1p:.3f}",
+            "train_pearson_cell_wise_1hop_nbr_log1p_median":    "{epoch}-{train_pearson_cell_wise_1hop_nbr_log1p_median:.3f}",
+            # val equivalents
+            "val_pearson_gene_wise_log1p":                      "{epoch}-{val_pearson_gene_wise_log1p:.3f}",
+            "val_pearson_gene_wise_log1p_median":               "{epoch}-{val_pearson_gene_wise_log1p_median:.3f}",
+            "val_pearson_gene_wise_hvg50_log1p":                "{epoch}-{val_pearson_gene_wise_hvg50_log1p:.3f}",
+            "val_pearson_gene_wise_hvg50_log1p_median":         "{epoch}-{val_pearson_gene_wise_hvg50_log1p_median:.3f}",
+            "val_pearson_cell_wise_log1p":                      "{epoch}-{val_pearson_cell_wise_log1p:.3f}",
+            "val_pearson_cell_wise_log1p_median":               "{epoch}-{val_pearson_cell_wise_log1p_median:.3f}",
+            "val_pearson_gene_wise_1hop_nbr_log1p":             "{epoch}-{val_pearson_gene_wise_1hop_nbr_log1p:.3f}",
+            "val_pearson_gene_wise_1hop_nbr_log1p_median":      "{epoch}-{val_pearson_gene_wise_1hop_nbr_log1p_median:.3f}",
+            "val_pearson_gene_wise_hvg50_1hop_nbr_log1p":       "{epoch}-{val_pearson_gene_wise_hvg50_1hop_nbr_log1p:.3f}",
+            "val_pearson_gene_wise_hvg50_1hop_nbr_log1p_median": "{epoch}-{val_pearson_gene_wise_hvg50_1hop_nbr_log1p_median:.3f}",
+            "val_pearson_cell_wise_1hop_nbr_log1p":             "{epoch}-{val_pearson_cell_wise_1hop_nbr_log1p:.3f}",
+            "val_pearson_cell_wise_1hop_nbr_log1p_median":      "{epoch}-{val_pearson_cell_wise_1hop_nbr_log1p_median:.3f}",
         }
         filename = _filename_by_monitor.get(
             monitor, "{epoch}-{val_pearson_cell_wise:.2f}"
@@ -879,16 +1123,29 @@ def train(variant: str):
             monitor = "val_pearson_cell_wise"
 
         checkpoint_params = cfg["trainer"]["checkpoint_params"]
-        callbacks = [
+        callbacks.append(
             pl.callbacks.ModelCheckpoint(
                 dirpath=str(ckpt_dir),
                 monitor=monitor,
                 filename=filename,
                 **checkpoint_params,
             )
-        ]
-    else:
-        callbacks = None
+        )
+
+    # ---- Early-stopping callback -------------------------------------------
+    es_cfg = cfg["trainer"].get("early_stopping_params", {})
+    if es_cfg.get("enabled", True):
+        callbacks.append(
+            pl.callbacks.EarlyStopping(
+                monitor   = es_cfg.get("monitor", "train_nb_attribute_reconstruction_loss"),
+                mode      = es_cfg.get("mode", "min"),
+                patience  = es_cfg.get("patience", 15),
+                min_delta = es_cfg.get("min_delta", 0.1),
+                verbose   = True,
+            )
+        )
+
+    callbacks = callbacks or None   # PL wants None, not [], when empty
 
     # ---- Trainer ----------------------------------------------------------
     trainer = pl.Trainer(

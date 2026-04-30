@@ -16,6 +16,7 @@ from vqniche.loss import (
     cross_entropy_loss,
     mse_attribute_reconstruction_loss,
     nb_attribute_reconstruction_loss,
+    nb_nbr_attribute_reconstruction_loss,
     mse_adjacency_reconstruction_loss,
     bce_adjacency_reconstruction_loss,
     mse_joint_code_commit_loss,
@@ -186,6 +187,28 @@ class BaseModel(pl.LightningModule):
                 wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
                 if wt_attr_reconstr is not None:
                     loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
+
+            elif loss_fn_name == 'nb_attribute_reconstruction_loss_nbr':
+                # Second NB reconstruction term for recon_mode='both'.
+                # Uses nb_nbr_attribute_reconstruction_loss — a thin wrapper
+                # that accepts pred_attr_nbr / target_attr_nbr kwargs so the
+                # dispatcher's key-based lookup doesn't collide with the cell
+                # branch's pred_attr / target_attr keys.
+                loss_fn = nb_nbr_attribute_reconstruction_loss
+
+                loss_fn_data_keys = ['pred_attr_nbr', 'target_attr_nbr', 'edge_index', 'batch_size', 'dispersion']
+
+                # k_hop_nb_loss=0: aggregation was done upstream in
+                # training_step; the wrapper must NOT re-aggregate.
+                loss_fn_params['k_hop_nb_loss'] = 0
+
+                wt_attr_reconstr_nbr = loss_kwargs.get('wt_attr_reconstr_nbr')
+                if wt_attr_reconstr_nbr is not None:
+                    loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr_nbr
+                else:
+                    wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
+                    if wt_attr_reconstr is not None:
+                        loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
 
             elif loss_fn_name == 'mse_adjacency_reconstruction_loss':
                 loss_fn = mse_adjacency_reconstruction_loss

@@ -28,7 +28,7 @@ from .clisis import compute_clisis
 from .gcs import compute_gcs
 from .mlami import compute_mlami
 from .nasw import compute_nasw
-from .pearson_correlation import compute_pearson_correlation
+from .pearson_correlation import compute_pearson_correlation, pearson_correlation
 from .mmd import compute_mmd_score, degree_histogram, eigenvalues_pmf
 from .codebook_utilization import compute_codebook_utilization
 
@@ -146,7 +146,122 @@ def compute_benchmarking_metrics(
             X_hat_key='X_hat_nbr',
             compare_genes=True,
         )
-    
+
+    # ---- log1p Pearson metrics (literature standard) -----------------------
+    # Per-gene Pearson on log1p-normalised counts is the primary reconstruction
+    # metric reported by scVI-tools, NicheCompass, STAGATE, Tangram, and most
+    # spatial imputation papers.  Log1p compression reduces the dynamic-range
+    # dominance of a few high-count genes, giving every gene roughly equal
+    # influence on the aggregate metric.
+    #
+    # Metrics reported for BOTH cell and neighbourhood branches:
+    #   pearson_gene_wise_*_log1p          per-gene Pearson (mean + median)
+    #   pearson_gene_wise_hvg50_*_log1p    per-gene Pearson restricted to top-50
+    #                                      HVGs by per-gene variance (mean + median)
+    #   pearson_cell_wise_*_log1p          per-cell Pearson (mean + median)
+    #
+    # Neighbourhood metrics are skipped gracefully when X_nbr / X_hat_nbr are
+    # absent from adata.uns (i.e. recon_mode='cell' variants).
+
+    # Helper: subset of metrics currently requested that belong to a branch
+    _cell_log1p_metrics = {
+        "pearson_gene_wise_log1p", "pearson_gene_wise_log1p_median",
+        "pearson_gene_wise_hvg50_log1p", "pearson_gene_wise_hvg50_log1p_median",
+        "pearson_cell_wise_log1p", "pearson_cell_wise_log1p_median",
+    }
+    _nbr_log1p_metrics = {
+        "pearson_gene_wise_1hop_nbr_log1p", "pearson_gene_wise_1hop_nbr_log1p_median",
+        "pearson_gene_wise_hvg50_1hop_nbr_log1p", "pearson_gene_wise_hvg50_1hop_nbr_log1p_median",
+        "pearson_cell_wise_1hop_nbr_log1p", "pearson_cell_wise_1hop_nbr_log1p_median",
+    }
+
+    _want_cell = bool(_cell_log1p_metrics & set(metrics))
+    _want_nbr  = bool(_nbr_log1p_metrics  & set(metrics)) and \
+                 ('X_nbr' in adata.uns and 'X_hat_nbr' in adata.uns)
+
+    if _want_cell or _want_nbr:
+        # ---- cell branch tensors -------------------------------------------
+        if _want_cell:
+            X_log     = torch.log1p(adata.uns['X'].float())
+            X_hat_log = torch.log1p(adata.uns['X_hat'].float())
+
+            # top-50 HVG indices by per-gene variance (computed once, reused)
+            n_hvg = min(50, X_log.shape[1])
+            gene_var   = X_log.var(dim=0)
+            hvg50_idx  = torch.topk(gene_var, k=n_hvg).indices   # (50,)
+
+        # ---- nbr branch tensors --------------------------------------------
+        if _want_nbr:
+            X_nbr_log     = torch.log1p(adata.uns['X_nbr'].float())
+            X_hat_nbr_log = torch.log1p(adata.uns['X_hat_nbr'].float())
+
+            n_hvg_nbr    = min(50, X_nbr_log.shape[1])
+            gene_var_nbr = X_nbr_log.var(dim=0)
+            hvg50_nbr_idx = torch.topk(gene_var_nbr, k=n_hvg_nbr).indices
+
+        # ---- per-gene (all genes) ------------------------------------------
+        if _want_cell:
+            print("Computing Pearson correlation (gene-wise, log1p)...")
+            _corrs = pearson_correlation(X=X_log, X_hat=X_hat_log,
+                                         compare_genes=True, mean=False)
+            if "pearson_gene_wise_log1p" in metrics:
+                benchmarking_dict["pearson_gene_wise_log1p"] = float(np.mean(_corrs))
+            if "pearson_gene_wise_log1p_median" in metrics:
+                benchmarking_dict["pearson_gene_wise_log1p_median"] = float(np.median(_corrs))
+
+        if _want_nbr:
+            print("Computing Pearson correlation (gene-wise, 1-hop nbr, log1p)...")
+            _corrs_nbr = pearson_correlation(X=X_nbr_log, X_hat=X_hat_nbr_log,
+                                              compare_genes=True, mean=False)
+            if "pearson_gene_wise_1hop_nbr_log1p" in metrics:
+                benchmarking_dict["pearson_gene_wise_1hop_nbr_log1p"] = float(np.mean(_corrs_nbr))
+            if "pearson_gene_wise_1hop_nbr_log1p_median" in metrics:
+                benchmarking_dict["pearson_gene_wise_1hop_nbr_log1p_median"] = float(np.median(_corrs_nbr))
+
+        # ---- per-gene (top-50 HVG) -----------------------------------------
+        if _want_cell and {"pearson_gene_wise_hvg50_log1p",
+                           "pearson_gene_wise_hvg50_log1p_median"} & set(metrics):
+            print("Computing Pearson correlation (gene-wise HVG-50, log1p)...")
+            _corrs_hvg = pearson_correlation(
+                X=X_log[:, hvg50_idx], X_hat=X_hat_log[:, hvg50_idx],
+                compare_genes=True, mean=False)
+            if "pearson_gene_wise_hvg50_log1p" in metrics:
+                benchmarking_dict["pearson_gene_wise_hvg50_log1p"] = float(np.mean(_corrs_hvg))
+            if "pearson_gene_wise_hvg50_log1p_median" in metrics:
+                benchmarking_dict["pearson_gene_wise_hvg50_log1p_median"] = float(np.median(_corrs_hvg))
+
+        if _want_nbr and {"pearson_gene_wise_hvg50_1hop_nbr_log1p",
+                          "pearson_gene_wise_hvg50_1hop_nbr_log1p_median"} & set(metrics):
+            print("Computing Pearson correlation (gene-wise HVG-50, 1-hop nbr, log1p)...")
+            _corrs_hvg_nbr = pearson_correlation(
+                X=X_nbr_log[:, hvg50_nbr_idx], X_hat=X_hat_nbr_log[:, hvg50_nbr_idx],
+                compare_genes=True, mean=False)
+            if "pearson_gene_wise_hvg50_1hop_nbr_log1p" in metrics:
+                benchmarking_dict["pearson_gene_wise_hvg50_1hop_nbr_log1p"] = float(np.mean(_corrs_hvg_nbr))
+            if "pearson_gene_wise_hvg50_1hop_nbr_log1p_median" in metrics:
+                benchmarking_dict["pearson_gene_wise_hvg50_1hop_nbr_log1p_median"] = float(np.median(_corrs_hvg_nbr))
+
+        # ---- per-cell -------------------------------------------------------
+        if _want_cell and {"pearson_cell_wise_log1p",
+                           "pearson_cell_wise_log1p_median"} & set(metrics):
+            print("Computing Pearson correlation (cell-wise, log1p)...")
+            _corrs_cell = pearson_correlation(X=X_log, X_hat=X_hat_log,
+                                               compare_genes=False, mean=False)
+            if "pearson_cell_wise_log1p" in metrics:
+                benchmarking_dict["pearson_cell_wise_log1p"] = float(np.mean(_corrs_cell))
+            if "pearson_cell_wise_log1p_median" in metrics:
+                benchmarking_dict["pearson_cell_wise_log1p_median"] = float(np.median(_corrs_cell))
+
+        if _want_nbr and {"pearson_cell_wise_1hop_nbr_log1p",
+                          "pearson_cell_wise_1hop_nbr_log1p_median"} & set(metrics):
+            print("Computing Pearson correlation (cell-wise, 1-hop nbr, log1p)...")
+            _corrs_cell_nbr = pearson_correlation(X=X_nbr_log, X_hat=X_hat_nbr_log,
+                                                   compare_genes=False, mean=False)
+            if "pearson_cell_wise_1hop_nbr_log1p" in metrics:
+                benchmarking_dict["pearson_cell_wise_1hop_nbr_log1p"] = float(np.mean(_corrs_cell_nbr))
+            if "pearson_cell_wise_1hop_nbr_log1p_median" in metrics:
+                benchmarking_dict["pearson_cell_wise_1hop_nbr_log1p_median"] = float(np.median(_corrs_cell_nbr))
+
     if "mmd_1hop_nbr" in metrics:
         print("Computing MMD (normalized 1-hop neighborhood cell-wise)...")
 

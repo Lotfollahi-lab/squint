@@ -464,16 +464,54 @@ class VQNiche(BaseModel):
 
         # --------------------- Prepare Data for Loss Computation ---------------------
         # 4) Prepare the predicted and target attributes for the Attribute Reconstruction Loss (negative binomial)
-        pred_attr, target_attr = batch_pred_attr_and_target_attr(
-            batch_x=train_batch.x,
-            batch_xhat=xhat_batch,
-            edge_index=train_batch.edge_index,
-            batch_size=batch_size,
-            mask_idx=mask_idx,
-            k_hop_nb_loss=self.loss_kwargs['k_hop_nb_loss'],
-            only_masked=self.loss_kwargs['only_masked'],
-        )
-        
+        #
+        # `recon_mode` controls which NB target(s) are computed:
+        #   "cell" — per-cell counts (legacy default, equivalent to k_hop_nb_loss=0)
+        #   "nbr"  — 1-hop neighborhood mean counts (legacy k_hop_nb_loss=1)
+        #   "both" — both, for use with TWO loss-name dispatches in the same step:
+        #            `nb_attribute_reconstruction_loss` (uses pred_attr/target_attr,
+        #             which point to the cell pair) AND
+        #            `nb_attribute_reconstruction_loss_nbr` (uses
+        #             pred_attr_nbr/target_attr_nbr).
+        #
+        # For backward compat, if `recon_mode` is not specified we infer it from
+        # the legacy `k_hop_nb_loss` kwarg.
+        recon_mode = self.loss_kwargs.get('recon_mode')
+        if recon_mode is None:
+            recon_mode = 'nbr' if self.loss_kwargs.get('k_hop_nb_loss', 0) == 1 else 'cell'
+        if recon_mode not in ('cell', 'nbr', 'both'):
+            raise ValueError(
+                f"loss_kwargs['recon_mode'] must be one of "
+                f"{{'cell', 'nbr', 'both'}}, got {recon_mode!r}."
+            )
+
+        pred_attr_nbr = target_attr_nbr = None
+        if recon_mode in ('cell', 'both'):
+            pred_attr, target_attr = batch_pred_attr_and_target_attr(
+                batch_x=train_batch.x,
+                batch_xhat=xhat_batch,
+                edge_index=train_batch.edge_index,
+                batch_size=batch_size,
+                mask_idx=mask_idx,
+                k_hop_nb_loss=0,
+                only_masked=self.loss_kwargs['only_masked'],
+            )
+        if recon_mode in ('nbr', 'both'):
+            pred_attr_nbr, target_attr_nbr = batch_pred_attr_and_target_attr(
+                batch_x=train_batch.x,
+                batch_xhat=xhat_batch,
+                edge_index=train_batch.edge_index,
+                batch_size=batch_size,
+                mask_idx=mask_idx,
+                k_hop_nb_loss=1,
+                only_masked=self.loss_kwargs['only_masked'],
+            )
+        if recon_mode == 'nbr':
+            # Legacy keys (used by `nb_attribute_reconstruction_loss`) point at
+            # the neighborhood pair so existing variants that just set
+            # k_hop_nb_loss=1 continue to work without code changes.
+            pred_attr, target_attr = pred_attr_nbr, target_attr_nbr
+
         indices_one_hot = F.one_hot(
                             indices,
                             num_classes=self.encoder.vq.codebook_size,
@@ -484,7 +522,7 @@ class VQNiche(BaseModel):
         train_loss_data = {
                         'quantizer_input': h_latent[:batch_size], # code and commit loss
                         'quantizer_output': h_quantized[:batch_size], # code and commit loss
-                        'pred_attr': pred_attr, # attribute reconstruction loss
+                        'pred_attr': pred_attr, # attribute reconstruction loss (cell or nbr depending on recon_mode)
                         'target_attr': target_attr, # attribute reconstruction loss
                         'edge_index': train_batch.edge_index, # attribute reconstruction loss
                         'batch_size': batch_size, # attribute and adjacency reconstruction loss
@@ -496,6 +534,12 @@ class VQNiche(BaseModel):
                         'h_spatial_prior': h_spatial_prior, # spatial prior loss
                         'indices_one_hot': indices_one_hot, # spatial prior loss
                         }
+        if pred_attr_nbr is not None and recon_mode == 'both':
+            # Only expose the nbr keys when we want them dispatched as a SECOND
+            # loss term. In recon_mode='nbr' the nbr pair is already mapped onto
+            # the legacy pred_attr/target_attr keys above.
+            train_loss_data['pred_attr_nbr'] = pred_attr_nbr
+            train_loss_data['target_attr_nbr'] = target_attr_nbr
         
         # Add mask token to train loss data if using learnable parameter strategy
         if self.mask_strategy == 'learnable_parameter':
@@ -582,16 +626,34 @@ class VQNiche(BaseModel):
             )
         
         # --------------------- Prepare Data for Loss Computation ---------------------
-        # 4) Prepare the predicted and target attributes for the Attribute Reconstruction Loss (negative binomial)
-        pred_attr, target_attr = batch_pred_attr_and_target_attr(
-            batch_x=val_batch.x,
-            batch_xhat=xhat_batch,
-            edge_index=val_batch.edge_index,
-            batch_size=batch_size,
-            mask_idx=mask_idx,
-            k_hop_nb_loss=self.loss_kwargs['k_hop_nb_loss'],
-            only_masked=False, # False and True are equivalent for validation
-        )
+        # 4) Prepare NB targets — mirrors the recon_mode logic in training_step.
+        recon_mode = self.loss_kwargs.get('recon_mode')
+        if recon_mode is None:
+            recon_mode = 'nbr' if self.loss_kwargs.get('k_hop_nb_loss', 0) == 1 else 'cell'
+
+        pred_attr_nbr = target_attr_nbr = None
+        if recon_mode in ('cell', 'both'):
+            pred_attr, target_attr = batch_pred_attr_and_target_attr(
+                batch_x=val_batch.x,
+                batch_xhat=xhat_batch,
+                edge_index=val_batch.edge_index,
+                batch_size=batch_size,
+                mask_idx=mask_idx,
+                k_hop_nb_loss=0,
+                only_masked=False,
+            )
+        if recon_mode in ('nbr', 'both'):
+            pred_attr_nbr, target_attr_nbr = batch_pred_attr_and_target_attr(
+                batch_x=val_batch.x,
+                batch_xhat=xhat_batch,
+                edge_index=val_batch.edge_index,
+                batch_size=batch_size,
+                mask_idx=mask_idx,
+                k_hop_nb_loss=1,
+                only_masked=False,
+            )
+        if recon_mode == 'nbr':
+            pred_attr, target_attr = pred_attr_nbr, target_attr_nbr
 
         indices_one_hot = F.one_hot(
                             indices,
@@ -614,6 +676,9 @@ class VQNiche(BaseModel):
                         'h_spatial_prior': h_spatial_prior, # spatial prior loss
                         'indices_one_hot': indices_one_hot, # spatial prior loss
                         }
+        if pred_attr_nbr is not None and recon_mode == 'both':
+            val_loss_data['pred_attr_nbr'] = pred_attr_nbr
+            val_loss_data['target_attr_nbr'] = target_attr_nbr
 
         # Add mask token to val loss data if using learnable parameter strategy
         if self.mask_strategy == 'learnable_parameter':
