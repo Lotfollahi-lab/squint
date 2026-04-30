@@ -1414,9 +1414,13 @@ def _build_clean_adata_from_inference(
         adata.layers["X_hat_nbr"] = to_np(inference_data["X_hat_nbr"])
 
     # ---- global metadata ----
+    num_quantizers = int(inference_data.get("num_quantizers", 1))
+    cb_sizes       = inference_data.get("codebook_sizes", None)
     adata.uns["squint"] = {
-        "codebook_size": int(inference_data.get("codebook_size", 0)),
-        "num_heads": num_heads,
+        "codebook_size":     int(inference_data.get("codebook_size", 0)),
+        "num_heads":         num_heads,
+        "num_quantizers":    num_quantizers,
+        "codebook_sizes":    list(cb_sizes) if cb_sizes is not None else None,
         "separate_codebook": bool(inference_data.get("separate", False)),
     }
     if "edge_index" in inference_data:
