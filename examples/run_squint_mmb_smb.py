@@ -48,8 +48,17 @@ Training metrics are logged to wandb under the project "squint".
   #      recon-cell+mask   cell NB + MAE feature masking
   #      recon-cell+mhvq   cell NB + multi-head VQ (10 heads, k=5000)
   #      recon-both+mhvq   cell+nbr NB + multi-head VQ (10 heads, k=5000)
-  #      recon-both+rvq    cell+nbr NB + Residual VQ (levels=[30, 200])
-  #      recon-both+cvq    cell+nbr NB + Conditional/Tree VQ (K1=30, K2=10)
+  #
+  #      RVQ ablations (Residual VQ, levels=[30, 200]):
+  #        recon-cell+rvq, recon-nbr+rvq, recon-both+rvq,
+  #        recon-cell+rvq+adj, recon-nbr+rvq+adj, recon-both+rvq+adj,
+  #        recon-cell+rvq+film, recon-cell+rvq+mask
+  #
+  #      CVQ ablations (Conditional / Tree VQ, K1=30, K2=10):
+  #        recon-cell+cvq, recon-nbr+cvq, recon-both+cvq,
+  #        recon-cell+cvq+adj, recon-nbr+cvq+adj, recon-both+cvq+adj,
+  #        recon-cell+cvq+film, recon-cell+cvq+mask
+  #
   #      full              all components composed
   #
   #    Output (flat run dir, ablation-aware):
@@ -456,17 +465,20 @@ def make_train_config_poc() -> dict:
             "max_epochs": 80,
             "enable_checkpointing": True,
             "ckpt_path": "best",
-            # Early stopping: watch the NB reconstruction loss (the actual
-            # optimisation objective) rather than Pearson, which can plateau
-            # and oscillate while the loss still makes meaningful progress.
+            # Early stopping: watch the GLOBAL training loss (the sum of
+            # all weighted loss terms — NB cell, NB nbr if active, commit,
+            # BCE adjacency if active, mask-token reg if active, etc.).
+            # This is the actual optimisation objective and the right thing
+            # to stop on. base_model logs it as `train_loss`.
             # patience=15 epochs: at batch_size=256 / ~100k cells that is
             # roughly 6k gradient steps, enough to distinguish a true plateau
             # from temporary stagnation after a codebook reshuffle.
-            # min_delta=0.1 on a loss in the ~140-170 range = ~0.07% relative
-            # improvement required per patience window.
+            # min_delta=0.1: small in absolute terms, but the train loss for
+            # variants in this codebase ranges ~140-170, so 0.1 corresponds
+            # to roughly 0.07% relative improvement required per window.
             "early_stopping_params": {
                 "enabled":    True,
-                "monitor":    "train_nb_attribute_reconstruction_loss",
+                "monitor":    "train_loss",
                 "mode":       "min",
                 "patience":   15,
                 "min_delta":  0.1,
@@ -814,6 +826,134 @@ VARIANTS: dict = {
         "patches": ["recon_mode=cell", "+mhvq(heads=10, codebook_size=5000)"],
         "build": lambda: _patch_multihead_vq(_patch_recon_cell(_B()),
                                              heads=10, codebook_size=5000),
+    },
+    # ========================================================================
+    # RVQ ablations — same axes as the standard-VQ variants above, with the
+    # codebook swapped for ResidualVQ_Squint (levels=[30, 200]).
+    # ========================================================================
+    "recon-cell+rvq": {
+        "description": (
+            "Per-cell NB + Residual VQ (levels=[30, 200]). Tests whether the "
+            "RVQ capacity bump alone improves per-cell reconstruction without "
+            "any neighbourhood / adjacency / FiLM / masking signal."
+        ),
+        "patches": ["recon_mode=cell", "+rvq(levels=[30, 200])"],
+        "build": lambda: _patch_rvq(_patch_recon_cell(_B())),
+    },
+    "recon-nbr+rvq": {
+        "description": (
+            "Neighbourhood-only NB + RVQ (levels=[30, 200]). Tests RVQ on the "
+            "purely niche-oriented objective."
+        ),
+        "patches": ["recon_mode=nbr", "+rvq(levels=[30, 200])"],
+        "build": lambda: _patch_rvq(_patch_recon_nbr(_B())),
+    },
+    "recon-cell+rvq+adj": {
+        "description": (
+            "Per-cell NB + RVQ + BCE adjacency reconstruction. RVQ + spatial "
+            "graph supervision."
+        ),
+        "patches": ["recon_mode=cell", "+rvq(levels=[30, 200])",
+                    "+bce_adjacency_reconstruction_loss"],
+        "build": lambda: _patch_adj(_patch_rvq(_patch_recon_cell(_B()))),
+    },
+    "recon-nbr+rvq+adj": {
+        "description": (
+            "Neighbourhood NB + RVQ + BCE adjacency reconstruction."
+        ),
+        "patches": ["recon_mode=nbr", "+rvq(levels=[30, 200])",
+                    "+bce_adjacency_reconstruction_loss"],
+        "build": lambda: _patch_adj(_patch_rvq(_patch_recon_nbr(_B()))),
+    },
+    "recon-both+rvq+adj": {
+        "description": (
+            "Cell + neighbourhood NB + RVQ + BCE adjacency reconstruction. "
+            "Maximum spatial supervision with RVQ capacity."
+        ),
+        "patches": ["recon_mode=both", "+nb_attribute_reconstruction_loss_nbr",
+                    "+rvq(levels=[30, 200])", "+bce_adjacency_reconstruction_loss"],
+        "build": lambda: _patch_adj(_patch_rvq(_patch_recon_both(_B()))),
+    },
+    "recon-cell+rvq+film": {
+        "description": (
+            "Per-cell NB + RVQ + FiLM conditioning on (rbf_distances, "
+            "cell_batch_id). Tests RVQ + batch/spatial conditioning."
+        ),
+        "patches": ["recon_mode=cell", "+rvq(levels=[30, 200])",
+                    "+film(rbf_distances, cell_batch_id)"],
+        "build": lambda: _patch_film(_patch_rvq(_patch_recon_cell(_B()))),
+    },
+    "recon-cell+rvq+mask": {
+        "description": (
+            "Per-cell NB + RVQ + MAE-style gene masking (0.2->0.6 over 5 "
+            "warmup epochs). Tests RVQ + forced neighbourhood-aware encoding."
+        ),
+        "patches": ["recon_mode=cell", "+rvq(levels=[30, 200])",
+                    "+masking(base=0.2, final=0.6, warmup=5)"],
+        "build": lambda: _patch_masking(_patch_rvq(_patch_recon_cell(_B()))),
+    },
+    # ========================================================================
+    # CVQ ablations — same axes again, with the codebook swapped for the
+    # tree-structured ConditionalVQ (K1=30, K2=10).
+    # ========================================================================
+    "recon-cell+cvq": {
+        "description": (
+            "Per-cell NB + Conditional / Tree VQ (K1=30, K2=10). Tests the "
+            "tree codebook structure on the per-cell objective."
+        ),
+        "patches": ["recon_mode=cell", "+cvq(k1=30, k2=10)"],
+        "build": lambda: _patch_cvq(_patch_recon_cell(_B())),
+    },
+    "recon-nbr+cvq": {
+        "description": (
+            "Neighbourhood-only NB + CVQ (K1=30, K2=10). Tests CVQ on the "
+            "niche-only objective; expect strong level-1 spatial structure."
+        ),
+        "patches": ["recon_mode=nbr", "+cvq(k1=30, k2=10)"],
+        "build": lambda: _patch_cvq(_patch_recon_nbr(_B())),
+    },
+    "recon-cell+cvq+adj": {
+        "description": (
+            "Per-cell NB + CVQ + BCE adjacency reconstruction."
+        ),
+        "patches": ["recon_mode=cell", "+cvq(k1=30, k2=10)",
+                    "+bce_adjacency_reconstruction_loss"],
+        "build": lambda: _patch_adj(_patch_cvq(_patch_recon_cell(_B()))),
+    },
+    "recon-nbr+cvq+adj": {
+        "description": (
+            "Neighbourhood NB + CVQ + BCE adjacency reconstruction."
+        ),
+        "patches": ["recon_mode=nbr", "+cvq(k1=30, k2=10)",
+                    "+bce_adjacency_reconstruction_loss"],
+        "build": lambda: _patch_adj(_patch_cvq(_patch_recon_nbr(_B()))),
+    },
+    "recon-both+cvq+adj": {
+        "description": (
+            "Cell + neighbourhood NB + CVQ + BCE adjacency reconstruction. "
+            "Maximum spatial supervision with hierarchical tree codebook."
+        ),
+        "patches": ["recon_mode=both", "+nb_attribute_reconstruction_loss_nbr",
+                    "+cvq(k1=30, k2=10)", "+bce_adjacency_reconstruction_loss"],
+        "build": lambda: _patch_adj(_patch_cvq(_patch_recon_both(_B()))),
+    },
+    "recon-cell+cvq+film": {
+        "description": (
+            "Per-cell NB + CVQ + FiLM conditioning on (rbf_distances, "
+            "cell_batch_id). Tests tree codebook + batch/spatial conditioning."
+        ),
+        "patches": ["recon_mode=cell", "+cvq(k1=30, k2=10)",
+                    "+film(rbf_distances, cell_batch_id)"],
+        "build": lambda: _patch_film(_patch_cvq(_patch_recon_cell(_B()))),
+    },
+    "recon-cell+cvq+mask": {
+        "description": (
+            "Per-cell NB + CVQ + MAE-style gene masking (0.2->0.6 over 5 "
+            "warmup epochs). Tests tree codebook + masked-pretraining."
+        ),
+        "patches": ["recon_mode=cell", "+cvq(k1=30, k2=10)",
+                    "+masking(base=0.2, final=0.6, warmup=5)"],
+        "build": lambda: _patch_masking(_patch_cvq(_patch_recon_cell(_B()))),
     },
     # ---- Combined-loss capacity ablations (recon-both base) ---------------
     # These three share recon_mode='both' so the cell + neighbourhood NB
@@ -1407,11 +1547,17 @@ def _build_clean_adata_from_inference(
         else:
             adata.obsm["code_indices"] = idx.astype(int)
 
-    # ---- reconstructions -> .layers ----
+    # ---- reconstructions + neighbourhood ground truth -> .layers ----
     if "X_hat" in inference_data:
         adata.layers["X_hat"] = to_np(inference_data["X_hat"])
     if "X_hat_nbr" in inference_data:
         adata.layers["X_hat_nbr"] = to_np(inference_data["X_hat_nbr"])
+    # Cache the 1-hop neighbourhood mean of the raw counts as well — same
+    # shape (n_cells, n_genes), and required by analysis tools that compare
+    # X_hat_nbr against its ground truth without rebuilding the spatial
+    # graph at analysis time.
+    if "X_nbr" in inference_data:
+        adata.layers["X_nbr"] = to_np(inference_data["X_nbr"])
 
     # ---- global metadata ----
     num_quantizers = int(inference_data.get("num_quantizers", 1))
