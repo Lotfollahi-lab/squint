@@ -60,7 +60,10 @@ def compute_mmd_score(
             bandwidth=bandwidth,
             kernel=kernel,
         )
-        mmd_bandwidth = K_XX + K_YY - 2 * K_XY
+        if kernel == 'l1_gaussian_tv':
+            mmd_bandwidth = K_XX + K_YY - 2 * K_XY
+        elif kernel == 'energy':
+            mmd_bandwidth = 2 * K_XY - K_XX - K_YY
         total_discrepancy_by_bandwidth.append(mmd_bandwidth)
 
     mmd = np.mean(total_discrepancy_by_bandwidth)

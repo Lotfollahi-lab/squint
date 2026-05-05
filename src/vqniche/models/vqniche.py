@@ -184,6 +184,8 @@ class VQNiche(BaseModel):
         if self.mask_strategy == 'learnable_parameter':
             self.mask_token = torch.nn.Parameter(torch.empty(self.in_channels))
             torch.nn.init.normal_(self.mask_token, mean=2.0, std=1.0)
+        elif self.mask_strategy == 'zeros':
+            self.mask_token = torch.zeros(self.in_channels)
 
 
     def _init_inference_data_caches(self) -> None:
@@ -324,7 +326,7 @@ class VQNiche(BaseModel):
         masked_x = batch_x.clone()
         
         # if the mask strategy is zeros or learnable_parameter, mask the input features of the source nodes where mask_idx is True with the mask token
-        if self.mask_strategy == 'learnable_parameter':
+        if self.mask_strategy in ['learnable_parameter', 'zeros']:
             # nonzero() returns indices of the `True` elements in the mask_idx tensor
             # squeeze(1) ensures that the index tensor is 1D
             index = mask_idx.to(masked_x.device).nonzero().squeeze(1)
@@ -363,7 +365,7 @@ class VQNiche(BaseModel):
         Prepare the masked input for the specified step.
         """
         # Set ratio of source nodes to mask
-        if self.mask_strategy == 'learnable_parameter':
+        if self.mask_strategy in ['learnable_parameter', 'zeros']:
             # set number of source nodes to mask based on the mask strategy and mask ratio
             if step == 'train':
                 mask_ratio: float = set_mask_ratio(

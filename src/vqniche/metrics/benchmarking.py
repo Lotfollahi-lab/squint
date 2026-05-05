@@ -33,6 +33,48 @@ from .mmd import compute_mmd_score, degree_histogram, eigenvalues_pmf
 from .codebook_utilization import compute_codebook_utilization
 
 
+def compute_lambda_zero_from_D(
+    D: np.ndarray,
+    method: str = "scipy",
+    kernel: str = "l1_gaussian_tv",
+) -> float:
+    """
+    Compute penalty factor for MMD from ground-truth distributions D.
+
+    Parameters
+    ----------
+    - D: np.ndarray
+        Ground-truth distributions.
+    - method: str
+        Method to use to compute the MMD score.
+    - kernel: str
+        Kernel to use to compute the MMD score.
+    
+    Returns
+    -------
+    - lambda_zero: float
+        Penalty factor for MMD.
+        
+    Notes
+    -----
+    - This method is used to compute the penalty factor for MMD from ground-truth distributions D only.
+    - Penalty is applied to the MMD score to penalize the model for predicting all zeros.
+    """
+    D = np.asarray(D, dtype=float)
+    n, d = D.shape
+
+    # Uniform "worst-case" predictor: same for every cell, depends only on d
+    U = np.full_like(D, 1.0 / d)
+
+    lambda_0 = compute_mmd_score(
+        D=[row for row in D],
+        D_hat=[row for row in U],
+        method=method,
+        kernel=kernel,
+    )
+    return float(lambda_0)
+
+
 def compute_benchmarking_metrics(
         adata: AnnData,
         metrics: list=[
@@ -265,18 +307,65 @@ def compute_benchmarking_metrics(
     if "mmd_1hop_nbr" in metrics:
         print("Computing MMD (normalized 1-hop neighborhood cell-wise)...")
 
-        D = adata.uns['X_nbr'] / adata.uns['X_nbr'].sum(axis=1, keepdims=True)
-        D_hat = adata.uns['X_hat_nbr'] / adata.uns['X_hat_nbr'].sum(axis=1, keepdims=True)
+        # Compute sums before division
+        X_nbr_sum = adata.uns['X_nbr'].sum(axis=1, keepdims=True)
+        X_hat_nbr_sum = adata.uns['X_hat_nbr'].sum(axis=1, keepdims=True)
+        
+        # Check for zero sums that would cause division by zero
+        zero_sum_X = (X_nbr_sum == 0).sum()
+        zero_sum_X_hat = (X_hat_nbr_sum == 0).sum()
+        
+        print(f"Number of rows with zero sum in X_nbr: {zero_sum_X} (out of {adata.uns['X_nbr'].shape[0]})")
+        print(f"Number of rows with zero sum in X_hat_nbr: {zero_sum_X_hat} (out of {adata.uns['X_hat_nbr'].shape[0]})")
+        
+        if zero_sum_X > 0 or zero_sum_X_hat > 0:
+            print("WARNING: Found zero sums - this will cause NaN values!")
+            # Optionally check the actual values
+            print(f"X_nbr min/max: {adata.uns['X_nbr'].min()}, {adata.uns['X_nbr'].max()}")
+            print(f"X_hat_nbr min/max: {adata.uns['X_hat_nbr'].min()}, {adata.uns['X_hat_nbr'].max()}")
+        
+        # Replace zero sums with 1 to avoid division by zero
+        # Zero rows will remain zero after division
+        X_nbr_sum[X_nbr_sum == 0] = 1
+        X_hat_nbr_sum[X_hat_nbr_sum == 0] = 1
+
+        D = adata.uns['X_nbr'] / X_nbr_sum
+        D_hat = adata.uns['X_hat_nbr'] / X_hat_nbr_sum
+
         D = D.numpy()
         D_hat = D_hat.numpy()
 
-        benchmarking_dict["mmd_1hop_nbr"] = compute_mmd_score(
-            D=[row for row in D],
-            D_hat=[row for row in D_hat],
+        # Detect rows where prediction is all zeros
+        zero_mask = np.all(D_hat == 0, axis=1)
+        n_zero = int(zero_mask.sum())
+        n_total = D_hat.shape[0]
+        zero_fraction = n_zero / float(n_total)
+
+        # Compute MMD only on non-collapsed rows
+        D_valid = D[~zero_mask]
+        D_hat_valid = D_hat[~zero_mask]
+
+        base_mmd = compute_mmd_score(
+            D=[row for row in D_valid],
+            D_hat=[row for row in D_hat_valid],
             method='scipy',
             kernel='l1_gaussian_tv',
         )
 
+        lambda_zero = compute_lambda_zero_from_D(
+            D=[row for row in D],
+            method='scipy',
+            kernel='l1_gaussian_tv',
+        )
+        mmd_penalised = base_mmd + lambda_zero * zero_fraction
+            
+        benchmarking_dict["mmd_1hop_nbr"] = mmd_penalised
+        print(f"MMD (penalised): {mmd_penalised}")
+        print(f"Base MMD: {base_mmd}")
+        print(f"Zero fraction: {zero_fraction}")
+        print(f"Lambda zero: {lambda_zero}")
+        print(f"MMD Penalty: {lambda_zero * zero_fraction}")
+        
     if "mmd_pca_1hop_nbr" in metrics:
         print("Computing MMD (PCA on 1-hop neighborhood cell-wise)...")
 
@@ -299,8 +388,31 @@ def compute_benchmarking_metrics(
     if "energy_1hop_nbr" in metrics:
         print("Computing Energy (normalized 1-hop neighborhood cell-wise)...")
 
-        D = adata.uns['X_nbr'] / adata.uns['X_nbr'].sum(axis=1, keepdims=True)
-        D_hat = adata.uns['X_hat_nbr'] / adata.uns['X_hat_nbr'].sum(axis=1, keepdims=True)
+        # Compute sums before division
+        X_nbr_sum = adata.uns['X_nbr'].sum(axis=1, keepdims=True)
+        X_hat_nbr_sum = adata.uns['X_hat_nbr'].sum(axis=1, keepdims=True)
+        
+        # Check for zero sums that would cause division by zero
+        zero_sum_X = (X_nbr_sum == 0).sum()
+        zero_sum_X_hat = (X_hat_nbr_sum == 0).sum()
+        
+        print(f"Number of rows with zero sum in X_nbr: {zero_sum_X} (out of {adata.uns['X_nbr'].shape[0]})")
+        print(f"Number of rows with zero sum in X_hat_nbr: {zero_sum_X_hat} (out of {adata.uns['X_hat_nbr'].shape[0]})")
+        
+        if zero_sum_X > 0 or zero_sum_X_hat > 0:
+            print("WARNING: Found zero sums - this will cause NaN values!")
+            # Optionally check the actual values
+            print(f"X_nbr min/max: {adata.uns['X_nbr'].min()}, {adata.uns['X_nbr'].max()}")
+            print(f"X_hat_nbr min/max: {adata.uns['X_hat_nbr'].min()}, {adata.uns['X_hat_nbr'].max()}")
+        
+        # Replace zero sums with 1 to avoid division by zero
+        # Zero rows will remain zero after division
+        X_nbr_sum[X_nbr_sum == 0] = 1e-6
+        X_hat_nbr_sum[X_hat_nbr_sum == 0] = 1e-6
+
+        D = adata.uns['X_nbr'] / X_nbr_sum
+        D_hat = adata.uns['X_hat_nbr'] / X_hat_nbr_sum
+        
         D = D.numpy()
         D_hat = D_hat.numpy()
 

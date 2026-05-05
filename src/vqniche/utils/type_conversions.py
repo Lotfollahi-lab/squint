@@ -32,7 +32,12 @@ def sparse_mx_to_float_tensor(
     sparse_mx = sparse_mx.astype(np.float32)
 
     # Convert directly to dense format as a PyTorch tensor
-    dense_tensor = torch.tensor(sparse_mx.toarray(), dtype=torch.float32)
+    if isinstance(sparse_mx, sp.csr_matrix):
+        dense_tensor = torch.tensor(sparse_mx.toarray(), dtype=torch.float32)
+    elif isinstance(sparse_mx, np.ndarray):
+        dense_tensor = torch.tensor(sparse_mx, dtype=torch.float32)
+    else:
+        raise ValueError(f"Unsupported sparse matrix type: {type(sparse_mx)}")
     return dense_tensor
 
 
