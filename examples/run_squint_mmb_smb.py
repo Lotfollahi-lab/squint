@@ -976,13 +976,15 @@ def make_train_config_dualvq() -> dict:
         "wt_commit_niche":      1.0,    # commit_niche
         # Adjacency BCE has small absolute magnitude (~0.5-1 nat at init,
         # bounded by log(2)) — it must be UPWEIGHTED to balance against
-        # the gene-NB losses (~150 nats). Empirically `wt_adj_reconstr=250`
-        # gives the best niche-coherence on the MERFISH/STARmap MB panel
-        # while still letting NB Pearson improve. The earlier "Pearson
-        # drop after epoch 1" symptom turned out to be the codebook-size
-        # bottleneck (NB→niche-mean predictor pathology), NOT the adj
-        # weight, so we keep the high adjacency pressure here.
-        "wt_adj_reconstr":      250.0,  # cosine adj BCE (1.0 -> 100 -> 25 -> 250)
+        # the gene-NB losses (~150 nats). Empirically `wt_adj_reconstr=1000`
+        # gives the strongest spatial-niche coherence on the MERFISH/STARmap
+        # MB panel without measurably hurting NB Pearson once the wide
+        # codebook setup is used (k=50 macro + RVQ refinement). The
+        # earlier "Pearson drop after epoch 1" symptom turned out to be
+        # the codebook-size bottleneck (NB→niche-mean predictor pathology),
+        # NOT the adj weight — once that's fixed via wide+RVQ, the model
+        # tolerates much higher adjacency pressure.
+        "wt_adj_reconstr":      1000.0,  # cosine adj BCE (1.0 -> 100 -> 25 -> 250 -> 1000)
         "edge_sampling_ratio":  2.0,
         "use_pos_weight":       True,
         "cosine_temperature":   0.1,
@@ -1117,6 +1119,37 @@ def _patch_dual_wide(
     cfg["datamodule"]["sampler_params"]["num_neighbors"] = list(sampler_neighbors)
 
     cfg["model"]["loss_params"]["loss_kwargs"]["nbr_aggregation_hops"] = int(nbr_hops)
+    return cfg
+
+
+def _patch_dual_film(
+        cfg: dict,
+        condition_list: List[str] = ["cell_batch_id"],
+    ) -> dict:
+    """
+    Enable FiLM batch-correction on the dual encoder.
+
+    The FiLM module is attached to the MLP output (post-MLP, pre-VQ-cell,
+    pre-GNN), so BOTH the cell codebook and the niche codebook see a
+    batch-corrected representation. This means cells from different
+    samples (e.g. MERFISH brain vs. STARmap brain) with the same
+    biological identity should map to the same code.
+
+    `condition_list` controls what the FiLM module is conditioned on.
+    Default ['cell_batch_id'] uses the per-cell sample identity (one-hot
+    encoded by the data loader from `adata.obs['batch']` if present, or
+    parsed from `cell_id` strings as a fallback). You can also include
+    'rbf_distances', 'timepoint_id', etc. — anything the loader's
+    encoder-conditioning pipeline knows how to populate.
+    """
+    enc = cfg["model"]["encoder_params"]
+    enc["conditioning_params"] = {
+        "condition_list":   list(condition_list),
+        "use_bias":         True,
+        "use_residual":     False,
+        "residual_weight":  0.2,
+        "init_mode":        "identity",
+    }
     return cfg
 
 
@@ -1521,32 +1554,32 @@ VARIANTS: dict = {
     },
     "dualvq+adj-mild": {
         "description": (
-            "Dual VQ with adjacency BCE DOWN-weighted to 25 (vs. default 250). "
+            "Dual VQ with adjacency BCE DOWN-weighted to 100 (vs. default 1000). "
             "Tests how much spatial coherence is sacrificed at 1/10 the "
             "default weight. Useful sanity check that the high default is "
             "actually doing useful work."
         ),
-        "patches": ["+cosine_adj(weight=25)"],
-        "build": lambda: _patch_dual_adj_weight(_BD(), weight=25.0),
+        "patches": ["+cosine_adj(weight=100)"],
+        "build": lambda: _patch_dual_adj_weight(_BD(), weight=100.0),
     },
     "dualvq+adj-strong": {
         "description": (
-            "Dual VQ with adjacency BCE UP-weighted to 500 (vs. default 250). "
-            "Tests whether 2x default weight further improves niche-code "
-            "spatial coherence. Will likely sacrifice some NB Pearson."
+            "Dual VQ with adjacency BCE UP-weighted to 2500 (vs. default 1000). "
+            "Tests whether 2.5x default weight further improves niche-code "
+            "spatial coherence. May sacrifice some NB Pearson."
         ),
-        "patches": ["+cosine_adj(weight=500)"],
-        "build": lambda: _patch_dual_adj_weight(_BD(), weight=500.0),
+        "patches": ["+cosine_adj(weight=2500)"],
+        "build": lambda: _patch_dual_adj_weight(_BD(), weight=2500.0),
     },
     "dualvq+adj-extreme": {
         "description": (
-            "Dual VQ with adjacency BCE UP-weighted to 1000 (vs. default 250). "
+            "Dual VQ with adjacency BCE UP-weighted to 5000 (vs. default 1000). "
             "Maximum spatial-coherence pressure. Expect noticeable NB "
             "Pearson degradation — useful only as an upper-bound run for "
             "what spatial coherence looks like when adjacency dominates."
         ),
-        "patches": ["+cosine_adj(weight=1000)"],
-        "build": lambda: _patch_dual_adj_weight(_BD(), weight=1000.0),
+        "patches": ["+cosine_adj(weight=5000)"],
+        "build": lambda: _patch_dual_adj_weight(_BD(), weight=5000.0),
     },
     # ========================================================================
     # "Wide" dualvq variants — deeper GNN + deeper sampler + bigger codebooks
@@ -1566,6 +1599,48 @@ VARIANTS: dict = {
             "+codebook_size=50 (cell+niche)", "+nbr_aggregation_hops=2",
         ],
         "build": lambda: _patch_dual_wide(_BD()),
+    },
+    "dualvq+wide+rvq-niche-3level": {
+        "description": (
+            "Wide dual VQ + RVQ on the niche branch with THREE levels "
+            "(K=[30, 90, 30], 81000 effective codes). Macro -> sub-niche "
+            "-> fine-grained refinement. Cell branch is plain VQ k=50. "
+            "Run only after `+rvq-niche` (2-level) results are confirmed "
+            "good — adding a level adds ~K3=30 codebook vectors of params "
+            "and a small per-step overhead, so worth a comparison."
+        ),
+        "patches": ["+wide", "+rvq(branch=niche, levels=[30, 90, 30])"],
+        "build": lambda: _patch_dual_rvq(
+            _patch_dual_wide(_BD()),
+            branch="niche", codebook_sizes=(30, 90, 30),
+        ),
+    },
+    "dualvq+wide+rvq-niche-larger": {
+        "description": (
+            "Wide dual VQ + RVQ on the niche branch with larger level-2 "
+            "(K=[30, 200], 6000 effective codes). Cell branch is plain "
+            "VQ k=50. Use if the level-2 utilization in `+rvq-niche` "
+            "([30, 90]) saturates near 90/90."
+        ),
+        "patches": ["+wide", "+rvq(branch=niche, levels=[30, 200])"],
+        "build": lambda: _patch_dual_rvq(
+            _patch_dual_wide(_BD()),
+            branch="niche", codebook_sizes=(30, 200),
+        ),
+    },
+    "dualvq+wide+rvq-niche-finer-l1": {
+        "description": (
+            "Wide dual VQ + RVQ on the niche branch with finer level-1 "
+            "(K=[50, 90], 4500 effective codes). Cell branch is plain "
+            "VQ k=50. Use if the level-1 utilization in `+rvq-niche` "
+            "([30, 90]) saturates near 30/30 — gives more macro-niche "
+            "resolution at the same level-2 capacity."
+        ),
+        "patches": ["+wide", "+rvq(branch=niche, levels=[50, 90])"],
+        "build": lambda: _patch_dual_rvq(
+            _patch_dual_wide(_BD()),
+            branch="niche", codebook_sizes=(50, 90),
+        ),
     },
     "dualvq+wide+rvq-niche": {
         "description": (
@@ -1617,6 +1692,45 @@ VARIANTS: dict = {
         "build": lambda: _patch_dual_cvq(
             _patch_dual_wide(_BD()),
             branch="niche", k1=30, k2=5,
+        ),
+    },
+    # ========================================================================
+    # FiLM batch-correction variants (MLP-output FiLM, both branches affected)
+    # ========================================================================
+    "dualvq+wide+film": {
+        "description": (
+            "Wide dual VQ + FiLM batch-correction at the MLP output. Both "
+            "the cell and niche codebooks see a batch-corrected representation, "
+            "so cells from different samples (MERFISH/STARmap, replicates, "
+            "platforms) with the same biological identity should map to the "
+            "same code. Conditioning on `cell_batch_id`. Use this as the "
+            "starting point for cross-sample integration."
+        ),
+        "patches": ["+wide", "+film(MLP-output, cell_batch_id)"],
+        "build": lambda: _patch_dual_film(_patch_dual_wide(_BD())),
+    },
+    "dualvq+wide+rvq-both+film": {
+        "description": (
+            "Wide dual VQ + RVQ on both branches (levels=[30, 90] each) + "
+            "FiLM batch-correction at the MLP output. Combines the best "
+            "single-sample setup with cross-sample batch correction — "
+            "recommended starting point for cross-tissue (MERFISH+STARmap) "
+            "or cross-replicate atlases."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=niche, levels=[30, 90])",
+            "+rvq(branch=cell, levels=[30, 90])",
+            "+film(MLP-output, cell_batch_id)",
+        ],
+        "build": lambda: _patch_dual_film(
+            _patch_dual_rvq(
+                _patch_dual_rvq(
+                    _patch_dual_wide(_BD()),
+                    branch="niche", codebook_sizes=(30, 90),
+                ),
+                branch="cell", codebook_sizes=(30, 90),
+            ),
         ),
     },
     "dualvq+wide+cvq-both": {
@@ -2011,18 +2125,33 @@ def train(variant: str):
     # ---- Logger: wandb cloud logging, local cache lives inside run_dir ----
     logging_enabled = cfg["logging"].get("enabled", True)
     if logging_enabled:
+        # Make timestamp prominent in the wandb run identity:
+        #   - `name`: shows up as the run title in the wandb UI
+        #   - `tags`: filterable tag (variant + timestamp)
+        #   - `config["timestamp"]` and `config["run_dir"]`: top-level keys in
+        #     the run's "Config" panel so the timestamp is the first thing
+        #     visible alongside the variant.
+        run_name = f"{variant}-{timestamp}"
         logger = WandbLogger(
             save_dir=str(run_dir),                    # local cache -> <run_dir>/wandb/
             project=WANDB_PROJECT,
+            name=run_name,
             # Group by dataset+batches so all ablations of one dataset cluster
             # together. The variant goes in `tags` so we can filter the wandb
             # UI to e.g. all "poc+nbr" runs across timestamps.
             group=f"{cfg['dataset']['dataset_name']}:batch={cfg['dataset']['adata_batch_idx']}",
             job_type="train",
-            tags=[f"variant:{variant}"],
+            tags=[f"variant:{variant}", f"timestamp:{timestamp}"],
             mode="offline" if cfg["logging"]["offline"] else "online",
             log_model=cfg["logging"]["log_model"],
-            config={"variant": variant, "ablation_summary": summary, **cfg},
+            config={
+                # Hoist run identity to the top of the wandb Config panel.
+                "timestamp":         timestamp,
+                "variant":           variant,
+                "run_dir":           str(run_dir),
+                "ablation_summary":  summary,
+                **cfg,
+            },
         )
     else:
         logger = False

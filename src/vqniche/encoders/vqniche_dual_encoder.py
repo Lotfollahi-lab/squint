@@ -111,10 +111,17 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         )
         niche_in_channels = self.gnn_module.dim
 
-        # ---- optional FiLM (applied to GNN output, niche-side only) ---------
+        # ---- optional FiLM batch conditioning -------------------------------
+        # Applied to the post-MLP latent (z_mlp), BEFORE the split into the
+        # cell branch (VQ_cell directly) and the niche branch (GNN ->
+        # VQ_niche). This way both codebooks see a batch-corrected
+        # representation, so cells from different platforms/replicates with
+        # the same biological identity end up assigned to the same code.
+        # Conditioning vector is per-cell (built upstream by the data loader
+        # from `adata.obs['batch']` or cell-id parsing), one-hot encoded.
         if 'condition_list' in conditioning_params:
             self.conditioning_module = FiLM(
-                in_channels=niche_in_channels,
+                in_channels=cell_in_channels,        # FiLM at MLP output
                 **conditioning_params,
             )
         else:
@@ -165,14 +172,16 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         # MLP (shared trunk)
         z_mlp = self.mlp_module(batch_x) if self.mlp_module is not None else batch_x
 
-        # GNN consumes the continuous z_mlp (NOT z_q_cell — see module docstring).
-        z_gnn = self.gnn_module(z_mlp, batch_edge_index)
-
-        # FiLM applied to z_gnn so the conditioning lands on the niche branch.
+        # FiLM applied at the MLP output (post-MLP, pre-VQ-cell, pre-GNN) so
+        # both branches inherit a batch-corrected representation and the
+        # cell + niche codebooks become batch-invariant.
         if self.conditioning_module is not None:
-            z_gnn = self.conditioning_module(
-                x=z_gnn, conditions=batch_encoder_conditions,
+            z_mlp = self.conditioning_module(
+                x=z_mlp, conditions=batch_encoder_conditions,
             )
+
+        # GNN consumes the conditioned (continuous) z_mlp.
+        z_gnn = self.gnn_module(z_mlp, batch_edge_index)
 
         # Two independent quantizations.
         z_q_cell,  idx_cell,  _ = self.vq_cell(z_mlp)
