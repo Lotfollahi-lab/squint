@@ -145,6 +145,23 @@ class VQNiche(BaseModel):
                         )
         print(f"4. Predictor: {predictor_name} that transforms {self.encoder.dim} hidden features to {out_channels} dimensional logits.")
 
+        # ---- Adjacency-loss input mode (optional) --------------------------
+        # By default, the BCE adjacency loss is computed on `h_adj`, which is
+        # the output of the adjacency_decoder MLP fed with the quantized
+        # latent. When `bypass_adj_decoder=True`, the BCE loss is computed
+        # directly on the quantized latent z_q, matching the NicheCompass /
+        # standard graph-VAE formulation:
+        #     edge_logit_ij = z_q_i^T z_q_j      (no extra non-linearity)
+        # This removes one MLP and forces the codebook embeddings themselves
+        # to encode pairwise spatial proximity, which is exactly the bias
+        # we want when the goal is for codes to capture spatial niches.
+        # Read here so it is set BEFORE the forward path is exercised.
+        loss_kwargs_for_flags = (loss_params.get('loss_kwargs', {})
+                                 if loss_params else {})
+        self.bypass_adj_decoder = bool(
+            loss_kwargs_for_flags.get('bypass_adj_decoder', False)
+        )
+
         # ---- Code-conditional dispersion (optional) ------------------------
         # When enabled, replace the global per-gene `dispersion` parameter
         # (kept on BaseModel as a fallback) with a small MLP that maps the
@@ -323,8 +340,16 @@ class VQNiche(BaseModel):
                     conditions=batch_attr_decoder_conditions,
                 )
 
-        # decode the VQ-encoded edge embeddings to recover the adjacency matrix
-        h_adj = self.adjacency_decoder(h_quantized)
+        # decode the VQ-encoded edge embeddings to recover the adjacency matrix.
+        # When `bypass_adj_decoder` is set, we feed the quantized latent z_q
+        # *directly* into the BCE adjacency loss so the edge logits are raw
+        # inner products z_q_i^T z_q_j — matching NicheCompass / standard
+        # graph-VAE formulation. This is a strong inductive bias toward codes
+        # whose embeddings cluster spatially.
+        if self.bypass_adj_decoder:
+            h_adj = h_quantized
+        else:
+            h_adj = self.adjacency_decoder(h_quantized)
 
         unnormalized_logits_batch = self.predictor(h_latent)
 

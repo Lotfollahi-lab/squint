@@ -127,6 +127,7 @@ If any of these are missing, run `--patch-uns` once.
 import argparse
 import sys
 from pathlib import Path
+from typing import List, Optional, Sequence
 
 import yaml
 
@@ -455,6 +456,16 @@ def make_train_config_poc() -> dict:
                     #   True                               -> on, linear head (no hidden)
                     #   {"enabled": True, "hidden_channels": [128]}
                     "code_conditional_dispersion": False,
+                    # Adjacency-loss input mode.
+                    # False (default): edge logits = h_adj_i^T h_adj_j where
+                    #     h_adj is the output of the MLP adjacency_decoder.
+                    # True            : edge logits = z_q_i^T z_q_j (the
+                    #     quantized latent itself).  This is the
+                    #     NicheCompass / standard graph-VAE formulation —
+                    #     forces the codebook embeddings to directly encode
+                    #     pairwise spatial proximity, which is exactly the
+                    #     bias we want when codes should capture niches.
+                    "bypass_adj_decoder": False,
                     "wt_commit": 1.0,
                 },
             },
@@ -720,6 +731,60 @@ def _patch_cvq(cfg: dict, k1: int = 30, k2: int = 10) -> dict:
     return cfg
 
 
+# ---- NicheCompass-style adjacency reconstruction ---------------------------
+
+def _patch_nichecompass_adj(cfg: dict, weight: float = 1.0) -> dict:
+    """
+    Switch the BCE adjacency reconstruction to the NicheCompass / standard
+    graph-VAE formulation, and weight it on par with the gene-expression NB
+    loss (default `weight=1.0`).
+
+    Two changes vs. `_patch_adj`:
+      (a) `bypass_adj_decoder=True` makes the BCE compute its edge logits
+          directly on the quantized latent z_q (raw inner product
+          z_q_i^T z_q_j), bypassing the SQUINT adjacency_decoder MLP. This
+          mirrors NicheCompass's `A_hat = sigmoid(Z @ Z^T)` formulation —
+          there is no extra non-linearity between the latent and the
+          edge prediction. The codebook embeddings themselves are forced
+          to encode pairwise spatial proximity.
+      (b) `wt_adj_reconstr=1.0` (vs. the legacy default 0.1) gives the
+          edge reconstruction roughly the same loss-magnitude footprint as
+          NB attribute reconstruction. The NicheCompass user guide
+          explicitly notes that "finding a balance between gene expression
+          and edge reconstruction is a key element for good niche
+          identification" — the default 0.1 weight in SQUINT was 10x too
+          weak for a niche-focused signal.
+
+    Adds `bce_adjacency_reconstruction_loss` to the loss list if not
+    already present.
+    """
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    if "bce_adjacency_reconstruction_loss" not in losses:
+        losses.append("bce_adjacency_reconstruction_loss")
+    lk = cfg["model"]["loss_params"]["loss_kwargs"]
+    lk["wt_adj_reconstr"]    = float(weight)
+    lk["bypass_adj_decoder"] = True
+    return cfg
+
+
+# ---- GATv2 encoder (NicheCompass-style GNN) --------------------------------
+
+def _patch_gatv2_encoder(cfg: dict) -> dict:
+    """
+    Switch the encoder GNN from GraphSAGE to GATv2 (dynamic attention).
+    NicheCompass recommends GATv2 over GCN/GraphSAGE for niche-focused
+    representations — attention weights are spatially adaptive, so cells
+    in dense parts of a niche aggregate from more informative neighbours
+    than cells at niche boundaries.
+
+    The MLP / hidden-channel / depth structure is left unchanged — this
+    patch only flips `gnn_name`. Use it stacked with a recon patch and
+    `_patch_nichecompass_adj` to get a NicheCompass-shaped pipeline.
+    """
+    cfg["model"]["encoder_params"]["gnn_name"] = "GATv2Conv"
+    return cfg
+
+
 # ---------------------------------------------------------------------------
 # 2c. Variant registry
 # ---------------------------------------------------------------------------
@@ -737,6 +802,332 @@ def _patch_cvq(cfg: dict, k1: int = 30, k2: int = 10) -> dict:
 def _B():
     """Shorthand: deep-copy of the base POC config."""
     return _copy(make_train_config_poc())
+
+
+# ---------------------------------------------------------------------------
+# 2c. VQNiche_Dual: dual-codebook config builder
+# ---------------------------------------------------------------------------
+# The dual model (`VQNiche_Dual`) has a separate cell and niche codebook + a
+# separate decoder for each branch. The config below is built by starting
+# from the single-codebook POC config and then:
+#   - replacing model_name/encoder_name with the dual classes
+#   - replacing `vq_params` with `vq_cell_params` + `vq_niche_params`
+#   - replacing `attribute_decoder_params` with `attribute_decoder_cell_params`
+#     + `attribute_decoder_niche_params`
+#   - replacing `loss_names` with the dual loss list
+#   - dropping `adjacency_decoder_params` (the dual model uses a direct
+#     cosine-similarity adjacency BCE on z_q_niche, so there is no MLP
+#     adjacency decoder)
+# ---------------------------------------------------------------------------
+
+def _default_vq_params(codebook_size: int = 30) -> dict:
+    """
+    Single-codebook (non-hierarchical) VectorQuantize defaults, identical
+    settings as the POC config so cell- and niche-branches start from a
+    matched VQ baseline. Swap in `_default_rvq_params(...)` for hierarchical.
+    """
+    return {
+        "vq_name": "VectorQuantize",
+        "freeze_codebook": False,
+        "use_cosine_sim": True,
+        "ema_update": True,
+        "manual_ema_update": False,
+        "threshold_ema_dead_code": 2,
+        "manual_in_place_optimizer_update": False,
+        "learnable_codebook": False,
+        "codebook_size": int(codebook_size),
+        "heads": 1,
+        "separate_codebook_per_head": False,
+        "decay": 0.8,
+        "eps": 0.00001,
+        "kmeans_init": True,
+        "kmeans_iters": 10,
+        "sync_kmeans": True,
+        "sample_codebook_temp": 0.0,
+        "commitment_weight": 0.0,
+        "commitment_use_cross_entropy_loss": False,
+        "codebook_diversity_loss_weight": 0.0,
+        "codebook_diversity_temperature": 100.0,
+        "orthogonal_reg_weight": 0.0,
+        "orthogonal_reg_max_codes": None,
+        "orthogonal_reg_active_codes_only": False,
+    }
+
+
+def _default_rvq_params(codebook_sizes=(30, 200)) -> dict:
+    """Residual-VQ defaults (hierarchical). Plug into vq_cell_params or vq_niche_params."""
+    return {
+        "vq_name": "ResidualVQ_Squint",
+        "num_quantizers": len(codebook_sizes),
+        "codebook_size": list(codebook_sizes),
+        "use_cosine_sim": True,
+        "ema_update": True,
+        "decay": 0.8,
+        "eps": 0.00001,
+        "threshold_ema_dead_code": 2,
+        "kmeans_init": True,
+        "kmeans_iters": 10,
+        "sync_kmeans": True,
+        "commitment_weight": 0.0,
+        "sample_codebook_temp": 0.0,
+    }
+
+
+def _default_cvq_params(k1: int = 30, k2: int = 10) -> dict:
+    """Conditional / tree VQ defaults. Plug into vq_cell_params or vq_niche_params."""
+    return {
+        "vq_name": "ConditionalVQ",
+        "codebook_size_l1": int(k1),
+        "codebook_size_l2": int(k2),
+        "use_cosine_sim": True,
+        "ema_update": True,
+        "decay": 0.8,
+        "eps": 0.00001,
+        "threshold_ema_dead_code": 2,
+        "kmeans_init": True,
+        "kmeans_iters": 10,
+        "sync_kmeans": True,
+        "commitment_weight": 0.0,
+        "sample_codebook_temp": 0.0,
+    }
+
+
+def make_train_config_dualvq() -> dict:
+    """
+    Build the base config for VQNiche_Dual.
+
+    Defaults (per design D1–D6):
+      - encoder: shared MLP [400, 256], GraphSAGE GNN with hidden=256,
+        num_layers=1 (matches POC config)
+      - vq_cell  = VectorQuantize(k=30) on the post-MLP latent
+      - vq_niche = VectorQuantize(k=30) on the post-GNN latent
+      - cell decoder + niche decoder are independent MLPSoftmax with
+        hidden_channels=[400, 400] each
+      - losses (all weights = 1.0):
+          nb_attribute_reconstruction_loss          (cell branch NB)
+          nb_attribute_reconstruction_loss_nbr      (niche branch NB,
+                                                     aggregated post-decoder)
+          mse_commit_loss_cell
+          mse_commit_loss_niche
+          bce_cosine_adjacency_reconstruction_loss  (on z_q_niche, cosine sim,
+                                                     NicheCompass-style)
+      - adjacency BCE uses cosine_temperature=0.1, weight=250 (heavily
+        upweighted to balance against gene-NB ~150 nats — empirical sweet
+        spot on the MERFISH/STARmap MB panel)
+      - cosine-similarity adjacency operates on z_gnn (continuous niche
+        embedding, NicheCompass-faithful) by default; switch via
+        `loss_kwargs['adj_loss_input'] = 'z_q_niche'` to use the
+        quantized version
+      - the BCE input tensor is the FULL batch (including sampled
+        neighbours) so negative-edge sampling has enough nodes
+    """
+    cfg = make_train_config_poc()
+
+    # --- model class names ------------------------------------------------
+    cfg["model"]["model_name"]   = "VQNiche_Dual"
+    cfg["model"]["encoder_name"] = "VQNiche_Dual_Encoder"
+    cfg["model"]["adjacency_decoder_name"] = None   # not used
+
+    # --- encoder: replace single vq_params with two slots ----------------
+    enc = cfg["model"]["encoder_params"]
+    enc["vq_cell_params"]  = _default_vq_params(codebook_size=30)
+    enc["vq_niche_params"] = _default_vq_params(codebook_size=30)
+    enc.pop("vq_params", None)   # legacy single-codebook key — removed
+
+    # --- two attribute decoders ------------------------------------------
+    cfg["model"]["attribute_decoder_cell_params"]  = _copy(cfg["model"]["attribute_decoder_params"])
+    cfg["model"]["attribute_decoder_niche_params"] = _copy(cfg["model"]["attribute_decoder_params"])
+    cfg["model"].pop("attribute_decoder_params", None)
+    cfg["model"].pop("adjacency_decoder_params",  None)
+
+    # --- losses & weights -------------------------------------------------
+    # Niche NB uses the *_dual variant so it reads `dispersion_niche` instead
+    # of `dispersion` — i.e. the niche branch has its own per-gene NB
+    # dispersion, decoupled from the cell branch's dispersion. This is
+    # essential because the per-cell counts (cell branch) and the
+    # neighbourhood-mean counts (niche branch) have very different variance
+    # structure; sharing the dispersion forces a compromise that makes the
+    # cell-branch NB loss drift up over training.
+    cfg["model"]["loss_params"]["loss_names"] = [
+        "nb_attribute_reconstruction_loss",            # cell branch
+        "nb_attribute_reconstruction_loss_nbr_dual",   # niche branch (separate theta)
+        "mse_commit_loss_cell",
+        "mse_commit_loss_niche",
+        "bce_cosine_adjacency_reconstruction_loss",    # on z_q_niche
+    ]
+    lk = cfg["model"]["loss_params"]["loss_kwargs"]
+    # Drop legacy single-codebook flags that don't apply.
+    for k in ("recon_mode", "k_hop_nb_loss", "bypass_adj_decoder",
+              "estimate_adj_kwargs"):
+        lk.pop(k, None)
+    lk.update({
+        # Two primary reconstruction objectives at parity. Both are
+        # NB log-likelihood summed over 431 genes -> magnitudes ~150 nats.
+        "wt_attr_reconstr":     1.0,    # NB cell
+        "wt_attr_reconstr_nbr": 1.0,    # NB nbr
+        # VQ-VAE commit losses are SOFT regularisers, not reconstruction
+        # objectives. Original VQ-VAE paper (van den Oord 2017) uses
+        # beta=0.25 and notes "results are robust to beta". We default to
+        # 1.0 (slightly tighter than the paper's 0.25) but importantly NOT
+        # match-magnitude with NB — that would over-constrain the encoder.
+        # See response notes: equal-magnitude weighting is NOT recommended
+        # in VQ-VAE literature; commit terms are intentionally smaller.
+        "wt_commit_cell":       1.0,    # commit_cell
+        "wt_commit_niche":      1.0,    # commit_niche
+        # Adjacency BCE has small absolute magnitude (~0.5-1 nat at init,
+        # bounded by log(2)) — it must be UPWEIGHTED to balance against
+        # the gene-NB losses (~150 nats). Empirically `wt_adj_reconstr=250`
+        # gives the best niche-coherence on the MERFISH/STARmap MB panel
+        # while still letting NB Pearson improve. The earlier "Pearson
+        # drop after epoch 1" symptom turned out to be the codebook-size
+        # bottleneck (NB→niche-mean predictor pathology), NOT the adj
+        # weight, so we keep the high adjacency pressure here.
+        "wt_adj_reconstr":      250.0,  # cosine adj BCE (1.0 -> 100 -> 25 -> 250)
+        "edge_sampling_ratio":  2.0,
+        "use_pos_weight":       True,
+        "cosine_temperature":   0.1,
+        # Which embedding the adjacency BCE operates on:
+        #   "z_gnn"     -> continuous, NicheCompass-faithful (default)
+        #   "z_q_niche" -> quantized (opt-in via _patch_dual_adj_on_zqniche)
+        # See `bce_cosine_adjacency_reconstruction_loss` for the rationale.
+        "adj_loss_input":       "z_gnn",
+        # K-hop aggregation radius for the niche reconstruction target.
+        #   1 -> mean over the cell's 1-hop spatial neighbourhood (default,
+        #        legacy behaviour).
+        #   2 -> mean over the 2-hop neighbourhood. Smoother targets ->
+        #        the niche codebook is forced to capture larger-scale
+        #        spatial structure rather than 1-hop variation. Requires
+        #        the datamodule sampler to sample at least 2-hop neighbours
+        #        (`num_neighbors=[8, 8]` or deeper) to be exact.
+        "nbr_aggregation_hops": 1,
+    })
+
+    # The dual model doesn't yet support recon_mode-style modes (it always
+    # reconstructs both branches), but downstream code reads `recon_mode`
+    # from loss_kwargs in some places — set it to a no-op marker.
+    lk["recon_mode"]  = "dual"
+
+    # Monitor metric: training-loss based (as set up by the early-stopping
+    # patch). Pearson-based monitors still work; default to log1p-cell since
+    # the dual model produces a meaningful per-cell X_hat.
+    cfg["trainer"]["monitor"] = "train_pearson_gene_wise_log1p"
+
+    return cfg
+
+
+def _BD():
+    """Shorthand: deep-copy of the dual-VQ base config."""
+    return _copy(make_train_config_dualvq())
+
+
+# ---------------------------------------------------------------------------
+# 2d. VQNiche_Dual ablation patches
+# ---------------------------------------------------------------------------
+
+def _patch_dual_no_adj(cfg: dict) -> dict:
+    """Drop the adjacency BCE loss term (test if it's load-bearing)."""
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    if "bce_cosine_adjacency_reconstruction_loss" in losses:
+        losses.remove("bce_cosine_adjacency_reconstruction_loss")
+    return cfg
+
+
+def _patch_dual_no_cell_recon(cfg: dict) -> dict:
+    """
+    Drop the cell-branch NB loss + cell commit loss (test the niche-only
+    setup; the cell decoder still runs but receives no gradient signal).
+    Useful as a ceiling test for whether the cell branch helps the niche
+    branch via the shared MLP trunk.
+    """
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    for ln in ("nb_attribute_reconstruction_loss", "mse_commit_loss_cell"):
+        if ln in losses:
+            losses.remove(ln)
+    return cfg
+
+
+def _patch_dual_rvq(cfg: dict,
+                    branch: str = "both",
+                    codebook_sizes=(30, 200)) -> dict:
+    """
+    Swap one or both VQ slots for ResidualVQ_Squint. `branch` may be
+    'cell', 'niche', or 'both'.
+    """
+    if branch in ("cell", "both"):
+        cfg["model"]["encoder_params"]["vq_cell_params"]  = _default_rvq_params(codebook_sizes)
+    if branch in ("niche", "both"):
+        cfg["model"]["encoder_params"]["vq_niche_params"] = _default_rvq_params(codebook_sizes)
+    return cfg
+
+
+def _patch_dual_cvq(cfg: dict,
+                    branch: str = "both",
+                    k1: int = 30, k2: int = 10) -> dict:
+    """Swap one or both VQ slots for ConditionalVQ (tree)."""
+    if branch in ("cell", "both"):
+        cfg["model"]["encoder_params"]["vq_cell_params"]  = _default_cvq_params(k1, k2)
+    if branch in ("niche", "both"):
+        cfg["model"]["encoder_params"]["vq_niche_params"] = _default_cvq_params(k1, k2)
+    return cfg
+
+
+def _patch_dual_gatv2(cfg: dict) -> dict:
+    """Switch the GNN encoder from SAGE to GATv2 (still 1 layer)."""
+    cfg["model"]["encoder_params"]["gnn_name"] = "GATv2Conv"
+    return cfg
+
+
+def _patch_dual_adj_weight(cfg: dict, weight: float) -> dict:
+    """Override the adjacency BCE weight (default in the dual base is 250)."""
+    cfg["model"]["loss_params"]["loss_kwargs"]["wt_adj_reconstr"] = float(weight)
+    return cfg
+
+
+def _patch_dual_wide(
+        cfg: dict,
+        cell_codebook_size:  int = 50,
+        niche_codebook_size: int = 50,
+        gnn_layers:          int = 2,
+        sampler_neighbors:   List[int] = [8, 8],
+        nbr_hops:            int = 2,
+    ) -> dict:
+    """
+    "Wide" variant of the dual model: bigger codebooks + deeper GNN +
+    deeper sampler + multi-hop nbr aggregation. These knobs are coupled —
+    if you bump the GNN depth without bumping the sampler depth, the GNN
+    will see partial neighbourhoods and learn nonsense; if you bump the
+    nbr-target aggregation without the sampler, the K-th-hop aggregate is
+    approximate (computed on incomplete neighbour info). This patch sets
+    them all together.
+
+    Defaults (calibrated for ~100k cells / 50 niches):
+      - cell VQ k=50          (was 30)
+      - niche VQ k=50         (was 30)
+      - GNN num_layers=2      (was 1) — niche encoder sees 2-hop context
+      - sampler [8, 8]        (was [8]) — needed for the deeper GNN
+      - nbr_aggregation_hops=2 — niche target is the 2-hop neighbourhood
+                                 mean, encouraging codes to capture
+                                 larger-scale spatial structure
+    """
+    enc = cfg["model"]["encoder_params"]
+    enc["vq_cell_params"]["codebook_size"]  = int(cell_codebook_size)
+    enc["vq_niche_params"]["codebook_size"] = int(niche_codebook_size)
+    enc["gnn_params"]["num_layers"]         = int(gnn_layers)
+
+    cfg["datamodule"]["sampler_params"]["num_neighbors"] = list(sampler_neighbors)
+
+    cfg["model"]["loss_params"]["loss_kwargs"]["nbr_aggregation_hops"] = int(nbr_hops)
+    return cfg
+
+
+def _patch_dual_adj_on_zqniche(cfg: dict) -> dict:
+    """
+    Switch the adjacency BCE input from continuous z_gnn (default) to the
+    quantized z_q_niche. Lets you A/B continuous vs. quantized adjacency
+    while keeping every other knob fixed.
+    """
+    cfg["model"]["loss_params"]["loss_kwargs"]["adj_loss_input"] = "z_q_niche"
+    return cfg
 
 
 VARIANTS: dict = {
@@ -992,6 +1383,289 @@ VARIANTS: dict = {
         "patches": ["recon_mode=both", "+nb_attribute_reconstruction_loss_nbr",
                     "+cvq(k1=30, k2=10)"],
         "build": lambda: _patch_cvq(_patch_recon_both(_B()), k1=30, k2=10),
+    },
+    # ========================================================================
+    # NicheCompass-style ablation matrix on the recon-nbr base.
+    #
+    # The full `recon-nbr+ncc` variant bundled three changes vs. plain
+    # `recon-nbr`:
+    #     (i)   adjacency BCE active           = "+adj" or "+adj-bypass"
+    #     (ii)  adjacency input = z_q directly = "-bypass" suffix
+    #     (iii) encoder GNN = GATv2            = "+gatv2"
+    # The variants below isolate each change so we can attribute any
+    # improvement (or absence of improvement) to the specific component.
+    #
+    # Note:  `recon-nbr+adj` already exists above (standard +adj with MLP
+    # adjacency decoder, weight=1.0, GraphSAGE encoder). Together with the
+    # three ablations below + the full `recon-nbr+ncc`, this gives the full
+    # 2x3 matrix {SAGE, GATv2} x {no adj, adj-MLP, adj-bypass}.
+    # ========================================================================
+    "recon-nbr+adj-bypass": {
+        "description": (
+            "recon-nbr + NicheCompass-style adjacency BCE on z_q (raw "
+            "inner-product formulation: edge_logit_ij = z_q_i^T z_q_j, "
+            "bypassing the SQUINT adjacency_decoder MLP) at weight 1.0. "
+            "Encoder is unchanged (GraphSAGE). This isolates the bypass-MLP "
+            "change vs. `recon-nbr+adj` (which uses the same weight but "
+            "keeps the adjacency_decoder MLP)."
+        ),
+        "patches": [
+            "recon_mode=nbr",
+            "+bce_adjacency_reconstruction_loss",
+            "+nichecompass_adj(weight=1.0, bypass_adj_decoder=True)",
+        ],
+        "build": lambda: _patch_nichecompass_adj(
+                            _patch_recon_nbr(_B()),
+                            weight=1.0),
+    },
+    "recon-nbr+gatv2": {
+        "description": (
+            "recon-nbr with the encoder GNN switched from GraphSAGE to "
+            "GATv2 (dynamic attention). No adjacency reconstruction loss. "
+            "Isolates the GATv2 change vs. plain `recon-nbr`."
+        ),
+        "patches": ["recon_mode=nbr", "+gatv2_encoder"],
+        "build": lambda: _patch_gatv2_encoder(_patch_recon_nbr(_B())),
+    },
+    "recon-nbr+gatv2+adj": {
+        "description": (
+            "recon-nbr + GATv2 encoder + standard SQUINT adjacency BCE "
+            "(weight=1.0, MLP adjacency_decoder still on the gradient path). "
+            "Tests GATv2 + standard adjacency — between `recon-nbr+gatv2` "
+            "(GATv2 alone) and `recon-nbr+ncc` (GATv2 + bypass adj)."
+        ),
+        "patches": ["recon_mode=nbr", "+gatv2_encoder",
+                    "+bce_adjacency_reconstruction_loss(weight=1.0)"],
+        "build": lambda: _patch_adj(
+                            _patch_gatv2_encoder(_patch_recon_nbr(_B())),
+                            weight=1.0),
+    },
+    "recon-nbr+ncc": {
+        "description": (
+            "NicheCompass-shaped recon-nbr: GATv2 encoder + neighbourhood-only "
+            "NB reconstruction + NicheCompass-style adjacency BCE on z_q "
+            "(bypassing the SQUINT adjacency_decoder MLP) at weight 1.0. "
+            "Tests the full bundle of NicheCompass-style changes."
+        ),
+        "patches": [
+            "recon_mode=nbr",
+            "+gatv2_encoder",
+            "+bce_adjacency_reconstruction_loss",
+            "+nichecompass_adj(weight=1.0, bypass_adj_decoder=True)",
+        ],
+        "build": lambda: _patch_nichecompass_adj(
+                            _patch_gatv2_encoder(
+                                _patch_recon_nbr(_B())),
+                            weight=1.0),
+    },
+    # ========================================================================
+    # VQNiche_Dual variants
+    # ========================================================================
+    # Two parallel codebooks: cell (post-MLP, pre-aggregation) and niche
+    # (post-GNN). Cell decoder reconstructs per-cell counts; niche decoder
+    # reconstructs neighbourhood-mean counts; cosine-similarity BCE on
+    # z_q_niche enforces spatial coherence on the niche codebook.
+    # ========================================================================
+    "dualvq": {
+        "description": (
+            "VQNiche_Dual baseline: two single-codebook VQs (k=30 each), "
+            "shared MLP trunk, GraphSAGE GNN feeding the niche branch. "
+            "Joint losses: NB(cell) + NB(nbr) + commit_cell + commit_niche "
+            "+ cosine-sim adjacency BCE on z_q_niche. All weights = 1.0."
+        ),
+        "patches": ["dualvq_baseline"],
+        "build": lambda: _BD(),
+    },
+    "dualvq+rvq-niche": {
+        "description": (
+            "Dual VQ with RVQ on the niche branch only "
+            "(levels=[30, 200]). Cell branch is plain VectorQuantize(k=30). "
+            "Tests whether scaling capacity on the niche side helps niche "
+            "discrimination without affecting the cell branch."
+        ),
+        "patches": ["+rvq(branch=niche, levels=[30, 200])"],
+        "build": lambda: _patch_dual_rvq(_BD(), branch="niche", codebook_sizes=(30, 200)),
+    },
+    "dualvq+rvq-cell": {
+        "description": (
+            "Dual VQ with RVQ on the cell branch only "
+            "(levels=[30, 200]). Niche branch is plain VectorQuantize(k=30). "
+            "Tests whether the cell codebook benefits from extra capacity."
+        ),
+        "patches": ["+rvq(branch=cell, levels=[30, 200])"],
+        "build": lambda: _patch_dual_rvq(_BD(), branch="cell", codebook_sizes=(30, 200)),
+    },
+    "dualvq+rvq-both": {
+        "description": (
+            "Dual VQ with RVQ on BOTH branches (levels=[30, 200] each). "
+            "Maximum capacity per branch."
+        ),
+        "patches": ["+rvq(branch=both, levels=[30, 200])"],
+        "build": lambda: _patch_dual_rvq(_BD(), branch="both", codebook_sizes=(30, 200)),
+    },
+    "dualvq+cvq-niche": {
+        "description": (
+            "Dual VQ with ConditionalVQ on the niche branch (K1=30, K2=10). "
+            "Cell branch unchanged. Tree-structured niche codebook."
+        ),
+        "patches": ["+cvq(branch=niche, k1=30, k2=10)"],
+        "build": lambda: _patch_dual_cvq(_BD(), branch="niche", k1=30, k2=10),
+    },
+    "dualvq+gatv2": {
+        "description": (
+            "Dual VQ with GATv2 GNN (instead of GraphSAGE). Tests whether "
+            "attention-weighted aggregation makes the niche branch sharper."
+        ),
+        "patches": ["+gatv2_encoder"],
+        "build": lambda: _patch_dual_gatv2(_BD()),
+    },
+    "dualvq+adj-mild": {
+        "description": (
+            "Dual VQ with adjacency BCE DOWN-weighted to 25 (vs. default 250). "
+            "Tests how much spatial coherence is sacrificed at 1/10 the "
+            "default weight. Useful sanity check that the high default is "
+            "actually doing useful work."
+        ),
+        "patches": ["+cosine_adj(weight=25)"],
+        "build": lambda: _patch_dual_adj_weight(_BD(), weight=25.0),
+    },
+    "dualvq+adj-strong": {
+        "description": (
+            "Dual VQ with adjacency BCE UP-weighted to 500 (vs. default 250). "
+            "Tests whether 2x default weight further improves niche-code "
+            "spatial coherence. Will likely sacrifice some NB Pearson."
+        ),
+        "patches": ["+cosine_adj(weight=500)"],
+        "build": lambda: _patch_dual_adj_weight(_BD(), weight=500.0),
+    },
+    "dualvq+adj-extreme": {
+        "description": (
+            "Dual VQ with adjacency BCE UP-weighted to 1000 (vs. default 250). "
+            "Maximum spatial-coherence pressure. Expect noticeable NB "
+            "Pearson degradation — useful only as an upper-bound run for "
+            "what spatial coherence looks like when adjacency dominates."
+        ),
+        "patches": ["+cosine_adj(weight=1000)"],
+        "build": lambda: _patch_dual_adj_weight(_BD(), weight=1000.0),
+    },
+    # ========================================================================
+    # "Wide" dualvq variants — deeper GNN + deeper sampler + bigger codebooks
+    # + 2-hop nbr aggregation. Recommended starting point for niche-focused
+    # runs once the basic dualvq architecture is validated.
+    # ========================================================================
+    "dualvq+wide": {
+        "description": (
+            "Wide dual VQ: GNN num_layers=2 (sees 2-hop context), sampler "
+            "[8, 8] (provides 2-hop neighbours), VQ k=50 per branch, niche "
+            "target aggregated over 2-hop neighbourhood. The GNN/sampler/"
+            "aggregation depths are all coupled so the receptive field is "
+            "consistent end-to-end."
+        ),
+        "patches": [
+            "+gnn_layers=2", "+sampler=[8,8]",
+            "+codebook_size=50 (cell+niche)", "+nbr_aggregation_hops=2",
+        ],
+        "build": lambda: _patch_dual_wide(_BD()),
+    },
+    "dualvq+wide+rvq-niche": {
+        "description": (
+            "Wide dual VQ + RVQ on the niche branch (levels=[30, 90], "
+            "2700 effective niche codes). Cell branch is plain VQ k=50. "
+            "Smaller-than-max capacity for first-pass testing — converges "
+            "faster, less risk of underused level-2 codes, still 54x more "
+            "effective codes than the K=50 baseline."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=niche, levels=[30, 90])",
+        ],
+        "build": lambda: _patch_dual_rvq(
+            _patch_dual_wide(_BD()),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+    },
+    "dualvq+wide+rvq-both": {
+        "description": (
+            "Wide dual VQ + RVQ on BOTH branches (levels=[30, 90] each, "
+            "2700 effective codes per branch). Symmetric capacity for "
+            "easy A/B against `+rvq-niche`. Use when cell-state granularity "
+            "matters too. Bump to [50, 200] / [50, 100] later if the "
+            "smaller sizes saturate."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=niche, levels=[30, 90])",
+            "+rvq(branch=cell, levels=[30, 90])",
+        ],
+        "build": lambda: _patch_dual_rvq(
+            _patch_dual_rvq(
+                _patch_dual_wide(_BD()),
+                branch="niche", codebook_sizes=(30, 90),
+            ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+    },
+    "dualvq+wide+cvq-niche": {
+        "description": (
+            "Wide dual VQ + ConditionalVQ (tree) on the niche branch "
+            "(K1=30 macro niches, K2=5 sub-niches per macro = 150 "
+            "effective). Conservative tree size: ~100k / 30 ≈ 3300 cells "
+            "per macro niche, then / 5 ≈ 660 cells per (macro, sub) pair "
+            "— well above the threshold where level-2 EMA becomes noisy."
+        ),
+        "patches": [
+            "+wide", "+cvq(branch=niche, k1=30, k2=5)",
+        ],
+        "build": lambda: _patch_dual_cvq(
+            _patch_dual_wide(_BD()),
+            branch="niche", k1=30, k2=5,
+        ),
+    },
+    "dualvq+wide+cvq-both": {
+        "description": (
+            "Wide dual VQ + ConditionalVQ (tree) on BOTH branches "
+            "(K1=30, K2=5 each = 150 effective codes per branch). "
+            "Symmetric tree-structured codebooks for easy A/B against "
+            "`+rvq-both`. Cell branch gets a coarse cell-type → "
+            "cell-state hierarchy; niche branch gets a macro-niche → "
+            "sub-niche hierarchy. Same per-(K1, K2)-bucket data as "
+            "`+cvq-niche` (~660 cells), so level-2 EMA is well-conditioned."
+        ),
+        "patches": [
+            "+wide", "+cvq(branch=both, k1=30, k2=5)",
+        ],
+        "build": lambda: _patch_dual_cvq(
+            _patch_dual_wide(_BD()),
+            branch="both", k1=30, k2=5,
+        ),
+    },
+    "dualvq+adj-on-zqniche": {
+        "description": (
+            "Dual VQ with the adjacency BCE input switched from z_gnn "
+            "(continuous, default) to z_q_niche (quantized). Useful for "
+            "A/B testing whether the continuous-vs-quantized choice matters "
+            "in practice. Adjacency weight kept at the default (100); pair "
+            "with `_patch_dual_adj_weight` for higher weights."
+        ),
+        "patches": ["+cosine_adj(input=z_q_niche)"],
+        "build": lambda: _patch_dual_adj_on_zqniche(_BD()),
+    },
+    "dualvq-no-adj": {
+        "description": (
+            "Dual VQ WITHOUT the cosine-sim adjacency BCE. Niche branch is "
+            "supervised only by neighbourhood NB. Tests whether the "
+            "adjacency term is load-bearing for spatial code coherence."
+        ),
+        "patches": ["-cosine_adj"],
+        "build": lambda: _patch_dual_no_adj(_BD()),
+    },
+    "dualvq-niche-only": {
+        "description": (
+            "Dual VQ with the cell-branch NB and cell-commit losses dropped: "
+            "only the niche branch is supervised. The cell decoder/codebook "
+            "still run forward but receive no gradient. Tests whether the "
+            "cell branch contributes useful signal to the shared MLP trunk."
+        ),
+        "patches": ["-nb_cell", "-commit_cell"],
+        "build": lambda: _patch_dual_no_cell_recon(_BD()),
     },
     # ---- Full SQUINT (all components) -------------------------------------
     "full": {
@@ -1305,14 +1979,28 @@ def train(variant: str):
         cfg["model"]["encoder_params"]["spatial_prior_params"][
             "spatial_prior_feature_dim"
         ] = data_batch.spatial_prior_feature_dim
-    if "conditioning_params" in cfg["model"]["attribute_decoder_params"]:
-        cfg["model"]["attribute_decoder_params"]["conditioning_params"][
-            "condition_dim"
-        ] = data_batch.attr_decoder_condition_dim
-    if "conditioning_params" in cfg["model"]["adjacency_decoder_params"]:
-        cfg["model"]["adjacency_decoder_params"]["conditioning_params"][
-            "condition_dim"
-        ] = data_batch.adj_decoder_condition_dim
+    # Bind FiLM condition dims onto whichever decoder param dicts the
+    # current config carries. Single-codebook configs (VQNiche etc.) use
+    # `attribute_decoder_params` + `adjacency_decoder_params`. The
+    # dual-codebook config (VQNiche_Dual) uses
+    # `attribute_decoder_cell_params` + `attribute_decoder_niche_params`
+    # and has no adjacency decoder.
+    for dec_key in ("attribute_decoder_params",
+                    "attribute_decoder_cell_params",
+                    "attribute_decoder_niche_params"):
+        dec_params = cfg["model"].get(dec_key)
+        if dec_params is None:
+            continue
+        if "conditioning_params" in dec_params:
+            dec_params["conditioning_params"]["condition_dim"] = (
+                data_batch.attr_decoder_condition_dim
+            )
+    if "adjacency_decoder_params" in cfg["model"]:
+        adj_params = cfg["model"]["adjacency_decoder_params"]
+        if "conditioning_params" in adj_params:
+            adj_params["conditioning_params"]["condition_dim"] = (
+                data_batch.adj_decoder_condition_dim
+            )
 
     model = initialize_model(
         config=cfg,
@@ -1538,6 +2226,20 @@ def _build_clean_adata_from_inference(
     if "H_adj" in inference_data:
         adata.obsm["X_squint_adj"] = to_np(inference_data["H_adj"])
 
+    # ---- VQNiche_Dual: cell- and niche-branch quantized embeddings ----
+    # Per design choice D6: keep them under the user-facing names
+    # 'cell_emb' and 'neighborhood_emb' so analysis tools can address each
+    # branch directly.
+    if "H_quantized_cell" in inference_data:
+        adata.obsm["cell_emb"] = to_np(inference_data["H_quantized_cell"])
+    if "H_quantized_niche" in inference_data:
+        adata.obsm["neighborhood_emb"] = to_np(inference_data["H_quantized_niche"])
+    # Also expose the pre-quantization continuous latents for diagnostics.
+    if "H_latent_cell" in inference_data:
+        adata.obsm["cell_latent"] = to_np(inference_data["H_latent_cell"])
+    if "H_latent_niche" in inference_data:
+        adata.obsm["neighborhood_latent"] = to_np(inference_data["H_latent_niche"])
+
     # ---- codebook indices -> .obs (single head) or .obsm (multi-head) ----
     num_heads = int(inference_data.get("num_heads", 1))
     if "Indices" in inference_data:
@@ -1546,6 +2248,20 @@ def _build_clean_adata_from_inference(
             adata.obs["code_index"] = idx.reshape(-1).astype(int)
         else:
             adata.obsm["code_indices"] = idx.astype(int)
+
+    # ---- VQNiche_Dual: per-branch codebook indices ----
+    # Same single/multi-dim convention as for legacy 'Indices' — 1D goes to
+    # `obs[<prefix>_code_index]`, multi-level/multi-head to
+    # `obsm[<prefix>_code_indices]`. Prefixes match D6: 'cell' / 'neighborhood'.
+    for src_key, prefix in [("Indices_cell", "cell"),
+                            ("Indices_niche", "neighborhood")]:
+        if src_key not in inference_data:
+            continue
+        idx = to_np(inference_data[src_key])
+        if idx.ndim == 1 or (idx.ndim == 2 and idx.shape[1] == 1):
+            adata.obs[f"{prefix}_code_index"] = idx.reshape(-1).astype(int)
+        else:
+            adata.obsm[f"{prefix}_code_indices"] = idx.astype(int)
 
     # ---- reconstructions + neighbourhood ground truth -> .layers ----
     if "X_hat" in inference_data:
@@ -1562,13 +2278,26 @@ def _build_clean_adata_from_inference(
     # ---- global metadata ----
     num_quantizers = int(inference_data.get("num_quantizers", 1))
     cb_sizes       = inference_data.get("codebook_sizes", None)
-    adata.uns["squint"] = {
+    squint_meta = {
         "codebook_size":     int(inference_data.get("codebook_size", 0)),
         "num_heads":         num_heads,
         "num_quantizers":    num_quantizers,
         "codebook_sizes":    list(cb_sizes) if cb_sizes is not None else None,
         "separate_codebook": bool(inference_data.get("separate", False)),
     }
+    # If this is a dual-model run, also expose per-branch codebook metadata
+    # under explicit `cell` / `niche` keys so analysis code can branch on
+    # them without having to inspect the obs/obsm slots.
+    is_dual = ("H_quantized_cell" in inference_data) or ("H_quantized_niche" in inference_data)
+    if is_dual:
+        squint_meta["dual"] = True
+        for branch in ("cell", "niche"):
+            squint_meta[f"codebook_size_{branch}"]  = int(inference_data.get(f"codebook_size_{branch}", 0))
+            squint_meta[f"num_quantizers_{branch}"] = int(inference_data.get(f"num_quantizers_{branch}", 1))
+            cb_sz = inference_data.get(f"codebook_sizes_{branch}", None)
+            if cb_sz is not None:
+                squint_meta[f"codebook_sizes_{branch}"] = list(cb_sz)
+    adata.uns["squint"] = squint_meta
     if "edge_index" in inference_data:
         # Keep edges in .uns — they're a graph-level object, not per-cell.
         adata.uns["edge_index"] = to_np(inference_data["edge_index"])

@@ -17,12 +17,16 @@ from vqniche.loss import (
     mse_attribute_reconstruction_loss,
     nb_attribute_reconstruction_loss,
     nb_nbr_attribute_reconstruction_loss,
+    nb_nbr_attribute_reconstruction_loss_dual,
     mse_adjacency_reconstruction_loss,
     bce_adjacency_reconstruction_loss,
+    bce_cosine_adjacency_reconstruction_loss,
     mse_joint_code_commit_loss,
     ce_spatial_prior_loss,
     mse_commit_loss,
     mse_code_loss,
+    mse_commit_loss_cell,
+    mse_commit_loss_niche,
     l2_codebook_orthogonal_regularization_loss,
     mask_token_regularization
 )
@@ -259,6 +263,75 @@ class BaseModel(pl.LightningModule):
                 wt_adj_reconstr = loss_kwargs.get('wt_adj_reconstr')
                 if wt_adj_reconstr is not None:
                     loss_fn_params['wt_adj_reconstr'] = wt_adj_reconstr
+
+            elif loss_fn_name == 'nb_attribute_reconstruction_loss_nbr_dual':
+                # Niche-branch NB for VQNiche_Dual with a SEPARATE dispersion
+                # parameter (`dispersion_niche`) decoupled from the cell-branch
+                # dispersion. See `nb_nbr_attribute_reconstruction_loss_dual`
+                # for the rationale (variance structure differs between
+                # per-cell and neighbourhood-mean targets).
+                loss_fn = nb_nbr_attribute_reconstruction_loss_dual
+                loss_fn_data_keys = ['pred_attr_nbr', 'target_attr_nbr',
+                                     'edge_index', 'batch_size', 'dispersion_niche']
+                loss_fn_params['k_hop_nb_loss'] = 0
+                wt_attr_reconstr_nbr = loss_kwargs.get('wt_attr_reconstr_nbr')
+                if wt_attr_reconstr_nbr is not None:
+                    loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr_nbr
+                else:
+                    wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
+                    if wt_attr_reconstr is not None:
+                        loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
+
+            elif loss_fn_name == 'bce_cosine_adjacency_reconstruction_loss':
+                # NicheCompass-style adjacency reconstruction via cosine
+                # similarity. Operates on either:
+                #   - 'z_gnn' (continuous, default; NicheCompass-faithful)
+                #   - 'z_q_niche' (quantized, opt-in)
+                # Selected by `loss_kwargs['adj_loss_input']`.
+                loss_fn = bce_cosine_adjacency_reconstruction_loss
+
+                adj_input = loss_kwargs.get('adj_loss_input', 'z_gnn')
+                if adj_input not in ('z_gnn', 'z_q_niche'):
+                    raise ValueError(
+                        f"loss_kwargs['adj_loss_input'] must be one of "
+                        f"{{'z_gnn', 'z_q_niche'}}, got {adj_input!r}."
+                    )
+                loss_fn_data_keys = ['batch_size', 'batch_edge_index', adj_input]
+
+                edge_sampling_ratio = loss_kwargs.get('edge_sampling_ratio')
+                if edge_sampling_ratio is not None:
+                    loss_fn_params['edge_sampling_ratio'] = edge_sampling_ratio
+                use_pos_weight = loss_kwargs.get('use_pos_weight')
+                if use_pos_weight is not None:
+                    loss_fn_params['use_pos_weight'] = use_pos_weight
+                cosine_temperature = loss_kwargs.get('cosine_temperature')
+                if cosine_temperature is not None:
+                    loss_fn_params['cosine_temperature'] = cosine_temperature
+                wt_adj_reconstr = loss_kwargs.get('wt_adj_reconstr')
+                if wt_adj_reconstr is not None:
+                    loss_fn_params['wt_adj_reconstr'] = wt_adj_reconstr
+
+            elif loss_fn_name == 'mse_commit_loss_cell':
+                # Commit loss for the CELL branch of VQNiche_Dual. Pulls
+                # z_mlp toward z_q_cell. Disjoint from the niche branch.
+                loss_fn = mse_commit_loss_cell
+                loss_fn_data_keys = ['quantizer_input_cell', 'quantizer_output_cell']
+                wt_commit_cell = loss_kwargs.get('wt_commit_cell')
+                if wt_commit_cell is None:
+                    wt_commit_cell = loss_kwargs.get('wt_commit')
+                if wt_commit_cell is not None:
+                    loss_fn_params['wt_commit'] = wt_commit_cell
+
+            elif loss_fn_name == 'mse_commit_loss_niche':
+                # Commit loss for the NICHE branch of VQNiche_Dual. Pulls
+                # z_gnn toward z_q_niche. Disjoint from the cell branch.
+                loss_fn = mse_commit_loss_niche
+                loss_fn_data_keys = ['quantizer_input_niche', 'quantizer_output_niche']
+                wt_commit_niche = loss_kwargs.get('wt_commit_niche')
+                if wt_commit_niche is None:
+                    wt_commit_niche = loss_kwargs.get('wt_commit')
+                if wt_commit_niche is not None:
+                    loss_fn_params['wt_commit'] = wt_commit_niche
 
             elif loss_fn_name == 'mse_joint_code_commit_loss':
                 loss_fn = mse_joint_code_commit_loss
@@ -685,11 +758,16 @@ class BaseModel(pl.LightningModule):
                 label_categories_dict=None,
             )
 
-            # 5) Compute the benchmarking metrics
+            # 5) Compute the benchmarking metrics.
+            # `estimate_adj_kwargs` is only meaningful for the legacy MLP
+            # adjacency-decoder path; the dual model and any other variant
+            # without that decoder doesn't carry it. Default to {} so we
+            # don't crash here; metrics that genuinely need it will skip
+            # themselves on missing inputs.
             metrics_dict = compute_benchmarking_metrics(
                 adata=adata,
                 metrics=metrics_list,
-                **self.loss_kwargs['estimate_adj_kwargs'],
+                **self.loss_kwargs.get('estimate_adj_kwargs', {}),
             )
             
             # 6) Clear the inference data cache

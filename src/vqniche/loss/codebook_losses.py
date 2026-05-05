@@ -45,6 +45,46 @@ def mse_commit_loss(
     return commit_loss * wt_commit
 
 
+def mse_commit_loss_cell(
+        quantizer_input_cell: torch.Tensor,
+        quantizer_output_cell: torch.Tensor,
+        wt_commit: float = 0.25
+    ) -> torch.Tensor:
+    """
+    Cell-branch commit loss for the dual VQ architecture (VQNiche_Dual).
+
+    Thin wrapper around `mse_commit_loss` that accepts the suffixed kwarg
+    names `quantizer_input_cell` / `quantizer_output_cell` so that the
+    loss-dispatcher's key-based lookup can register it independently of
+    the niche-branch commit loss without colliding on the legacy keys.
+
+    The two commit-loss branches in VQNiche_Dual are *disjoint*:
+        cell:  pulls z_mlp toward z_q_cell  (per-cell features)
+        niche: pulls z_gnn toward z_q_niche (post-aggregation features)
+    """
+    return mse_commit_loss(
+        quantizer_input=quantizer_input_cell,
+        quantizer_output=quantizer_output_cell,
+        wt_commit=wt_commit,
+    )
+
+
+def mse_commit_loss_niche(
+        quantizer_input_niche: torch.Tensor,
+        quantizer_output_niche: torch.Tensor,
+        wt_commit: float = 0.25
+    ) -> torch.Tensor:
+    """
+    Niche-branch commit loss for the dual VQ architecture (VQNiche_Dual).
+    See `mse_commit_loss_cell` for the rationale.
+    """
+    return mse_commit_loss(
+        quantizer_input=quantizer_input_niche,
+        quantizer_output=quantizer_output_niche,
+        wt_commit=wt_commit,
+    )
+
+
 def mse_code_loss(
         quantizer_input: torch.Tensor,
         quantizer_output: torch.Tensor,
