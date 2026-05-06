@@ -765,10 +765,17 @@ class BaseModel(pl.LightningModule):
                 inference_data_cache[key] = torch.cat(inference_data_cache[key], dim=0)
             inference_data_cache['edge_index'] = dataloader.data.edge_index
 
-            # 4) Convert the inference data to an AnnData object
+            # 4) Convert the inference data to an AnnData object. Pass
+            # the per-AnnData `obs` DataFrames (collected at blob-build
+            # time and stashed on the datamodule) so every column from
+            # every input AnnData ends up on the inference output adata,
+            # NaN-filled for cells from sources that don't carry the column.
             adata = inference_data_dict_to_adata(
                 inference_data=inference_data_cache,
                 label_categories_dict=None,
+                obs_per_batch_id=getattr(
+                    self.trainer.datamodule, 'obs_per_batch_id', None,
+                ),
             )
 
             # 5) Compute the benchmarking metrics.

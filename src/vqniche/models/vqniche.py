@@ -931,6 +931,17 @@ class VQNiche(BaseModel):
         cache_dict['XY_coordinates'].append(batch.xy_coordinates[:batch_size])
         cache_dict['adata_batch_ids'].append(batch.adata_batch_ids[:batch_size])
 
+        # Optional per-cell row index INTO the source AnnData's `.obs` —
+        # used together with `adata_batch_ids` to look up arbitrary obs
+        # columns from `dataset_blob.obs_per_batch_id` when building the
+        # inference output AnnData. Same dynamic-cache pattern as `y_*`.
+        if getattr(batch, 'obs_row_index', None) is not None:
+            if 'obs_row_index' not in cache_dict:
+                cache_dict['obs_row_index'] = []
+                if 'obs_row_index' not in self.cache_keys:
+                    self.cache_keys.append('obs_row_index')
+            cache_dict['obs_row_index'].append(batch.obs_row_index[:batch_size])
+
         # Cache model outputs
         cache_dict['H_latent'].append(h_latent[:batch_size])
         cache_dict['H_quantized'].append(h_quantized[:batch_size])

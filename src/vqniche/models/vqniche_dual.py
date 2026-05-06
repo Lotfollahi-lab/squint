@@ -97,6 +97,7 @@ class VQNiche_Dual(BaseModel):
             adversarial_batch_dim: int = 0,
             adversarial_alpha: float = 1.0,
             adversarial_hidden_channels: Optional[List[int]] = None,
+            adversarial_warmup_epochs: int = 0,
         ):
         # BaseModel.__init__ stores names + builds the loss-fn dispatcher.
         # We pass placeholder values for adjacency_decoder_name (unused)
@@ -232,7 +233,12 @@ class VQNiche_Dual(BaseModel):
     # ------------------------------------------------------------------
 
     def _init_inference_data_caches(self) -> None:
-        # Tensors that will be torch.cat'd at the end of each epoch.
+        # Tensors that will be torch.cat'd at the end of each epoch. The
+        # optional per-cell `obs_row_index` (added together with
+        # `adata_batch_ids` to form a unique per-cell key for arbitrary-
+        # obs-column lookup at inference time) is added dynamically inside
+        # `_cache_inference_data` only if the dataloader carries it — same
+        # convention as the optional `y_*` label tensors below.
         data_keys = ['X', 'X_nbr', 'XY_coordinates', 'adata_batch_ids']
         cell_keys  = ['H_latent_cell',  'H_quantized_cell',  'Indices_cell',  'X_hat']
         niche_keys = ['H_latent_niche', 'H_quantized_niche', 'Indices_niche', 'X_hat_nbr']
@@ -276,6 +282,7 @@ class VQNiche_Dual(BaseModel):
             batch_x: torch.Tensor,
             batch_edge_index: torch.Tensor,
             batch_encoder_conditions: Optional[torch.Tensor] = None,
+            batch_attr_decoder_conditions: Optional[torch.Tensor] = None,
             read_depth: Optional[torch.Tensor] = None,
             adata_batch_ids: Optional[torch.Tensor] = None,
         ):
@@ -321,14 +328,22 @@ class VQNiche_Dual(BaseModel):
             z_q_niche_in = z_q_niche
 
         # Cell decoder: z_q_cell -> per-cell prediction at the cell's read depth.
+        # `batch_attr_decoder_conditions` is threaded through to the decoder so
+        # FiLM-conditioned variants (apply_conditioning='in-MLP' / 'pre-MLP')
+        # can modulate each layer with the per-cell batch one-hot. With
+        # `apply_conditioning=None` the decoder ignores `conditions`.
         xhat_cell = self.attribute_decoder_cell(
-            x=z_q_cell_in, read_depth=read_depth, conditions=None,
+            x=z_q_cell_in,
+            read_depth=read_depth,
+            conditions=batch_attr_decoder_conditions,
         )
         # Niche decoder: z_q_niche -> per-cell prediction. We compute the NB
         # loss on the *aggregated* (1-hop neighborhood mean) version of this
         # output against the aggregated true counts — see training_step.
         xhat_niche = self.attribute_decoder_niche(
-            x=z_q_niche_in, read_depth=read_depth, conditions=None,
+            x=z_q_niche_in,
+            read_depth=read_depth,
+            conditions=batch_attr_decoder_conditions,
         )
 
         logits = self.predictor(z_mlp)
@@ -348,8 +363,9 @@ class VQNiche_Dual(BaseModel):
         """
         batch_size = batch.batch_size
 
-        encoder_conditions = getattr(batch, 'encoder_conditions', None)
-        adata_batch_ids    = getattr(batch, 'adata_batch_ids',    None)
+        encoder_conditions      = getattr(batch, 'encoder_conditions',      None)
+        attr_decoder_conditions = getattr(batch, 'attr_decoder_conditions', None)
+        adata_batch_ids         = getattr(batch, 'adata_batch_ids',         None)
 
         (z_mlp, z_gnn, z_q_cell, z_q_niche,
          idx_cell, idx_niche,
@@ -357,6 +373,7 @@ class VQNiche_Dual(BaseModel):
             batch_x=batch.x,
             batch_edge_index=batch.edge_index,
             batch_encoder_conditions=encoder_conditions,
+            batch_attr_decoder_conditions=attr_decoder_conditions,
             read_depth=batch.x.sum(dim=-1),
             adata_batch_ids=adata_batch_ids,
         )
@@ -419,8 +436,17 @@ class VQNiche_Dual(BaseModel):
         )
 
         # Adversarial batch-invariance head: predict batch from z_mlp;
-        # GRL inside the head ensures encoder is pushed AWAY from being
+        # GRL inside the head ensures the encoder is pushed AWAY from being
         # batch-predictive when this loss is back-propagated.
+        #
+        # We classify the FULL z_mlp tensor (seeds + sampled neighbours), not
+        # just the seed-node prefix. The niche branch's GNN aggregates over
+        # neighbour z_mlp activations to produce z_gnn, so to make z_gnn
+        # batch-invariant we need every input to that aggregation — i.e.
+        # every row of z_mlp — to be pushed toward batch-invariance, not
+        # only the seed rows. Restricting the adversary to z_mlp[:batch_size]
+        # leaves the encoder free to encode batch info in non-seed rows
+        # which then leak into z_gnn via the GNN.
         batch_logits_for_loss = None
         if self.batch_adversary is not None:
             if adata_batch_ids is None:
@@ -431,12 +457,8 @@ class VQNiche_Dual(BaseModel):
                     "that initialize_databatch is being called for this "
                     "variant."
                 )
-            # Use only the SEED nodes (first batch_size rows) — the per-cell
-            # adversarial loss should weight all training cells equally,
-            # not over-count sampled neighbours.
-            z_mlp_seed = z_mlp[:batch_size]
             batch_logits_for_loss = self.batch_adversary(
-                z_mlp_seed, alpha=self.adversarial_alpha,
+                z_mlp, alpha=self.adversarial_alpha,
             )
 
         loss_data = {
@@ -477,9 +499,11 @@ class VQNiche_Dual(BaseModel):
 
         # Adversarial batch loss data (only when the adversary is built).
         # Loss dispatcher reads `batch_logits` and `batch_labels` keys.
+        # FULL-batch labels (seeds + sampled neighbours) — paired 1:1 with
+        # the FULL `z_mlp` we just classified above.
         if batch_logits_for_loss is not None:
             loss_data['batch_logits'] = batch_logits_for_loss
-            loss_data['batch_labels'] = adata_batch_ids[:batch_size].long()
+            loss_data['batch_labels'] = adata_batch_ids.long()
 
         loss_value = self.common_step(
             batch_loss_data=loss_data,
@@ -515,14 +539,16 @@ class VQNiche_Dual(BaseModel):
     def test_step(self, test_batch) -> None:
         # No loss computation in test_step; just cache.
         batch_size = test_batch.batch_size
-        encoder_conditions = getattr(test_batch, 'encoder_conditions', None)
-        adata_batch_ids    = getattr(test_batch, 'adata_batch_ids',    None)
+        encoder_conditions      = getattr(test_batch, 'encoder_conditions',      None)
+        attr_decoder_conditions = getattr(test_batch, 'attr_decoder_conditions', None)
+        adata_batch_ids         = getattr(test_batch, 'adata_batch_ids',         None)
         (z_mlp, z_gnn, z_q_cell, z_q_niche,
          idx_cell, idx_niche,
          xhat_cell, xhat_niche, _logits) = self(
             batch_x=test_batch.x,
             batch_edge_index=test_batch.edge_index,
             batch_encoder_conditions=encoder_conditions,
+            batch_attr_decoder_conditions=attr_decoder_conditions,
             read_depth=test_batch.x.sum(dim=-1),
             adata_batch_ids=adata_batch_ids,
         )
@@ -542,14 +568,16 @@ class VQNiche_Dual(BaseModel):
         the trainer can stitch a final inference dict together.
         """
         batch_size = predict_batch.batch_size
-        encoder_conditions = getattr(predict_batch, 'encoder_conditions', None)
-        adata_batch_ids    = getattr(predict_batch, 'adata_batch_ids',    None)
+        encoder_conditions      = getattr(predict_batch, 'encoder_conditions',      None)
+        attr_decoder_conditions = getattr(predict_batch, 'attr_decoder_conditions', None)
+        adata_batch_ids         = getattr(predict_batch, 'adata_batch_ids',         None)
         (z_mlp, z_gnn, z_q_cell, z_q_niche,
          idx_cell, idx_niche,
          xhat_cell, xhat_niche, _logits) = self(
             batch_x=predict_batch.x,
             batch_edge_index=predict_batch.edge_index,
             batch_encoder_conditions=encoder_conditions,
+            batch_attr_decoder_conditions=attr_decoder_conditions,
             read_depth=predict_batch.x.sum(dim=-1),
             adata_batch_ids=adata_batch_ids,
         )
@@ -611,6 +639,16 @@ class VQNiche_Dual(BaseModel):
                 cache_dict[key].append(getattr(batch, key)[:batch_size])
         cache_dict['XY_coordinates'].append(batch.xy_coordinates[:batch_size])
         cache_dict['adata_batch_ids'].append(batch.adata_batch_ids[:batch_size])
+        # Optional per-cell row index INTO the source AnnData's `.obs`.
+        # Only present when the dataset blob was built with the new
+        # `process_anndata_batch` (and only flows through if the dataloader
+        # carries it). Same dynamic-cache pattern as `y_*` below.
+        if getattr(batch, 'obs_row_index', None) is not None:
+            if 'obs_row_index' not in cache_dict:
+                cache_dict['obs_row_index'] = []
+                if 'obs_row_index' not in self.cache_keys:
+                    self.cache_keys.append('obs_row_index')
+            cache_dict['obs_row_index'].append(batch.obs_row_index[:batch_size])
 
         # ---- cell branch -----------------------------------------------------
         cache_dict['H_latent_cell'].append(z_mlp[:batch_size])

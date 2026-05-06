@@ -47,6 +47,7 @@ class InMemoryDataModule(LightningNodeData):
             sampler_name: Optional[Literal['NeighborSampler']] = 'NeighborSampler',
             sampler_params: Optional[dict] = {},
             sample_neighbors_for_inference: bool = False,
+            obs_per_batch_id: Optional[dict] = None,
         ) -> None:
         """
         This function initializes the InMemoryDataModule class with the given DataLoader and Sampler classes along with their corresponding parameters.
@@ -186,7 +187,14 @@ class InMemoryDataModule(LightningNodeData):
             'test_mask': data.test_mask,
             'adata_batch_ids': data.adata_batch_ids,
         }
-        
+        # `obs_row_index` (per-cell long tensor: row position INTO the source
+        # AnnData's `.obs`) is required to look up arbitrary obs columns at
+        # inference time. Older datamodules / blobs that don't have it still
+        # work — the inference adata builder treats absence as "skip the
+        # full-obs propagation".
+        if getattr(data, 'obs_row_index', None) is not None:
+            base_data['obs_row_index'] = data.obs_row_index
+
         optional_data_keys = [
             # 'y_cell_types',
             # 'y_niche_types',
@@ -217,6 +225,12 @@ class InMemoryDataModule(LightningNodeData):
             **self.loader_params,
             **self.sampler_params
         )
+
+        # Stash the per-AnnData obs DataFrames here so the model's
+        # `compute_metrics` (which only has access to `self.trainer.datamodule`)
+        # can pass them into `inference_data_dict_to_adata` to write every
+        # input obs column onto the inference output AnnData.
+        self.obs_per_batch_id = obs_per_batch_id or {}
 
 
     def set_custom_loader_class(

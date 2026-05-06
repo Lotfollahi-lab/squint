@@ -1215,7 +1215,7 @@ def _patch_dual_film(
 def _patch_dual_adversarial(
         cfg: dict,
         alpha: float = 1.0,
-        wt_adv_batch: float = 1.0,
+        wt_adv_batch: float = 100.0,
         hidden_channels: Optional[List[int]] = None,
     ) -> dict:
     """
@@ -1228,6 +1228,10 @@ def _patch_dual_adversarial(
       - The encoder is pushed AWAY from being batch-predictive (gets the
         negated gradient).
 
+    The model classifies the FULL `z_mlp` (seeds + sampled GNN neighbours),
+    not only the seed-node prefix — see VQNiche_Dual._step for the rationale.
+    This makes the niche branch's GNN aggregate over batch-invariant inputs.
+
     Effect: provides the missing batch-invariance pressure on the latent
     that NicheCompass gets from its KL prior. Pair with
     `_patch_dual_decoder_covariate` for the full NicheCompass-shaped
@@ -1238,11 +1242,18 @@ def _patch_dual_adversarial(
     ----------
     alpha: float
         Strength of the gradient reversal (encoder pressure). 1.0 is
-        standard; smaller values are softer. A linear ramp from 0 to
-        target alpha over the first few epochs is a common refinement
-        but not yet implemented here.
+        the standard Ganin-Lempitsky setting; multiplies the negated
+        gradient that flows back to the encoder.
     wt_adv_batch: float
-        Weight of the CE loss in the total loss.
+        Weight of the CE loss in the total loss. Default 100.0 (was 1.0
+        in the original paper recipe). With 2 batches the binary CE is
+        bounded by log(2) ≈ 0.69 nats while the cell + niche NB losses
+        sit at ~150 nats each; at `wt_adv_batch=1.0` the adversarial
+        gradient is ~150x weaker than the reconstruction signal and the
+        encoder essentially ignores it. 100.0 brings the adversarial
+        gradient into the same order of magnitude as the reconstruction
+        gradients. Sweep on a log scale (50, 100, 250, 500) if 100 isn't
+        enough — the right value depends on dataset and codebook size.
     hidden_channels: list of int, optional
         Hidden widths for the classifier MLP. Default [128] (one
         hidden layer of 128 units).
@@ -1256,6 +1267,51 @@ def _patch_dual_adversarial(
     if "adversarial_batch_loss" not in losses:
         losses.append("adversarial_batch_loss")
     cfg["model"]["loss_params"]["loss_kwargs"]["wt_adv_batch"] = float(wt_adv_batch)
+    return cfg
+
+
+def _patch_dual_decoder_film(
+        cfg: dict,
+        condition_list: List[str] = ["cell_batch_id"],
+    ) -> dict:
+    """
+    Enable FiLM batch-correction INSIDE the dual-model attribute decoders
+    (cell + niche). Mutually exclusive with `_patch_dual_decoder_covariate`
+    (which concatenates the one-hot onto z_q instead).
+
+    What it does: sets `apply_conditioning='in-MLP'` on both decoder
+    parameter dicts and configures their FiLM `condition_list` (default
+    ['cell_batch_id'], i.e. per-cell batch one-hot). The data loader's
+    `attr_decoder_conditions` tensor is then threaded through to each
+    decoder by VQNiche_Dual.forward, and FiLM modulates each decoder
+    layer with γ/β derived from the batch one-hot.
+
+    Compared to `_patch_dual_decoder_covariate` (NicheCompass-style
+    concat-on-z_q):
+      - Concat works cleanly when the decoder is a *linear* scoring head
+        over gene programs (NicheCompass): the one-hot has a clean per-
+        batch additive effect on each gene rate.
+      - With our deeper non-linear MLPSoftmax decoder, the concat path
+        diffuses through ReLU/GELU layers and the network has no
+        architectural pressure to keep batch effects siloed in the
+        covariate's pathway. FiLM gives the covariate a structurally-
+        enforced, multiplicative role on every layer's activations,
+        which is a better fit for non-linear decoders.
+
+    Encoder is "freed" to encode batch-invariant biological identity
+    because the decoder can absorb per-batch gene patterns via FiLM.
+    """
+    film_params = {
+        "condition_list":   list(condition_list),
+        "use_bias":         True,
+        "use_residual":     False,
+        "residual_weight":  0.2,
+        "init_mode":        "identity",
+    }
+    for dec_key in ("attribute_decoder_cell_params",
+                    "attribute_decoder_niche_params"):
+        cfg["model"][dec_key]["apply_conditioning"] = "in-MLP"
+        cfg["model"][dec_key]["conditioning_params"] = film_params.copy()
     return cfg
 
 
@@ -1967,6 +2023,98 @@ VARIANTS: dict = {
             test_batch_idx=[4],
         ),
     },
+    "dualvq+wide+rvq-both+dec-film+lung5-rep3-test": {
+        "description": (
+            "Lung5 holdout-replicate + FiLM batch-correction INSIDE the "
+            "cell + niche decoders (`apply_conditioning='in-MLP'`, "
+            "condition=cell_batch_id). Train: Lung5_Rep1 + Lung5_Rep2 "
+            "(idx=[2, 3]); Val (test): Lung5_Rep3 (idx=[4]). Direct A/B "
+            "against `+decoder-cov+lung5-rep3-test` (concat covariate) "
+            "and `+decoder-cov+adv+lung5-rep3-test` (concat + adversary). "
+            "FiLM is recommended over concat for the deeper non-linear "
+            "MLPSoftmax decoders used here."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+dec-film(in-MLP, cell_batch_id)",
+            "+chl59_lung5(train=[2,3], test=[4])",
+        ],
+        "build": lambda: _patch_dual_chl59_lung5(
+            _patch_dual_decoder_film(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            train_batch_idx=[2, 3],
+            test_batch_idx=[4],
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+lung5-rep3-test": {
+        "description": (
+            "Lung5 holdout-replicate + decoder covariate + domain-"
+            "adversarial batch-invariance head. Train: Lung5_Rep1 + "
+            "Lung5_Rep2 (idx=[2, 3]); Val (test): Lung5_Rep3 (idx=[4]). "
+            "NicheCompass-shape recipe: covariate concat lets the "
+            "decoder absorb per-batch gene patterns; adversarial GRL "
+            "(applied to FULL z_mlp incl. sampled neighbours) actively "
+            "pushes the encoder toward batch-invariance. wt_adv_batch=100 "
+            "calibrated against the ~150-nat NB reconstruction losses."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=100.0)",
+            "+chl59_lung5(train=[2,3], test=[4])",
+        ],
+        "build": lambda: _patch_dual_chl59_lung5(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=100.0,
+            ),
+            train_batch_idx=[2, 3],
+            test_batch_idx=[4],
+        ),
+    },
+    "dualvq+wide+rvq-both+adv+lung5-rep3-test": {
+        "description": (
+            "Lung5 holdout-replicate + adversarial-only batch correction "
+            "(no decoder covariate, no FiLM). Train: Lung5_Rep1 + "
+            "Lung5_Rep2 (idx=[2, 3]); Val (test): Lung5_Rep3 (idx=[4]). "
+            "Tests whether the GRL alone is enough — should not work as "
+            "well as the +decoder-cov+adv combo since the decoder has no "
+            "way to fit per-batch gene patterns."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+adversarial_batch(alpha=1.0, wt=100.0)",
+            "+chl59_lung5(train=[2,3], test=[4])",
+        ],
+        "build": lambda: _patch_dual_chl59_lung5(
+            _patch_dual_adversarial(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+                alpha=1.0, wt_adv_batch=100.0,
+            ),
+            train_batch_idx=[2, 3],
+            test_batch_idx=[4],
+        ),
+    },
     "dualvq+wide+rvq-both+decoder-cov+lung5+lung9-multi-test": {
         "description": (
             "Lung5+Lung9 holdout + decoder-covariate batch correction. "
@@ -2046,12 +2194,13 @@ VARIANTS: dict = {
             "domain-adversarial batch-invariance head. The combination is "
             "the NicheCompass-shape recipe: covariate concat lets the "
             "decoder absorb per-batch gene patterns; adversarial GRL "
+            "(applied to the FULL z_mlp incl. sampled neighbours) "
             "actively pushes the encoder to make z_mlp batch-invariant. "
             "Recommended cross-tissue / cross-platform integration variant."
         ),
         "patches": [
             "+wide", "+rvq(branch=both, levels=[30, 90])",
-            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=1.0)",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=100.0)",
         ],
         "build": lambda: _patch_dual_adversarial(
             _patch_dual_decoder_covariate(
@@ -2063,7 +2212,7 @@ VARIANTS: dict = {
                     branch="cell", codebook_sizes=(30, 90),
                 ),
             ),
-            alpha=1.0, wt_adv_batch=1.0,
+            alpha=1.0, wt_adv_batch=100.0,
         ),
     },
     "dualvq+wide+rvq-both+adv": {
@@ -2075,7 +2224,7 @@ VARIANTS: dict = {
         ),
         "patches": [
             "+wide", "+rvq(branch=both, levels=[30, 90])",
-            "+adversarial_batch(alpha=1.0, wt=1.0)",
+            "+adversarial_batch(alpha=1.0, wt=100.0)",
         ],
         "build": lambda: _patch_dual_adversarial(
             _patch_dual_rvq(
@@ -2085,7 +2234,7 @@ VARIANTS: dict = {
                 ),
                 branch="cell", codebook_sizes=(30, 90),
             ),
-            alpha=1.0, wt_adv_batch=1.0,
+            alpha=1.0, wt_adv_batch=100.0,
         ),
     },
     "dualvq+wide+rvq-both+decoder-cov": {
@@ -2103,6 +2252,35 @@ VARIANTS: dict = {
             "+decoder_covariate(concat per-cell batch one-hot)",
         ],
         "build": lambda: _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+                _patch_dual_rvq(
+                    _patch_dual_wide(_BD()),
+                    branch="niche", codebook_sizes=(30, 90),
+                ),
+                branch="cell", codebook_sizes=(30, 90),
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-both+dec-film": {
+        "description": (
+            "Wide dual VQ + RVQ on both branches (levels=[30, 90] each) + "
+            "FiLM batch-correction INSIDE the cell + niche decoders "
+            "(`apply_conditioning='in-MLP'`, condition=cell_batch_id). "
+            "No decoder-input concat, no adversarial head. The encoder "
+            "is pushed toward batch-invariant codes purely by the "
+            "structural separation between encoder (sees only counts) "
+            "and decoder (gets the per-cell batch one-hot via FiLM, "
+            "modulating each layer's activations). A/B against "
+            "`+decoder-cov` (concat-based) and `+decoder-cov+adv` "
+            "(concat + adversarial)."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=niche, levels=[30, 90])",
+            "+rvq(branch=cell, levels=[30, 90])",
+            "+dec-film(in-MLP, cell_batch_id)",
+        ],
+        "build": lambda: _patch_dual_decoder_film(
             _patch_dual_rvq(
                 _patch_dual_rvq(
                     _patch_dual_wide(_BD()),
@@ -2494,7 +2672,11 @@ def train(variant: str):
     # ---- Dataset / Databatch / Datamodule ---------------------------------
     dataset_blob = initialize_dataset_blob(cfg)
     data_batch = initialize_databatch(config=cfg, dataset_blob=dataset_blob)
-    datamodule_batch = initialize_datamodule(config=cfg, data=data_batch)
+    datamodule_batch = initialize_datamodule(
+        config=cfg,
+        data=data_batch,
+        obs_per_batch_id=getattr(dataset_blob, 'obs_per_batch_id', None),
+    )
 
     # ---- Model: bind condition dims if FiLM is enabled --------------------
     if "conditioning_params" in cfg["model"]["encoder_params"]:
@@ -2961,7 +3143,11 @@ def predict(
             gene_panel = pickle.load(f)
 
     data_batch = initialize_databatch(config=config, dataset_blob=dataset_blob)
-    datamodule = initialize_datamodule(config=config, data=data_batch)
+    datamodule = initialize_datamodule(
+        config=config,
+        data=data_batch,
+        obs_per_batch_id=getattr(dataset_blob, 'obs_per_batch_id', None),
+    )
 
     # Recover the post-HVG gene names (if available). SubsetHVG stores the
     # surviving column indices on each Data section as `hvg_indices`. Indexing

@@ -128,6 +128,39 @@ class InMemoryDatasetBlob(InMemoryDataset):
         # This index is set to 0 because there is only one processed data file.
         self.load(self.processed_paths[0])
 
+        # Best-effort load of the per-AnnData obs DataFrames written by
+        # `process()`. Pre-existing blobs that were built before this field
+        # was introduced won't have the file — fall back to an empty dict
+        # (downstream code treats "no obs_per_batch_id" as "don't write
+        # extra obs columns to the inference adata").
+        obs_pkl = Path(self.processed_dir) / "obs_per_batch_id.pkl"
+        if obs_pkl.exists():
+            with open(obs_pkl, "rb") as f:
+                self.obs_per_batch_id = pickle.load(f)
+        else:
+            self.obs_per_batch_id = {}
+
+
+    def _derive_adata_batch_id(self, adata_batch, adata_batch_file) -> int:
+        """
+        Derive the integer `adata_batch_id` for a given AnnData / path pair.
+
+        Same logic as `process_anndata_batch`, factored out so pass 1 can
+        accumulate per-batch obs DataFrames keyed by the same id that
+        `process_anndata_batch` will write into the per-cell PyG Data
+        objects in pass 2.
+        """
+        uns_batch = adata_batch.uns.get('batch', None)
+        try:
+            return int(uns_batch[5:])
+        except (TypeError, ValueError, IndexError):
+            try:
+                return int(self.raw_paths.index(str(adata_batch_file)))
+            except ValueError:
+                return int(
+                    [str(p) for p in self.raw_paths].index(str(adata_batch_file))
+                )
+
 
     def process(self) -> None:
         """
@@ -151,8 +184,27 @@ class InMemoryDatasetBlob(InMemoryDataset):
             for label_name in self.label_names
         }
 
+        # Collect each input AnnData's full `.obs` DataFrame, keyed by the
+        # same integer `adata_batch_id` that `process_anndata_batch` will
+        # stamp on the per-cell PyG Data objects. Pickled to disk and
+        # used by `inference_data_dict_to_adata` to write *every* obs
+        # column of every input AnnData onto the inference output AnnData,
+        # NaN-filling columns that are present only in some batches.
+        # Done in pass 1 (sequential, single-process) because pass 2 runs
+        # in a process pool — accumulating shared state from inside that
+        # pool would not propagate back to the parent.
+        self.obs_per_batch_id: dict = {}
+
         for adata_batch_file in self.raw_paths:
             adata_batch = sc.read(adata_batch_file)
+
+            # Capture full `.obs` for this AnnData (copy so subsequent
+            # reads / mutations don't affect what we save).
+            adata_batch_id = self._derive_adata_batch_id(
+                adata_batch=adata_batch,
+                adata_batch_file=adata_batch_file,
+            )
+            self.obs_per_batch_id[adata_batch_id] = adata_batch.obs.copy()
 
             if self.gene_panel is None:
                 # adata_batch.var is a pandas dataframe
@@ -204,6 +256,11 @@ class InMemoryDatasetBlob(InMemoryDataset):
         # save the gene panel to disk
         with open(Path(self.processed_dir) / "gene_panel.pkl", "wb") as f:
             pickle.dump(self.gene_panel, f)
+
+        # save the per-AnnData `.obs` DataFrames to disk for inference-time
+        # propagation to the output AnnData (see __init__ load below).
+        with open(Path(self.processed_dir) / "obs_per_batch_id.pkl", "wb") as f:
+            pickle.dump(self.obs_per_batch_id, f)
 
         # ----------------- Second Pass over AnnData Batches -----------------
         # This pass is used to process each batch of AnnData into a PyG Data object.
@@ -420,6 +477,17 @@ class InMemoryDatasetBlob(InMemoryDataset):
         batch_dict['tissue'] = adata_batch.uns['tissue']
         batch_dict['species'] = adata_batch.uns['species']
 
+        # Per-cell row index INTO this AnnData's `.obs` DataFrame. Combined
+        # with `adata_batch_ids` it forms a unique per-cell key that
+        # survives PyG concat + NeighborLoader sub-sampling, used at
+        # inference time to look up arbitrary obs columns from the
+        # dataset_blob's stored `obs_per_batch_id` and write them onto
+        # the output AnnData (with NaN-fill for columns missing in this
+        # AnnData but present in another).
+        batch_dict['obs_row_index'] = torch.arange(
+            len(adata_batch), dtype=torch.long
+        )
+
         # `adata.obs[batch_key]` (default `batch`) is the canonical source
         # for FiLM batch conditioning when the cell_ids don't encode the
         # batch as a "batchN" prefix (e.g. CosMx Lung samples named
@@ -437,21 +505,14 @@ class InMemoryDatasetBlob(InMemoryDataset):
         # Historically derived from `uns['batch'][5:]` ("batchN" -> N).
         # Be defensive: fall back to a sequential index if `uns['batch']`
         # is missing or doesn't follow the "batchN" convention.
-        uns_batch = adata_batch.uns.get('batch', None)
-        try:
-            batch_dict['adata_batch_id'] = int(uns_batch[5:])
-        except (TypeError, ValueError, IndexError):
-            # No / unparseable uns['batch']: derive a stable integer id
-            # from the file's position in the (sorted) raw_paths list.
-            try:
-                batch_dict['adata_batch_id'] = int(
-                    self.raw_paths.index(str(adata_batch_file))
-                )
-            except ValueError:
-                batch_dict['adata_batch_id'] = int(
-                    [str(p) for p in self.raw_paths].index(str(adata_batch_file))
-                )
-        print(f"{batch_dict['adata_batch_id']=}, uns['batch']={uns_batch!r}")
+        batch_dict['adata_batch_id'] = self._derive_adata_batch_id(
+            adata_batch=adata_batch,
+            adata_batch_file=adata_batch_file,
+        )
+        print(
+            f"{batch_dict['adata_batch_id']=}, "
+            f"uns['batch']={adata_batch.uns.get('batch', None)!r}"
+        )
 
         # ----------------- Convert Data Dict to PyG Data Object -----------------
         data_batch = Data(**batch_dict)

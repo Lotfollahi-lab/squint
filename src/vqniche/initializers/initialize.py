@@ -406,27 +406,57 @@ def initialize_databatch(
                         seen.add(c)
                         attr_decoder_condition_list.append(c)
 
-    # TODO: clean up this multi-section conditioning code
-    # Two sources for the per-cell batch one-hot are supported, in priority:
+    # Per-cell batch one-hots come from one of two sources, in priority:
     #
-    #   1. `data_batch.obs_batch` — the per-cell `adata.obs[batch_key]`
-    #      values collected during dataset-blob construction. Densifies
-    #      unique label strings to contiguous indices.
-    #   2. `data_batch.cell_id` — legacy fallback that parses "batchN"
-    #      substrings out of cell_id strings. Used when the AnnDatas
-    #      didn't have an `obs[batch_key]` column at blob-build time.
+    #   1. `data_batch.obs_batch` — per-cell `adata.obs[batch_key]` values
+    #      collected during dataset-blob construction (preferred).
+    #   2. `data_batch.cell_id` — fallback that parses "batchN" substrings
+    #      out of cell_id strings (used by older datasets that didn't have
+    #      an `obs[batch_key]` column at blob-build time).
     #
-    # `build_batch_one_hot[*]` densifies the raw labels to contiguous
-    # indices [0, n_unique_batches), so `max_batch` is no longer needed
-    # and the one-hot dim matches the number of distinct samples.
-    if hasattr(data_batch, 'obs_batch') and data_batch.obs_batch is not None:
+    # If BOTH fail (no `obs_batch`, and `cell_id` doesn't contain "batchN"),
+    # we raise an explicit ValueError. The fallback's regex can quietly
+    # mis-attribute cells when cell_id formats vary, so we want to make it
+    # loud when the obs path isn't available — but we don't want to break
+    # legacy datasets that genuinely encode batch only in cell_id.
+    #
+    # Both `build_batch_one_hot[*]` densify the raw labels to contiguous
+    # indices [0, n_unique_batches); the one-hot dim equals the number of
+    # distinct samples actually present.
+    use_obs_path = (
+        hasattr(data_batch, 'obs_batch') and data_batch.obs_batch is not None
+    )
+    if use_obs_path:
         batch_ids, batch_conditions = build_batch_one_hot_from_obs(
             obs_batch=data_batch.obs_batch,
         )
     else:
-        batch_ids, batch_conditions = build_batch_one_hot(
-            cell_ids=data_batch.cell_id,
-        )
+        cell_ids = getattr(data_batch, 'cell_id', None)
+        if cell_ids is None:
+            raise ValueError(
+                "Could not retrieve per-cell batch labels: neither "
+                "`data_batch.obs_batch` nor `data_batch.cell_id` is "
+                "available. Set `adata.obs[batch_key]` (default 'batch') "
+                "in every input AnnData and pass `batch_key='batch'` (or "
+                "your actual column name) in `graph_kwargs` at blob-build "
+                "time, OR ensure each AnnData carries a `cell_id` column "
+                "with 'batchN' substrings."
+            )
+        try:
+            batch_ids, batch_conditions = build_batch_one_hot(
+                cell_ids=cell_ids,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "Could not retrieve per-cell batch labels: "
+                "`data_batch.obs_batch` was absent and the cell_id "
+                "fallback failed to parse 'batchN' from at least one "
+                "cell identifier. Set `adata.obs[batch_key]` (default "
+                "'batch') in every input AnnData and pass "
+                "`batch_key='batch'` (or your actual column name) in "
+                "`graph_kwargs` at blob-build time. Original parse "
+                f"error: {exc}"
+            ) from exc
     data_batch.adata_batch_ids = batch_ids
 
     if encoder_condition_list is not None:
@@ -483,6 +513,7 @@ def initialize_databatch(
 def initialize_datamodule(
         config: Dict,
         data: Data,
+        obs_per_batch_id: Optional[Dict] = None,
     ) -> pl.LightningDataModule:
     # set parameters for data loader and sampler for training, validation, and testing
     loader_name = config['datamodule']['loader_name']
@@ -499,6 +530,7 @@ def initialize_datamodule(
                             loader_params=loader_params,
                             sampler_name=sampler_name,
                             sampler_params=sampler_params,
+                            obs_per_batch_id=obs_per_batch_id,
                             **inference_params,
                         )
     return datamodule_batch

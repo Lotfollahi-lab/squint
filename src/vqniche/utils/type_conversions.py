@@ -201,6 +201,7 @@ def torch_one_hot_to_label_name(
 def inference_data_dict_to_adata(
         inference_data: Dict,
         label_categories_dict: Optional[Dict] = None,
+        obs_per_batch_id: Optional[Dict] = None,
     ) -> ad.AnnData:
     """
     Build an AnnData object from inference data dictionary.
@@ -233,6 +234,15 @@ def inference_data_dict_to_adata(
         If provided, a dictionary containing 'cell_types' and 'niche_types' as keys and label categories as values.
         For example, {'cell_types': ['cell_type_1', 'cell_type_2', 'cell_type_3'], 'niche_types': ['niche_type_1', 'niche_type_2', 'niche_type_3']}.
         If not provided, the label categories will be set to integer categories.
+    obs_per_batch_id : Optional[Dict]
+        Mapping from `adata_batch_id` (int) to that AnnData's full `obs`
+        DataFrame, as collected at blob-build time. When provided AND
+        `inference_data['obs_row_index']` is present, every column that
+        appears in *any* input AnnData is propagated onto the output
+        AnnData's `.obs`. Cells whose source AnnData doesn't carry a
+        given column are NaN-filled for it. Existing obs columns
+        (`adata_batch_ids`, plus any `y_*` labels written above) are
+        kept and not overwritten.
 
     Returns
     -------
@@ -345,6 +355,61 @@ def inference_data_dict_to_adata(
         adata.uns['num_heads'] = 1
     if 'separate' not in adata.uns and ('Indices_niche' in adata.uns):
         adata.uns['separate'] = False
+
+    # ----- Propagate every input obs column to the output adata --------
+    # Each cell carries:
+    #   - `adata_batch_ids[k]`: which input AnnData it came from
+    #   - `obs_row_index[k]`:   its row position INTO that AnnData's `.obs`
+    # Together they form a unique join key. We take the UNION of obs
+    # columns across all input AnnDatas; cells from a source that doesn't
+    # carry a given column get NaN for it. Existing `adata.obs` columns
+    # written above (e.g. label columns from `y_*`, plus
+    # `adata_batch_ids`) are kept and not overwritten.
+    if (
+        obs_per_batch_id
+        and 'obs_row_index' in inference_data
+        and 'adata_batch_ids' in inference_data
+    ):
+        batch_ids_np = inference_data['adata_batch_ids'].cpu().numpy().astype(int)
+        row_idx_np   = inference_data['obs_row_index'].cpu().numpy().astype(int)
+
+        # Union of columns in deterministic order: first-seen across the
+        # sorted batch ids, so the output column order is stable run-to-run.
+        union_cols: list = []
+        seen: set = set()
+        for bid in sorted(obs_per_batch_id.keys()):
+            df = obs_per_batch_id[bid]
+            for col in df.columns:
+                if col not in seen:
+                    seen.add(col)
+                    union_cols.append(col)
+
+        # Build per-cell values for each column. Use a Python list and
+        # let pandas infer the dtype at the end (handles mixed numeric/
+        # string columns and NaN-fill for missing batches uniformly).
+        n_cells = len(batch_ids_np)
+        for col in union_cols:
+            if col in adata.obs.columns:
+                # Don't overwrite columns already written by the model
+                # (e.g. one-hot decoded labels, `adata_batch_ids`).
+                continue
+
+            values = [None] * n_cells
+            for k in range(n_cells):
+                bid = int(batch_ids_np[k])
+                df  = obs_per_batch_id.get(bid)
+                if df is None or col not in df.columns:
+                    # Source AnnData doesn't carry this column → NaN-fill.
+                    continue
+                ridx = int(row_idx_np[k])
+                if 0 <= ridx < len(df):
+                    values[k] = df[col].iloc[ridx]
+
+            series = pd.Series(values, index=adata.obs.index, name=col)
+            # `None` -> `NaN` for numeric columns; for object/string
+            # columns pandas keeps `None` which AnnData treats as NaN
+            # for downstream consumers.
+            adata.obs[col] = series
 
     return adata
 
