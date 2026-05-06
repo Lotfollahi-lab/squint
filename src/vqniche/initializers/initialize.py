@@ -92,6 +92,62 @@ def build_batch_one_hot(
     return batch_ids, batch_one_hot
 
 
+def build_batch_one_hot_from_obs(
+        obs_batch: List[List[str]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build a per-cell batch one-hot from `adata.obs[batch_key]` values that
+    have been collected as per-AnnData lists in the dataset blob.
+
+    Unlike `build_batch_one_hot`, this does NOT parse anything out of
+    `cell_id` — it directly densifies the raw obs labels (strings or ints)
+    to [0, n_unique_labels) in sorted order. Use this when the AnnData
+    files have an explicit `obs[batch_key]` column instead of (or in
+    addition to) batch info encoded in `cell_id` strings.
+
+    Parameters
+    ----------
+    obs_batch : List[List[<str|int>]]
+        Nested list of obs[batch_key] values, one inner list per AnnData
+        batch in the dataset blob. Inner-list element types may be str or
+        int — both are normalised to str before lookup so 'Lung5_Rep1'
+        and 1 are both supported.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        - Dense batch ID tensor of shape (num_cells,), values in
+          [0, n_unique_labels).
+        - One-hot tensor of shape (num_cells, n_unique_labels).
+    """
+    # Pass 1: collect unique labels, build label -> dense map.
+    raw_per_cell: list[str] = []
+    for group in obs_batch:
+        for label in group:
+            raw_per_cell.append(str(label))
+
+    unique_labels = sorted(set(raw_per_cell))
+    label_to_dense = {lbl: i for i, lbl in enumerate(unique_labels)}
+    n_classes = len(unique_labels)
+
+    # Pass 2: densify + one-hot.
+    batch_ids = []
+    batch_one_hot = []
+    for group in obs_batch:
+        group_tensor = []
+        for label in group:
+            d = label_to_dense[str(label)]
+            one_hot = torch.zeros(n_classes, dtype=torch.float)
+            one_hot[d] = 1.0
+            batch_ids.append(d)
+            group_tensor.append(one_hot)
+        batch_one_hot.append(torch.stack(group_tensor))
+
+    batch_ids = torch.tensor(batch_ids, dtype=torch.long)
+    batch_one_hot = torch.cat(batch_one_hot, dim=0)
+    return batch_ids, batch_one_hot
+
+
 def build_timepoint_one_hot(
         batch_ids: torch.Tensor,
         max_timepoint: int = 4,
@@ -192,20 +248,47 @@ def initialize_dataset_blob(
                                     None,
                                 )
     
-    attr_decoder_condition_list = config['model']['attribute_decoder_params'].get(
-                                    'conditioning_params',
-                                    {},
-                                ).get(
-                                    'condition_list',
-                                    None,
-                                )
-    adj_decoder_condition_list = config['model']['adjacency_decoder_params'].get(
-                                    'conditioning_params',
-                                    {},
-                                ).get(
-                                    'condition_list',
-                                    None,
-                                )
+    # Decoder-conditioning lookup. Single-codebook configs (VQNiche etc.)
+    # carry `attribute_decoder_params` / `adjacency_decoder_params`. The
+    # dual-codebook config (VQNiche_Dual) replaces them with per-branch
+    # equivalents and removes the adjacency decoder entirely. Be tolerant
+    # of either layout.
+    def _get_condition_list(decoder_params: dict) -> Optional[list]:
+        return decoder_params.get('conditioning_params', {}).get('condition_list', None)
+
+    if 'attribute_decoder_params' in config['model']:
+        attr_decoder_condition_list = _get_condition_list(
+            config['model']['attribute_decoder_params']
+        )
+    else:
+        # Dual model: take the union of conditioning lists across the cell
+        # and niche decoders (they typically share conditioning, but be
+        # defensive). Order is preserved relative to the first occurrence.
+        cond_lists = []
+        for branch_key in ('attribute_decoder_cell_params',
+                           'attribute_decoder_niche_params'):
+            branch_params = config['model'].get(branch_key, {})
+            cl = _get_condition_list(branch_params)
+            if cl:
+                cond_lists.append(cl)
+        if not cond_lists:
+            attr_decoder_condition_list = None
+        else:
+            seen = set()
+            attr_decoder_condition_list = []
+            for cl in cond_lists:
+                for c in cl:
+                    if c not in seen:
+                        seen.add(c)
+                        attr_decoder_condition_list.append(c)
+
+    if 'adjacency_decoder_params' in config['model']:
+        adj_decoder_condition_list = _get_condition_list(
+            config['model']['adjacency_decoder_params']
+        )
+    else:
+        # Dual model has no MLP adjacency decoder — no conditioning to fetch.
+        adj_decoder_condition_list = None
     
     ExperimentDataKeys = SetExperimentDataKeys(
                             feature_names=feature_names,
@@ -292,21 +375,58 @@ def initialize_databatch(
                                 'condition_list',
                                 None,
                             )
-    attr_decoder_condition_list = config['model']['attribute_decoder_params'].get(
-                                    'conditioning_params',
-                                    {},
-                                ).get(
-                                    'condition_list',
-                                    None,
-                                )
+    # Decoder-conditioning lookup is dual-config-aware: fall back to
+    # `attribute_decoder_cell_params` + `attribute_decoder_niche_params`
+    # (taking the union of their condition lists) when the legacy
+    # single-decoder key is absent (VQNiche_Dual layout).
+    if 'attribute_decoder_params' in config['model']:
+        attr_decoder_condition_list = config['model']['attribute_decoder_params'].get(
+                                        'conditioning_params',
+                                        {},
+                                    ).get(
+                                        'condition_list',
+                                        None,
+                                    )
+    else:
+        cond_lists = []
+        for branch_key in ('attribute_decoder_cell_params',
+                           'attribute_decoder_niche_params'):
+            branch_params = config['model'].get(branch_key, {})
+            cl = branch_params.get('conditioning_params', {}).get('condition_list', None)
+            if cl:
+                cond_lists.append(cl)
+        if not cond_lists:
+            attr_decoder_condition_list = None
+        else:
+            seen = set()
+            attr_decoder_condition_list = []
+            for cl in cond_lists:
+                for c in cl:
+                    if c not in seen:
+                        seen.add(c)
+                        attr_decoder_condition_list.append(c)
 
     # TODO: clean up this multi-section conditioning code
-    # `build_batch_one_hot` densifies raw batch numbers (e.g. {15, 82}) to
-    # contiguous indices [0, n_unique_batches), so `max_batch` is no longer
-    # needed and the one-hot dim matches the number of tissue sections.
-    batch_ids, batch_conditions = build_batch_one_hot(
-                                            cell_ids=data_batch.cell_id,
-                                        )
+    # Two sources for the per-cell batch one-hot are supported, in priority:
+    #
+    #   1. `data_batch.obs_batch` — the per-cell `adata.obs[batch_key]`
+    #      values collected during dataset-blob construction. Densifies
+    #      unique label strings to contiguous indices.
+    #   2. `data_batch.cell_id` — legacy fallback that parses "batchN"
+    #      substrings out of cell_id strings. Used when the AnnDatas
+    #      didn't have an `obs[batch_key]` column at blob-build time.
+    #
+    # `build_batch_one_hot[*]` densifies the raw labels to contiguous
+    # indices [0, n_unique_batches), so `max_batch` is no longer needed
+    # and the one-hot dim matches the number of distinct samples.
+    if hasattr(data_batch, 'obs_batch') and data_batch.obs_batch is not None:
+        batch_ids, batch_conditions = build_batch_one_hot_from_obs(
+            obs_batch=data_batch.obs_batch,
+        )
+    else:
+        batch_ids, batch_conditions = build_batch_one_hot(
+            cell_ids=data_batch.cell_id,
+        )
     data_batch.adata_batch_ids = batch_ids
 
     if encoder_condition_list is not None:
@@ -393,6 +513,9 @@ def set_model_class(
         Model = VanillaGNN
     elif model_name == 'VQNiche':
         Model = VQNiche
+    elif model_name == 'VQNiche_Dual':
+        from vqniche.models import VQNiche_Dual
+        Model = VQNiche_Dual
     else:
         raise ValueError(f"Model {model_name} not found.")
     return Model
@@ -405,25 +528,55 @@ def initialize_model(
     ) -> pl.LightningModule:
     # --------------------- Set Model Parameters ---------------------
     model_name = config['model']['model_name']
+
+    # Common parameter set used by all models. The dual model accepts the
+    # same legacy keys (it just ignores `adjacency_decoder_params`) so we
+    # keep one shared dict and extend it model-specifically below.
     model_param_dict = {
         'model_name': model_name,
         'encoder_name': config['model']['encoder_name'],
         'attribute_decoder_name': config['model']['attribute_decoder_name'],
-        'adjacency_decoder_name': config['model']['adjacency_decoder_name'],
+        'adjacency_decoder_name': config['model'].get('adjacency_decoder_name'),
         'predictor_name': config['model']['predictor_name'],
         'train_metrics_list': config['model']['train_metrics_list'],
         'test_metrics_list': config['model']['test_metrics_list'],
         'in_channels': in_channels,
         'out_channels': out_channels,
         'encoder_params': config['model']['encoder_params'],
-        'attribute_decoder_params': config['model']['attribute_decoder_params'],
-        'adjacency_decoder_params': config['model']['adjacency_decoder_params'],
         'optimizer_params': config['model']['optimizer_params'],
         'loss_params': config['model']['loss_params'],
     }
 
-    if model_name == 'VQNiche':
-        model_param_dict['imputation_params'] = config['model']['imputation_params']
+    # Single-decoder models: use the legacy `attribute_decoder_params` key.
+    if model_name in ('VQNiche', 'VanillaMLP', 'GraphSAGE', 'GATv2', 'GIN'):
+        model_param_dict['attribute_decoder_params'] = config['model'].get('attribute_decoder_params', {})
+        model_param_dict['adjacency_decoder_params'] = config['model'].get('adjacency_decoder_params', {})
+    # Dual-decoder model: use the two cell/niche keys (and ignore the
+    # legacy single-decoder keys if they happen to be present).
+    elif model_name == 'VQNiche_Dual':
+        model_param_dict['attribute_decoder_cell_params']  = config['model']['attribute_decoder_cell_params']
+        model_param_dict['attribute_decoder_niche_params'] = config['model']['attribute_decoder_niche_params']
+        # NicheCompass-style decoder covariate. Set in `train()` after data
+        # load (n_unique_batches). Default 0 = off.
+        model_param_dict['decoder_covariate_dim'] = int(
+            config['model'].get('decoder_covariate_dim', 0)
+        )
+        # Domain-adversarial batch-invariance head. Set in `train()` after
+        # data load (n_unique_batches). Default 0 = off.
+        model_param_dict['adversarial_batch_dim'] = int(
+            config['model'].get('adversarial_batch_dim', 0)
+        )
+        model_param_dict['adversarial_alpha'] = float(
+            config['model'].get('adversarial_alpha', 1.0)
+        )
+        adv_hidden = config['model'].get('adversarial_hidden_channels')
+        if adv_hidden is not None:
+            model_param_dict['adversarial_hidden_channels'] = list(adv_hidden)
+
+    if model_name in ('VQNiche', 'VQNiche_Dual'):
+        # Both VQNiche variants accept imputation_params (VQNiche_Dual
+        # currently ignores it but accepts the kwarg for forward-compat).
+        model_param_dict['imputation_params'] = config['model'].get('imputation_params')
 
     # --------------------- Initialize Model ---------------------
     Model = set_model_class(model_name=model_name)

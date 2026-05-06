@@ -301,6 +301,50 @@ def inference_data_dict_to_adata(
         adata.uns['separate'] = inference_data['separate']
     if 'num_heads' in inference_data:
         adata.uns['num_heads'] = inference_data['num_heads']
+    # Multi-level VQ metadata (RVQ / ConditionalVQ).
+    # Defaults to single-level when absent → propagated as 1 for back-compat.
+    if 'num_quantizers' in inference_data:
+        adata.uns['num_quantizers'] = inference_data['num_quantizers']
+    if 'codebook_sizes' in inference_data:
+        adata.uns['codebook_sizes'] = inference_data['codebook_sizes']
+
+    # ----- VQNiche_Dual: per-branch keys -----------------------------------
+    # The dual model caches per-branch tensors and metadata under
+    # *_cell / *_niche suffixes. Propagate them all to adata.uns so
+    # downstream analysis can address each branch directly. Where the
+    # legacy single-codebook key (`Indices`, `codebook_size`, etc.) is
+    # missing, alias the *niche* branch into it so the existing
+    # benchmarking utilities (codebook_utilization, etc.) keep working
+    # against the niche codebook by default.
+    for branch_key in ('Indices_cell', 'Indices_niche',
+                       'H_quantized_cell', 'H_quantized_niche',
+                       'H_latent_cell', 'H_latent_niche'):
+        if branch_key in inference_data:
+            adata.uns[branch_key] = inference_data[branch_key]
+    for meta_key in ('codebook_size_cell', 'codebook_size_niche',
+                     'codebook_sizes_cell', 'codebook_sizes_niche',
+                     'num_quantizers_cell', 'num_quantizers_niche'):
+        if meta_key in inference_data:
+            adata.uns[meta_key] = inference_data[meta_key]
+
+    # Back-compat aliases: when the dual model is in use the legacy
+    # single-codebook keys may be unset. Default them to the *niche*
+    # branch so spatial-coherence-oriented benchmarking still has the
+    # right tensor / sizes to read.
+    if 'Indices' not in adata.uns and 'Indices_niche' in adata.uns:
+        adata.uns['Indices'] = adata.uns['Indices_niche']
+    if 'codebook_size' not in adata.uns and 'codebook_size_niche' in adata.uns:
+        adata.uns['codebook_size'] = adata.uns['codebook_size_niche']
+    if 'num_quantizers' not in adata.uns and 'num_quantizers_niche' in adata.uns:
+        adata.uns['num_quantizers'] = adata.uns['num_quantizers_niche']
+    if 'codebook_sizes' not in adata.uns and 'codebook_sizes_niche' in adata.uns:
+        adata.uns['codebook_sizes'] = adata.uns['codebook_sizes_niche']
+    # The dual model has heads=1 and separate=False on both branches —
+    # set sensible defaults if missing.
+    if 'num_heads' not in adata.uns and ('Indices_niche' in adata.uns):
+        adata.uns['num_heads'] = 1
+    if 'separate' not in adata.uns and ('Indices_niche' in adata.uns):
+        adata.uns['separate'] = False
 
     return adata
 

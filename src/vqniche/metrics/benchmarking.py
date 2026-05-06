@@ -108,7 +108,22 @@ def compute_benchmarking_metrics(
             codebook_size=adata.uns['codebook_size'],
             separate=adata.uns['separate'],
             num_heads=adata.uns['num_heads'],
+            # Multi-level VQ (RVQ / ConditionalVQ) — defaults to 1 for back-
+            # compat with single-codebook variants.
+            num_quantizers=adata.uns.get('num_quantizers', 1),
         )
+
+        # When the VQ is multi-level, also expose per-level utilizations so
+        # the user can spot e.g. starved level-2 buckets in CVQ.
+        if int(adata.uns.get('num_quantizers', 1)) > 1:
+            cb_sizes = adata.uns.get('codebook_sizes', None)
+            if cb_sizes is None:
+                # Fallback: assume the scalar codebook_size applies per level.
+                cb_sizes = [int(adata.uns['codebook_size'])] * int(adata.uns['num_quantizers'])
+            idx_flat = adata.uns['Indices'].reshape(-1, int(adata.uns['num_quantizers']))
+            for q in range(int(adata.uns['num_quantizers'])):
+                used_q = torch.unique(idx_flat[:, q]).numel()
+                benchmarking_dict[f"codebook_utilization_level{q+1}"] = float(used_q / int(cb_sizes[q]))
 
     # ------------------------------------------------------------------------
     # Compute attribute imputation metrics

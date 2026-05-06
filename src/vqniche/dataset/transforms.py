@@ -310,20 +310,33 @@ class SpatialBatchSplit(T.BaseTransform):
     
     def forward(self, data: Data) -> Data:
         num_nodes = data.x.shape[0]
-        
+
         if data.adata_batch_id in self.train_batches:
             data.train_mask = torch.ones(num_nodes, dtype=torch.bool)
             data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
             data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
 
         elif data.adata_batch_id in self.val_batches:
-            data.val_mask = self._is_in_region(data.xy_coordinates, self.region)
-            data.train_mask = ~data.val_mask
+            # `region=None` means "this entire batch is held out as val"
+            # (used by holdout-replicate variants where whole AnnData files
+            # are kept aside for evaluation). When a region IS given, only
+            # cells inside the region are val, the rest train.
+            if self.region is None:
+                data.val_mask = torch.ones(num_nodes, dtype=torch.bool)
+                data.train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+            else:
+                data.val_mask = self._is_in_region(data.xy_coordinates, self.region)
+                data.train_mask = ~data.val_mask
             data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
-            
+
         elif data.adata_batch_id in self.test_batches:
-            data.test_mask = self._is_in_region(data.xy_coordinates, self.region)
-            data.train_mask = ~data.test_mask
+            # Same convention as val_batches above.
+            if self.region is None:
+                data.test_mask = torch.ones(num_nodes, dtype=torch.bool)
+                data.train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+            else:
+                data.test_mask = self._is_in_region(data.xy_coordinates, self.region)
+                data.train_mask = ~data.test_mask
             data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
 
         return data

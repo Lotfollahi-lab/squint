@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from .base_model import BaseModel
 from ..encoders.vqniche_encoder import VQNiche_Encoder
+from ..modules import DispersionHead
 from vqniche.utils.loss_utils import (
     batch_pred_attr_and_target_attr,
     aggregate_1hop_neighbor_features,
@@ -144,6 +145,52 @@ class VQNiche(BaseModel):
                         )
         print(f"4. Predictor: {predictor_name} that transforms {self.encoder.dim} hidden features to {out_channels} dimensional logits.")
 
+        # ---- Adjacency-loss input mode (optional) --------------------------
+        # By default, the BCE adjacency loss is computed on `h_adj`, which is
+        # the output of the adjacency_decoder MLP fed with the quantized
+        # latent. When `bypass_adj_decoder=True`, the BCE loss is computed
+        # directly on the quantized latent z_q, matching the NicheCompass /
+        # standard graph-VAE formulation:
+        #     edge_logit_ij = z_q_i^T z_q_j      (no extra non-linearity)
+        # This removes one MLP and forces the codebook embeddings themselves
+        # to encode pairwise spatial proximity, which is exactly the bias
+        # we want when the goal is for codes to capture spatial niches.
+        # Read here so it is set BEFORE the forward path is exercised.
+        loss_kwargs_for_flags = (loss_params.get('loss_kwargs', {})
+                                 if loss_params else {})
+        self.bypass_adj_decoder = bool(
+            loss_kwargs_for_flags.get('bypass_adj_decoder', False)
+        )
+
+        # ---- Code-conditional dispersion (optional) ------------------------
+        # When enabled, replace the global per-gene `dispersion` parameter
+        # (kept on BaseModel as a fallback) with a small MLP that maps the
+        # quantized embedding `z_q` to per-cell, per-gene log-dispersion.
+        # The flag is read from loss_params['loss_kwargs']; default False.
+        loss_kwargs = loss_params.get('loss_kwargs', {}) if loss_params else {}
+        ccd_cfg = loss_kwargs.get('code_conditional_dispersion', False)
+        if isinstance(ccd_cfg, bool):
+            ccd_enabled = ccd_cfg
+            ccd_hidden  = []
+        else:
+            # dict form: {'enabled': bool, 'hidden_channels': [..]}
+            ccd_enabled = bool(ccd_cfg.get('enabled', False))
+            ccd_hidden  = list(ccd_cfg.get('hidden_channels', []) or [])
+        self.code_conditional_dispersion = ccd_enabled
+        if ccd_enabled:
+            self.dispersion_head = DispersionHead(
+                in_channels=self.encoder.dim,
+                out_channels=in_channels,
+                hidden_channels=ccd_hidden,
+            )
+            print(
+                f"5. Dispersion Head: code-conditional NB dispersion ENABLED "
+                f"(z_q[{self.encoder.dim}] -> log_theta[{in_channels}]; hidden={ccd_hidden})."
+            )
+        else:
+            self.dispersion_head = None
+            print(f"5. Dispersion: GLOBAL per-gene parameter (code-conditional dispersion off).")
+
         # Initialize cache dicts for capturing data and model outputs during training, validation, and test steps
         self._init_inference_data_caches()
 
@@ -207,6 +254,13 @@ class VQNiche(BaseModel):
             cache['codebook_size'] = self.encoder.vq.codebook_size
             cache['separate'] = self.encoder.vq.separate_codebook_per_head
             cache['num_heads'] = self.encoder.vq.heads
+            # Multi-level VQ metadata. Default to single-level for back-compat
+            # with VectorQuantize and other lucidrains base classes.
+            cache['num_quantizers'] = int(getattr(self.encoder.vq, 'num_quantizers', 1))
+            # Per-level sizes (list); only set when the VQ exposes them.
+            cb_sizes = getattr(self.encoder.vq, 'codebook_sizes', None)
+            if cb_sizes is not None:
+                cache['codebook_sizes'] = list(cb_sizes)
 
 
     def forward(
@@ -286,8 +340,16 @@ class VQNiche(BaseModel):
                     conditions=batch_attr_decoder_conditions,
                 )
 
-        # decode the VQ-encoded edge embeddings to recover the adjacency matrix
-        h_adj = self.adjacency_decoder(h_quantized)
+        # decode the VQ-encoded edge embeddings to recover the adjacency matrix.
+        # When `bypass_adj_decoder` is set, we feed the quantized latent z_q
+        # *directly* into the BCE adjacency loss so the edge logits are raw
+        # inner products z_q_i^T z_q_j — matching NicheCompass / standard
+        # graph-VAE formulation. This is a strong inductive bias toward codes
+        # whose embeddings cluster spatially.
+        if self.bypass_adj_decoder:
+            h_adj = h_quantized
+        else:
+            h_adj = self.adjacency_decoder(h_quantized)
 
         unnormalized_logits_batch = self.predictor(h_latent)
 
@@ -298,6 +360,39 @@ class VQNiche(BaseModel):
             h_adj, \
             unnormalized_logits_batch, \
             h_spatial_prior
+
+
+    # ----- helpers shared by training/validation/test step ------------------
+
+    def _resolve_dispersion(self, h_quantized_seed: torch.Tensor) -> torch.Tensor:
+        """
+        Return the NB dispersion tensor for this batch.
+
+        - If `code_conditional_dispersion=True`: a small MLP head maps the
+          quantized embedding `z_q` (shape (B, D)) to per-cell, per-gene
+          dispersion of shape (B, n_genes).
+        - Otherwise: the legacy per-gene global parameter is exp'd to a
+          shape-(n_genes,) tensor that broadcasts against (B, n_genes).
+        """
+        if self.code_conditional_dispersion and self.dispersion_head is not None:
+            return self.dispersion_head(h_quantized_seed)
+        return torch.exp(self.dispersion)
+
+    def _safe_one_hot_indices(self, indices: torch.Tensor):
+        """
+        One-hot encode VQ indices for the spatial-prior loss.
+
+        Multi-level VQ (RVQ / ConditionalVQ) emits indices of shape
+        `(..., num_quantizers)` whose per-level codebooks have different
+        sizes — there is no single `num_classes` to encode against. The
+        spatial-prior loss is gated by `h_spatial_prior is not None`
+        downstream, which is only set when an explicit spatial prior MLP
+        is configured (none of the current ablation variants enable it),
+        so we safely pass `None` in the multi-level case.
+        """
+        if int(getattr(self.encoder.vq, 'num_quantizers', 1)) > 1:
+            return None
+        return F.one_hot(indices, num_classes=self.encoder.vq.codebook_size)
 
 
     def apply_mask_to_attributes(
@@ -512,10 +607,7 @@ class VQNiche(BaseModel):
             # k_hop_nb_loss=1 continue to work without code changes.
             pred_attr, target_attr = pred_attr_nbr, target_attr_nbr
 
-        indices_one_hot = F.one_hot(
-                            indices,
-                            num_classes=self.encoder.vq.codebook_size,
-                        )
+        indices_one_hot = self._safe_one_hot_indices(indices)
 
         # 5) Prepare dictionary of data required for computing loss
         # Slicing the first batch_size entries is necessary because when the NeighborLoader (which wraps the NeighborSampler) is used, the source nodes, i.e. the nodes for which we compute the loss in this batch in this training step, are placed at the start of the batch. The number of source nodes is equal to the batch size. The remaining entries of the forward output correspond to the sampled neighbors of the source nodes.
@@ -526,7 +618,7 @@ class VQNiche(BaseModel):
                         'target_attr': target_attr, # attribute reconstruction loss
                         'edge_index': train_batch.edge_index, # attribute reconstruction loss
                         'batch_size': batch_size, # attribute and adjacency reconstruction loss
-                        'dispersion': torch.exp(self.dispersion), # attribute reconstruction loss
+                        'dispersion': self._resolve_dispersion(h_quantized[:batch_size]), # attribute reconstruction loss
                         'h_adj': h_adj_batch, # adjacency reconstruction loss
                         'batch_edge_index': train_batch.edge_index, # adjacency reconstruction loss
                         'logits': unnormalized_logits_batch[:batch_size], # label prediction loss
@@ -655,10 +747,7 @@ class VQNiche(BaseModel):
         if recon_mode == 'nbr':
             pred_attr, target_attr = pred_attr_nbr, target_attr_nbr
 
-        indices_one_hot = F.one_hot(
-                            indices,
-                            num_classes=self.encoder.vq.codebook_size,
-                        )
+        indices_one_hot = self._safe_one_hot_indices(indices)
 
         # 5) Prepare dictionary of data required for computing loss
         val_loss_data = {
@@ -668,7 +757,7 @@ class VQNiche(BaseModel):
                         'target_attr': target_attr,
                         'edge_index': val_batch.edge_index,
                         'batch_size': batch_size,
-                        'dispersion': torch.exp(self.dispersion),
+                        'dispersion': self._resolve_dispersion(h_quantized[:batch_size]),
                         'h_adj': h_adj_batch,
                         'batch_edge_index': val_batch.edge_index,
                         'logits': unnormalized_logits_batch[:batch_size],
