@@ -541,11 +541,25 @@ class SetExperimentDataKeys(T.BaseTransform):
         ) -> torch.Tensor:
         """
         Set the node labels in the data object given the label_name.
+
+        When `label_name` is None (no supervision configured) or when the
+        named label is absent from this batch (e.g. the dataset blob was
+        built with `label_names=[]` because the source AnnDatas don't
+        carry a usable label column), return a zero-channel placeholder
+        tensor of shape `(N, 0)`. Downstream code uses `data.y.shape[1]`
+        as `num_classes`; a 0-channel tensor gives `num_classes=0`, which
+        is a valid no-supervision signal and lets the model be built and
+        trained on purely-unsupervised objectives (NB recon, adjacency,
+        commit, adversarial). The cross-entropy loss is never registered
+        in loss_names for these configs, so the dummy `data.y` is unused.
         """
-        if f"y_{self.label_name}" in data.keys():
-            return getattr(data, f"y_{self.label_name}")
-        else:
-            raise ValueError(f"Label key {self.label_name} not found in data.")
+        if self.label_name is None or f"y_{self.label_name}" not in data.keys():
+            num_nodes = (
+                data.x.shape[0] if hasattr(data, 'x')
+                else data.num_nodes
+            )
+            return torch.zeros(num_nodes, 0)
+        return getattr(data, f"y_{self.label_name}")
 
 
     def set_edge_index(
