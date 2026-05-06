@@ -21,6 +21,7 @@ from vqniche.loss import (
     mse_adjacency_reconstruction_loss,
     bce_adjacency_reconstruction_loss,
     bce_cosine_adjacency_reconstruction_loss,
+    adversarial_batch_loss,
     mse_joint_code_commit_loss,
     ce_spatial_prior_loss,
     mse_commit_loss,
@@ -310,6 +311,18 @@ class BaseModel(pl.LightningModule):
                 wt_adj_reconstr = loss_kwargs.get('wt_adj_reconstr')
                 if wt_adj_reconstr is not None:
                     loss_fn_params['wt_adj_reconstr'] = wt_adj_reconstr
+
+            elif loss_fn_name == 'adversarial_batch_loss':
+                # Domain-adversarial batch invariance for VQNiche_Dual.
+                # CE on the BatchAdversaryHead's logits against per-cell
+                # batch IDs. The head's GRL flips the gradient sign so
+                # the encoder is pushed toward batch-invariance while the
+                # classifier itself trains normally.
+                loss_fn = adversarial_batch_loss
+                loss_fn_data_keys = ['batch_logits', 'batch_labels']
+                wt_adv_batch = loss_kwargs.get('wt_adv_batch')
+                if wt_adv_batch is not None:
+                    loss_fn_params['wt_adv_batch'] = wt_adv_batch
 
             elif loss_fn_name == 'mse_commit_loss_cell':
                 # Commit loss for the CELL branch of VQNiche_Dual. Pulls

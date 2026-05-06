@@ -181,6 +181,13 @@ class InMemoryDatasetBlob(InMemoryDataset):
                     )
 
             for label_name, label_key in zip(self.label_names, self.label_keys):
+                if label_key not in adata_batch.obs.columns:
+                    print(
+                        f"WARNING: obs column '{label_key}' missing from "
+                        f"{Path(adata_batch_file).name}; skipping y_{label_name} "
+                        "for this batch."
+                    )
+                    continue
                 self.label_categories[label_name].update(adata_batch.obs[label_key].unique())
 
         print("All batches have the same gene panel.")
@@ -334,6 +341,12 @@ class InMemoryDatasetBlob(InMemoryDataset):
             # ----------------- Build Torch One-Hot Labels -----------------
         # build for node labels (categorical pandas series to one hot tensor)
         for label_name, label_key in zip(self.label_names, self.label_keys):
+            if label_key not in adata_batch.obs.columns:
+                # Already warned during pre-scan; just skip writing
+                # the y_<label> tensor for this batch. Downstream code
+                # that consumes y_<label> already tolerates missing keys
+                # (it iterates over `batch.keys()` looking for 'y_*').
+                continue
             batch_dict[f"y_{label_name}"] = pandas_to_torch_one_hot(
                                                 adata_batch.obs[label_key],
                                                 categories=self.label_categories[label_name]
@@ -406,8 +419,39 @@ class InMemoryDatasetBlob(InMemoryDataset):
         batch_dict['dataset_id'] = adata_batch.uns['dataset_id']
         batch_dict['tissue'] = adata_batch.uns['tissue']
         batch_dict['species'] = adata_batch.uns['species']
-        batch_dict['adata_batch_id'] = int(adata_batch.uns['batch'][5:])
-        print(f"{batch_dict['adata_batch_id']=}, {adata_batch.uns['batch']=}")
+
+        # `adata.obs[batch_key]` (default `batch`) is the canonical source
+        # for FiLM batch conditioning when the cell_ids don't encode the
+        # batch as a "batchN" prefix (e.g. CosMx Lung samples named
+        # 'Lung5_Rep1'). When present, it's stored per-cell and used
+        # downstream by `build_batch_one_hot_from_obs`. Older blobs without
+        # this field still work via the cell-id parsing fallback.
+        batch_key = self.graph_kwargs.get('batch_key', 'batch')
+        if batch_key in adata_batch.obs.columns:
+            batch_dict['obs_batch'] = (
+                adata_batch.obs[batch_key].astype(str).to_list()
+            )
+
+        # `adata_batch_id` is a small integer key used by the in-memory
+        # dataloader to label each cell with which AnnData it came from.
+        # Historically derived from `uns['batch'][5:]` ("batchN" -> N).
+        # Be defensive: fall back to a sequential index if `uns['batch']`
+        # is missing or doesn't follow the "batchN" convention.
+        uns_batch = adata_batch.uns.get('batch', None)
+        try:
+            batch_dict['adata_batch_id'] = int(uns_batch[5:])
+        except (TypeError, ValueError, IndexError):
+            # No / unparseable uns['batch']: derive a stable integer id
+            # from the file's position in the (sorted) raw_paths list.
+            try:
+                batch_dict['adata_batch_id'] = int(
+                    self.raw_paths.index(str(adata_batch_file))
+                )
+            except ValueError:
+                batch_dict['adata_batch_id'] = int(
+                    [str(p) for p in self.raw_paths].index(str(adata_batch_file))
+                )
+        print(f"{batch_dict['adata_batch_id']=}, uns['batch']={uns_batch!r}")
 
         # ----------------- Convert Data Dict to PyG Data Object -----------------
         data_batch = Data(**batch_dict)

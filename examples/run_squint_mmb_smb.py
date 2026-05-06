@@ -169,6 +169,58 @@ WANDB_PROJECT = "squint"
 # 1. Dataset-blob config (one-time preprocessing)
 # ---------------------------------------------------------------------------
 
+def make_dataset_blob_config_chl59() -> dict:
+    """
+    Dataset-blob build config for the CosMx Lung dataset
+    (`/nfs/team361/sb75/DATASETS/silver/chl59-8b_1p`, 8 AnnDatas).
+
+    Differences from `make_dataset_blob_config`:
+      - root data path -> /nfs/team361/sb75/DATASETS
+      - dataset name -> chl59-8b_1p
+      - label_names empty by default — the Lung AnnDatas may not have
+        an `obs['cell_type']` column. The blob loader is now defensive
+        (skips missing label columns with a warning), so you can put
+        labels back if your AnnDatas DO have them under a different
+        name, e.g. `label_names=["cell_types=celltype"]`.
+      - `graph_kwargs.batch_key` -> 'batch'. If your Lung AnnDatas don't
+        have `obs['batch']` (the user confirmed batch info is encoded
+        in `obs['cell_id']` strings as '..._batchN_...'), the loader
+        will silently fall back to parsing `cell_id` for the batch
+        one-hot. So this default is safe even when obs['batch'] is
+        absent.
+    """
+    return {
+        "experiment": {
+            "name": "in_memory_dataset_blob",
+            "description": "CosMx Lung — 8 samples (Lung5/6/9/12/13 incl. replicates)",
+        },
+        "dataset": {
+            "name": "chl59-8b_1p",
+            "feature_names": ["cell_gene_counts"],
+            "label_names": [],   # set to ["cell_types=<your_obs_key>"] if available
+            "graph_kwargs": {
+                "coord_type":         "generic",
+                "spatial_key":        "spatial",
+                "n_neighs_list":      [8],
+                "radius_list":        None,
+                "include_self_loop":  True,
+                "batch_key":          "batch",     # falls back to cell_id if absent
+                "k": {
+                    "lm_eigvecs": 128,
+                },
+            },
+            "data_directory_path": "/nfs/team361/sb75/DATASETS",
+            "pre_transform": None,
+            "pre_filter":    None,
+            "overwrite":     True,
+        },
+        "software_paths": {
+            "deepwalk": "",
+            "gosh":     "",
+        },
+    }
+
+
 def make_dataset_blob_config() -> dict:
     """
     Mirrors  config/create_in_memory_dataset_blob/mmb0-4b_1p.yaml  but for
@@ -277,6 +329,13 @@ def make_train_config_poc() -> dict:
                 "delaunay": False,
                 "n_neighs": 8,
                 "radius": None,
+                # Source for per-cell batch labels used by FiLM batch-correction
+                # and by `build_batch_one_hot_from_obs`. When this column is
+                # present in adata.obs at blob-build time, its values are
+                # stored per-cell and used downstream (densified to contiguous
+                # indices). When absent, the loader falls back to parsing
+                # "batchN" substrings out of `obs['cell_id']`.
+                "batch_key": "batch",
             },
             "feature_names": ["X"],
             "label_name": "cell_types",
@@ -1153,6 +1212,144 @@ def _patch_dual_film(
     return cfg
 
 
+def _patch_dual_adversarial(
+        cfg: dict,
+        alpha: float = 1.0,
+        wt_adv_batch: float = 1.0,
+        hidden_channels: Optional[List[int]] = None,
+    ) -> dict:
+    """
+    Enable a domain-adversarial batch-invariance head on `z_mlp`.
+
+    What it does: a small MLP classifier predicts the per-cell batch
+    label from `z_mlp`. A Gradient Reversal Layer (GRL) is placed between
+    the encoder and the classifier, so:
+      - The classifier learns to predict batch (gets the true gradient).
+      - The encoder is pushed AWAY from being batch-predictive (gets the
+        negated gradient).
+
+    Effect: provides the missing batch-invariance pressure on the latent
+    that NicheCompass gets from its KL prior. Pair with
+    `_patch_dual_decoder_covariate` for the full NicheCompass-shaped
+    setup (decoder absorbs per-batch gene patterns, encoder is pushed
+    to be batch-invariant).
+
+    Parameters
+    ----------
+    alpha: float
+        Strength of the gradient reversal (encoder pressure). 1.0 is
+        standard; smaller values are softer. A linear ramp from 0 to
+        target alpha over the first few epochs is a common refinement
+        but not yet implemented here.
+    wt_adv_batch: float
+        Weight of the CE loss in the total loss.
+    hidden_channels: list of int, optional
+        Hidden widths for the classifier MLP. Default [128] (one
+        hidden layer of 128 units).
+    """
+    cfg["model"]["adversarial_batch_dim_request"] = True
+    cfg["model"]["adversarial_alpha"] = float(alpha)
+    if hidden_channels is not None:
+        cfg["model"]["adversarial_hidden_channels"] = list(hidden_channels)
+
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    if "adversarial_batch_loss" not in losses:
+        losses.append("adversarial_batch_loss")
+    cfg["model"]["loss_params"]["loss_kwargs"]["wt_adv_batch"] = float(wt_adv_batch)
+    return cfg
+
+
+def _patch_dual_decoder_covariate(cfg: dict) -> dict:
+    """
+    Enable NicheCompass-style decoder covariate (concat-based batch
+    correction).
+
+    What it does: at runtime, `train()` sets `decoder_covariate_dim` to
+    the number of distinct samples in the dataset (= n_unique batch one-
+    hot dim). The dual model then concatenates the per-cell batch one-hot
+    onto z_q_cell and z_q_niche before each decoder. The decoders are
+    constructed with extended `in_channels` to consume the concat tensor.
+
+    Effect:
+      - Decoders use the batch covariate to fit per-batch / per-platform
+        gene patterns (different gene-capture rates, different noise
+        structure across MERFISH/STARmap/CosMx).
+      - Encoder is "freed" from encoding batch info in z_q because the
+        decoder can absorb per-batch differences via the covariate.
+      - Codebook (shared across batches) is biased toward batch-invariant
+        biological identity.
+
+    Compared to the previous `+film` (FiLM at encoder MLP output): FiLM
+    has no positive signal for batch-INVARIANCE; with reconstruction-only
+    training it learns to AMPLIFY batch-specific signal because that's
+    easier for the decoder to fit. Decoder covariate flips the
+    incentive: the decoder gets free access to batch info, so the
+    encoder benefits from being batch-invariant rather than batch-
+    specific.
+    """
+    cfg["model"]["decoder_covariate_dim_request"] = True
+    return cfg
+
+
+def _patch_dual_chl59_lung5(
+        cfg: dict,
+        train_batch_idx: List[int],
+        test_batch_idx: List[int],
+    ) -> dict:
+    """
+    Swap the dataset to /nfs/team361/sb75/DATASETS/silver/chl59-8b_1p (8
+    CosMx Lung samples) and configure whole-replicate holdout via
+    SpatialBatchSplit.
+
+    The 8 source AnnDatas in alphabetical order (sorted as the blob
+    builder sees them):
+       0  Lung12+SMI+Flat+data.tar.h5ad
+       1  Lung13+SMI+Flat+data.tar.h5ad
+       2  Lung5_Rep1+SMI+Flat+data.tar.h5ad
+       3  Lung5_Rep2+SMI+Flat+data.tar.h5ad
+       4  Lung5_Rep3+SMI+Flat+data.tar.h5ad
+       5  Lung6+SMI+Flat+data.tar.h5ad
+       6  Lung9_Rep1+SMI+Flat+data.tar.h5ad
+       7  Lung9_Rep2+SMI+Flat+data.tar.h5ad
+
+    Cells from `train_batch_idx` go entirely to train; cells from
+    `test_batch_idx` go entirely to val (-> show up as `val_pearson_*` in
+    wandb, computed on the held-out replicate(s)). With the modified
+    `SpatialBatchSplit` (region=None semantics), val_batches with no
+    region means "all cells are val" — perfect for whole-replicate
+    holdout.
+
+    All 8 batches are loaded into the blob; only the train+test subset
+    is used (their adata_batch_id values are the positional indices
+    above). FiLM batch-correction is configured to read from
+    `obs[batch_key]` (default 'batch') so the per-sample / per-replicate
+    label is used for batch one-hots.
+    """
+    cfg["dataset"]["dataset_name"]   = "chl59-8b_1p"
+    cfg["dataset"]["root_data_dir"]  = "/nfs/team361/sb75/DATASETS"
+    cfg["dataset"]["adata_batch_idx"] = sorted(set(list(train_batch_idx) + list(test_batch_idx)))
+
+    # Whole-batch holdout: train_batches keeps Rep1/Rep2 cells in train,
+    # val_batches puts entire Rep3 (and any other holdout replicates) into
+    # val. region=None means "all cells are val" (see SpatialBatchSplit).
+    cfg["dataset"]["train_transform_params"] = {
+        "region":         None,
+        "train_batches":  list(train_batch_idx),
+        "val_batches":    list(test_batch_idx),
+        "test_batches":   [],
+        "xy_key":         "xy_coordinates",
+    }
+
+    # The Lung AnnDatas have `obs['batch']` populated with per-sample
+    # labels; the batch-key flag tells the blob builder to read it.
+    cfg["dataset"]["graph_params"]["batch_key"] = "batch"
+
+    # Validation runs on the held-out replicate(s); name the monitor
+    # accordingly so checkpoints are saved on test-set Pearson.
+    cfg["trainer"]["monitor"] = "val_pearson_gene_wise_log1p"
+    return cfg
+
+
 def _patch_dual_adj_on_zqniche(cfg: dict) -> dict:
     """
     Switch the adjacency BCE input from continuous z_gnn (default) to the
@@ -1709,6 +1906,212 @@ VARIANTS: dict = {
         "patches": ["+wide", "+film(MLP-output, cell_batch_id)"],
         "build": lambda: _patch_dual_film(_patch_dual_wide(_BD())),
     },
+    # ========================================================================
+    # CosMx Lung holdout-replicate variants (dataset: chl59-8b_1p)
+    # ========================================================================
+    # Whole-replicate holdout: train batches go entirely to the train loader,
+    # test batches go entirely to the val loader -> wandb logs `train_*`
+    # metrics on the training replicates and `val_*` metrics on the held-out
+    # replicate(s). Uses the wide+rvq-both+film recipe (best result on the
+    # mouse-brain MERFISH+STARmap data) as the model backbone.
+    "dualvq+wide+rvq-both+film+lung5-rep3-test": {
+        "description": (
+            "Lung5 holdout-replicate setup: train on Lung5_Rep1 + Lung5_Rep2 "
+            "(adata_batch_idx=[2, 3]), validate on Lung5_Rep3 (idx=[4]). "
+            "Wide+RVQ-both backbone + FiLM batch-correction conditioned on "
+            "obs['batch']. `val_pearson_*` metrics in wandb are the "
+            "test-set (Rep3) metrics, computed simultaneously each epoch."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+film(MLP-output, cell_batch_id)",
+            "+chl59_lung5(train=[2,3], test=[4])",
+        ],
+        "build": lambda: _patch_dual_chl59_lung5(
+            _patch_dual_film(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            train_batch_idx=[2, 3],
+            test_batch_idx=[4],
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+lung5-rep3-test": {
+        "description": (
+            "Lung5 holdout-replicate + decoder-covariate batch correction. "
+            "Train: Lung5_Rep1 + Lung5_Rep2 (idx=[2, 3]); Val (test): "
+            "Lung5_Rep3 (idx=[4]). Decoder covariate concatenates per-cell "
+            "batch one-hot to z_q before each decoder, freeing the "
+            "codebook to be batch-invariant across replicates."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+chl59_lung5(train=[2,3], test=[4])",
+        ],
+        "build": lambda: _patch_dual_chl59_lung5(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            train_batch_idx=[2, 3],
+            test_batch_idx=[4],
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+lung5+lung9-multi-test": {
+        "description": (
+            "Lung5+Lung9 holdout + decoder-covariate batch correction. "
+            "Train: 6 samples (idx=[0,1,2,3,5,6]); Val (test): Lung5_Rep3 "
+            "+ Lung9_Rep2 (idx=[4, 7]). The decoder covariate is the key "
+            "ingredient that makes codes consistent across the 6 training "
+            "samples."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+chl59_lung5(train=[0,1,2,3,5,6], test=[4,7])",
+        ],
+        "build": lambda: _patch_dual_chl59_lung5(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            train_batch_idx=[0, 1, 2, 3, 5, 6],
+            test_batch_idx=[4, 7],
+        ),
+    },
+    "dualvq+wide+rvq-both+film+lung5+lung9-multi-test": {
+        "description": (
+            "Lung5+Lung9 holdout-replicate setup: train on all 8 samples "
+            "EXCEPT Lung5_Rep3 and Lung9_Rep2 (adata_batch_idx="
+            "[0, 1, 2, 3, 5, 6]); validate on the two held-out replicates "
+            "(idx=[4, 7]). Wide+RVQ-both backbone + FiLM batch-correction "
+            "(via obs['batch']). `val_pearson_*` metrics are the average "
+            "test-set Pearson across both held-out replicates."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+film(MLP-output, cell_batch_id)",
+            "+chl59_lung5(train=[0,1,2,3,5,6], test=[4,7])",
+        ],
+        "build": lambda: _patch_dual_chl59_lung5(
+            _patch_dual_film(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            train_batch_idx=[0, 1, 2, 3, 5, 6],
+            test_batch_idx=[4, 7],
+        ),
+    },
+    # ========================================================================
+    # NicheCompass-style decoder-covariate batch correction (concat).
+    # Replaces the previous FiLM-at-encoder mechanism, which conceptually
+    # AMPLIFIES batch effects rather than removing them (no
+    # batch-invariance pressure on the encoder).
+    # ========================================================================
+    "dualvq+wide+decoder-cov": {
+        "description": (
+            "Wide dual VQ + NicheCompass-style decoder covariate "
+            "(per-cell batch one-hot is concatenated to z_q before each "
+            "decoder). The decoders absorb per-batch gene patterns, "
+            "freeing the codebook to encode batch-invariant biological "
+            "identity. Recommended starting point for cross-sample / "
+            "cross-platform integration."
+        ),
+        "patches": ["+wide", "+decoder_covariate(concat per-cell batch one-hot)"],
+        "build": lambda: _patch_dual_decoder_covariate(_patch_dual_wide(_BD())),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv": {
+        "description": (
+            "Wide dual VQ + RVQ on both branches + decoder covariate + "
+            "domain-adversarial batch-invariance head. The combination is "
+            "the NicheCompass-shape recipe: covariate concat lets the "
+            "decoder absorb per-batch gene patterns; adversarial GRL "
+            "actively pushes the encoder to make z_mlp batch-invariant. "
+            "Recommended cross-tissue / cross-platform integration variant."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=1.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=1.0,
+        ),
+    },
+    "dualvq+wide+rvq-both+adv": {
+        "description": (
+            "Wide dual VQ + RVQ on both branches + adversarial-only batch "
+            "correction (no decoder covariate). Tests whether the GRL "
+            "alone is enough — should not work as well as +decoder-cov+adv "
+            "since the decoder has no way to fit per-batch noise."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+adversarial_batch(alpha=1.0, wt=1.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_rvq(
+                _patch_dual_rvq(
+                    _patch_dual_wide(_BD()),
+                    branch="niche", codebook_sizes=(30, 90),
+                ),
+                branch="cell", codebook_sizes=(30, 90),
+            ),
+            alpha=1.0, wt_adv_batch=1.0,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov": {
+        "description": (
+            "Wide dual VQ + RVQ on both branches (levels=[30, 90] each) + "
+            "NicheCompass-style decoder covariate. Combines best "
+            "single-sample setup with concat-based cross-sample batch "
+            "correction. Recommended cross-tissue (MERFISH+STARmap) "
+            "starting point."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=niche, levels=[30, 90])",
+            "+rvq(branch=cell, levels=[30, 90])",
+            "+decoder_covariate(concat per-cell batch one-hot)",
+        ],
+        "build": lambda: _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+                _patch_dual_rvq(
+                    _patch_dual_wide(_BD()),
+                    branch="niche", codebook_sizes=(30, 90),
+                ),
+                branch="cell", codebook_sizes=(30, 90),
+            ),
+        ),
+    },
     "dualvq+wide+rvq-both+film": {
         "description": (
             "Wide dual VQ + RVQ on both branches (levels=[30, 90] each) + "
@@ -1922,9 +2325,14 @@ def harmonize_anndata_var():
 # Build dataset blob (one-time preprocessing)
 # ---------------------------------------------------------------------------
 
-def build_blob():
+def build_blob(dataset: str = "mmb-smb"):
     """
     Build the in-memory PyG DatasetBlob in-process.
+
+    `dataset` selects which builder config to use:
+      - 'mmb-smb' (default): MERFISH MB + STARmap MB (`mmb0-1b_smb1-1b_1p_coord_aligned`)
+      - 'chl59'              : CosMx Lung 8-sample dataset (`chl59-8b_1p`),
+                               built from /nfs/team361/sb75/DATASETS/silver/chl59-8b_1p
 
     Implementation note: previously this shelled out to
         squint-reproducibility/analysis/create_in_memory_dataset_blob.py
@@ -1934,8 +2342,12 @@ def build_blob():
     here directly with the same arguments.
     """
     CONFIG_OUT_DIR.mkdir(parents=True, exist_ok=True)
-    cfg_path = CONFIG_OUT_DIR / "build_blob.yaml"
-    cfg = make_dataset_blob_config()
+    if dataset == "chl59":
+        cfg = make_dataset_blob_config_chl59()
+        cfg_path = CONFIG_OUT_DIR / "build_blob_chl59.yaml"
+    else:
+        cfg = make_dataset_blob_config()
+        cfg_path = CONFIG_OUT_DIR / "build_blob.yaml"
     with open(cfg_path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
     print(f"Wrote dataset-blob config to {cfg_path}")
@@ -2093,6 +2505,33 @@ def train(variant: str):
         cfg["model"]["encoder_params"]["spatial_prior_params"][
             "spatial_prior_feature_dim"
         ] = data_batch.spatial_prior_feature_dim
+    # Helper: derive the number of distinct batches in this run from the
+    # densified per-cell batch IDs. `adata_batch_ids` is ALWAYS populated
+    # by `initialize_databatch` (regardless of whether encoder FiLM is on),
+    # so this is a reliable source. `encoder_condition_dim` was the wrong
+    # source — it only gets set when FiLM is enabled, which is not the
+    # case for adversarial-only or covariate-only variants.
+    def _n_distinct_batches(db) -> int:
+        return int(db.adata_batch_ids.max().item()) + 1
+
+    # NicheCompass-style decoder covariate (concat-based batch correction).
+    # When the user enables it via _patch_dual_decoder_covariate, the dual
+    # model expects `decoder_covariate_dim` to equal the dimensionality of
+    # the per-cell batch one-hot. Set it from the data loader here.
+    if (
+        cfg["model"].get("model_name") == "VQNiche_Dual"
+        and cfg["model"].get("decoder_covariate_dim_request") is True
+    ):
+        cfg["model"]["decoder_covariate_dim"] = _n_distinct_batches(data_batch)
+
+    # Domain-adversarial batch-invariance head. When requested, sized to
+    # the number of distinct batches.
+    if (
+        cfg["model"].get("model_name") == "VQNiche_Dual"
+        and cfg["model"].get("adversarial_batch_dim_request") is True
+    ):
+        cfg["model"]["adversarial_batch_dim"] = _n_distinct_batches(data_batch)
+
     # Bind FiLM condition dims onto whichever decoder param dicts the
     # current config carries. Single-codebook configs (VQNiche etc.) use
     # `attribute_decoder_params` + `adjacency_decoder_params`. The
@@ -2652,6 +3091,127 @@ def predict(
 # CLI
 # ---------------------------------------------------------------------------
 
+def run_all_pipeline(
+        variant: str,
+        silver_dir: Optional[str] = None,
+        output_dir: Optional[str] = None,
+        model_ckpt_fname: Optional[str] = None,
+        label_keys: str = "cell_type",
+        batch_rename: Optional[str] = None,
+    ) -> None:
+    """
+    End-to-end pipeline:
+
+      1. train(variant)            -> writes <ARTIFACTS_DIR>/<dataset>/<variant>/<TS>/
+      2. predict(run_dir=auto)     -> writes <ARTIFACTS_DIR>/inference/<run-name>/
+                                       predicted_adata.h5ad
+      3. plot_code_indices_spatial -> per-batch spatial plots of code indices
+      4. plot_svg_reconstruction   -> SVG vs. reconstruction sanity plots
+      5. plot_latent_umap          -> UMAP of each latent slot
+
+    Plot scripts run via subprocess so each gets a clean process / cuda
+    state and the output of one doesn't pollute the others. They write
+    SVGs/PNGs into subdirectories of the predict output folder.
+    """
+    import subprocess
+
+    # ------------------------------------------------------------------
+    # 1. Train
+    # ------------------------------------------------------------------
+    print("=" * 78)
+    print(f"[1/5] Train  variant={variant!r}")
+    print("=" * 78)
+    run_dir = train(variant)
+    if run_dir is None:
+        # Older train() signatures didn't return; fall back to looking up
+        # the most recent run dir for this variant.
+        variant_slug = variant.replace("/", "_")
+        candidates = sorted((ARTIFACTS_DIR / DATASET_NAME / variant_slug).glob("*/"))
+        if not candidates:
+            raise RuntimeError(f"Could not auto-locate run_dir for variant {variant}")
+        run_dir = str(candidates[-1])
+    print(f"[1/5] Done. run_dir={run_dir}")
+
+    # ------------------------------------------------------------------
+    # 2. Predict
+    # ------------------------------------------------------------------
+    print()
+    print("=" * 78)
+    print(f"[2/5] Predict on run_dir={run_dir}")
+    print("=" * 78)
+    predict(
+        run_dir=run_dir,
+        silver_dir=silver_dir,
+        model_ckpt_fname=model_ckpt_fname,
+        output_dir=output_dir,
+    )
+    # Resolve where the predicted_adata.h5ad landed.
+    if output_dir is None:
+        run_name = Path(run_dir).name
+        # Match the naming convention used inside `predict()`:
+        # variant slug parent of run_dir + run-name child.
+        variant_slug = Path(run_dir).parent.name
+        predict_dir = INFERENCE_DIR / variant_slug / run_name
+    else:
+        predict_dir = Path(output_dir)
+    predicted_adata_path = predict_dir / "predicted_adata.h5ad"
+    if not predicted_adata_path.exists():
+        raise FileNotFoundError(
+            f"Expected predicted AnnData at {predicted_adata_path} but it's missing."
+        )
+    print(f"[2/5] Done. predicted_adata={predicted_adata_path}")
+
+    # ------------------------------------------------------------------
+    # 3. plot_code_indices_spatial
+    # ------------------------------------------------------------------
+    examples_dir = Path(__file__).parent
+    common_args = ["--predicted-adata", str(predicted_adata_path)]
+
+    print()
+    print("=" * 78)
+    print("[3/5] plot_code_indices_spatial")
+    print("=" * 78)
+    subprocess.run(
+        [sys.executable, str(examples_dir / "plot_code_indices_spatial.py")] + common_args,
+        check=True,
+    )
+
+    # ------------------------------------------------------------------
+    # 4. plot_svg_reconstruction
+    # ------------------------------------------------------------------
+    print()
+    print("=" * 78)
+    print("[4/5] plot_svg_reconstruction")
+    print("=" * 78)
+    subprocess.run(
+        [sys.executable, str(examples_dir / "plot_svg_reconstruction.py")] + common_args,
+        check=True,
+    )
+
+    # ------------------------------------------------------------------
+    # 5. plot_latent_umap
+    # ------------------------------------------------------------------
+    print()
+    print("=" * 78)
+    print("[5/5] plot_latent_umap")
+    print("=" * 78)
+    umap_args = list(common_args) + ["--label-keys", label_keys]
+    if batch_rename:
+        umap_args += ["--batch-rename", batch_rename]
+    subprocess.run(
+        [sys.executable, str(examples_dir / "plot_latent_umap.py")] + umap_args,
+        check=True,
+    )
+
+    print()
+    print("=" * 78)
+    print("Pipeline complete.")
+    print(f"  Run dir:           {run_dir}")
+    print(f"  Predicted AnnData: {predicted_adata_path}")
+    print(f"  Plots:             {predict_dir}/{{code_index_plots,svg_plots,umap_plots}}/")
+    print("=" * 78)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--patch-uns", action="store_true",
@@ -2660,7 +3220,13 @@ def main():
                    help="Subset and align .var across the two .h5ad files (one-time, "
                         "run if --build-blob fails with 'All batches must have the same gene panel').")
     p.add_argument("--build-blob", action="store_true",
-                   help="Build the in-memory PyG DatasetBlob (one-time).")
+                   help="Build the in-memory PyG DatasetBlob (one-time). "
+                        "Use --build-blob-dataset to pick which dataset.")
+    p.add_argument("--build-blob-dataset", type=str, default="mmb-smb",
+                   choices=["mmb-smb", "chl59"],
+                   help="Which dataset to build (default: mmb-smb). "
+                        "'chl59' = /nfs/team361/sb75/DATASETS/silver/chl59-8b_1p "
+                        "(CosMx Lung, 8 samples).")
     p.add_argument("--train", action="store_true",
                    help="Train SQUINT on the WHOLE dataset blob (logs to wandb project 'squint').")
     p.add_argument("--variant", type=str, default="poc",
@@ -2670,6 +3236,18 @@ def main():
                    help="Print all registered ablation variants and exit.")
     p.add_argument("--predict", action="store_true",
                    help="Run inference on a folder of .h5ad files using a trained checkpoint.")
+    p.add_argument("--all", action="store_true",
+                   help="End-to-end: train -> predict -> run all 3 plot scripts "
+                        "(plot_code_indices_spatial, plot_svg_reconstruction, "
+                        "plot_latent_umap) on the predicted AnnData. Convenience "
+                        "wrapper for `--train --variant <V>` followed by "
+                        "`--predict --run-dir <auto>`.")
+    p.add_argument("--batch-rename", type=str, default=None,
+                   help="Optional comma-separated rename for adata_batch_id "
+                        "categories in UMAP plots (e.g. 'MERFISH,STARmap PLUS').")
+    p.add_argument("--label-keys", type=str, default="cell_type",
+                   help="Comma-separated obs columns to color UMAPs and code-index "
+                        "plots by (default: cell_type).")
     p.add_argument("--run-dir", type=str, default=None,
                    help="Path to the run directory of the trained model "
                         "(<ARTIFACTS_DIR>/<DATASET_NAME>/<TIMESTAMP>). Required with --predict.")
@@ -2694,7 +3272,8 @@ def main():
             print(f"    patches:     {spec['patches']}")
         return
 
-    if not (args.patch_uns or args.harmonize_var or args.build_blob or args.train or args.predict):
+    if not (args.patch_uns or args.harmonize_var or args.build_blob
+            or args.train or args.predict or args.all):
         p.print_help()
         return
 
@@ -2703,7 +3282,7 @@ def main():
     if args.harmonize_var:
         harmonize_anndata_var()
     if args.build_blob:
-        build_blob()
+        build_blob(dataset=args.build_blob_dataset)
     if args.train:
         train(args.variant)
     if args.predict:
@@ -2717,6 +3296,17 @@ def main():
             silver_dir=args.silver_dir,
             model_ckpt_fname=args.model_ckpt_fname,
             output_dir=args.output_dir,
+        )
+
+    # --all: end-to-end train -> predict -> 3 plot scripts.
+    if args.all:
+        run_all_pipeline(
+            variant=args.variant,
+            silver_dir=args.silver_dir,
+            output_dir=args.output_dir,
+            model_ckpt_fname=args.model_ckpt_fname,
+            label_keys=args.label_keys,
+            batch_rename=args.batch_rename,
         )
 
 
