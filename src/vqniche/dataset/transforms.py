@@ -1,4 +1,4 @@
-from typing import Optional, List, Literal, Union
+from typing import Dict, Optional, List, Literal, Union
 
 import scanpy as sc
 import anndata as ad
@@ -81,6 +81,9 @@ def init_train_transforms(
         # early stopping / best-ckpt selection inside training sections).
         train_val_cell_split: float = 0.0,
         cell_split_seed: int = 0,
+        # Per-batch held-out region rectangles for the gene-reconstruction
+        # downstream task (SpatialBatchSplit.test_regions).
+        test_regions: Optional[Dict[int, Union[dict, List[dict]]]] = None,
     ) -> List[T.BaseTransform]:
     """
     Initialize a list of training-related PyG transforms to be applied to the Data object.
@@ -139,6 +142,7 @@ def init_train_transforms(
                 test_batches=test_batches,
                 train_val_cell_split=train_val_cell_split,
                 cell_split_seed=cell_split_seed,
+                test_regions=test_regions,
             )
         )
     
@@ -235,6 +239,7 @@ class SpatialBatchSplit(T.BaseTransform):
             test_batches: Optional[list] = None,
             train_val_cell_split: float = 0.0,
             cell_split_seed: int = 0,
+            test_regions: Optional[Dict[int, Union[dict, List[dict]]]] = None,
         ):
         """
         Split nodes based on batch information. Useful when you have multiple tissue sections
@@ -271,6 +276,23 @@ class SpatialBatchSplit(T.BaseTransform):
             RNG seed for the cell-level split. Same seed -> same split
             cells across runs (so wandb val_* curves are comparable
             across re-runs of the same variant).
+        - test_regions: dict
+            Per-batch test rectangles for the held-out-region
+            reconstruction task. Maps `adata_batch_id -> region_spec`
+            where each spec is either a single dict or a list of dicts.
+            Supported region keys (mix freely; absolute and percentile
+            entries can coexist on the same dict):
+              absolute   : x_min, x_max, y_min, y_max  (in xy_coords)
+              percentile : x_min_pct, x_max_pct, y_min_pct, y_max_pct
+                           (fractions in [0,1] of the section's xy range)
+            For batches present in this dict, the LISTED CELLS go to
+            test_mask=True and the REST of THAT BATCH go to
+            train_mask=True (val_mask=zero). Useful for the gene-
+            reconstruction downstream task: the held-out patch is
+            predicted by the trained model and Pearson is reported on
+            test cells only. Independent from `test_batches` (which
+            holds out whole sections); the two can be used together if
+            needed.
 
         Example:
         --------
@@ -290,18 +312,48 @@ class SpatialBatchSplit(T.BaseTransform):
         self.test_batches = test_batches
         self.train_val_cell_split = float(train_val_cell_split)
         self.cell_split_seed = int(cell_split_seed)
+        # Normalise keys to int so YAML-loaded `{15: {...}}` and
+        # `{"15": {...}}` are both accepted.
+        self.test_regions: Dict[int, Union[dict, List[dict]]] = (
+            {int(k): v for k, v in (test_regions or {}).items()}
+        )
         
     def _is_in_single_region(self, coords, region):
-        """Check if coordinates are within a single specified region."""
+        """
+        Check if coordinates are within a single specified region.
+
+        Region can use ABSOLUTE bounds (`x_min`, `x_max`, `y_min`,
+        `y_max`) and/or PERCENTILE bounds (`x_min_pct`, `x_max_pct`,
+        `y_min_pct`, `y_max_pct` — fractions in [0, 1] of the
+        section's actual xy range, computed on `coords`). Percentile
+        keys make the same region spec portable across sections with
+        different coordinate scales (MERFISH vs STARmap have very
+        different absolute coordinate ranges).
+        """
         if region is None:
             return torch.zeros(coords.shape[0], dtype=torch.bool)
-            
+
         x_coords = coords[:, 0]
         y_coords = coords[:, 1]
-        
-        x_mask = (x_coords >= region['x_min']) & (x_coords <= region['x_max'])
-        y_mask = (y_coords >= region['y_min']) & (y_coords <= region['y_max'])
-        
+
+        def _resolve_bound(abs_key: str, pct_key: str, fallback) -> float:
+            if abs_key in region and region[abs_key] is not None:
+                return float(region[abs_key])
+            if pct_key in region and region[pct_key] is not None:
+                rng_min = float(x_coords.min()) if abs_key.startswith("x") else float(y_coords.min())
+                rng_max = float(x_coords.max()) if abs_key.startswith("x") else float(y_coords.max())
+                pct = float(region[pct_key])
+                return rng_min + pct * (rng_max - rng_min)
+            return fallback
+
+        x_min = _resolve_bound("x_min", "x_min_pct", float("-inf"))
+        x_max = _resolve_bound("x_max", "x_max_pct", float("inf"))
+        y_min = _resolve_bound("y_min", "y_min_pct", float("-inf"))
+        y_max = _resolve_bound("y_max", "y_max_pct", float("inf"))
+
+        x_mask = (x_coords >= x_min) & (x_coords <= x_max)
+        y_mask = (y_coords >= y_min) & (y_coords <= y_max)
+
         return x_mask & y_mask
         
     def _is_in_region(self, coords, regions):
@@ -336,6 +388,45 @@ class SpatialBatchSplit(T.BaseTransform):
     
     def forward(self, data: Data) -> Data:
         num_nodes = data.x.shape[0]
+
+        # Per-batch held-out test regions (independent of `test_batches`).
+        # When this batch has an entry in `test_regions`, cells inside the
+        # region(s) are test_mask=True, the REMAINING cells go through
+        # the same in-section cell-level train/val split as a normal
+        # training section (so early-stopping on val_loss still has a
+        # signal — the val cells are NOT held-out-region cells, they're
+        # a random 10% sample of the rest of the section).
+        # Used by the held-out gene-reconstruction downstream task.
+        bid_int = int(data.adata_batch_id)
+        if self.test_regions and bid_int in self.test_regions:
+            region_spec = self.test_regions[bid_int]
+            test_mask = self._is_in_region(
+                data[self.xy_key], region_spec,
+            )
+            train_mask = ~test_mask
+            val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+
+            # Cell-level train/val split on the non-test cells. Same RNG
+            # convention as the train_batches branch
+            # (`(cell_split_seed, adata_batch_id)` -> deterministic).
+            if self.train_val_cell_split > 0.0:
+                gen = torch.Generator()
+                gen.manual_seed(
+                    self.cell_split_seed * 1_000_003 + int(data.adata_batch_id)
+                )
+                train_idx = torch.where(train_mask)[0]
+                n_eligible = int(train_idx.numel())
+                if n_eligible > 0:
+                    n_val = int(round(self.train_val_cell_split * n_eligible))
+                    perm = torch.randperm(n_eligible, generator=gen)
+                    val_positions = train_idx[perm[:n_val]]
+                    val_mask[val_positions] = True
+                    train_mask[val_positions] = False
+
+            data.test_mask  = test_mask
+            data.train_mask = train_mask
+            data.val_mask   = val_mask
+            return data
 
         if data.adata_batch_id in self.train_batches:
             data.train_mask = torch.ones(num_nodes, dtype=torch.bool)

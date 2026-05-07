@@ -1418,37 +1418,6 @@ def _patch_dual_dropout(cfg: dict, p: float = 0.1) -> dict:
     return cfg
 
 
-def _patch_dual_film(
-        cfg: dict,
-        condition_list: List[str] = ["cell_batch_id"],
-    ) -> dict:
-    """
-    Enable FiLM batch-correction on the dual encoder.
-
-    The FiLM module is attached to the MLP output (post-MLP, pre-VQ-cell,
-    pre-GNN), so BOTH the cell codebook and the niche codebook see a
-    batch-corrected representation. This means cells from different
-    samples (e.g. MERFISH brain vs. STARmap brain) with the same
-    biological identity should map to the same code.
-
-    `condition_list` controls what the FiLM module is conditioned on.
-    Default ['cell_batch_id'] uses the per-cell sample identity (one-hot
-    encoded by the data loader from `adata.obs['batch']` if present, or
-    parsed from `cell_id` strings as a fallback). You can also include
-    'rbf_distances', 'timepoint_id', etc. — anything the loader's
-    encoder-conditioning pipeline knows how to populate.
-    """
-    enc = cfg["model"]["encoder_params"]
-    enc["conditioning_params"] = {
-        "condition_list":   list(condition_list),
-        "use_bias":         True,
-        "use_residual":     False,
-        "residual_weight":  0.2,
-        "init_mode":        "identity",
-    }
-    return cfg
-
-
 def _patch_dual_adversarial(
         cfg: dict,
         alpha: float = 1.0,
@@ -1576,35 +1545,55 @@ def _patch_dual_decoder_film(
     return cfg
 
 
-def _patch_dual_decoder_covariate(cfg: dict) -> dict:
+def _patch_dual_decoder_covariate(
+        cfg: dict,
+        embed_dim: int = 16,
+    ) -> dict:
     """
-    Enable NicheCompass-style decoder covariate (concat-based batch
-    correction).
+    Enable NicheCompass-style decoder covariate via a LEARNED batch
+    embedding (concat-based batch correction).
 
     What it does: at runtime, `train()` sets `decoder_covariate_dim` to
-    the number of distinct samples in the dataset (= n_unique batch one-
-    hot dim). The dual model then concatenates the per-cell batch one-hot
-    onto z_q_cell and z_q_niche before each decoder. The decoders are
-    constructed with extended `in_channels` to consume the concat tensor.
+    the number of distinct samples in the dataset (= n train batches).
+    The dual model then learns an `nn.Embedding(n_batches, embed_dim)`
+    and concatenates `embedding[adata_batch_ids]` (an `embed_dim`-dim
+    learned vector per cell) onto z_q_cell and z_q_niche before each
+    decoder. The decoders are constructed with extended `in_channels`
+    by `embed_dim` (NOT by `n_batches` — the old one-hot scheme).
+
+    Why a learned embedding instead of one-hot:
+      - Generalises to NOVEL batches at inference. The mean of trained
+        embeddings is a meaningful "neutral" covariate for held-out
+        sections; one-hot has no valid index for unseen batches and
+        forces an arbitrary "treat as if it were train batch 0"
+        fallback. The dual model's forward path swaps in the mean
+        embedding for cells flagged via `adata_batch_ids_unseen_mask`
+        (set by `build_batch_one_hot_from_obs` when the cell's label
+        wasn't in the train-time densification map).
+      - Lower-dim conditional (default embed_dim=16 vs n_batches which
+        can be 8-20+).
+      - Encoder still doesn't see batch info → codes (= VQ output) are
+        batch-invariant by construction; only the DECODER reconstruction
+        depends on the embedding lookup.
 
     Effect:
-      - Decoders use the batch covariate to fit per-batch / per-platform
+      - Decoders use the learned batch embedding to fit per-batch
         gene patterns (different gene-capture rates, different noise
         structure across MERFISH/STARmap/CosMx).
       - Encoder is "freed" from encoding batch info in z_q because the
-        decoder can absorb per-batch differences via the covariate.
-      - Codebook (shared across batches) is biased toward batch-invariant
-        biological identity.
+        decoder can absorb per-batch differences via the embedding.
+      - Codebook (shared across batches) is biased toward batch-
+        invariant biological identity.
 
-    Compared to the previous `+film` (FiLM at encoder MLP output): FiLM
-    has no positive signal for batch-INVARIANCE; with reconstruction-only
-    training it learns to AMPLIFY batch-specific signal because that's
-    easier for the decoder to fit. Decoder covariate flips the
-    incentive: the decoder gets free access to batch info, so the
-    encoder benefits from being batch-invariant rather than batch-
-    specific.
+    Parameters
+    ----------
+    embed_dim : int
+        Dimensionality of the learned batch embedding. 16 is a good
+        default — large enough to capture meaningful cross-batch
+        differences, small enough to keep the decoder input compact.
     """
     cfg["model"]["decoder_covariate_dim_request"] = True
+    cfg["model"]["decoder_covariate_embed_dim"]   = int(embed_dim)
     return cfg
 
 
@@ -1874,6 +1863,73 @@ def _patch_dual_mmb20_holdout(cfg: dict) -> dict:
     )
 
 
+def _patch_holdout_regions(
+        cfg: dict,
+        regions: Optional[dict] = None,
+    ) -> dict:
+    """
+    Hold out spatially-contiguous patches WITHIN sections for the
+    gene-reconstruction downstream task (NicheCompass / MLGenX-style).
+
+    Both source sections stay in the train graph (so the model still
+    sees most of each tissue), but the cells inside the per-batch
+    `regions` rectangle become `test_mask=True` and are masked OUT of
+    the training loss. At inference, predict() runs over every cell and
+    `compute_inference_metrics.py` reports stratified Pearson on the
+    `data_split == "test"` subset only.
+
+    Parameters
+    ----------
+    regions : dict[int, dict]
+        Mapping `adata_batch_id -> region_spec`. Each region spec can mix
+        absolute keys (`x_min`, `x_max`, `y_min`, `y_max`) and percentile
+        keys (`x_min_pct`, `x_max_pct`, `y_min_pct`, `y_max_pct`,
+        fractions of the section's xy range). Percentile keys are
+        recommended for cross-platform datasets where MERFISH and
+        STARmap+ live in very different coordinate frames — the same
+        spec then resolves to a comparable patch in both.
+
+        Default: a central 25% × 25% patch in batch 15 (STARmap+ MB) and
+        a different central-but-shifted 25% × 25% patch in batch 82
+        (MERFISH MB), so the two held-outs cover different anatomical
+        zones across platforms. Override to pick specific anatomical
+        landmarks (e.g. cortex, hippocampus).
+
+    Notes
+    -----
+    - Independent from `test_batches` (which holds out whole sections).
+    - The base mmb-smb config has `train_batches=[15, 82]` and empty
+      `test_batches`, which is exactly what this patch needs — both
+      batches stay in training, just with cell-level masks applied.
+    - Predict() reads `test_regions` from the saved config and tags
+      held-out cells with `obs["data_split"] = "test"` so post-inference
+      Pearson stratifies correctly.
+    """
+    # Default regions: rectangular patches near the centre of each
+    # section (STARmap+ batch 15 and MERFISH batch 82 live in different
+    # coordinate frames, so percentile-based regions resolve cleanly in
+    # both).
+    if regions is None:
+        regions = {
+            # STARmap+ batch 15: a patch in the upper-left quadrant.
+            15: {
+                "x_min_pct": 0.10, "x_max_pct": 0.35,
+                "y_min_pct": 0.55, "y_max_pct": 0.80,
+            },
+            # MERFISH batch 82: a patch in the lower-right quadrant
+            # (different anatomical region than batch 15's hold-out).
+            82: {
+                "x_min_pct": 0.55, "x_max_pct": 0.80,
+                "y_min_pct": 0.20, "y_max_pct": 0.45,
+            },
+        }
+
+    cfg["dataset"]["train_transform_params"]["test_regions"] = {
+        int(k): v for k, v in regions.items()
+    }
+    return cfg
+
+
 def _patch_dual_adj_on_zqniche(cfg: dict) -> dict:
     """
     Switch the adjacency BCE input from continuous z_gnn (default) to the
@@ -2138,6 +2194,46 @@ VARIANTS: dict = {
                 alpha=1.0, wt_adv_batch=150.0,
             ),
             weight=250.0,
+        ),
+    },
+    # ========================================================================
+    # mmb0-1b_smb1-1b_1p held-out region (downstream gene-reconstruction
+    # task, NicheCompass / MLGenX-style). Both batches stay in training
+    # but a contiguous patch in each is masked out cell-wise; Pearson is
+    # then reported only on the held-out cells via
+    # `compute_inference_metrics.py`'s `data_split == "test"` rows.
+    # See `_patch_holdout_regions` for the default region geometry; use
+    # `examples/plot_holdout_regions.py` to visualise / iterate on it.
+    # ========================================================================
+    "dualvq+rvq-both+decoder-cov+adv+region-holdout+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "1-layer-spine baseline (RVQ-both + decoder-cov + adv) WITH "
+            "per-batch held-out spatial patches: a 25% x 25% box near "
+            "the upper-left of STARmap+ batch15 and a 25% x 25% box near "
+            "the lower-right of MERFISH batch82. Both sections stay in "
+            "training; the held-out cells are masked out cell-wise and "
+            "are tagged `data_split=\"test\"` so post-inference Pearson "
+            "isolates the gene-reconstruction task from the trained-on "
+            "cells."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+region_holdout(test_regions={15: 25%x25% upper-left, "
+            "82: 25%x25% lower-right})",
+        ],
+        "build": lambda: _patch_holdout_regions(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 90)),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
         ),
     },
     # ---- Reconstruction-mode ablations (all other components fixed) --------
@@ -2671,56 +2767,12 @@ VARIANTS: dict = {
         ),
     },
     # ========================================================================
-    # FiLM batch-correction variants (MLP-output FiLM, both branches affected)
-    # ========================================================================
-    "dualvq+wide+film": {
-        "description": (
-            "Wide dual VQ + FiLM batch-correction at the MLP output. Both "
-            "the cell and niche codebooks see a batch-corrected representation, "
-            "so cells from different samples (MERFISH/STARmap, replicates, "
-            "platforms) with the same biological identity should map to the "
-            "same code. Conditioning on `cell_batch_id`. Use this as the "
-            "starting point for cross-sample integration."
-        ),
-        "patches": ["+wide", "+film(MLP-output, cell_batch_id)"],
-        "build": lambda: _patch_dual_film(_patch_dual_wide(_BD())),
-    },
-    # ========================================================================
     # CosMx Lung holdout-replicate variants (dataset: chl59-8b_1p)
     # ========================================================================
     # Whole-replicate holdout: train batches go entirely to the train loader,
     # test batches go entirely to the val loader -> wandb logs `train_*`
     # metrics on the training replicates and `val_*` metrics on the held-out
-    # replicate(s). Uses the wide+rvq-both+film recipe (best result on the
-    # mouse-brain MERFISH+STARmap data) as the model backbone.
-    "dualvq+wide+rvq-both+film+chl59-8b_1p": {
-        "description": (
-            "chl59-8b_1p split: train on adata_batch_id 0 + 1 + 4 + 5 + 6 + 7 "
-            "(6 sections), hold out adata_batch_id 2 + 3 as test. "
-            "Wide+RVQ-both backbone + FiLM batch-correction conditioned on "
-            "obs['batch']. Val signal during training is the 10% in-section "
-            "cell sample of the training sections; the held-out batch2 + "
-            "batch3 sections are evaluated post-hoc by the predict + "
-            "compute_inference_metrics pipeline."
-        ),
-        "patches": [
-            "+wide", "+rvq(branch=both, levels=[30, 90])",
-            "+film(MLP-output, cell_batch_id)",
-            "+chl59-8b_1p(test_ids=[2,3])",
-        ],
-        "build": lambda: _patch_dual_chl59_lung5(
-            _patch_dual_film(
-                _patch_dual_rvq(
-                    _patch_dual_rvq(
-                        _patch_dual_wide(_BD()),
-                        branch="niche", codebook_sizes=(30, 90),
-                    ),
-                    branch="cell", codebook_sizes=(30, 90),
-                ),
-            ),
-            test_batch_idx=[2, 3],
-        ),
-    },
+    # replicate(s).
     "dualvq+wide+rvq-both+decoder-cov+chl59-8b_1p": {
         "description": (
             "chl59-8b_1p split + decoder-covariate batch correction. "
@@ -3230,30 +3282,6 @@ VARIANTS: dict = {
             alpha=1.0, wt_adv_batch=150.0,
         ),
     },
-    "dualvq+wide+rvq-both+film": {
-        "description": (
-            "Wide dual VQ + RVQ on both branches (levels=[30, 90] each) + "
-            "FiLM batch-correction at the MLP output. Combines the best "
-            "single-sample setup with cross-sample batch correction — "
-            "recommended starting point for cross-tissue (MERFISH+STARmap) "
-            "or cross-replicate atlases."
-        ),
-        "patches": [
-            "+wide",
-            "+rvq(branch=niche, levels=[30, 90])",
-            "+rvq(branch=cell, levels=[30, 90])",
-            "+film(MLP-output, cell_batch_id)",
-        ],
-        "build": lambda: _patch_dual_film(
-            _patch_dual_rvq(
-                _patch_dual_rvq(
-                    _patch_dual_wide(_BD()),
-                    branch="niche", codebook_sizes=(30, 90),
-                ),
-                branch="cell", codebook_sizes=(30, 90),
-            ),
-        ),
-    },
     "dualvq+wide+cvq-both": {
         "description": (
             "Wide dual VQ + ConditionalVQ (tree) on BOTH branches "
@@ -3646,6 +3674,14 @@ DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations"] = [
     # Adjacency BCE weight axis: 1000 -> {3000, 250}
     "dualvq+rvq-both+decoder-cov+adv+adj-w3000+mmb0-1b_smb1-1b_1p",
     "dualvq+rvq-both+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p",
+]
+
+# Held-out-region downstream task. Currently a single variant — the
+# 1-layer-spine baseline (RVQ-both + decoder-cov + adv) with per-batch
+# spatial holdout patches. Add more entries here later (e.g. larger
+# patches, different anatomical zones) without touching the submitter.
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-region-holdout"] = [
+    "dualvq+rvq-both+decoder-cov+adv+region-holdout+mmb0-1b_smb1-1b_1p",
 ]
 
 
@@ -4295,6 +4331,7 @@ def _build_clean_adata_from_inference(
     id_to_path: dict,
     gene_names: list | None = None,
     test_batch_ids: list | None = None,
+    test_regions: dict | None = None,
     # Legacy kwargs kept for signature back-compat — ignored.
     label_categories_dict: dict | None = None,
     source_paths: list | None = None,
@@ -4351,6 +4388,16 @@ def _build_clean_adata_from_inference(
         `adata_batch_id` values that were held out from training; cells
         from these sections get `obs["data_split"] = "test"`,
         everything else is "train".
+    test_regions:
+        Optional mapping `adata_batch_id -> region_spec` for the held-
+        out-region downstream task (`SpatialBatchSplit.test_regions`).
+        Cells whose `obsm["spatial"]` falls inside the region for their
+        batch ALSO get `data_split = "test"` (in addition to whatever
+        `test_batch_ids` already marked). Region keys: `x_min`, `x_max`,
+        `y_min`, `y_max` (absolute) and/or their `_pct` percentile
+        equivalents (resolved against this batch's per-section coordinate
+        range — same convention as the training-time
+        `_is_in_single_region`).
     """
     import anndata as ad
     import numpy as np
@@ -4468,8 +4515,63 @@ def _build_clean_adata_from_inference(
         [name_for_id[bid] for bid in batch_ids_np]
     )
     test_set = set(int(b) for b in (test_batch_ids or []))
+    is_test = np.array(
+        [int(b) in test_set for b in batch_ids_np], dtype=bool
+    )
+
+    # Held-out-region downstream task: mark cells whose spatial xy falls
+    # inside per-batch test_regions. Resolve percentile bounds against
+    # each section's actual coord range (mirrors SpatialBatchSplit's
+    # `_is_in_single_region` semantics — keeping the predict-time data
+    # split consistent with the train-time one).
+    if test_regions and "spatial" in adata.obsm:
+        regions_normed: dict = {int(k): v for k, v in test_regions.items()}
+        spatial = np.asarray(adata.obsm["spatial"], dtype=float)
+        if spatial.shape[1] >= 2:
+            for bid, region_spec in regions_normed.items():
+                cells_in_bid = (batch_ids_np.astype(int) == int(bid))
+                if not cells_in_bid.any():
+                    continue
+                # Resolve per-batch xy range from THIS batch's cells (not
+                # the global range) so percentile bounds line up with
+                # what SpatialBatchSplit computed at training time.
+                xy_b = spatial[cells_in_bid, :2]
+                x_lo, y_lo = xy_b.min(axis=0)
+                x_hi, y_hi = xy_b.max(axis=0)
+                regions_list = (
+                    region_spec if isinstance(region_spec, list)
+                    else [region_spec]
+                )
+                in_any = np.zeros(spatial.shape[0], dtype=bool)
+                for r in regions_list:
+                    rx_min = float(r["x_min"]) if "x_min" in r and r["x_min"] is not None else (
+                        x_lo + float(r["x_min_pct"]) * (x_hi - x_lo)
+                        if "x_min_pct" in r and r["x_min_pct"] is not None else float("-inf")
+                    )
+                    rx_max = float(r["x_max"]) if "x_max" in r and r["x_max"] is not None else (
+                        x_lo + float(r["x_max_pct"]) * (x_hi - x_lo)
+                        if "x_max_pct" in r and r["x_max_pct"] is not None else float("inf")
+                    )
+                    ry_min = float(r["y_min"]) if "y_min" in r and r["y_min"] is not None else (
+                        y_lo + float(r["y_min_pct"]) * (y_hi - y_lo)
+                        if "y_min_pct" in r and r["y_min_pct"] is not None else float("-inf")
+                    )
+                    ry_max = float(r["y_max"]) if "y_max" in r and r["y_max"] is not None else (
+                        y_lo + float(r["y_max_pct"]) * (y_hi - y_lo)
+                        if "y_max_pct" in r and r["y_max_pct"] is not None else float("inf")
+                    )
+                    in_box = (
+                        (spatial[:, 0] >= rx_min)
+                        & (spatial[:, 0] <= rx_max)
+                        & (spatial[:, 1] >= ry_min)
+                        & (spatial[:, 1] <= ry_max)
+                    )
+                    in_any |= in_box
+                # Region only applies to its own batch's cells.
+                is_test |= (cells_in_bid & in_any)
+
     adata.obs["data_split"] = pd.Categorical(
-        ["test" if int(b) in test_set else "train" for b in batch_ids_np],
+        ["test" if t else "train" for t in is_test],
         categories=["train", "test"],
     )
 
@@ -4640,6 +4742,26 @@ def predict(
     with open(Path(dataset_blob.processed_dir) / "label_categories.pkl", "rb") as f:
         label_categories = pickle.load(f)
 
+    # Expand `adata_batch_idx` to EVERY section in the blob so predict()
+    # also encodes whole-section holdouts (e.g. chl59 batches 2 + 3,
+    # mmb20 batches 15 + 82). The saved training config carries
+    # `adata_batch_idx = [train+val positions]` only — without this
+    # override held-out sections never enter the dataloader, never get
+    # encoded, and never appear in `predicted_adata.h5ad` (so the
+    # downstream `plot_code_indices_spatial` etc. silently skip them).
+    # Existing behaviour is preserved when no sections are held out:
+    # `range(len(blob))` equals the original `adata_batch_idx` whenever
+    # train+val already covers the whole blob.
+    _orig_idx = list(config["dataset"].get("adata_batch_idx", []))
+    config["dataset"]["adata_batch_idx"] = list(range(len(dataset_blob)))
+    if config["dataset"]["adata_batch_idx"] != _orig_idx:
+        print(
+            f"Predict: expanding adata_batch_idx {_orig_idx} -> "
+            f"all {len(dataset_blob)} sections "
+            f"{config['dataset']['adata_batch_idx']} so held-out sections "
+            f"are encoded and visible in downstream plots."
+        )
+
     # Try to load the canonical gene panel saved at blob-build time so we can
     # propagate gene names through HVG selection into the predicted AnnData.
     gene_panel = None
@@ -4648,7 +4770,49 @@ def predict(
         with open(gene_panel_path, "rb") as f:
             gene_panel = pickle.load(f)
 
-    data_batch = initialize_databatch(config=config, dataset_blob=dataset_blob)
+    # Reconstruct the TRAIN-TIME `label_to_dense` mapping for batch one-
+    # hot. The trained decoder-covariate / FiLM / adversary head all
+    # have a fixed input/output dim N = number of train batches. With
+    # the predict-time `adata_batch_idx` expansion above (so held-out
+    # sections also get encoded), `obs_batch` now contains labels the
+    # train pipeline never saw — re-densifying observed labels would
+    # produce a one-hot dim > N and trigger CUDA index OOB inside the
+    # adversary's softmax / decoder concat.
+    # Mirror `build_batch_one_hot_from_obs`'s sorted-unique densification
+    # but ONLY over train sections; held-out cells fall back to dense
+    # ID 0 (= the first/reference train batch). Codes for held-out
+    # cells are then "what would this cell look like if it were in the
+    # reference batch" — usable for code-index visualisation and for
+    # post-hoc Pearson, but the batch-correction effect is treated as
+    # if from the reference batch.
+    _train_batch_ids = (
+        config.get("dataset", {})
+              .get("train_transform_params", {})
+              .get("train_batches", []) or []
+    )
+    _train_batch_ids_set = {int(b) for b in _train_batch_ids}
+    _train_labels: set = set()
+    for _pos in range(len(dataset_blob)):
+        _d = dataset_blob[_pos]
+        if int(_d.adata_batch_id) in _train_batch_ids_set:
+            grp = getattr(_d, "obs_batch", None)
+            if grp:
+                _train_labels.add(str(grp[0]))
+    _train_label_to_dense: dict = {
+        lbl: i for i, lbl in enumerate(sorted(_train_labels))
+    }
+    if _train_label_to_dense:
+        print(
+            f"Predict: train-time label->dense map (used for batch "
+            f"covariate at predict): {_train_label_to_dense}"
+        )
+
+    data_batch = initialize_databatch(
+        config=config,
+        dataset_blob=dataset_blob,
+        batch_label_to_dense=_train_label_to_dense or None,
+        unknown_batch_label_dense_id=0,
+    )
     datamodule = initialize_datamodule(
         config=config,
         data=data_batch,
@@ -4905,12 +5069,21 @@ def predict(
               .get("test_batches", [])
         or []
     )
+    # Per-batch held-out regions (downstream gene-reconstruction task).
+    # Read from the saved training config so predict()'s `data_split`
+    # tagging matches what `SpatialBatchSplit` masked out at train time.
+    test_regions = (
+        config.get("dataset", {})
+              .get("train_transform_params", {})
+              .get("test_regions", None)
+    )
     adata = _build_clean_adata_from_inference(
         inference_data=predict_data_dict,
         source_adatas=source_adatas,
         id_to_path=id_to_path,
         gene_names=gene_names,
         test_batch_ids=list(test_batch_ids),
+        test_regions=test_regions,
     )
     adata.uns["squint"]["run_dir"] = run_dir
     adata.uns["squint"]["ckpt"] = str(config["model"]["model_ckpt_fname"])
@@ -4980,7 +5153,7 @@ def run_inference_and_analysis(
                                        run_dir itself
       3. plot_code_indices_spatial -> per-batch spatial plots of code indices
       4. plot_svg_reconstruction   -> SVG vs. reconstruction sanity plots
-      5. plot_latent_umap          -> UMAP of each latent slot
+      5. plot_latent_umap          -> UMAP of each latent slot (rapids env)
       6. compute_inference_metrics -> NMI/ARI vs. ground-truth labels +
                                        batch integration (iLISI, ASW, MMD)
                                        + avg cosine similarity
@@ -4992,6 +5165,7 @@ def run_inference_and_analysis(
 
     Returns the resolved `predict_dir` (= output_dir if set, else run_dir).
     """
+    import os
     import subprocess
 
     # ------------------------------------------------------------------
@@ -4999,7 +5173,7 @@ def run_inference_and_analysis(
     # ------------------------------------------------------------------
     print()
     print("=" * 78)
-    print(f"[2/5] Predict on run_dir={run_dir}")
+    print(f"[2/6] Predict on run_dir={run_dir}")
     print("=" * 78)
     predict(
         run_dir=run_dir,
@@ -5018,7 +5192,7 @@ def run_inference_and_analysis(
         raise FileNotFoundError(
             f"Expected predicted AnnData at {predicted_adata_path} but it's missing."
         )
-    print(f"[2/5] Done. predicted_adata={predicted_adata_path}")
+    print(f"[2/6] Done. predicted_adata={predicted_adata_path}")
 
     # ------------------------------------------------------------------
     # 3. plot_code_indices_spatial
@@ -5028,7 +5202,7 @@ def run_inference_and_analysis(
 
     print()
     print("=" * 78)
-    print("[3/5] plot_code_indices_spatial")
+    print("[3/6] plot_code_indices_spatial")
     print("=" * 78)
     subprocess.run(
         [sys.executable, str(examples_dir / "plot_code_indices_spatial.py")] + common_args,
@@ -5040,7 +5214,7 @@ def run_inference_and_analysis(
     # ------------------------------------------------------------------
     print()
     print("=" * 78)
-    print("[4/5] plot_svg_reconstruction")
+    print("[4/6] plot_svg_reconstruction")
     print("=" * 78)
     subprocess.run(
         [sys.executable, str(examples_dir / "plot_svg_reconstruction.py")] + common_args,
@@ -5050,6 +5224,34 @@ def run_inference_and_analysis(
     # ------------------------------------------------------------------
     # 5. plot_latent_umap
     # ------------------------------------------------------------------
+    # The UMAP step is the only one that benefits from rapids-singlecell
+    # (GPU UMAP via cuML). Rapids is fragile to install alongside torch +
+    # pyg in a single venv, so it lives in a separate conda env. Invoke
+    # the UMAP script via a wrapper that does `module load cellgen/conda`
+    # + `conda activate $RAPIDS_ENV` before running. Override the env
+    # path at submit time:
+    #   RAPIDS_ENV=/path/to/conda/env bash examples/submit_dataset_sweep.sh ...
+    # If $RAPIDS_ENV is unset OR the env is missing, fall back to running
+    # the script in the current (squint uv) venv — plot_latent_umap.py's
+    # `_detect_gpu_umap_backend()` then auto-falls-back to scanpy CPU.
+    #
+    # Free torch's cached GPU memory FIRST. The rapids subprocess uses
+    # the same GPU (LSF gives the job one exclusive device), and torch's
+    # caching allocator can hold gigabytes of "freed" blocks after
+    # predict() completes. Without this release, rapids' first cupy
+    # allocation fails with `MemoryError: failed to allocate <small>
+    # bytes` even though no work is actually running on the GPU. Wrap in
+    # try/except so the path still works in CPU-only configurations.
+    try:
+        import gc as _gc
+        import torch as _torch
+        _gc.collect()
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
+            _torch.cuda.synchronize()
+            print(f"[5/6] released parent torch CUDA cache before rapids subprocess")
+    except Exception as _e:  # noqa: BLE001
+        print(f"[5/6] could not release torch CUDA cache (ok): {_e}")
     print()
     print("=" * 78)
     print("[5/6] plot_latent_umap")
@@ -5057,10 +5259,28 @@ def run_inference_and_analysis(
     umap_args = list(common_args) + ["--label-keys", label_keys]
     if batch_rename:
         umap_args += ["--batch-rename", batch_rename]
-    subprocess.run(
-        [sys.executable, str(examples_dir / "plot_latent_umap.py")] + umap_args,
-        check=True,
+
+    rapids_env = os.environ.get(
+        "RAPIDS_ENV", "/nfs/team361/sb75/ENVS/rapids-singlecell"
     )
+    rapids_wrapper = examples_dir / "_run_umap_rapids.sh"
+    if Path(rapids_env).exists() and rapids_wrapper.exists():
+        print(f"[5/6] using rapids conda env: {rapids_env}")
+        subprocess.run(
+            ["bash", str(rapids_wrapper), *umap_args],
+            check=True,
+            env={**os.environ, "RAPIDS_ENV": rapids_env},
+        )
+    else:
+        print(
+            f"[5/6] rapids env not found at {rapids_env} (or wrapper "
+            f"missing); running plot_latent_umap.py in the current venv "
+            f"(scanpy CPU fallback)."
+        )
+        subprocess.run(
+            [sys.executable, str(examples_dir / "plot_latent_umap.py")] + umap_args,
+            check=True,
+        )
 
     # ------------------------------------------------------------------
     # 6. compute_inference_metrics
@@ -5125,7 +5345,7 @@ def run_all_pipeline(
     # 1. Train
     # ------------------------------------------------------------------
     print("=" * 78)
-    print(f"[1/5] Train  variant={variant!r}")
+    print(f"[1/6] Train  variant={variant!r}")
     print("=" * 78)
     run_dir = train(variant)
     if run_dir is None:
@@ -5144,7 +5364,7 @@ def run_all_pipeline(
         if not candidates:
             raise RuntimeError(f"Could not auto-locate run_dir for variant {variant}")
         run_dir = str(candidates[-1])
-    print(f"[1/5] Done. run_dir={run_dir}")
+    print(f"[1/6] Done. run_dir={run_dir}")
 
     run_inference_and_analysis(
         run_dir=run_dir,

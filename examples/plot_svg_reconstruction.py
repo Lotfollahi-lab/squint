@@ -81,6 +81,14 @@ import scipy.sparse as sp
 import squidpy as sq
 
 
+def _save_dual(fig, out_path, **savefig_kwargs) -> None:
+    """Save the figure as BOTH `.png` and `.svg` (sibling files sharing
+    the same stem)."""
+    out_path = Path(out_path)
+    for ext in (".png", ".svg"):
+        fig.savefig(out_path.with_suffix(ext), **savefig_kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -344,7 +352,7 @@ def plot_batch(
             _spatial_panel(axes[r, c], xy, vec, title_tpl.format(gene=gene))
 
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    _save_dual(fig, out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 

@@ -62,12 +62,36 @@ export TMPDIR="${TMPDIR:-$WANDB_BASE/tmp}"
 echo "[$(date '+%F %T')] activating venv: $VENV_PATH"
 # shellcheck disable=SC1091
 source "$VENV_PATH/bin/activate"
+
+# ----------------------------------------------------------------------------
+# Make torch's bundled CUDA shared libraries findable. Pip-installed torch +
+# rapids ship the CUDA toolkit pieces under
+# <venv>/lib/python*/site-packages/nvidia/<lib>/lib/, but the dynamic linker
+# only finds them if the dirs are on LD_LIBRARY_PATH. Interactive shells on
+# HPC usually inherit a populated LD_LIBRARY_PATH from `module load cuda/...`
+# in ~/.bashrc; LSF jobs start clean so torch can't find e.g.
+# libcusparse.so.12 and `import torch` (transitively triggered by
+# `import anndata` in compute_inference_metrics.py) fails with:
+#   ImportError: libcusparse.so.12: cannot open shared object file
+# Discover the nvidia/*/lib dirs from the active venv and prepend them.
+NVIDIA_LIB_DIRS=$(python - <<'PY'
+import glob, os, site
+sp = site.getsitepackages()[0]
+dirs = sorted(glob.glob(os.path.join(sp, "nvidia", "*", "lib")))
+print(":".join(dirs))
+PY
+)
+if [[ -n "$NVIDIA_LIB_DIRS" ]]; then
+    export LD_LIBRARY_PATH="${NVIDIA_LIB_DIRS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
 echo "  which python       : $(which python)"
 echo "  python -V          : $(python --version 2>&1)"
 echo "  WANDB_DIR          : $WANDB_DIR"
 echo "  WANDB_CACHE_DIR    : $WANDB_CACHE_DIR"
 echo "  WANDB_ARTIFACT_DIR : $WANDB_ARTIFACT_DIR"
 echo "  TMPDIR             : $TMPDIR"
+echo "  LD_LIBRARY_PATH    : $LD_LIBRARY_PATH"
 
 cd "$SQUINT_REPO"
 echo "[$(date '+%F %T')] starting variant: $VARIANT"

@@ -94,6 +94,7 @@ class VQNiche_Dual(BaseModel):
             optimizer_params: Optional[dict] = None,
             loss_params: Optional[dict] = None,
             decoder_covariate_dim: int = 0,
+            decoder_covariate_embed_dim: int = 16,
             adversarial_batch_dim: int = 0,
             adversarial_alpha: float = 1.0,
             adversarial_hidden_channels: Optional[List[int]] = None,
@@ -131,20 +132,45 @@ class VQNiche_Dual(BaseModel):
         )
 
         # ---- decoder covariate (NicheCompass-style batch correction) -------
-        # When `decoder_covariate_dim > 0`, the per-cell batch one-hot is
-        # CONCATENATED with z_q before each decoder call. The decoders are
-        # therefore built with extended input dims so the linear layers can
-        # consume the joint (z_q, batch_one_hot) tensor. This is the
-        # NicheCompass mechanism: the decoder uses the batch covariate to
-        # explain per-batch gene patterns, freeing z (and the codebook) to
-        # represent batch-invariant biological identity.
-        # `train()` sets `decoder_covariate_dim` from `data_batch.encoder_
-        # condition_dim` after data loading, so it's number-of-batches
-        # (n_unique_samples) at runtime.
-        self.decoder_covariate_dim = int(decoder_covariate_dim)
+        # When `decoder_covariate_dim > 0`, a learned per-batch embedding
+        # is CONCATENATED with z_q before each decoder call. The decoders
+        # consume the joint (z_q, batch_embedding) tensor — same idea as
+        # NicheCompass's batch one-hot, but with a *learned*, lower-dim
+        # representation of each batch instead of a fixed one-hot.
+        #
+        # Why nn.Embedding instead of one-hot:
+        #   1. Generalisation to NOVEL batches at inference. With one-hot
+        #      the decoder's batch slots are ABI-locked to the train
+        #      batches; novel batches have no valid one-hot index. The
+        #      learned embedding has a continuous space — the mean of
+        #      train embeddings is a meaningful "neutral" covariate for
+        #      cells from unseen batches.
+        #   2. Lower-dim conditional. Decoder input grows by `embed_dim`
+        #      (default 16) instead of `n_batches` (often 8-20+).
+        #
+        # The encoder is still untouched by batch info (only the decoder
+        # sees the embedding), so the codes (= VQ output of z_mlp /
+        # z_gnn) are batch-invariant by construction. Adversarial
+        # training pressures z_mlp toward batch-invariance during
+        # training; at inference the codes don't depend on which batch
+        # the embedding lookup returns.
+        # `train()` sets `decoder_covariate_dim` to n_distinct_train_
+        # batches after data loading.
+        self.decoder_covariate_dim       = int(decoder_covariate_dim)
+        self.decoder_covariate_embed_dim = (
+            int(decoder_covariate_embed_dim) if self.decoder_covariate_dim > 0 else 0
+        )
+        if self.decoder_covariate_dim > 0:
+            self.batch_embedding = torch.nn.Embedding(
+                num_embeddings=self.decoder_covariate_dim,
+                embedding_dim=self.decoder_covariate_embed_dim,
+            )
+            torch.nn.init.normal_(
+                self.batch_embedding.weight, mean=0.0, std=0.02,
+            )
 
-        cell_decoder_in  = self.encoder.cell_dim  + self.decoder_covariate_dim
-        niche_decoder_in = self.encoder.niche_dim + self.decoder_covariate_dim
+        cell_decoder_in  = self.encoder.cell_dim  + self.decoder_covariate_embed_dim
+        niche_decoder_in = self.encoder.niche_dim + self.decoder_covariate_embed_dim
 
         # Two attribute decoders — separate weights, separate input dims.
         # Reuse the parent's _init_attribute_decoder for both.
@@ -160,8 +186,11 @@ class VQNiche_Dual(BaseModel):
             attribute_decoder_name=attribute_decoder_name,
             attribute_decoder_params=(attribute_decoder_niche_params or {}),
         )
-        cov_msg = (f" (+{self.decoder_covariate_dim} batch covariate dims)"
-                   if self.decoder_covariate_dim > 0 else "")
+        cov_msg = (
+            f" (+{self.decoder_covariate_embed_dim}-dim learned embedding "
+            f"for {self.decoder_covariate_dim} train batches)"
+            if self.decoder_covariate_dim > 0 else ""
+        )
         print(
             f"2. Cell decoder ({attribute_decoder_name}): "
             f"{cell_decoder_in} -> {in_channels}{cov_msg}."
@@ -283,6 +312,7 @@ class VQNiche_Dual(BaseModel):
             batch_edge_index: torch.Tensor,
             batch_encoder_conditions: Optional[torch.Tensor] = None,
             batch_attr_decoder_conditions: Optional[torch.Tensor] = None,
+            adata_batch_ids_unseen_mask: Optional[torch.Tensor] = None,
             read_depth: Optional[torch.Tensor] = None,
             adata_batch_ids: Optional[torch.Tensor] = None,
         ):
@@ -301,15 +331,19 @@ class VQNiche_Dual(BaseModel):
         if read_depth is None:
             read_depth = batch_x.sum(dim=-1)
 
-        # NicheCompass-style decoder covariate: when enabled, the per-cell
-        # batch one-hot is CONCATENATED with the quantized embedding before
-        # each decoder. The decoder uses this batch indicator to fit per-
-        # batch gene patterns, which leaves z_q (and the codebook) free to
-        # represent batch-invariant biological identity. The decoders were
-        # built with extended in_channels to consume the concat tensor.
-        # Built directly from `adata_batch_ids` so this mechanism works
-        # independently of (and is not interfered with by) any encoder-side
-        # FiLM conditioning.
+        # NicheCompass-style decoder covariate via a LEARNED batch embedding.
+        # `self.batch_embedding` (nn.Embedding) maps each train batch to a
+        # `decoder_covariate_embed_dim`-d vector; we look up the embedding
+        # using `adata_batch_ids` and concatenate with z_q before each
+        # decoder. The decoders were built with extended in_channels to
+        # consume the concat tensor.
+        #
+        # `adata_batch_ids_unseen_mask` (per-cell bool, True for novel
+        # batches at predict time) overrides the lookup for those cells
+        # with the MEAN of all train embeddings — a neutral / centroid
+        # covariate. Codes are unaffected (encoder doesn't see batch info)
+        # so this only changes which "batch context" the decoder uses
+        # when reconstructing held-out cells.
         if self.decoder_covariate_dim > 0:
             if adata_batch_ids is None:
                 raise ValueError(
@@ -317,10 +351,17 @@ class VQNiche_Dual(BaseModel):
                     "passed to forward(). Pass `batch.adata_batch_ids` from "
                     "the step methods."
                 )
-            cov = torch.nn.functional.one_hot(
-                adata_batch_ids.long(),
-                num_classes=self.decoder_covariate_dim,
-            ).float()
+            cov = self.batch_embedding(adata_batch_ids.long())
+            if (
+                adata_batch_ids_unseen_mask is not None
+                and adata_batch_ids_unseen_mask.any()
+            ):
+                mean_emb = self.batch_embedding.weight.mean(dim=0, keepdim=True)
+                cov = torch.where(
+                    adata_batch_ids_unseen_mask.unsqueeze(-1).to(cov.device),
+                    mean_emb.to(cov.device).expand_as(cov),
+                    cov,
+                )
             z_q_cell_in  = torch.cat([z_q_cell,  cov], dim=-1)
             z_q_niche_in = torch.cat([z_q_niche, cov], dim=-1)
         else:
@@ -366,6 +407,7 @@ class VQNiche_Dual(BaseModel):
         encoder_conditions      = getattr(batch, 'encoder_conditions',      None)
         attr_decoder_conditions = getattr(batch, 'attr_decoder_conditions', None)
         adata_batch_ids         = getattr(batch, 'adata_batch_ids',         None)
+        unseen_mask             = getattr(batch, 'adata_batch_ids_unseen_mask', None)
 
         (z_mlp, z_gnn, z_q_cell, z_q_niche,
          idx_cell, idx_niche,
@@ -374,6 +416,7 @@ class VQNiche_Dual(BaseModel):
             batch_edge_index=batch.edge_index,
             batch_encoder_conditions=encoder_conditions,
             batch_attr_decoder_conditions=attr_decoder_conditions,
+            adata_batch_ids_unseen_mask=unseen_mask,
             read_depth=batch.x.sum(dim=-1),
             adata_batch_ids=adata_batch_ids,
         )
@@ -542,6 +585,7 @@ class VQNiche_Dual(BaseModel):
         encoder_conditions      = getattr(test_batch, 'encoder_conditions',      None)
         attr_decoder_conditions = getattr(test_batch, 'attr_decoder_conditions', None)
         adata_batch_ids         = getattr(test_batch, 'adata_batch_ids',         None)
+        unseen_mask             = getattr(test_batch, 'adata_batch_ids_unseen_mask', None)
         (z_mlp, z_gnn, z_q_cell, z_q_niche,
          idx_cell, idx_niche,
          xhat_cell, xhat_niche, _logits) = self(
@@ -549,6 +593,7 @@ class VQNiche_Dual(BaseModel):
             batch_edge_index=test_batch.edge_index,
             batch_encoder_conditions=encoder_conditions,
             batch_attr_decoder_conditions=attr_decoder_conditions,
+            adata_batch_ids_unseen_mask=unseen_mask,
             read_depth=test_batch.x.sum(dim=-1),
             adata_batch_ids=adata_batch_ids,
         )
@@ -571,6 +616,7 @@ class VQNiche_Dual(BaseModel):
         encoder_conditions      = getattr(predict_batch, 'encoder_conditions',      None)
         attr_decoder_conditions = getattr(predict_batch, 'attr_decoder_conditions', None)
         adata_batch_ids         = getattr(predict_batch, 'adata_batch_ids',         None)
+        unseen_mask             = getattr(predict_batch, 'adata_batch_ids_unseen_mask', None)
         (z_mlp, z_gnn, z_q_cell, z_q_niche,
          idx_cell, idx_niche,
          xhat_cell, xhat_niche, _logits) = self(
@@ -578,6 +624,7 @@ class VQNiche_Dual(BaseModel):
             batch_edge_index=predict_batch.edge_index,
             batch_encoder_conditions=encoder_conditions,
             batch_attr_decoder_conditions=attr_decoder_conditions,
+            adata_batch_ids_unseen_mask=unseen_mask,
             read_depth=predict_batch.x.sum(dim=-1),
             adata_batch_ids=adata_batch_ids,
         )

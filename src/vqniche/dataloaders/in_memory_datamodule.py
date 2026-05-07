@@ -195,6 +195,15 @@ class InMemoryDataModule(LightningNodeData):
         if getattr(data, 'obs_row_index', None) is not None:
             base_data['obs_row_index'] = data.obs_row_index
 
+        # `adata_batch_ids_unseen_mask` (per-cell bool) is True for cells
+        # whose batch label wasn't in the train-time densification map
+        # (predict-time novel batches). The dual model checks this in
+        # forward() and swaps in a mean batch-embedding for those cells
+        # so the decoder doesn't apply an arbitrary reference batch's
+        # covariate.
+        if getattr(data, 'adata_batch_ids_unseen_mask', None) is not None:
+            base_data['adata_batch_ids_unseen_mask'] = data.adata_batch_ids_unseen_mask
+
         optional_data_keys = [
             # 'y_cell_types',
             # 'y_niche_types',

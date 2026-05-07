@@ -94,58 +94,81 @@ def build_batch_one_hot(
 
 def build_batch_one_hot_from_obs(
         obs_batch: List[List[str]],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        label_to_dense: Optional[Dict[str, int]] = None,
+        unknown_label_dense_id: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Build a per-cell batch one-hot from `adata.obs[batch_key]` values that
-    have been collected as per-AnnData lists in the dataset blob.
+    Build per-cell batch dense IDs + one-hot from `adata.obs[batch_key]`
+    values collected as per-AnnData lists in the dataset blob.
 
-    Unlike `build_batch_one_hot`, this does NOT parse anything out of
-    `cell_id` — it directly densifies the raw obs labels (strings or ints)
-    to [0, n_unique_labels) in sorted order. Use this when the AnnData
-    files have an explicit `obs[batch_key]` column instead of (or in
-    addition to) batch info encoded in `cell_id` strings.
+    Returns three tensors. The third — `unseen_mask` — is True for cells
+    whose label wasn't in `label_to_dense` (predict-time novel batches);
+    downstream code uses it to swap in a learned mean batch embedding so
+    the decoder doesn't condition novel cells on an arbitrary reference
+    batch.
 
     Parameters
     ----------
     obs_batch : List[List[<str|int>]]
         Nested list of obs[batch_key] values, one inner list per AnnData
         batch in the dataset blob. Inner-list element types may be str or
-        int — both are normalised to str before lookup so 'Lung5_Rep1'
-        and 1 are both supported.
+        int — both are normalised to str before lookup.
+    label_to_dense : optional dict[str, int]
+        When given, use THIS pre-computed map instead of densifying the
+        observed labels on the fly. Required at PREDICT time when the
+        loaded sections include held-out batches the model wasn't trained
+        on — re-densifying would produce a one-hot dim larger than the
+        trained decoder / adversary head expects (CUDA index OOB at
+        inference). At train time this stays None and the function
+        densifies the train batches as before.
+    unknown_label_dense_id : int
+        Dense ID assigned to labels not present in `label_to_dense`.
+        Default 0 (= the first/reference train batch); the cells get
+        flagged in `unseen_mask` so the model knows to override with a
+        mean-embedding lookup.
 
     Returns
     -------
-    Tuple[torch.Tensor, torch.Tensor]
-        - Dense batch ID tensor of shape (num_cells,), values in
-          [0, n_unique_labels).
-        - One-hot tensor of shape (num_cells, n_unique_labels).
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        - batch_ids   : (num_cells,) long. Dense IDs in [0, n_classes).
+        - one_hot     : (num_cells, n_classes) float. Legacy one-hot
+                        (kept for callers that still consume it; the
+                        nn.Embedding-based decoder doesn't use it).
+        - unseen_mask : (num_cells,) bool. True iff the cell's label
+                        wasn't in `label_to_dense`.
     """
-    # Pass 1: collect unique labels, build label -> dense map.
-    raw_per_cell: list[str] = []
-    for group in obs_batch:
-        for label in group:
-            raw_per_cell.append(str(label))
+    if label_to_dense is None:
+        # Pass 1: collect unique labels, build label -> dense map (train mode).
+        raw_per_cell: list[str] = []
+        for group in obs_batch:
+            for label in group:
+                raw_per_cell.append(str(label))
+        unique_labels = sorted(set(raw_per_cell))
+        label_to_dense = {lbl: i for i, lbl in enumerate(unique_labels)}
+    n_classes = len(label_to_dense)
 
-    unique_labels = sorted(set(raw_per_cell))
-    label_to_dense = {lbl: i for i, lbl in enumerate(unique_labels)}
-    n_classes = len(unique_labels)
-
-    # Pass 2: densify + one-hot.
+    # Pass 2: densify + one-hot. Unknown labels (predict-time only) get
+    # mapped to `unknown_label_dense_id` AND flagged in `unseen_mask`.
     batch_ids = []
     batch_one_hot = []
+    unseen_flags = []
     for group in obs_batch:
         group_tensor = []
         for label in group:
-            d = label_to_dense[str(label)]
+            key = str(label)
+            is_known = key in label_to_dense
+            d = label_to_dense[key] if is_known else unknown_label_dense_id
             one_hot = torch.zeros(n_classes, dtype=torch.float)
             one_hot[d] = 1.0
             batch_ids.append(d)
+            unseen_flags.append(not is_known)
             group_tensor.append(one_hot)
         batch_one_hot.append(torch.stack(group_tensor))
 
     batch_ids = torch.tensor(batch_ids, dtype=torch.long)
     batch_one_hot = torch.cat(batch_one_hot, dim=0)
-    return batch_ids, batch_one_hot
+    unseen_mask = torch.tensor(unseen_flags, dtype=torch.bool)
+    return batch_ids, batch_one_hot, unseen_mask
 
 
 def build_timepoint_one_hot(
@@ -332,6 +355,8 @@ def initialize_dataset_blob(
 def initialize_databatch(
         config: Dict,
         dataset_blob: InMemoryDatasetBlob,
+        batch_label_to_dense: Optional[Dict[str, int]] = None,
+        unknown_batch_label_dense_id: int = 0,
     ) -> Batch:
     # load PyG data object(s) corresponding to adata_batch_idx (e.g. 0 -> AnnData batch0)
     # NOTE: sss2-1b_1p is 1-indexed, while others are 0-indexed
@@ -424,10 +449,19 @@ def initialize_databatch(
             "`patch_anndata_uns()` or the harmonize script's "
             "`_stamp_uns_and_cell_id` helper)."
         )
-    batch_ids, batch_conditions = build_batch_one_hot_from_obs(
+    batch_ids, batch_conditions, unseen_mask = build_batch_one_hot_from_obs(
         obs_batch=data_batch.obs_batch,
+        label_to_dense=batch_label_to_dense,
+        unknown_label_dense_id=unknown_batch_label_dense_id,
     )
     data_batch.adata_batch_ids = batch_ids
+    # Per-cell flag: True iff the cell's batch label wasn't in the
+    # train-time densification map. The model uses this at predict time
+    # to override the lookup of `nn.Embedding[adata_batch_ids]` with the
+    # mean of all trained embeddings — so novel-batch cells get a
+    # neutral decoder covariate rather than being treated as the
+    # arbitrary "fallback" batch (dense ID 0).
+    data_batch.adata_batch_ids_unseen_mask = unseen_mask
 
     if encoder_condition_list is not None:
         if 'cell_batch_id' in encoder_condition_list:
