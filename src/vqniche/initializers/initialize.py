@@ -406,57 +406,27 @@ def initialize_databatch(
                         seen.add(c)
                         attr_decoder_condition_list.append(c)
 
-    # Per-cell batch one-hots come from one of two sources, in priority:
-    #
-    #   1. `data_batch.obs_batch` — per-cell `adata.obs[batch_key]` values
-    #      collected during dataset-blob construction (preferred).
-    #   2. `data_batch.cell_id` — fallback that parses "batchN" substrings
-    #      out of cell_id strings (used by older datasets that didn't have
-    #      an `obs[batch_key]` column at blob-build time).
-    #
-    # If BOTH fail (no `obs_batch`, and `cell_id` doesn't contain "batchN"),
-    # we raise an explicit ValueError. The fallback's regex can quietly
-    # mis-attribute cells when cell_id formats vary, so we want to make it
-    # loud when the obs path isn't available — but we don't want to break
-    # legacy datasets that genuinely encode batch only in cell_id.
-    #
-    # Both `build_batch_one_hot[*]` densify the raw labels to contiguous
-    # indices [0, n_unique_batches); the one-hot dim equals the number of
-    # distinct samples actually present.
-    use_obs_path = (
-        hasattr(data_batch, 'obs_batch') and data_batch.obs_batch is not None
-    )
-    if use_obs_path:
-        batch_ids, batch_conditions = build_batch_one_hot_from_obs(
-            obs_batch=data_batch.obs_batch,
+    # Per-cell batch one-hots are derived from `data_batch.obs_batch`,
+    # which `process_anndata_batch` populates by broadcasting each
+    # section's `adata.uns['batch']` value to every cell in that section.
+    # `uns['batch']` is the single canonical source for batch identity;
+    # the previous `obs[batch_key]` and `cell_id` parsing fallbacks have
+    # both been removed because they could silently mis-attribute cells
+    # to wrong batches when formats varied across upstream tools.
+    if not (hasattr(data_batch, 'obs_batch') and data_batch.obs_batch is not None):
+        raise ValueError(
+            "Could not retrieve per-cell batch labels: "
+            "`data_batch.obs_batch` is absent. Every input AnnData must "
+            "carry `adata.uns['batch']` so the dataset blob's "
+            "`process_anndata_batch` can broadcast it to a per-cell "
+            "batch label. Rebuild the dataset blob after stamping "
+            "`uns['batch']` on every silver file (e.g. via "
+            "`patch_anndata_uns()` or the harmonize script's "
+            "`_stamp_uns_and_cell_id` helper)."
         )
-    else:
-        cell_ids = getattr(data_batch, 'cell_id', None)
-        if cell_ids is None:
-            raise ValueError(
-                "Could not retrieve per-cell batch labels: neither "
-                "`data_batch.obs_batch` nor `data_batch.cell_id` is "
-                "available. Set `adata.obs[batch_key]` (default 'batch') "
-                "in every input AnnData and pass `batch_key='batch'` (or "
-                "your actual column name) in `graph_kwargs` at blob-build "
-                "time, OR ensure each AnnData carries a `cell_id` column "
-                "with 'batchN' substrings."
-            )
-        try:
-            batch_ids, batch_conditions = build_batch_one_hot(
-                cell_ids=cell_ids,
-            )
-        except ValueError as exc:
-            raise ValueError(
-                "Could not retrieve per-cell batch labels: "
-                "`data_batch.obs_batch` was absent and the cell_id "
-                "fallback failed to parse 'batchN' from at least one "
-                "cell identifier. Set `adata.obs[batch_key]` (default "
-                "'batch') in every input AnnData and pass "
-                "`batch_key='batch'` (or your actual column name) in "
-                "`graph_kwargs` at blob-build time. Original parse "
-                f"error: {exc}"
-            ) from exc
+    batch_ids, batch_conditions = build_batch_one_hot_from_obs(
+        obs_batch=data_batch.obs_batch,
+    )
     data_batch.adata_batch_ids = batch_ids
 
     if encoder_condition_list is not None:

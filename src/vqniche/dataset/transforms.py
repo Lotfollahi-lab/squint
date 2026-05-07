@@ -76,7 +76,11 @@ def init_train_transforms(
         region: dict = None,
         train_batches: Optional[list] = None,
         val_batches: Optional[list] = None,
-        test_batches: Optional[list] = None
+        test_batches: Optional[list] = None,
+        # Cell-level holdout knobs for SpatialBatchSplit (in-distribution
+        # early stopping / best-ckpt selection inside training sections).
+        train_val_cell_split: float = 0.0,
+        cell_split_seed: int = 0,
     ) -> List[T.BaseTransform]:
     """
     Initialize a list of training-related PyG transforms to be applied to the Data object.
@@ -132,7 +136,9 @@ def init_train_transforms(
                 xy_key=xy_key,
                 train_batches=train_batches,
                 val_batches=val_batches,
-                test_batches=test_batches
+                test_batches=test_batches,
+                train_val_cell_split=train_val_cell_split,
+                cell_split_seed=cell_split_seed,
             )
         )
     
@@ -226,14 +232,16 @@ class SpatialBatchSplit(T.BaseTransform):
             xy_key: str = 'xy_coordinates',
             train_batches: Optional[list] = None,
             val_batches: Optional[list] = None,
-            test_batches: Optional[list] = None
+            test_batches: Optional[list] = None,
+            train_val_cell_split: float = 0.0,
+            cell_split_seed: int = 0,
         ):
         """
         Split nodes based on batch information. Useful when you have multiple tissue sections
         and want to use entire batches/sections for different splits.
-        
+
         Test batches are automatically assigned as all remaining batches after train and val.
-        
+
         Parameters:
         ----------
         - region: dict or list of dicts
@@ -247,12 +255,28 @@ class SpatialBatchSplit(T.BaseTransform):
             List of batch indices to assign to validation.
         - test_batches: list
             List of batch indices to assign to testing.
-            
+        - train_val_cell_split: float
+            Cell-level (not section-level) holdout fraction. When > 0,
+            ~`train_val_cell_split` of cells in EACH training section are
+            randomly moved from `train_mask` to `val_mask` so the val
+            dataloader can compute an in-distribution early-stopping /
+            best-checkpoint signal. The `val_*` wandb metrics then reflect
+            the union of (a) any whole-section holdouts in `val_batches`
+            and (b) this cell-level subsample of training sections.
+            Useful when training is unstable late (e.g. adversarial
+            losses) and you want best-ckpt-on-val to recover the best
+            in-distribution snapshot. Default 0.0 = current behaviour
+            (no cell-level split).
+        - cell_split_seed: int
+            RNG seed for the cell-level split. Same seed -> same split
+            cells across runs (so wandb val_* curves are comparable
+            across re-runs of the same variant).
+
         Example:
         --------
         # Single region
         region = {'x_min': 100, 'x_max': 150, 'y_min': 0, 'y_max': 100}
-        
+
         # Multiple regions
         regions = [
             {'x_min': 0, 'x_max': 10, 'y_min': -10, 'y_max': 0},
@@ -264,6 +288,8 @@ class SpatialBatchSplit(T.BaseTransform):
         self.train_batches = train_batches
         self.val_batches = val_batches
         self.test_batches = test_batches
+        self.train_val_cell_split = float(train_val_cell_split)
+        self.cell_split_seed = int(cell_split_seed)
         
     def _is_in_single_region(self, coords, region):
         """Check if coordinates are within a single specified region."""
@@ -315,6 +341,32 @@ class SpatialBatchSplit(T.BaseTransform):
             data.train_mask = torch.ones(num_nodes, dtype=torch.bool)
             data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
             data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+
+            # Cell-level train/val split. Random `train_val_cell_split`
+            # fraction (default 0.10) of cells in each training section
+            # is moved from train_mask -> val_mask, providing the val
+            # signal used during training for early stopping +
+            # best-checkpoint selection. RNG is seeded with
+            # `(cell_split_seed, adata_batch_id)` so the partition is
+            # deterministic across runs and uncorrelated across sections
+            # (different sections get different sub-samples even though
+            # the seed is the same).
+            #
+            # Note: at inference time, val cells are folded back into
+            # "train" — see `data_split` in
+            # `_build_clean_adata_from_inference`. The val set is purely
+            # a training-time mechanism.
+            if self.train_val_cell_split > 0.0:
+                gen = torch.Generator()
+                gen.manual_seed(
+                    self.cell_split_seed * 1_000_003
+                    + int(data.adata_batch_id)
+                )
+                perm = torch.randperm(num_nodes, generator=gen)
+                n_val = int(round(self.train_val_cell_split * num_nodes))
+                val_idx = perm[:n_val]
+                data.val_mask[val_idx]   = True
+                data.train_mask[val_idx] = False
 
         elif data.adata_batch_id in self.val_batches:
             # `region=None` means "this entire batch is held out as val"

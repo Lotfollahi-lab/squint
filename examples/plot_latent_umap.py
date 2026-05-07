@@ -32,8 +32,22 @@ Usage:
 """
 
 import argparse
+import warnings
 from pathlib import Path
 from typing import List, Optional
+
+# Silence two upstream FutureWarnings (dask legacy DataFrame, anndata
+# `read_text` re-export); see run_squint.py for context.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Importing read_text from `anndata` is deprecated.*",
+    category=FutureWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*legacy Dask DataFrame implementation is deprecated.*",
+    category=FutureWarning,
+)
 
 import anndata as ad
 import matplotlib.pyplot as plt

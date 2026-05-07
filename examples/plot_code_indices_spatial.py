@@ -4,7 +4,7 @@ per codebook.
 
 Strategy
 --------
-1. Load the predicted AnnData written by `run_squint_mmb_smb.py --predict`.
+1. Load the predicted AnnData written by `run_squint.py --predict`.
 2. Detect the codebook structure. Three layouts are supported:
      - VQNiche_Dual: TWO codebooks, addressed under per-branch keys
          adata.obs['cell_code_index']           or adata.obsm['cell_code_indices']
@@ -49,8 +49,22 @@ Useful flags:
 """
 
 import argparse
+import warnings
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+# Silence two upstream FutureWarnings (dask legacy DataFrame, anndata
+# `read_text` re-export); see run_squint.py for context.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Importing read_text from `anndata` is deprecated.*",
+    category=FutureWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*legacy Dask DataFrame implementation is deprecated.*",
+    category=FutureWarning,
+)
 
 import anndata as ad
 import matplotlib.pyplot as plt

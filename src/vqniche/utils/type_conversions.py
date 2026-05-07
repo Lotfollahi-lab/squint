@@ -12,6 +12,40 @@ from torch_geometric.utils import to_dense_adj
 from torch_geometric.data import InMemoryDataset
 
 
+def _coerce_for_h5ad(values, index, name):
+    """
+    Convert a list-of-mixed (strings/numbers/None) into a `pandas.Series`
+    that anndata's h5ad backend can write without choking.
+
+    h5py's variable-length-string converter rejects Python `None` mixed
+    with strings — that's the failure path when an obs column is present
+    in some input AnnDatas but not others (cells from sources without it
+    get `None`, sources with strings get the string, and h5py can't
+    serialise the mixture). anndata DOES write `pandas.Categorical` and
+    float dtypes natively with NaN as missing, so:
+
+      - All-null      -> float NaN.
+      - All-strings   -> Categorical (NaN where None).
+      - All-numeric   -> float (None coerced to NaN).
+      - Mixed/other   -> stringify everything, write as Categorical.
+    """
+    series = pd.Series(values, index=index, name=name)
+    non_null = series.dropna()
+    if non_null.empty:
+        return series.astype(float)
+    if all(isinstance(v, (str, np.str_, bytes)) for v in non_null):
+        return series.astype("category")
+    if all(isinstance(v, (int, float, np.integer, np.floating, bool, np.bool_))
+           for v in non_null):
+        return pd.to_numeric(series, errors="coerce")
+    # Mixed types — stringify and use Categorical.
+    return (
+        series.where(series.notna(), other=pd.NA)
+              .astype("string")
+              .astype("category")
+    )
+
+
 def sparse_mx_to_float_tensor(
         sparse_mx: sp.csr_matrix
     ) -> torch.Tensor:
@@ -404,12 +438,16 @@ def inference_data_dict_to_adata(
                 ridx = int(row_idx_np[k])
                 if 0 <= ridx < len(df):
                     values[k] = df[col].iloc[ridx]
-
-            series = pd.Series(values, index=adata.obs.index, name=col)
-            # `None` -> `NaN` for numeric columns; for object/string
-            # columns pandas keeps `None` which AnnData treats as NaN
-            # for downstream consumers.
-            adata.obs[col] = series
+            # Cast for h5ad-safe writing. h5py's vlen-string converter
+            # chokes on `None` mixed with strings; anndata DOES write
+            # `Categorical` and float dtypes natively with NaN as
+            # missing, so detect from non-null entries:
+            #   all strings  -> Categorical
+            #   all numeric  -> float (None -> NaN)
+            #   mixed/other  -> stringify + Categorical
+            adata.obs[col] = _coerce_for_h5ad(
+                values, index=adata.obs.index, name=col,
+            )
 
     return adata
 

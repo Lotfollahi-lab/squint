@@ -70,7 +70,7 @@ def collect_test_configs(
         wandb_run_dir = args.wandb_run_dir
 
     # get config file path. Two supported layouts:
-    #   (a) Flat run dir produced by examples/run_squint_mmb_smb.py:
+    #   (a) Flat run dir produced by examples/run_squint.py:
     #         <run_dir>/user_specified_config.yaml
     #   (b) Legacy wandb-controlled layout:
     #         <run_dir>/files/user_specified_config.yaml

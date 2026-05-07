@@ -143,23 +143,56 @@ class InMemoryDatasetBlob(InMemoryDataset):
 
     def _derive_adata_batch_id(self, adata_batch, adata_batch_file) -> int:
         """
-        Derive the integer `adata_batch_id` for a given AnnData / path pair.
+        Derive the integer `adata_batch_id` from `adata.uns['batch']`.
 
-        Same logic as `process_anndata_batch`, factored out so pass 1 can
-        accumulate per-batch obs DataFrames keyed by the same id that
-        `process_anndata_batch` will write into the per-cell PyG Data
-        objects in pass 2.
+        Accepted shapes for `uns['batch']`:
+          - integer (`6`, `np.int64(6)`, ...)              -> 6
+          - integer string (`'6'`)                         -> 6
+          - 'batchN' string (`'batch6'`)                   -> 6
+
+        Anything else is a hard error — `uns['batch']` is the canonical
+        and only source of section-level batch identity. The previous
+        file-alphabetical-position fallback was removed because it could
+        silently mis-attribute sections when files were added / removed /
+        renamed between blob builds.
         """
         uns_batch = adata_batch.uns.get('batch', None)
+        if uns_batch is None:
+            raise ValueError(
+                f"adata.uns['batch'] is missing for "
+                f"{Path(adata_batch_file).name}. Every input AnnData must "
+                f"carry uns['batch'] (an int, int-string, or 'batchN' "
+                f"string) — that's the canonical source of section-level "
+                f"batch identity."
+            )
+        # int or numpy int-like — already done.
         try:
-            return int(uns_batch[5:])
-        except (TypeError, ValueError, IndexError):
+            import numpy as _np
+            if isinstance(uns_batch, (int, _np.integer)):
+                return int(uns_batch)
+        except ImportError:
+            if isinstance(uns_batch, int):
+                return int(uns_batch)
+        # 'batchN' string.
+        if isinstance(uns_batch, str):
+            if uns_batch.startswith('batch'):
+                tail = uns_batch[5:]
+                try:
+                    return int(tail)
+                except ValueError:
+                    pass
+            # Plain integer string ('6').
             try:
-                return int(self.raw_paths.index(str(adata_batch_file)))
+                return int(uns_batch)
             except ValueError:
-                return int(
-                    [str(p) for p in self.raw_paths].index(str(adata_batch_file))
-                )
+                pass
+        raise ValueError(
+            f"adata.uns['batch']={uns_batch!r} for "
+            f"{Path(adata_batch_file).name} is not parseable as an int. "
+            f"Accepted shapes: integer, integer-string ('6'), or 'batchN' "
+            f"string ('batch6'). Re-stamp uns['batch'] on every silver "
+            f"file in the dataset before rebuilding the blob."
+        )
 
 
     def process(self) -> None:
@@ -488,16 +521,19 @@ class InMemoryDatasetBlob(InMemoryDataset):
             len(adata_batch), dtype=torch.long
         )
 
-        # `adata.obs[batch_key]` (default `batch`) is the canonical source
-        # for FiLM batch conditioning when the cell_ids don't encode the
-        # batch as a "batchN" prefix (e.g. CosMx Lung samples named
-        # 'Lung5_Rep1'). When present, it's stored per-cell and used
-        # downstream by `build_batch_one_hot_from_obs`. Older blobs without
-        # this field still work via the cell-id parsing fallback.
-        batch_key = self.graph_kwargs.get('batch_key', 'batch')
-        if batch_key in adata_batch.obs.columns:
+        # Per-cell batch label for FiLM / decoder-covariate / adversarial
+        # batch correction. Sourced from `adata.uns['batch']` (per-section
+        # value) and broadcast to every cell in the section. Earlier
+        # versions read `adata.obs[batch_key]` (per-cell) and fell back to
+        # parsing 'batchN' out of `obs['cell_id']`; both are now
+        # superseded — `uns['batch']` is the single canonical source for
+        # the section's batch identity. If `uns['batch']` is missing the
+        # field is left unset, and `initialize_databatch` will raise a
+        # clear error pointing at the dataset blob build.
+        uns_batch_value = adata_batch.uns.get('batch', None)
+        if uns_batch_value is not None:
             batch_dict['obs_batch'] = (
-                adata_batch.obs[batch_key].astype(str).to_list()
+                [str(uns_batch_value)] * len(adata_batch)
             )
 
         # `adata_batch_id` is a small integer key used by the in-memory

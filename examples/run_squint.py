@@ -27,12 +27,12 @@ Training metrics are logged to wandb under the project "squint".
   # 0) one-time only — patch .uns metadata of the two .h5ad files if they
   #    don't yet contain the keys SQUINT needs (see "AnnData expectations"
   #    below). Skip if your files already have them.
-  python examples/run_squint_mmb_smb.py --patch-uns
+  python examples/run_squint.py --patch-uns
 
   # 1) one-time only — preprocess the two .h5ad files into a cached PyG
   #    DatasetBlob.  Output:
   #        <silver-root>/gold/in-memory-PyG-dataset-blob/<DATASET_NAME>/
-  python examples/run_squint_mmb_smb.py --build-blob
+  python examples/run_squint.py --build-blob
 
   # 2) train SQUINT on the WHOLE dataset (both batches, every cell).
   #    --variant <name>  picks the ablation. Use --list-variants to see all.
@@ -68,14 +68,15 @@ Training metrics are logged to wandb under the project "squint".
   #          checkpoints/<best>.ckpt
   #          wandb/run-<id>/...              (wandb local cache; cloud logging
   #                                           still goes to project "squint")
-  python examples/run_squint_mmb_smb.py --train --variant recon-cell
-  python examples/run_squint_mmb_smb.py --train --variant recon-both+adj
+  python examples/run_squint.py --train --variant recon-cell
+  python examples/run_squint.py --train --variant recon-both+adj
 
   # 3) inference on a folder of .h5ad files. Returns a single AnnData with
-  #    the SQUINT outputs in .obsm / .obs / .layers, saved as .h5ad under
-  #    <ARTIFACTS_DIR>/inference/<variant>/<timestamp>/predicted_adata.h5ad.
-  #    --run-dir is the directory printed at the end of step 2.
-  python examples/run_squint_mmb_smb.py --predict \
+  #    the SQUINT outputs in .obsm / .obs / .layers, saved as .h5ad inside
+  #    the run_dir itself (predicted_adata.h5ad alongside checkpoints and
+  #    user_specified_config.yaml). --run-dir is the directory printed at
+  #    the end of step 2.
+  python examples/run_squint.py --predict \
       --run-dir <ARTIFACTS_DIR>/<DATASET_NAME>/<VARIANT>/<TIMESTAMP> \
       --silver-dir /lustre/scratch126/cellgen/lotfollahi/DATASETS/silver/mmb0-1b_smb1-1b_1p_coord_aligned
 
@@ -126,8 +127,39 @@ If any of these are missing, run `--patch-uns` once.
 """
 import argparse
 import sys
+import warnings
 from pathlib import Path
 from typing import List, Optional, Sequence
+
+# Silence two upstream FutureWarnings that fire at import time of our deps:
+#   1. dask: legacy DataFrame deprecation ("Set dataframe.query-planning=True").
+#      Triggered transitively (anndata -> ... -> dask) before any user code
+#      runs. Prefer turning planning on directly when dask is available;
+#      fall back to a warnings filter so older dask versions don't break.
+#   2. anndata: "Importing read_text from `anndata` is deprecated. Import
+#      anndata.io.read_text instead." Triggered by a transitive dep
+#      (likely scvi-tools / scanpy / squidpy) using the old import path —
+#      we don't import read_text ourselves. Filter by message text since
+#      `category=FutureWarning` alone is too broad and would hide
+#      genuine deprecations from our own code.
+# Both filters must run BEFORE the dependencies are imported to take effect.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Importing read_text from `anndata` is deprecated.*",
+    category=FutureWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*legacy Dask DataFrame implementation is deprecated.*",
+    category=FutureWarning,
+)
+try:
+    import dask
+    dask.config.set({"dataframe.query-planning": True})
+except Exception:  # noqa: BLE001
+    # dask not installed or older version without query-planning -- the
+    # warnings filter above will catch the FutureWarning anyway.
+    pass
 
 import yaml
 
@@ -158,8 +190,10 @@ CONFIG_OUT_DIR = ARTIFACTS_DIR / "configs"
 # under here.
 LOG_ROOT = ARTIFACTS_DIR / "wandb"
 
-# Where inference results go.
-INFERENCE_DIR = ARTIFACTS_DIR / "inference"
+# Inference results (predicted_adata.h5ad + plots + metrics) are written
+# directly into the run_dir
+# (`ARTIFACTS_DIR/<dataset>/<variant>/<timestamp>/`) so everything for one
+# training run lives in a single folder.
 
 # Project name in wandb.
 WANDB_PROJECT = "squint"
@@ -231,7 +265,7 @@ def make_dataset_blob_config_mmb20() -> dict:
     Run order (one-time):
         1. python examples/harmonize_mmb_smb20_panels.py
            -> writes harmonised AnnDatas to <DATA_ROOT>/silver/<dataset>_shared_genes/
-        2. python examples/run_squint_mmb_smb.py --build-blob --build-blob-dataset mmb20
+        2. python examples/run_squint.py --build-blob --build-blob-dataset mmb20
            -> reads from the dir written in step 1, builds dataset_blob.pt
 
     Notes:
@@ -369,12 +403,28 @@ def make_train_config_poc() -> dict:
         "experiment": {"seed": 0, "mode": "standalone"},
         "logging": {
             "root_log_dir": str(LOG_ROOT),
-            "log_model": True,
+            # Don't upload checkpoints to wandb. Lightning's
+            # ModelCheckpoint already writes the best ckpt to
+            # `<run_dir>/checkpoints/` on NFS, which is the canonical
+            # location predict() reads from. Wandb upload of large
+            # tensors stages each ckpt into $WANDB_CACHE_DIR (default
+            # $HOME/.cache/wandb/artifacts/staging/) and across a
+            # multi-variant sweep that overflows typical HPC home quotas.
+            "log_model": False,
             "offline": False,
             "enabled": True,
         },
         "dataset": {
             "dataset_name": DATASET_NAME,
+            # `dataset_tag` is the SHORT identifier used for artifact /
+            # run directory paths (`<ARTIFACTS_DIR>/<dataset_tag>/<variant>/
+            # <timestamp>/`). It strips the technical suffixes that live
+            # in `dataset_name` (`_coord_aligned`, `_shared_genes`) — those
+            # belong to the silver / gold blob paths but make on-disk
+            # artifact dirs unwieldy. If a future variant doesn't set
+            # `dataset_tag`, the artifact path falls back to
+            # `dataset_name`.
+            "dataset_tag": "mmb0-1b_smb1-1b_1p",
             # adata_batch_idx are *positions* in the sorted DatasetBlob:
             #   idx 0 -> batch15 (STARmap+)   idx 1 -> batch82 (MERFISH)
             "adata_batch_idx": [0, 1],
@@ -409,6 +459,17 @@ def make_train_config_poc() -> dict:
                 "val_batches": [],
                 "test_batches": [],
                 "xy_key": "xy_coordinates",
+                # Cell-level holdout for in-distribution early stopping +
+                # best-checkpoint-on-val. ONLY applied when `val_batches`
+                # is empty (no whole-section holdout configured). When
+                # `val_batches` is non-empty, that section IS the val set
+                # — we do NOT additionally sub-sample training cells.
+                # Adversarial training can be unstable late; a 10%
+                # in-section val sample gives a stable in-distribution
+                # signal that early stopping and best-ckpt-on-val use.
+                # Set to 0.0 to disable.
+                "train_val_cell_split": 0.10,
+                "cell_split_seed":      0,
             },
         },
         "datamodule": {
@@ -593,25 +654,34 @@ def make_train_config_poc() -> dict:
             },
         },
         "trainer": {
-            "monitor": "train_pearson_gene_wise_log1p",
-            "checkpoint_params": {"mode": "max", "save_top_k": 1, "save_last": True},
+            # Best-checkpoint metric: val_loss (sum of all weighted loss
+            # terms over the in-distribution VAL set — same 10% cell-level
+            # holdout from the training sections that early stopping
+            # watches; see `train_val_cell_split`). Single source of truth
+            # for "best epoch" — the saved ckpt is the one early stopping
+            # would have stopped at. Robust to adversarial late-stage
+            # instability: when the encoder oscillates, val_loss climbs
+            # before train_loss does, so the kept snapshot is from before
+            # the drift.
+            "monitor": "val_loss",
+            "checkpoint_params": {"mode": "min", "save_top_k": 1, "save_last": True},
             "max_epochs": 80,
             "enable_checkpointing": True,
             "ckpt_path": "best",
-            # Early stopping: watch the GLOBAL training loss (the sum of
-            # all weighted loss terms — NB cell, NB nbr if active, commit,
-            # BCE adjacency if active, mask-token reg if active, etc.).
-            # This is the actual optimisation objective and the right thing
-            # to stop on. base_model logs it as `train_loss`.
-            # patience=15 epochs: at batch_size=256 / ~100k cells that is
-            # roughly 6k gradient steps, enough to distinguish a true plateau
-            # from temporary stagnation after a codebook reshuffle.
-            # min_delta=0.1: small in absolute terms, but the train loss for
-            # variants in this codebase ranges ~140-170, so 0.1 corresponds
-            # to roughly 0.07% relative improvement required per window.
+            # Early stopping: watch the val_loss (= sum of all weighted
+            # loss terms over the val set). Switching from train_loss to
+            # val_loss makes early stopping respond to in-distribution
+            # generalisation rather than the optimisation objective on
+            # the training set, which matters in particular for the
+            # adversarial variants where train_loss can keep declining
+            # while val performance silently degrades. patience=15 epochs
+            # ≈ 6k gradient steps at batch_size=256 / ~100k cells —
+            # enough to distinguish a true plateau from a codebook
+            # reshuffle. min_delta=0.1: small absolute, but val_loss in
+            # this codebase ranges ~140-170 so 0.1 ≈ 0.07% relative.
             "early_stopping_params": {
                 "enabled":    True,
-                "monitor":    "train_loss",
+                "monitor":    "val_loss",
                 "mode":       "min",
                 "patience":   15,
                 "min_delta":  0.1,
@@ -652,7 +722,7 @@ def _patch_recon_cell(cfg: dict) -> dict:
         losses.remove("nb_attribute_reconstruction_loss_nbr")
     if "nb_attribute_reconstruction_loss" not in losses:
         losses.insert(0, "nb_attribute_reconstruction_loss")
-    cfg["trainer"]["monitor"] = "train_pearson_gene_wise_log1p"
+    cfg["trainer"]["monitor"] = "val_loss"
     return cfg
 
 
@@ -671,7 +741,7 @@ def _patch_recon_nbr(cfg: dict) -> dict:
         losses.remove("nb_attribute_reconstruction_loss_nbr")
     if "nb_attribute_reconstruction_loss" not in losses:
         losses.insert(0, "nb_attribute_reconstruction_loss")
-    cfg["trainer"]["monitor"] = "train_pearson_gene_wise_1hop_nbr_log1p"
+    cfg["trainer"]["monitor"] = "val_loss"
     return cfg
 
 
@@ -691,7 +761,7 @@ def _patch_recon_both(cfg: dict) -> dict:
     if "nb_attribute_reconstruction_loss_nbr" not in losses:
         idx = losses.index("nb_attribute_reconstruction_loss") + 1
         losses.insert(idx, "nb_attribute_reconstruction_loss_nbr")
-    cfg["trainer"]["monitor"] = "train_pearson_gene_wise_log1p"
+    cfg["trainer"]["monitor"] = "val_loss"
     return cfg
 
 
@@ -1134,7 +1204,7 @@ def make_train_config_dualvq() -> dict:
     # Monitor metric: training-loss based (as set up by the early-stopping
     # patch). Pearson-based monitors still work; default to log1p-cell since
     # the dual model produces a meaningful per-cell X_hat.
-    cfg["trainer"]["monitor"] = "train_pearson_gene_wise_log1p"
+    cfg["trainer"]["monitor"] = "val_loss"
 
     return cfg
 
@@ -1244,6 +1314,110 @@ def _patch_dual_wide(
     return cfg
 
 
+# ---------------------------------------------------------------------------
+# Architecture ablations (mouse data)
+# ---------------------------------------------------------------------------
+
+def _patch_dual_small(cfg: dict, hidden: int = 128) -> dict:
+    """
+    scvi-style compact architecture: a single hidden layer of `hidden`
+    dim (default 128) for the encoder MLP, the GNN, and both decoders.
+
+    Configures:
+      - encoder MLP:   hidden_channels = [hidden]   (was [400, 256])
+      - GNN:           hidden_channels = hidden, num_layers = 1
+      - cell decoder:  hidden_channels = [hidden]   (was [400, 400])
+      - niche decoder: hidden_channels = [hidden]   (was [400, 400])
+
+    Latent / codebook embedding dim becomes `hidden` (cell_dim and
+    niche_dim both = `hidden`), so the codebook itself is also more
+    compact. Codebook size is left untouched (still 30 by default; bump
+    via `_patch_dual_rvq` etc. on top of this).
+
+    Tests whether the smaller-is-better intuition that drives scvi
+    transfers to spatial VQ-VAE. Parameter count drops ~5x vs the
+    SQUINT default.
+    """
+    enc = cfg["model"]["encoder_params"]
+    enc["mlp_params"]["hidden_channels"]  = [int(hidden)]
+    enc["gnn_params"]["hidden_channels"]  = int(hidden)
+    enc["gnn_params"]["num_layers"]       = 1
+    for dec_key in ("attribute_decoder_cell_params",
+                    "attribute_decoder_niche_params"):
+        cfg["model"][dec_key]["mlp_params"]["hidden_channels"] = [int(hidden)]
+    return cfg
+
+
+def _patch_dual_gnn2(
+        cfg: dict,
+        sampler_neighbors: List[int] = [8, 8],
+        nbr_aggregation_hops: int = 2,
+    ) -> dict:
+    """
+    Bump GNN depth from 1 to 2 layers WITHOUT changing the codebook
+    size (`_patch_dual_wide` couples both). Sampler depth and niche
+    target aggregation hops move with it (otherwise the GNN samples
+    nodes it won't aggregate over, or the nbr-target aggregation runs
+    on incomplete neighbours — see `_patch_dual_wide` docstring).
+
+    Use this as a clean isolation of "does deeper spatial context
+    help?" — codebook stays at 30 (or whatever was set upstream),
+    everything else as default.
+    """
+    cfg["model"]["encoder_params"]["gnn_params"]["num_layers"] = 2
+    cfg["datamodule"]["sampler_params"]["num_neighbors"] = list(sampler_neighbors)
+    cfg["model"]["loss_params"]["loss_kwargs"]["nbr_aggregation_hops"] = int(
+        nbr_aggregation_hops
+    )
+    return cfg
+
+
+def _patch_dual_small_latent(cfg: dict, latent_dim: int = 128) -> dict:
+    """
+    Shrink the latent / codebook-embedding dimension. Both `cell_dim`
+    (= last layer of encoder MLP) and `niche_dim` (= GNN hidden) move
+    to `latent_dim` (default 128, down from 256).
+
+    Tighter bottleneck → fewer dimensions to spread information across,
+    so each code's embedding has to be more semantically concentrated.
+    NicheCompass / scvi typically use 10–32; 128 still leaves headroom
+    while halving the SQUINT default.
+
+    Decoder hidden widths and codebook size are unchanged.
+    """
+    enc = cfg["model"]["encoder_params"]
+    h = list(enc["mlp_params"].get("hidden_channels", []))
+    if len(h) == 0:
+        # No MLP trunk — just set the GNN dim. The cell branch then
+        # quantises raw input directly which is unusual; warn but
+        # respect.
+        print("WARN: _patch_dual_small_latent: no MLP trunk configured "
+              "(mlp_params.hidden_channels is empty). Setting GNN hidden "
+              "only — cell branch latent dim will equal in_channels.")
+    else:
+        h[-1] = int(latent_dim)
+        enc["mlp_params"]["hidden_channels"] = h
+    enc["gnn_params"]["hidden_channels"] = int(latent_dim)
+    return cfg
+
+
+def _patch_dual_dropout(cfg: dict, p: float = 0.1) -> dict:
+    """
+    Add dropout `p` (default 0.1) to encoder MLP, GNN, and both
+    decoders. Cheap regularization — useful when val Pearson plateaus
+    while train Pearson keeps climbing (a sign of overfitting). With
+    val_loss-based early stopping, dropout's effect is monitorable
+    directly in wandb.
+    """
+    enc = cfg["model"]["encoder_params"]
+    enc["mlp_params"]["dropout"] = float(p)
+    enc["gnn_params"]["dropout"] = float(p)
+    for dec_key in ("attribute_decoder_cell_params",
+                    "attribute_decoder_niche_params"):
+        cfg["model"][dec_key]["mlp_params"]["dropout"] = float(p)
+    return cfg
+
+
 def _patch_dual_film(
         cfg: dict,
         condition_list: List[str] = ["cell_batch_id"],
@@ -1277,8 +1451,8 @@ def _patch_dual_film(
 
 def _patch_dual_adversarial(
         cfg: dict,
-        alpha: float = 2.0,
-        wt_adv_batch: float = 100.0,
+        alpha: float = 1.0,
+        wt_adv_batch: float = 150.0,
         hidden_channels: Optional[List[int]] = None,
     ) -> dict:
     """
@@ -1304,25 +1478,27 @@ def _patch_dual_adversarial(
     Parameters
     ----------
     alpha: float
-        Strength of the gradient reversal (encoder pressure). Default 2.0
-        (was 1.0 = standard Ganin-Lempitsky). Empirically the integration
-        was "almost good" at alpha=1.0 with wt_adv_batch=100, so we bump
-        encoder pressure slightly. `alpha` is preferred over
-        `wt_adv_batch` for strengthening: it only scales the encoder's
-        reversed gradient, leaving the classifier learning at its natural
-        pace, whereas bumping `wt_adv_batch` also accelerates the
-        classifier — risking saturation (CE → 0 → no gradient signal
-        flowing back).
+        Strength of the gradient reversal (encoder pressure). Default 1.0
+        — the standard Ganin-Lempitsky setting; multiplies the negated
+        gradient that flows back to the encoder. Earlier we tried alpha
+        =2.0 (with wt_adv_batch=100) and the codes started to collapse
+        (encoder pressure too aggressive). Reverted to alpha=1.0 and
+        bumped `wt_adv_batch` instead — the encoder gradient magnitude
+        is `alpha * wt_adv_batch * d_CE/d_z`, so the two knobs are
+        interchangeable for encoder pressure; the difference is that
+        `wt_adv_batch` also accelerates the classifier (sharper
+        adversary signal at the cost of faster CE→0 saturation).
     wt_adv_batch: float
-        Weight of the CE loss in the total loss. Default 100.0 (was 1.0
-        in the original paper recipe). With 2 batches the binary CE is
-        bounded by log(2) ≈ 0.69 nats while the cell + niche NB losses
-        sit at ~150 nats each; at `wt_adv_batch=1.0` the adversarial
-        gradient is ~150x weaker than the reconstruction signal and the
-        encoder essentially ignores it. 100.0 brings the adversarial
-        gradient into the same order of magnitude as the reconstruction
-        gradients. Sweep on a log scale (50, 100, 250, 500) if 100 isn't
-        enough — the right value depends on dataset and codebook size.
+        Weight of the CE loss in the total loss. Default 150.0. With 2
+        batches the binary CE is bounded by log(2) ≈ 0.69 nats while
+        the cell + niche NB losses sit at ~150 nats each; at
+        `wt_adv_batch=1.0` the adversarial gradient is ~150x weaker
+        than reconstruction and the encoder ignores it. 150.0 brings
+        the encoder pressure to ~1.5x the "almost good" alpha=1, wt=100
+        baseline without the codebook collapse seen at alpha=2. Sweep
+        log-ish (100, 150, 200, 300) — the right value depends on
+        dataset, codebook size, and how aggressive the decoder's batch-
+        absorption pathway (concat / FiLM) already is.
     hidden_channels: list of int, optional
         Hidden widths for the classifier MLP. Default [128] (one
         hidden layer of 128 units).
@@ -1434,64 +1610,85 @@ def _patch_dual_decoder_covariate(cfg: dict) -> dict:
 
 def _patch_dual_chl59_lung5(
         cfg: dict,
-        train_batch_idx: List[int],
-        test_batch_idx: List[int],
+        train_batch_idx: Optional[List[int]] = None,
+        test_batch_idx: Optional[List[int]] = None,
         batch_size: int = 128,
         edge_sampling_ratio: float = 1.0,
     ) -> dict:
     """
     Swap the dataset to /nfs/team361/sb75/DATASETS/silver/chl59-8b_1p (8
-    CosMx Lung samples) and configure whole-replicate holdout via
+    CosMx Lung samples) and configure whole-section holdout via
     SpatialBatchSplit.
+
+    Parameters
+    ----------
+    train_batch_idx, test_batch_idx:
+        `adata_batch_id` values (= the integer parsed out of
+        `uns['batch']`, e.g. `uns['batch']='batch6'` -> id=6), NOT
+        alphabetical file positions in the silver dir. SpatialBatchSplit
+        matches `data.adata_batch_id` against these lists, so they MUST
+        be the actual ids.
+
+        Translation to `cfg['dataset']['adata_batch_idx']` (which IS
+        position-based, used by `initialize_databatch` to slice the
+        dataset blob) is done at runtime in `train()` after the blob
+        is loaded, by reading each section's actual `adata_batch_id`
+        and inverting the id -> position mapping.
+
+        Two buckets:
+          - `train_batch_idx`: sections used for gradient updates.
+                               OPTIONAL — when omitted (default), train()
+                               picks every blob section that isn't in
+                               test/val. The base config's 10% cell-level
+                               split runs on these and provides the val
+                               signal for early stopping +
+                               best-checkpoint.
+          - `test_batch_idx`:  whole sections held out ENTIRELY from
+                               training (NOT loaded into the training
+                               data graph). Evaluated post-hoc by
+                               `predict()` + the inference metrics
+                               pipeline. Default `None` = no test set.
 
     Memory: lowers `batch_size` to 128 (from the 256 default inherited
     from the mmb-smb config) and `edge_sampling_ratio` to 1.0 (from 2.0).
     The Lung sections are denser than the mouse-brain ones AND have a
     larger gene panel (~946 vs. 431), so per-step autograd memory is
-    roughly 2x the mmb-smb cost at the same batch_size. On a 44 GiB GPU
-    the wide+RVQ-both stack peaks past 40 GiB at batch_size=256 and
-    OOMs in the cosine-adjacency negative-sampling step. Halving batch
-    size restores comfortable headroom; halving the negative-edge ratio
-    further trims the adjacency-loss peak. Override via the kwargs if
-    your GPU has more memory.
-
-    The 8 source AnnDatas in alphabetical order (sorted as the blob
-    builder sees them):
-       0  Lung12+SMI+Flat+data.tar.h5ad
-       1  Lung13+SMI+Flat+data.tar.h5ad
-       2  Lung5_Rep1+SMI+Flat+data.tar.h5ad
-       3  Lung5_Rep2+SMI+Flat+data.tar.h5ad
-       4  Lung5_Rep3+SMI+Flat+data.tar.h5ad
-       5  Lung6+SMI+Flat+data.tar.h5ad
-       6  Lung9_Rep1+SMI+Flat+data.tar.h5ad
-       7  Lung9_Rep2+SMI+Flat+data.tar.h5ad
-
-    Cells from `train_batch_idx` go entirely to train; cells from
-    `test_batch_idx` go entirely to val (-> show up as `val_pearson_*` in
-    wandb, computed on the held-out replicate(s)). With the modified
-    `SpatialBatchSplit` (region=None semantics), val_batches with no
-    region means "all cells are val" — perfect for whole-replicate
-    holdout.
-
-    All 8 batches are loaded into the blob; only the train+test subset
-    is used (their adata_batch_id values are the positional indices
-    above). FiLM batch-correction is configured to read from
-    `obs[batch_key]` (default 'batch') so the per-sample / per-replicate
-    label is used for batch one-hots.
+    roughly 2x the mmb-smb cost at the same batch_size. Override via the
+    kwargs if your GPU has more memory.
     """
-    cfg["dataset"]["dataset_name"]   = "chl59-8b_1p"
-    cfg["dataset"]["root_data_dir"]  = "/nfs/team361/sb75/DATASETS"
-    cfg["dataset"]["adata_batch_idx"] = sorted(set(list(train_batch_idx) + list(test_batch_idx)))
+    test_batch_idx = list(test_batch_idx) if test_batch_idx else []
+    # train_batch_idx is OPTIONAL — leave the train_batches list empty
+    # when not specified so train() defaults to "every blob section not
+    # in test/val".
+    train_batch_idx = list(train_batch_idx) if train_batch_idx else []
 
-    # Whole-batch holdout: train_batches keeps Rep1/Rep2 cells in train,
-    # val_batches puts entire Rep3 (and any other holdout replicates) into
-    # val. region=None means "all cells are val" (see SpatialBatchSplit).
+    cfg["dataset"]["dataset_name"]   = "chl59-8b_1p"
+    cfg["dataset"]["dataset_tag"]    = "chl59-8b_1p"
+    cfg["dataset"]["root_data_dir"]  = "/nfs/team361/sb75/DATASETS"
+    # `adata_batch_idx` (positions) is filled in at runtime in `train()`
+    # by translating `train_batches` (ids) via the loaded blob's
+    # id-to-position mapping. We leave it as a placeholder here so the
+    # variant config archives the user-intended ids rather than positions
+    # baked under a particular id-derivation assumption.
+    cfg["dataset"]["adata_batch_idx"] = []
+
     cfg["dataset"]["train_transform_params"] = {
         "region":         None,
         "train_batches":  list(train_batch_idx),
-        "val_batches":    list(test_batch_idx),
-        "test_batches":   [],
+        "val_batches":    [],   # no whole-section val; cell-level split provides val
+        # `test_batches` here is INFORMATIONAL — these sections aren't
+        # in `adata_batch_idx` so the data graph never contains them and
+        # `SpatialBatchSplit.forward` is never called on them at training
+        # time. We stamp the ids anyway so `predict()` reads them from
+        # the saved config and tags inference cells with
+        # `data_split = "test"` for stratified post-hoc metrics.
+        "test_batches":   test_batch_idx,
         "xy_key":         "xy_coordinates",
+        # Cell-level 10% split provides the val signal during training.
+        "train_val_cell_split":
+            cfg["dataset"]["train_transform_params"].get("train_val_cell_split", 0.10),
+        "cell_split_seed":
+            cfg["dataset"]["train_transform_params"].get("cell_split_seed", 0),
     }
 
     # The Lung AnnDatas have `obs['batch']` populated with per-sample
@@ -1508,31 +1705,14 @@ def _patch_dual_chl59_lung5(
 
     # Validation runs on the held-out replicate(s); name the monitor
     # accordingly so checkpoints are saved on test-set Pearson.
-    cfg["trainer"]["monitor"] = "val_pearson_gene_wise_log1p"
+    cfg["trainer"]["monitor"] = "val_loss"
     return cfg
-
-
-def _mmb20_adata_id_to_position(adata_id: int) -> int:
-    """
-    Map an mmb20 `adata_batch_id` to its position in the sorted-by-id
-    dataset blob. The harmonize script stamps `uns['batch'] = 'batchN'`
-    on every file; the blob sorts by parsed N ascending. STARmap batches
-    are 1..20 (positions 0..19); MERFISH is batch82 (position 20).
-    """
-    if 1 <= adata_id <= 20:
-        return adata_id - 1
-    if adata_id == 82:
-        return 20
-    raise ValueError(
-        f"Unknown mmb20 adata_batch_id: {adata_id}. "
-        f"Valid: 1..20 (STARmap) or 82 (MERFISH)."
-    )
 
 
 def _patch_dual_mmb20(
         cfg: dict,
-        train_adata_ids: List[int],
-        val_adata_ids: List[int],
+        train_adata_ids: Optional[List[int]] = None,
+        test_adata_ids: Optional[List[int]] = None,
         batch_size: int = 64,
         edge_sampling_ratio: float = 1.0,
         gnn_layers: int = 1,
@@ -1547,7 +1727,7 @@ def _patch_dual_mmb20(
 
     Parameters
     ----------
-    train_adata_ids, val_adata_ids:
+    train_adata_ids, test_adata_ids:
         `adata_batch_id` values (= the integer parsed out of `uns['batch']`
         that the harmonize script stamps from the filename), NOT
         positions in the sorted blob. STARmap sections are 1..20; MERFISH
@@ -1556,9 +1736,23 @@ def _patch_dual_mmb20(
         would silently produce no masks for any section and trigger a
         `KeyError: 'train_mask'` at the next collate step.
 
+        Two buckets:
+          - `train_adata_ids`: sections used for gradient updates. The
+                               base config's 10% cell-level split runs
+                               on these and provides the val signal for
+                               early stopping + best-checkpoint
+                               selection.
+          - `test_adata_ids`:  sections held out ENTIRELY from training
+                               (NOT loaded into the training data graph
+                               at all — excluded from `adata_batch_idx`).
+                               Evaluated post-hoc by `predict()` + the
+                               inference metrics pipeline. Default
+                               `None` = no test set.
+
         `cfg['dataset']['adata_batch_idx']` is position-based (used by
-        `initialize_databatch` to slice the dataset blob), so we
-        translate each id -> position via `_mmb20_adata_id_to_position`.
+        `initialize_databatch` to slice the dataset blob); the
+        translation from ids to positions happens at runtime in
+        `train()` once the blob is loaded.
 
     batch_size, edge_sampling_ratio:
         Memory tuning. mmb20 stays on the 431-gene MERFISH panel so
@@ -1590,19 +1784,38 @@ def _patch_dual_mmb20(
     per-cell batch one-hots used by the encoder/decoder batch correction
     (FiLM, decoder covariate, adversarial head).
     """
-    all_ids = sorted(set(list(train_adata_ids) + list(val_adata_ids)))
+    test_adata_ids = list(test_adata_ids) if test_adata_ids else []
+    # train_adata_ids is OPTIONAL — when omitted train() defaults to
+    # every blob section not in test/val.
+    train_adata_ids = list(train_adata_ids) if train_adata_ids else []
+
     cfg["dataset"]["dataset_name"]   = "mmb0-1b_smb1-20b_1p_shared_genes"
+    cfg["dataset"]["dataset_tag"]    = "mmb0-1b_smb1-20b_1p"
     cfg["dataset"]["root_data_dir"]  = "/lustre/scratch126/cellgen/lotfollahi/DATASETS"
-    cfg["dataset"]["adata_batch_idx"] = sorted(
-        _mmb20_adata_id_to_position(i) for i in all_ids
-    )
+    # `adata_batch_idx` (positions) is resolved at runtime in `train()`
+    # from `train_batches` (ids) via the loaded blob's id-to-position
+    # mapping. Test sections are deliberately excluded — they never
+    # enter the training data graph; `predict()` builds its own dataset
+    # from the silver dir and CAN run inference on them post-hoc.
+    cfg["dataset"]["adata_batch_idx"] = []
 
     cfg["dataset"]["train_transform_params"] = {
         "region":         None,
         "train_batches":  list(train_adata_ids),
-        "val_batches":    list(val_adata_ids),
-        "test_batches":   [],
+        "val_batches":    [],   # no whole-section val; cell-level split provides val
+        # `test_batches` here is INFORMATIONAL — these sections aren't
+        # in `adata_batch_idx` so the data graph never contains them and
+        # `SpatialBatchSplit.forward` is never called on them at training
+        # time. We stamp the ids anyway so `predict()` reads them from
+        # the saved config and tags inference cells with
+        # `data_split = "test"` for stratified post-hoc metrics.
+        "test_batches":   test_adata_ids,
         "xy_key":         "xy_coordinates",
+        # Cell-level 10% split provides the val signal during training.
+        "train_val_cell_split":
+            cfg["dataset"]["train_transform_params"].get("train_val_cell_split", 0.10),
+        "cell_split_seed":
+            cfg["dataset"]["train_transform_params"].get("cell_split_seed", 0),
     }
 
     cfg["dataset"]["graph_params"]["batch_key"] = "batch"
@@ -1625,25 +1838,40 @@ def _patch_dual_mmb20(
 
     # Validation runs on the held-out section(s); name the monitor
     # accordingly so checkpoints are saved on test-set Pearson.
-    cfg["trainer"]["monitor"] = "val_pearson_gene_wise_log1p"
+    cfg["trainer"]["monitor"] = "val_loss"
     return cfg
 
 
-def _patch_dual_mmb20_holdout_merfish_b10(cfg: dict) -> dict:
+def _patch_dual_mmb20_holdout(cfg: dict) -> dict:
     """
     Convenience holdout for the mmb20 cross-platform retrieval experiment.
 
-    Train: STARmap+ batches 1..9 + 11..20 (19 sections)
-    Val  : STARmap+ batch 10 (within-platform baseline, similar to batch
-           15 in the smaller mmb0-1b_smb1-1b dataset) + MERFISH batch 82
-           (cross-platform OOD test)
+    Train: STARmap+ batches 1..14 + 16..20 (19 sections used for gradient
+           updates).
+    Val  : (empty) — no whole-section val. The base config's cell-level
+           10% in-section sample of the 19 training sections is the
+           in-distribution early-stopping / best-ckpt-on-val signal.
+    Test : STARmap+ batch 15 (within-platform baseline; matches the
+           STARmap section held out in the smaller mmb-smb experiment)
+           AND MERFISH batch 82 (cross-platform OOD). Both are TRUE
+           held-outs — not loaded into the training data graph at all.
+           They are evaluated post-hoc by the predict +
+           compute_inference_metrics pipeline (which loads every file
+           in the silver dir, runs inference, and computes Pearson /
+           NMI / ARI / batch-integration metrics on every section). The
+           training pipeline itself never sees them.
 
     These are `adata_batch_id` values (not positions); see
     `_patch_dual_mmb20` for the rationale.
+
+    Only `test_adata_ids` is specified — `train()` defaults to "every
+    blob section that isn't in test/val", so STARmap+ batches 1..14 +
+    16..20 (19 sections) get used for training automatically.
     """
-    train_ids = [i for i in range(1, 21) if i != 10]   # 1..9 + 11..20
-    val_ids   = [10, 82]                               # STARmap batch10 + MERFISH
-    return _patch_dual_mmb20(cfg, train_adata_ids=train_ids, val_adata_ids=val_ids)
+    return _patch_dual_mmb20(
+        cfg,
+        test_adata_ids=[15, 82],
+    )
 
 
 def _patch_dual_adj_on_zqniche(cfg: dict) -> dict:
@@ -1656,7 +1884,262 @@ def _patch_dual_adj_on_zqniche(cfg: dict) -> dict:
     return cfg
 
 
+def _patch_quick(
+        cfg: dict,
+        max_epochs: int = 1,
+        batch_size: int = 32,
+    ) -> dict:
+    """
+    Smoke-test patch: cap training at `max_epochs` (default 1), disable
+    early stopping so the run definitely finishes, force a single-hop GNN
+    config, and set a small batch_size. The narrow GNN + small batch
+    keeps memory low so the smoke test can run on the largest dataset
+    (chl59 with 6 dense Lung sections, mmb20 with 19 STARmap sections)
+    without OOMing.
+
+    The narrow GNN settings (num_layers=1, sampler=[8], nbr_aggregation_hops=1)
+    are EXPLICITLY re-asserted here even though `_BD()` already defaults
+    to them — that way later patches in the smoke-test build chain
+    (e.g. `_patch_dual_decoder_covariate`, `_patch_dual_adversarial`)
+    can't accidentally drift the smoke test into a heavier config.
+    Dataset patches applied AFTER `_patch_quick` (e.g. `_patch_dual_mmb20`)
+    can still override batch_size if they need to.
+    """
+    cfg["trainer"]["max_epochs"] = int(max_epochs)
+    cfg["trainer"]["early_stopping_params"]["enabled"] = False
+    # Narrow GNN — single-hop everywhere.
+    cfg["model"]["encoder_params"]["gnn_params"]["num_layers"] = 1
+    cfg["datamodule"]["sampler_params"]["num_neighbors"] = [8]
+    cfg["model"]["loss_params"]["loss_kwargs"]["nbr_aggregation_hops"] = 1
+    # Smaller batch for memory headroom.
+    cfg["datamodule"]["loader_params"]["batch_size"] = int(batch_size)
+    return cfg
+
+
 VARIANTS: dict = {
+    # ---- Smoke test (1 epoch end-to-end) ----------------------------------
+    "smoke-test+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "1-epoch end-to-end pipeline test on the mmb-smb mouse data. "
+            "Dual-VQ + NicheCompass-style decoder covariate + adversarial "
+            "GRL on the FULL z_mlp (alpha=1.0, wt_adv_batch=150) — same "
+            "batch-correction recipe used by the overnight sweep, capped "
+            "at max_epochs=1, early stopping disabled, narrow GNN "
+            "(num_layers=1, sampler=[8], nbr_hops=1), batch_size=32. Use "
+            "before launching the sweep to verify train -> predict -> "
+            "plots -> metrics works end-to-end on the current blob in a "
+            "few minutes."
+        ),
+        "patches": [
+            "+quick(max_epochs=1, batch_size=32, narrow GNN)",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_quick(_BD(), max_epochs=1, batch_size=32)
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+    },
+    "smoke-test+chl59-8b_1p": {
+        "description": (
+            "1-epoch end-to-end pipeline test on the chl59-8b_1p CosMx Lung "
+            "data (test ids = [2, 3], train = the other 6 sections, val = "
+            "10% in-section cell sample). Dual-VQ + decoder covariate + "
+            "adversarial GRL — same batch-correction recipe as the "
+            "overnight sweep, capped at 1 epoch, early stopping disabled, "
+            "narrow GNN (num_layers=1, sampler=[8], nbr_hops=1), "
+            "batch_size lowered to 16 (the Lung sections have a ~2x "
+            "larger gene panel than mmb-smb, so per-step autograd memory "
+            "needs an extra cushion)."
+        ),
+        "patches": [
+            "+quick(max_epochs=1, batch_size=16, narrow GNN)",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+chl59-8b_1p(test_ids=[2,3])",
+        ],
+        "build": lambda: _patch_dual_chl59_lung5(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_quick(_BD(), max_epochs=1, batch_size=16)
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            test_batch_idx=[2, 3],
+            batch_size=16,
+        ),
+    },
+    "smoke-test+mmb0-1b_smb1-20b_1p": {
+        "description": (
+            "1-epoch end-to-end pipeline test on the mmb20 MERFISH+STARmap+ "
+            "21-section data (test ids = [15, 82], train = the other 19 "
+            "STARmap+ sections, val = 10% in-section cell sample). "
+            "Dual-VQ + decoder covariate + adversarial GRL — same "
+            "batch-correction recipe as the overnight sweep, capped at 1 "
+            "epoch, early stopping disabled, narrow GNN (num_layers=1, "
+            "sampler=[8], nbr_hops=1), batch_size lowered to 16 (memory "
+            "is tight at 19 training sections worth of static `x` + "
+            "edge_index on GPU)."
+        ),
+        "patches": [
+            "+quick(max_epochs=1, batch_size=16, narrow GNN)",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+mmb0-1b_smb1-20b_1p(test_ids=[15,82])",
+        ],
+        "build": lambda: _patch_dual_mmb20(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_quick(_BD(), max_epochs=1, batch_size=16)
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            test_adata_ids=[15, 82],
+            batch_size=16,
+        ),
+    },
+    # ========================================================================
+    # mmb0-1b_smb1-1b_1p 1-layer-GNN focused ablation matrix.
+    # ========================================================================
+    # Spine baseline = RVQ on both branches (k1=30, k2=90) + NicheCompass-
+    # style decoder covariate + adversarial GRL on FULL z_mlp (alpha=1.0,
+    # wt_adv_batch=150) + 1-layer SAGEConv GNN. Each variant ablates ONE
+    # axis from this spine. Group via `--all-dataset mmb0-1b_smb1-1b_1p-ablations`.
+    # The 1-layer spine (vs. the +wide 2-layer one used by the broader
+    # sweep) is the user's preferred starting point on this dataset.
+    #
+    # Existing variants reused for the matrix:
+    #   - dualvq+rvq-both+decoder-cov+adv+mmb0-1b_smb1-1b_1p     (the spine itself)
+    #   - dualvq+wide+rvq-both+decoder-cov+adv+mmb0-1b_smb1-1b_1p (2-layer GNN)
+    #   - dualvq+small+rvq-both+decoder-cov+adv+mmb0-1b_smb1-1b_1p (scvi-style encoder)
+    "dualvq+rvq-both+decoder-cov+adv+gatv2+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Spine ablation — SAGEConv -> GATv2Conv on the 1-layer GNN. "
+            "Tests per-edge attention vs. uniform mean aggregation at "
+            "1-hop on mmb-smb. Direct A/B against the +wide+gatv2 variant "
+            "to see whether GAT helps at narrow GNN depth."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+gatv2(SAGEConv -> GATv2Conv, num_layers=1)",
+        ],
+        "build": lambda: _patch_dual_gatv2(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 90)),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv-w300+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Spine ablation — adversarial weight bumped 150 -> 300 (2x). "
+            "Pushes the encoder harder toward batch-invariant z_mlp; "
+            "useful diagnostic for whether the default 150 is leaving "
+            "headroom or whether stronger pressure starts collapsing "
+            "codes."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=300.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(_BD(),
+                        branch="niche", codebook_sizes=(30, 90)),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=300.0,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv-w50+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Spine ablation — adversarial weight cut 150 -> 50 (~3x "
+            "lower). Tests whether the default GRL is over-regularising "
+            "z_mlp at the cost of biological signal."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=50.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(_BD(),
+                        branch="niche", codebook_sizes=(30, 90)),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=50.0,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+adj-w3000+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Spine ablation — cosine adjacency BCE weight bumped 1000 -> "
+            "3000 (3x). Stronger spatial-niche pressure on z_gnn; tests "
+            "whether the codebooks tolerate even more spatial coherence "
+            "than the default."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+adj(weight=3000)",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 90)),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            weight=3000.0,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Spine ablation — cosine adjacency BCE weight cut 1000 -> 250 "
+            "(4x lower; matches an earlier default). Tests whether the "
+            "default 1000 is over-pressuring spatial coherence at the "
+            "cost of NB Pearson."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+adj(weight=250)",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 90)),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            weight=250.0,
+        ),
+    },
     # ---- Reconstruction-mode ablations (all other components fixed) --------
     "recon-cell": {
         "description": (
@@ -2210,18 +2693,20 @@ VARIANTS: dict = {
     # metrics on the training replicates and `val_*` metrics on the held-out
     # replicate(s). Uses the wide+rvq-both+film recipe (best result on the
     # mouse-brain MERFISH+STARmap data) as the model backbone.
-    "dualvq+wide+rvq-both+film+lung5-rep3-test": {
+    "dualvq+wide+rvq-both+film+chl59-8b_1p": {
         "description": (
-            "Lung5 holdout-replicate setup: train on Lung5_Rep1 + Lung5_Rep2 "
-            "(adata_batch_idx=[2, 3]), validate on Lung5_Rep3 (idx=[4]). "
+            "chl59-8b_1p split: train on adata_batch_id 0 + 1 + 4 + 5 + 6 + 7 "
+            "(6 sections), hold out adata_batch_id 2 + 3 as test. "
             "Wide+RVQ-both backbone + FiLM batch-correction conditioned on "
-            "obs['batch']. `val_pearson_*` metrics in wandb are the "
-            "test-set (Rep3) metrics, computed simultaneously each epoch."
+            "obs['batch']. Val signal during training is the 10% in-section "
+            "cell sample of the training sections; the held-out batch2 + "
+            "batch3 sections are evaluated post-hoc by the predict + "
+            "compute_inference_metrics pipeline."
         ),
         "patches": [
             "+wide", "+rvq(branch=both, levels=[30, 90])",
             "+film(MLP-output, cell_batch_id)",
-            "+chl59_lung5(train=[2,3], test=[4])",
+            "+chl59-8b_1p(test_ids=[2,3])",
         ],
         "build": lambda: _patch_dual_chl59_lung5(
             _patch_dual_film(
@@ -2233,21 +2718,20 @@ VARIANTS: dict = {
                     branch="cell", codebook_sizes=(30, 90),
                 ),
             ),
-            train_batch_idx=[2, 3],
-            test_batch_idx=[4],
+            test_batch_idx=[2, 3],
         ),
     },
-    "dualvq+wide+rvq-both+decoder-cov+lung5-rep3-test": {
+    "dualvq+wide+rvq-both+decoder-cov+chl59-8b_1p": {
         "description": (
-            "Lung5 holdout-replicate + decoder-covariate batch correction. "
-            "Train: Lung5_Rep1 + Lung5_Rep2 (idx=[2, 3]); Val (test): "
-            "Lung5_Rep3 (idx=[4]). Decoder covariate concatenates per-cell "
-            "batch one-hot to z_q before each decoder, freeing the "
-            "codebook to be batch-invariant across replicates."
+            "chl59-8b_1p split + decoder-covariate batch correction. "
+            "Train: adata_batch_id 0 + 1 + 4 + 5 + 6 + 7; Test: "
+            "adata_batch_id 2 + 3. Decoder covariate concatenates "
+            "per-cell batch one-hot to z_q before each decoder, freeing "
+            "the codebook to be batch-invariant across replicates."
         ),
         "patches": [
             "+wide", "+rvq(branch=both, levels=[30, 90])",
-            "+decoder_covariate", "+chl59_lung5(train=[2,3], test=[4])",
+            "+decoder_covariate", "+chl59-8b_1p(test_ids=[2,3])",
         ],
         "build": lambda: _patch_dual_chl59_lung5(
             _patch_dual_decoder_covariate(
@@ -2259,25 +2743,24 @@ VARIANTS: dict = {
                     branch="cell", codebook_sizes=(30, 90),
                 ),
             ),
-            train_batch_idx=[2, 3],
-            test_batch_idx=[4],
+            test_batch_idx=[2, 3],
         ),
     },
-    "dualvq+wide+rvq-both+dec-film+lung5-rep3-test": {
+    "dualvq+wide+rvq-both+dec-film+chl59-8b_1p": {
         "description": (
-            "Lung5 holdout-replicate + FiLM batch-correction INSIDE the "
+            "chl59-8b_1p split + FiLM batch-correction INSIDE the "
             "cell + niche decoders (`apply_conditioning='in-MLP'`, "
-            "condition=cell_batch_id). Train: Lung5_Rep1 + Lung5_Rep2 "
-            "(idx=[2, 3]); Val (test): Lung5_Rep3 (idx=[4]). Direct A/B "
-            "against `+decoder-cov+lung5-rep3-test` (concat covariate) "
-            "and `+decoder-cov+adv+lung5-rep3-test` (concat + adversary). "
+            "condition=cell_batch_id). Train: adata_batch_id "
+            "0 + 1 + 4 + 5 + 6 + 7; Test: adata_batch_id 2 + 3. Direct "
+            "A/B against `+decoder-cov+chl59-8b_1p` (concat covariate) "
+            "and `+decoder-cov+adv+chl59-8b_1p` (concat + adversary). "
             "FiLM is recommended over concat for the deeper non-linear "
             "MLPSoftmax decoders used here."
         ),
         "patches": [
             "+wide", "+rvq(branch=both, levels=[30, 90])",
             "+dec-film(in-MLP, cell_batch_id)",
-            "+chl59_lung5(train=[2,3], test=[4])",
+            "+chl59-8b_1p(test_ids=[2,3])",
         ],
         "build": lambda: _patch_dual_chl59_lung5(
             _patch_dual_decoder_film(
@@ -2289,25 +2772,25 @@ VARIANTS: dict = {
                     branch="cell", codebook_sizes=(30, 90),
                 ),
             ),
-            train_batch_idx=[2, 3],
-            test_batch_idx=[4],
+            test_batch_idx=[2, 3],
         ),
     },
-    "dualvq+wide+rvq-both+decoder-cov+adv+lung5-rep3-test": {
+    "dualvq+wide+rvq-both+decoder-cov+adv+chl59-8b_1p": {
         "description": (
-            "Lung5 holdout-replicate + decoder covariate + domain-"
-            "adversarial batch-invariance head. Train: Lung5_Rep1 + "
-            "Lung5_Rep2 (idx=[2, 3]); Val (test): Lung5_Rep3 (idx=[4]). "
+            "chl59-8b_1p split + decoder covariate + domain-"
+            "adversarial batch-invariance head. Train: adata_batch_id "
+            "0 + 1 + 4 + 5 + 6 + 7; Test: adata_batch_id 2 + 3. "
             "NicheCompass-shape recipe: covariate concat lets the "
             "decoder absorb per-batch gene patterns; adversarial GRL "
             "(applied to FULL z_mlp incl. sampled neighbours) actively "
-            "pushes the encoder toward batch-invariance. wt_adv_batch=100 "
-            "calibrated against the ~150-nat NB reconstruction losses."
+            "pushes the encoder toward batch-invariance. wt_adv_batch="
+            "150 calibrated against the ~150-nat NB reconstruction "
+            "losses."
         ),
         "patches": [
             "+wide", "+rvq(branch=both, levels=[30, 90])",
-            "+decoder_covariate", "+adversarial_batch(alpha=2.0, wt=100.0)",
-            "+chl59_lung5(train=[2,3], test=[4])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+chl59-8b_1p(test_ids=[2,3])",
         ],
         "build": lambda: _patch_dual_chl59_lung5(
             _patch_dual_adversarial(
@@ -2320,25 +2803,24 @@ VARIANTS: dict = {
                         branch="cell", codebook_sizes=(30, 90),
                     ),
                 ),
-                alpha=2.0, wt_adv_batch=100.0,
+                alpha=1.0, wt_adv_batch=150.0,
             ),
-            train_batch_idx=[2, 3],
-            test_batch_idx=[4],
+            test_batch_idx=[2, 3],
         ),
     },
-    "dualvq+wide+rvq-both+adv+lung5-rep3-test": {
+    "dualvq+wide+rvq-both+adv+chl59-8b_1p": {
         "description": (
-            "Lung5 holdout-replicate + adversarial-only batch correction "
-            "(no decoder covariate, no FiLM). Train: Lung5_Rep1 + "
-            "Lung5_Rep2 (idx=[2, 3]); Val (test): Lung5_Rep3 (idx=[4]). "
-            "Tests whether the GRL alone is enough — should not work as "
-            "well as the +decoder-cov+adv combo since the decoder has no "
-            "way to fit per-batch gene patterns."
+            "chl59-8b_1p split + adversarial-only batch correction "
+            "(no decoder covariate, no FiLM). Train: adata_batch_id "
+            "0 + 1 + 4 + 5 + 6 + 7; Test: adata_batch_id 2 + 3. Tests "
+            "whether the GRL alone is enough — should not work as "
+            "well as the +decoder-cov+adv combo since the decoder has "
+            "no way to fit per-batch gene patterns."
         ),
         "patches": [
             "+wide", "+rvq(branch=both, levels=[30, 90])",
-            "+adversarial_batch(alpha=2.0, wt=100.0)",
-            "+chl59_lung5(train=[2,3], test=[4])",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+chl59-8b_1p(test_ids=[2,3])",
         ],
         "build": lambda: _patch_dual_chl59_lung5(
             _patch_dual_adversarial(
@@ -2349,31 +2831,36 @@ VARIANTS: dict = {
                     ),
                     branch="cell", codebook_sizes=(30, 90),
                 ),
-                alpha=2.0, wt_adv_batch=100.0,
+                alpha=1.0, wt_adv_batch=150.0,
             ),
-            train_batch_idx=[2, 3],
-            test_batch_idx=[4],
+            test_batch_idx=[2, 3],
         ),
     },
     # ========================================================================
     # mmb20 cross-platform retrieval (dataset: mmb0-1b_smb1-20b_1p_shared_genes)
     # ========================================================================
-    # Train on 19 STARmap+ sections (mouse CNS, batches 1..9 + 11..20);
-    # hold out STARmap batch 10 (within-platform baseline, similar to
-    # batch 15 in the smaller mmb-smb dataset) and the MERFISH section
-    # (cross-platform OOD test). Both holdouts go to val so wandb logs
-    # `val_*` metrics for both simultaneously.
-    "dualvq+narrow+rvq-both+dec-film+adv+mmb20-merfish": {
+    # Train on 19 STARmap+ sections (mouse CNS, batches 1..14 + 16..20);
+    # hold out STARmap batch 15 (within-platform baseline; matches the
+    # STARmap section held out in the smaller mmb-smb experiment) and
+    # MERFISH batch 82 (cross-platform OOD test). Both holdouts are TRUE
+    # held-outs — they never enter the training data graph; post-hoc
+    # evaluation runs through predict + compute_inference_metrics on the
+    # full silver dir.
+    "dualvq+narrow+rvq-both+dec-film+adv+mmb0-1b_smb1-20b_1p": {
         "description": (
-            "mmb20 (1 MERFISH + 20 STARmap, shared MERFISH gene panel) "
-            "with FiLM-in-decoder + domain-adversarial batch correction. "
-            "Train: 19 STARmap+ sections (batches 1..9 + 11..20). "
-            "Val (test): STARmap+ batch10 (within-platform baseline) + "
-            "MERFISH batch82 (cross-platform OOD). "
+            "mmb0-1b_smb1-20b_1p (1 MERFISH + 20 STARmap, shared MERFISH "
+            "gene panel) with FiLM-in-decoder + domain-adversarial batch "
+            "correction. Train: 19 STARmap+ sections (batches 1..14 + "
+            "16..20). Val: 10% cell-level sample of the training "
+            "sections (in-distribution early-stopping signal). Test: "
+            "STARmap+ batch15 + MERFISH batch82 — BOTH held out from "
+            "training entirely (not loaded into the training data graph) "
+            "and evaluated post-hoc by the predict + analysis pipeline "
+            "(within-platform vs cross-platform retrieval). "
             "Recommended starting recipe for the cross-platform retrieval "
             "experiment — FiLM gives the decoder a per-layer batch-"
             "modulation surface; the adversary on FULL z_mlp pushes the "
-            "encoder toward batch-invariant codes (wt_adv_batch=100). "
+            "encoder toward batch-invariant codes (wt_adv_batch=150). "
             "'narrow' = single-hop GNN + sampler=[8] + nbr_hops=1, "
             "calibrated for memory on a 44 GiB GPU at this dataset scale."
         ),
@@ -2382,10 +2869,10 @@ VARIANTS: dict = {
             "+rvq(branch=niche, levels=[30, 90])",
             "+rvq(branch=cell, levels=[30, 90])",
             "+dec-film(in-MLP, cell_batch_id)",
-            "+adversarial_batch(alpha=2.0, wt=100.0)",
-            "+mmb20(train_ids=[1..9,11..20], val_ids=[10,82])",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+mmb0-1b_smb1-20b_1p(test_ids=[15,82])",
         ],
-        "build": lambda: _patch_dual_mmb20_holdout_merfish_b10(
+        "build": lambda: _patch_dual_mmb20_holdout(
             _patch_dual_adversarial(
                 _patch_dual_decoder_film(
                     _patch_dual_rvq(
@@ -2396,27 +2883,29 @@ VARIANTS: dict = {
                         branch="cell", codebook_sizes=(30, 90),
                     ),
                 ),
-                alpha=2.0, wt_adv_batch=100.0,
+                alpha=1.0, wt_adv_batch=150.0,
             ),
         ),
     },
-    "dualvq+narrow+rvq-both+decoder-cov+adv+mmb20-merfish": {
+    "dualvq+narrow+rvq-both+decoder-cov+adv+mmb0-1b_smb1-20b_1p": {
         "description": (
-            "mmb20 with concat decoder covariate + adversarial. Same "
-            "holdout split as the dec-film+adv variant (val_ids = "
-            "[STARmap batch10, MERFISH batch82]); A/B against it to measure "
-            "FiLM-in-decoder vs. concat-based covariate on the 21-section "
-            "retrieval setup. Same 'narrow' GNN/sampler config."
+            "mmb0-1b_smb1-20b_1p with concat decoder covariate + "
+            "adversarial. Same holdout split as the dec-film+adv "
+            "variant (train=batches 1..14 + 16..20, val=10% in-section "
+            "cell sample, test=STARmap batch15 + MERFISH batch82 "
+            "evaluated post-hoc); A/B against it to measure "
+            "FiLM-in-decoder vs. concat-based covariate on the 21-"
+            "section retrieval setup. Same 'narrow' GNN/sampler config."
         ),
         "patches": [
             "+narrow(gnn=1, sampler=[8], nbr_hops=1)",
             "+rvq(branch=niche, levels=[30, 90])",
             "+rvq(branch=cell, levels=[30, 90])",
             "+decoder_covariate",
-            "+adversarial_batch(alpha=2.0, wt=100.0)",
-            "+mmb20(train_ids=[1..9,11..20], val_ids=[10,82])",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+mmb0-1b_smb1-20b_1p(test_ids=[15,82])",
         ],
-        "build": lambda: _patch_dual_mmb20_holdout_merfish_b10(
+        "build": lambda: _patch_dual_mmb20_holdout(
             _patch_dual_adversarial(
                 _patch_dual_decoder_covariate(
                     _patch_dual_rvq(
@@ -2427,28 +2916,29 @@ VARIANTS: dict = {
                         branch="cell", codebook_sizes=(30, 90),
                     ),
                 ),
-                alpha=2.0, wt_adv_batch=100.0,
+                alpha=1.0, wt_adv_batch=150.0,
             ),
         ),
     },
-    "dualvq+narrow+rvq-both+adv+mmb20-merfish": {
+    "dualvq+narrow+rvq-both+adv+mmb0-1b_smb1-20b_1p": {
         "description": (
-            "mmb20 with adversarial-only batch correction (no decoder "
-            "covariate, no FiLM). Train on 19 STARmap, hold out STARmap "
-            "batch10 + MERFISH. The strictest 'biology-only' setup — the "
-            "decoder has no batch-specific pathway, so the codes have to "
-            "be platform-invariant by themselves. Useful as a control "
-            "for the cross-platform retrieval experiment. Same 'narrow' "
-            "GNN/sampler config."
+            "mmb0-1b_smb1-20b_1p with adversarial-only batch correction "
+            "(no decoder covariate, no FiLM). Train on 19 STARmap+ "
+            "sections (batches 1..14 + 16..20), hold out STARmap "
+            "batch15 + MERFISH batch82. The strictest 'biology-only' "
+            "setup — the decoder has no batch-specific pathway, so the "
+            "codes have to be platform-invariant by themselves. Useful "
+            "as a control for the cross-platform retrieval experiment. "
+            "Same 'narrow' GNN/sampler config."
         ),
         "patches": [
             "+narrow(gnn=1, sampler=[8], nbr_hops=1)",
             "+rvq(branch=niche, levels=[30, 90])",
             "+rvq(branch=cell, levels=[30, 90])",
-            "+adversarial_batch(alpha=2.0, wt=100.0)",
-            "+mmb20(train_ids=[1..9,11..20], val_ids=[10,82])",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+mmb0-1b_smb1-20b_1p(test_ids=[15,82])",
         ],
-        "build": lambda: _patch_dual_mmb20_holdout_merfish_b10(
+        "build": lambda: _patch_dual_mmb20_holdout(
             _patch_dual_adversarial(
                 _patch_dual_rvq(
                     _patch_dual_rvq(
@@ -2457,65 +2947,18 @@ VARIANTS: dict = {
                     ),
                     branch="cell", codebook_sizes=(30, 90),
                 ),
-                alpha=2.0, wt_adv_batch=100.0,
+                alpha=1.0, wt_adv_batch=150.0,
             ),
         ),
     },
-    "dualvq+wide+rvq-both+decoder-cov+lung5+lung9-multi-test": {
-        "description": (
-            "Lung5+Lung9 holdout + decoder-covariate batch correction. "
-            "Train: 6 samples (idx=[0,1,2,3,5,6]); Val (test): Lung5_Rep3 "
-            "+ Lung9_Rep2 (idx=[4, 7]). The decoder covariate is the key "
-            "ingredient that makes codes consistent across the 6 training "
-            "samples."
-        ),
-        "patches": [
-            "+wide", "+rvq(branch=both, levels=[30, 90])",
-            "+decoder_covariate",
-            "+chl59_lung5(train=[0,1,2,3,5,6], test=[4,7])",
-        ],
-        "build": lambda: _patch_dual_chl59_lung5(
-            _patch_dual_decoder_covariate(
-                _patch_dual_rvq(
-                    _patch_dual_rvq(
-                        _patch_dual_wide(_BD()),
-                        branch="niche", codebook_sizes=(30, 90),
-                    ),
-                    branch="cell", codebook_sizes=(30, 90),
-                ),
-            ),
-            train_batch_idx=[0, 1, 2, 3, 5, 6],
-            test_batch_idx=[4, 7],
-        ),
-    },
-    "dualvq+wide+rvq-both+film+lung5+lung9-multi-test": {
-        "description": (
-            "Lung5+Lung9 holdout-replicate setup: train on all 8 samples "
-            "EXCEPT Lung5_Rep3 and Lung9_Rep2 (adata_batch_idx="
-            "[0, 1, 2, 3, 5, 6]); validate on the two held-out replicates "
-            "(idx=[4, 7]). Wide+RVQ-both backbone + FiLM batch-correction "
-            "(via obs['batch']). `val_pearson_*` metrics are the average "
-            "test-set Pearson across both held-out replicates."
-        ),
-        "patches": [
-            "+wide", "+rvq(branch=both, levels=[30, 90])",
-            "+film(MLP-output, cell_batch_id)",
-            "+chl59_lung5(train=[0,1,2,3,5,6], test=[4,7])",
-        ],
-        "build": lambda: _patch_dual_chl59_lung5(
-            _patch_dual_film(
-                _patch_dual_rvq(
-                    _patch_dual_rvq(
-                        _patch_dual_wide(_BD()),
-                        branch="niche", codebook_sizes=(30, 90),
-                    ),
-                    branch="cell", codebook_sizes=(30, 90),
-                ),
-            ),
-            train_batch_idx=[0, 1, 2, 3, 5, 6],
-            test_batch_idx=[4, 7],
-        ),
-    },
+    # NOTE: the previous `lung5+lung9-multi-test` variants were removed
+    # when chl59 switched to `adata_batch_id`-based splits — their
+    # position-based indices `[0,1,2,3,5,6]` / `[4,7]` were derived from
+    # alphabetical filename order at a time when chl59 files lacked
+    # `uns['batch']`, and don't translate to a clean `uns['batch']`
+    # split without re-inspecting the silver files. Re-add them by
+    # passing the corresponding `adata_batch_id` lists once the mapping
+    # is confirmed.
     # ========================================================================
     # NicheCompass-style decoder-covariate batch correction (concat).
     # Replaces the previous FiLM-at-encoder mechanism, which conceptually
@@ -2534,6 +2977,124 @@ VARIANTS: dict = {
         "patches": ["+wide", "+decoder_covariate(concat per-cell batch one-hot)"],
         "build": lambda: _patch_dual_decoder_covariate(_patch_dual_wide(_BD())),
     },
+    # ========================================================================
+    # Architecture ablations on mmb0-1b_smb1-1b_1p (mouse-brain MERFISH+STARmap) — fixed batch correction
+    # (decoder-cov + adversarial), varying encoder/decoder/GNN/latent only.
+    # All assume the current best batch-correction recipe and isolate the
+    # architecture effect.
+    # ========================================================================
+    "dualvq+decoder-cov+adv": {
+        "description": (
+            "Basic dual VQ baseline (no +wide, no +rvq) with decoder "
+            "covariate + adversarial batch correction. Reference point "
+            "for the architecture ablations below — same batch correction "
+            "everywhere, only the encoder/decoder/GNN/latent shape "
+            "differs."
+        ),
+        "patches": [
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(_BD()),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+    },
+    "dualvq+small+decoder-cov+adv": {
+        "description": (
+            "scvi-style compact: 1 hidden layer of 128 dim everywhere "
+            "(encoder MLP, GNN, both decoders). Latent / codebook "
+            "embedding dim = 128 (down from 256). Codebook size stays "
+            "at 30. ~5x fewer parameters than the SQUINT default; tests "
+            "whether scvi's smaller-is-better intuition transfers to "
+            "spatial VQ-VAE."
+        ),
+        "patches": [
+            "+small(hidden=128 — encoder MLP + GNN + both decoders)",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(_patch_dual_small(_BD())),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+    },
+    "dualvq+gnn2+decoder-cov+adv": {
+        "description": (
+            "Like the basic baseline but with GNN depth=2 (sampler=[8,8], "
+            "nbr_hops=2). Isolates the effect of deeper spatial context "
+            "on the niche branch from `+wide`'s codebook-size bump."
+        ),
+        "patches": [
+            "+gnn2(num_layers=2, sampler=[8,8], nbr_hops=2)",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(_patch_dual_gnn2(_BD())),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+    },
+    "dualvq+gatv2+decoder-cov+adv": {
+        "description": (
+            "Like the basic baseline but swap the GNN from GraphSAGE "
+            "(SAGEConv, default) to GATv2 (GATv2Conv). 1 layer either "
+            "way. SAGEConv aggregates neighbours uniformly (mean / "
+            "weighted-by-degree); GATv2 learns per-edge attention "
+            "weights so the GNN can up- or down-weight individual "
+            "neighbours based on feature similarity. For sparser, more "
+            "heterogeneous spatial neighbourhoods this can sharpen "
+            "niche signal; for dense, homogeneous ones (mouse brain) "
+            "it usually doesn't change much. Direct A/B against "
+            "`dualvq+decoder-cov+adv` (same config, just SAGEConv)."
+        ),
+        "patches": [
+            "+gatv2(SAGEConv -> GATv2Conv, num_layers=1)",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(_patch_dual_gatv2(_BD())),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+    },
+    "dualvq+small-latent+decoder-cov+adv": {
+        "description": (
+            "Tighter latent bottleneck: cell_dim and niche_dim = 128 "
+            "(down from 256). Encoder MLP keeps its first layer at 400; "
+            "only the last hidden layer + GNN hidden shrink. Decoder "
+            "widths unchanged. Tests whether forcing more "
+            "semantically-concentrated codebook embeddings helps."
+        ),
+        "patches": [
+            "+small-latent(latent_dim=128)",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(_patch_dual_small_latent(_BD())),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+    },
+    "dualvq+dropout+decoder-cov+adv": {
+        "description": (
+            "Add dropout p=0.1 to encoder MLP, GNN, and both decoders. "
+            "Default architecture otherwise. Useful if the model is "
+            "overfitting (val Pearson plateaus while train Pearson keeps "
+            "climbing) — early-stopping on val_loss already mitigates "
+            "this, but dropout reduces the gap to the unattainable "
+            "ceiling."
+        ),
+        "patches": [
+            "+dropout(p=0.1)",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(_patch_dual_dropout(_BD())),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+    },
     "dualvq+wide+rvq-both+decoder-cov+adv": {
         "description": (
             "Wide dual VQ + RVQ on both branches + decoder covariate + "
@@ -2546,7 +3107,7 @@ VARIANTS: dict = {
         ),
         "patches": [
             "+wide", "+rvq(branch=both, levels=[30, 90])",
-            "+decoder_covariate", "+adversarial_batch(alpha=2.0, wt=100.0)",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
         ],
         "build": lambda: _patch_dual_adversarial(
             _patch_dual_decoder_covariate(
@@ -2558,7 +3119,7 @@ VARIANTS: dict = {
                     branch="cell", codebook_sizes=(30, 90),
                 ),
             ),
-            alpha=2.0, wt_adv_batch=100.0,
+            alpha=1.0, wt_adv_batch=150.0,
         ),
     },
     "dualvq+wide+rvq-both+adv": {
@@ -2570,7 +3131,7 @@ VARIANTS: dict = {
         ),
         "patches": [
             "+wide", "+rvq(branch=both, levels=[30, 90])",
-            "+adversarial_batch(alpha=2.0, wt=100.0)",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
         ],
         "build": lambda: _patch_dual_adversarial(
             _patch_dual_rvq(
@@ -2580,7 +3141,7 @@ VARIANTS: dict = {
                 ),
                 branch="cell", codebook_sizes=(30, 90),
             ),
-            alpha=2.0, wt_adv_batch=100.0,
+            alpha=1.0, wt_adv_batch=150.0,
         ),
     },
     "dualvq+wide+rvq-both+decoder-cov": {
@@ -2645,7 +3206,7 @@ VARIANTS: dict = {
             "FiLM gives the decoder a structurally cleaner per-layer "
             "modulation surface than concat (better fit for the deeper "
             "non-linear MLPSoftmax decoders); the adversary (applied to "
-            "the FULL z_mlp incl. sampled neighbours, wt_adv_batch=100) "
+            "the FULL z_mlp incl. sampled neighbours, wt_adv_batch=150) "
             "acts as a regularizer against the decoder over-explaining "
             "genuine biology as batch."
         ),
@@ -2654,7 +3215,7 @@ VARIANTS: dict = {
             "+rvq(branch=niche, levels=[30, 90])",
             "+rvq(branch=cell, levels=[30, 90])",
             "+dec-film(in-MLP, cell_batch_id)",
-            "+adversarial_batch(alpha=2.0, wt=100.0)",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
         ],
         "build": lambda: _patch_dual_adversarial(
             _patch_dual_decoder_film(
@@ -2666,7 +3227,7 @@ VARIANTS: dict = {
                     branch="cell", codebook_sizes=(30, 90),
                 ),
             ),
-            alpha=2.0, wt_adv_batch=100.0,
+            alpha=1.0, wt_adv_batch=150.0,
         ),
     },
     "dualvq+wide+rvq-both+film": {
@@ -2764,6 +3325,328 @@ VARIANTS: dict = {
             heads=10, codebook_size=5000),
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Per-dataset ablation sweep matrix (10 variants per dataset).
+# ---------------------------------------------------------------------------
+# A consistent 10-axis ablation sweep registered for each of the 3 datasets.
+# Run one dataset's sweep per HPC job (one per node) via:
+#
+#   python examples/run_squint.py --all-dataset mmb0-1b_smb1-1b_1p
+#   python examples/run_squint.py --all-dataset chl59-8b_1p
+#   python examples/run_squint.py --all-dataset mmb0-1b_smb1-20b_1p
+#
+# Each variant ablates ONE axis from a fixed spine baseline. The spine is:
+#   wide (or narrow on memory-constrained datasets) + RVQ on both branches
+#   (k1=30, k2=90) + NicheCompass-style decoder covariate (concat per-cell
+#   batch one-hot) + adversarial GRL on FULL z_mlp (alpha=1.0, wt=150).
+#
+# For wide-spine datasets the 10 axes are:
+#   1. baseline       — pure spine
+#   2. gatv2          — SAGEConv -> GATv2Conv
+#   3. small          — scvi-style hidden=128 everywhere (replaces wide)
+#   4. small-latent   — latent / codebook-embedding dim 256 -> 128
+#   5. dropout        — p=0.1 on encoder MLP, GNN, both decoders
+#   6. dec-film       — FiLM-in-decoder INSTEAD of decoder covariate concat
+#   7. no-adv         — drop the adversarial head
+#   8. no-arch        — drop +wide (1-hop GNN, default codebook)
+#   9. no-rvq         — single VQ k=30 on both branches (no RVQ)
+#  10. no-adj         — drop the cosine adjacency BCE loss
+#
+# For the narrow (memory-constrained) mmb20 dataset, axis 8 changes from
+# 'no-arch' to 'codebook-large' (RVQ levels 50/150 instead of 30/90),
+# because a wider GNN OOMs at 19 sections on a 44 GiB GPU.
+
+_SWEEP_AXES_WIDE = [
+    "baseline", "gatv2", "small", "small-latent", "dropout",
+    "dec-film", "no-adv", "no-arch", "no-rvq", "no-adj",
+]
+_SWEEP_AXES_NARROW = [
+    "baseline", "gatv2", "small", "small-latent", "dropout",
+    "dec-film", "no-adv", "codebook-large", "no-rvq", "no-adj",
+]
+
+_SWEEP_AXIS_DESC = {
+    "baseline": (
+        "Spine baseline (no ablation). Wide-or-narrow GNN + RVQ on both "
+        "branches (k1=30, k2=90) + NicheCompass-style decoder covariate "
+        "(concat per-cell batch one-hot) + adversarial GRL on FULL z_mlp "
+        "(alpha=1.0, wt_adv_batch=150). Reference point for the 10-axis "
+        "sweep."
+    ),
+    "gatv2": (
+        "Spine + SAGEConv -> GATv2Conv on the niche-branch GNN. Tests "
+        "per-edge attention vs. uniform mean aggregation. Helps more on "
+        "sparse / heterogeneous neighbourhoods."
+    ),
+    "small": (
+        "scvi-style compact architecture: 1 hidden layer of 128 dim "
+        "everywhere (encoder MLP, GNN, both decoders). Latent / codebook "
+        "embedding dim = 128. ~5x fewer parameters than the SQUINT default. "
+        "Replaces +wide (which sets 2-layer GNN at 256 dim). RVQ + "
+        "decoder-cov + adv unchanged. Tests whether smaller-is-better "
+        "transfers to spatial VQ-VAE."
+    ),
+    "small-latent": (
+        "Spine + latent / codebook-embedding dim 256 -> 128. Encoder MLP "
+        "first layer stays at 400; only the last hidden layer + GNN hidden "
+        "shrink. Tests whether forcing more semantically-concentrated "
+        "codebook embeddings helps."
+    ),
+    "dropout": (
+        "Spine + dropout p=0.1 on encoder MLP, GNN, and both decoders. "
+        "Cheap regularization. Useful diagnostic when val Pearson plateaus "
+        "while train Pearson keeps climbing."
+    ),
+    "dec-film": (
+        "Spine but FiLM batch-correction INSIDE the cell + niche decoders "
+        "(`apply_conditioning='in-MLP'`, condition=cell_batch_id) INSTEAD "
+        "of concat-based decoder covariate. FiLM gives the decoder a "
+        "per-layer modulation surface; recommended over concat for the "
+        "deeper non-linear MLPSoftmax decoders."
+    ),
+    "no-adv": (
+        "Spine WITHOUT the adversarial head. Decoder still gets the "
+        "covariate. Tests whether the GRL is contributing batch invariance "
+        "beyond what concat covariate alone achieves."
+    ),
+    "no-arch": (
+        "Spine WITHOUT +wide (so 1-hop GNN, sampler=[8], nbr_hops=1, "
+        "default codebook size). Tests whether the deeper spatial context "
+        "from +wide is load-bearing once RVQ is in place."
+    ),
+    "no-rvq": (
+        "Spine WITHOUT RVQ — single VQ at k=30 on both branches instead "
+        "of residual (30, 90). Tests whether the hierarchical RVQ "
+        "structure helps over a flat codebook of comparable budget."
+    ),
+    "no-adj": (
+        "Spine WITHOUT the cosine adjacency BCE loss. Niche branch is "
+        "supervised only by neighbourhood NB. Tests whether the "
+        "adjacency term is load-bearing for spatial code coherence."
+    ),
+    "codebook-large": (
+        "Spine but RVQ levels 30,90 -> 50,150 on both branches (larger "
+        "primary + larger residual codebooks). Single coupled "
+        "codebook-capacity scan; substituted for +wide on narrow "
+        "(memory-constrained) datasets where a 2-hop GNN OOMs."
+    ),
+}
+
+
+def _compose_sweep_spine(ablation: str, narrow: bool = False) -> dict:
+    """
+    Build the dual-VQ spine for the per-dataset ablation sweep, ablating
+    exactly one axis. See the SWEEP_AXES tables for the axis catalogue.
+
+    The dataset wrapper (e.g. _patch_dual_chl59_lung5,
+    _patch_dual_mmb20_holdout) is applied AFTER this returns — those
+    patches are not the responsibility of this function.
+    """
+    cfg = _BD()
+
+    # Architecture (wide vs. narrow vs. small).
+    if ablation == "small":
+        # 'small' replaces both +wide AND the default-1-hop GNN (it sets
+        # num_layers=1, hidden=128 directly). On narrow datasets the
+        # dataset patch later re-asserts num_layers=1 (no conflict).
+        cfg = _patch_dual_small(cfg)
+    elif ablation == "no-arch":
+        # No architectural patch: defaults to 1-hop GNN, default codebook.
+        pass
+    elif not narrow:
+        cfg = _patch_dual_wide(cfg)
+    # narrow + non-small: defer GNN config to the dataset wrapper (e.g.
+    # _patch_dual_mmb20 sets num_layers=1, sampler=[8], nbr_hops=1).
+
+    # VQ structure.
+    if ablation == "no-rvq":
+        # Single VQ at base k=30 on both branches — no RVQ wrap.
+        pass
+    elif ablation == "codebook-large":
+        cfg = _patch_dual_rvq(cfg, branch="niche", codebook_sizes=(50, 150))
+        cfg = _patch_dual_rvq(cfg, branch="cell",  codebook_sizes=(50, 150))
+    else:
+        cfg = _patch_dual_rvq(cfg, branch="niche", codebook_sizes=(30, 90))
+        cfg = _patch_dual_rvq(cfg, branch="cell",  codebook_sizes=(30, 90))
+
+    # Latent dim shrink.
+    if ablation == "small-latent":
+        cfg = _patch_dual_small_latent(cfg, latent_dim=128)
+
+    # Dropout.
+    if ablation == "dropout":
+        cfg = _patch_dual_dropout(cfg, p=0.1)
+
+    # GNN type.
+    if ablation == "gatv2":
+        cfg = _patch_dual_gatv2(cfg)
+
+    # Decoder batch correction shape.
+    if ablation == "dec-film":
+        cfg = _patch_dual_decoder_film(cfg)
+    else:
+        cfg = _patch_dual_decoder_covariate(cfg)
+
+    # Adversarial head.
+    if ablation != "no-adv":
+        cfg = _patch_dual_adversarial(cfg, alpha=1.0, wt_adv_batch=150.0)
+
+    # Adjacency.
+    if ablation == "no-adj":
+        cfg = _patch_dual_no_adj(cfg)
+
+    return cfg
+
+
+def _sweep_variant_name(ablation: str, dataset_tag: str, narrow: bool) -> str:
+    """Compose a descriptive variant name for the sweep matrix."""
+    arch = "narrow" if narrow else "wide"
+    if ablation == "baseline":
+        core = f"{arch}+rvq-both+decoder-cov+adv"
+    elif ablation == "gatv2":
+        core = f"{arch}+rvq-both+decoder-cov+adv+gatv2"
+    elif ablation == "small":
+        # 'small' overrides architecture; prefix narrow-dataset names with
+        # 'narrow+' so the dataset context stays visible.
+        core = f"{'narrow+' if narrow else ''}small+rvq-both+decoder-cov+adv"
+    elif ablation == "small-latent":
+        core = f"{arch}+rvq-both+decoder-cov+adv+small-latent"
+    elif ablation == "dropout":
+        core = f"{arch}+rvq-both+decoder-cov+adv+dropout"
+    elif ablation == "dec-film":
+        core = f"{arch}+rvq-both+dec-film+adv"
+    elif ablation == "no-adv":
+        core = f"{arch}+rvq-both+decoder-cov"
+    elif ablation == "no-arch":
+        core = f"rvq-both+decoder-cov+adv"
+    elif ablation == "no-rvq":
+        core = f"{arch}+decoder-cov+adv"
+    elif ablation == "no-adj":
+        core = f"{arch}+rvq-both+decoder-cov+adv+no-adj"
+    elif ablation == "codebook-large":
+        core = f"{arch}+rvq-both-large+decoder-cov+adv"
+    else:
+        raise ValueError(f"unknown sweep ablation: {ablation!r}")
+    return f"dualvq+{core}+{dataset_tag}"
+
+
+def _sweep_patch_tags(ablation: str, narrow: bool) -> list[str]:
+    """Patch-tag list for the variant's `patches` field (display only)."""
+    arch_tag = "+narrow" if narrow else "+wide"
+    rvq_tag = "+rvq(branch=both, levels=[30, 90])"
+    base = [arch_tag, rvq_tag, "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)"]
+    if ablation == "baseline":              return list(base)
+    if ablation == "gatv2":                 return list(base) + ["+gatv2"]
+    if ablation == "small":
+        return ["+small(hidden=128 — encoder MLP + GNN + both decoders)", rvq_tag, "+decoder_covariate",
+                "+adversarial_batch(alpha=1.0, wt=150.0)"]
+    if ablation == "small-latent":          return list(base) + ["+small-latent(latent_dim=128)"]
+    if ablation == "dropout":               return list(base) + ["+dropout(p=0.1)"]
+    if ablation == "dec-film":
+        return [arch_tag, rvq_tag, "+dec-film(in-MLP, cell_batch_id)",
+                "+adversarial_batch(alpha=1.0, wt=150.0)"]
+    if ablation == "no-adv":                return [arch_tag, rvq_tag, "+decoder_covariate"]
+    if ablation == "no-arch":               return [rvq_tag, "+decoder_covariate",
+                                                   "+adversarial_batch(alpha=1.0, wt=150.0)"]
+    if ablation == "no-rvq":                return [arch_tag, "+decoder_covariate",
+                                                   "+adversarial_batch(alpha=1.0, wt=150.0)"]
+    if ablation == "no-adj":                return list(base) + ["-cosine_adj"]
+    if ablation == "codebook-large":
+        return [arch_tag, "+rvq(branch=both, levels=[50, 150])",
+                "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)"]
+    raise ValueError(f"unknown sweep ablation: {ablation!r}")
+
+
+def _register_dataset_sweep(
+        dataset_tag: str,
+        dataset_apply_fn,
+        narrow: bool = False,
+    ) -> list[str]:
+    """
+    Register the 10-axis sweep variants for a dataset under VARIANTS.
+
+    Idempotent: if a variant with the composed name already exists in
+    VARIANTS (e.g. user-curated entries higher up in this file), the
+    existing entry is kept and only the name is appended to the returned
+    list. This lets the sweep matrix coexist with the hand-written
+    variants without clobbering them.
+
+    Returns the ordered list of variant names — used by run_dataset_pipeline.
+    """
+    axes = _SWEEP_AXES_NARROW if narrow else _SWEEP_AXES_WIDE
+    names: list[str] = []
+    for ablation in axes:
+        name = _sweep_variant_name(ablation, dataset_tag, narrow)
+        if name not in VARIANTS:
+            # Bind ablation+narrow into closures so each variant builds its own.
+            def _build(_a=ablation, _n=narrow, _apply=dataset_apply_fn):
+                return _apply(_compose_sweep_spine(_a, narrow=_n))
+            VARIANTS[name] = {
+                "description": (
+                    _SWEEP_AXIS_DESC[ablation]
+                    + f" Dataset: {dataset_tag}."
+                ),
+                "patches": _sweep_patch_tags(ablation, narrow)
+                           + [f"+{dataset_tag}"],
+                "build": _build,
+            }
+        names.append(name)
+    return names
+
+
+# Map short dataset tag -> ordered list of sweep variant names. The CLI's
+# --all-dataset flag accepts these short tags. The full dataset_name (used
+# as the cfg key + artifact dir) is set by each variant's build() via the
+# corresponding _patch_dual_{chl59_lung5,mmb20_holdout} (or the base config
+# for mmb-smb).
+DATASET_VARIANTS: dict = {}
+
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p"] = _register_dataset_sweep(
+    dataset_tag="mmb0-1b_smb1-1b_1p",
+    dataset_apply_fn=lambda c: c,   # base config IS the mmb-smb dataset
+    narrow=False,
+)
+
+DATASET_VARIANTS["chl59-8b_1p"] = _register_dataset_sweep(
+    dataset_tag="chl59-8b_1p",
+    dataset_apply_fn=lambda c: _patch_dual_chl59_lung5(
+        c, test_batch_idx=[2, 3]),
+    narrow=False,
+)
+
+DATASET_VARIANTS["mmb0-1b_smb1-20b_1p"] = _register_dataset_sweep(
+    dataset_tag="mmb0-1b_smb1-20b_1p",
+    dataset_apply_fn=lambda c: _patch_dual_mmb20_holdout(c),
+    narrow=True,
+)
+
+# Targeted mmb0-1b_smb1-1b_1p 1-layer-GNN ablation matrix (separate from the
+# 10-axis sweep above). The spine is RVQ-both + decoder-cov + adv +
+# 1-layer GNN; each variant ablates ONE axis. Run via:
+#   python examples/run_squint.py --all-dataset mmb0-1b_smb1-1b_1p-ablations
+# Note: the key is NOT a dataset tag — DATASET_VARIANTS doubles here as
+# a registry of named variant groups. The runner only cares about the
+# value (a list of variant names); it does not require the key to match
+# any `dataset_name` / `dataset_tag` on the cfg.
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations"] = [
+    # baseline (the spine itself; registered earlier as a sweep variant)
+    "dualvq+rvq-both+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+    # GNN type axis: SAGE -> GATv2
+    "dualvq+rvq-both+decoder-cov+adv+gatv2+mmb0-1b_smb1-1b_1p",
+    # GNN depth axis: 1 -> 2 layers (registered as the +wide sweep variant)
+    "dualvq+wide+rvq-both+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+    # Encoder size axis: default -> scvi-style small (hidden=128)
+    "dualvq+small+rvq-both+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+    # Adversarial weight axis: 150 -> {300, 50}
+    "dualvq+rvq-both+decoder-cov+adv-w300+mmb0-1b_smb1-1b_1p",
+    "dualvq+rvq-both+decoder-cov+adv-w50+mmb0-1b_smb1-1b_1p",
+    # Adjacency BCE weight axis: 1000 -> {3000, 250}
+    "dualvq+rvq-both+decoder-cov+adv+adj-w3000+mmb0-1b_smb1-1b_1p",
+    "dualvq+rvq-both+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p",
+]
 
 
 def _ablation_summary(variant: str) -> dict:
@@ -2882,14 +3765,17 @@ def harmonize_anndata_var():
 # Build dataset blob (one-time preprocessing)
 # ---------------------------------------------------------------------------
 
-def build_blob(dataset: str = "mmb-smb"):
+def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
     """
     Build the in-memory PyG DatasetBlob in-process.
 
     `dataset` selects which builder config to use:
-      - 'mmb-smb' (default): MERFISH MB + STARmap MB (`mmb0-1b_smb1-1b_1p_coord_aligned`)
-      - 'chl59'              : CosMx Lung 8-sample dataset (`chl59-8b_1p`),
+      - 'mmb0-1b_smb1-1b_1p' (default): MERFISH MB + STARmap MB
+                               (`mmb0-1b_smb1-1b_1p_coord_aligned`).
+      - 'chl59-8b_1p'        : CosMx Lung 8-sample dataset (`chl59-8b_1p`),
                                built from /nfs/team361/sb75/DATASETS/silver/chl59-8b_1p
+      - 'mmb0-1b_smb1-20b_1p': MERFISH MB + 20-section STARmap+ CNS dataset
+                               (`mmb0-1b_smb1-20b_1p_shared_genes`).
 
     Implementation note: previously this shelled out to
         squint-reproducibility/analysis/create_in_memory_dataset_blob.py
@@ -2899,15 +3785,20 @@ def build_blob(dataset: str = "mmb-smb"):
     here directly with the same arguments.
     """
     CONFIG_OUT_DIR.mkdir(parents=True, exist_ok=True)
-    if dataset == "chl59":
+    if dataset == "chl59-8b_1p":
         cfg = make_dataset_blob_config_chl59()
-        cfg_path = CONFIG_OUT_DIR / "build_blob_chl59.yaml"
-    elif dataset == "mmb20":
+        cfg_path = CONFIG_OUT_DIR / "build_blob_chl59-8b_1p.yaml"
+    elif dataset == "mmb0-1b_smb1-20b_1p":
         cfg = make_dataset_blob_config_mmb20()
-        cfg_path = CONFIG_OUT_DIR / "build_blob_mmb20.yaml"
-    else:
+        cfg_path = CONFIG_OUT_DIR / "build_blob_mmb0-1b_smb1-20b_1p.yaml"
+    elif dataset == "mmb0-1b_smb1-1b_1p":
         cfg = make_dataset_blob_config()
-        cfg_path = CONFIG_OUT_DIR / "build_blob.yaml"
+        cfg_path = CONFIG_OUT_DIR / "build_blob_mmb0-1b_smb1-1b_1p.yaml"
+    else:
+        raise ValueError(
+            f"Unknown --build-blob-dataset {dataset!r}. Choices: "
+            f"'mmb0-1b_smb1-1b_1p', 'chl59-8b_1p', 'mmb0-1b_smb1-20b_1p'."
+        )
     with open(cfg_path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
     print(f"Wrote dataset-blob config to {cfg_path}")
@@ -3001,7 +3892,18 @@ def train(variant: str):
     # play it safe and keep '+' (no spaces, no slashes).
     variant_slug = variant.replace("/", "_").replace(" ", "_")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = ARTIFACTS_DIR / DATASET_NAME / variant_slug / timestamp
+    # Route artifacts under the variant's CHOSEN dataset, using the
+    # short `dataset_tag` (e.g. `mmb0-1b_smb1-1b_1p`) rather than the
+    # full `dataset_name` (e.g. `mmb0-1b_smb1-1b_1p_coord_aligned`). The
+    # tag drops technical suffixes (`_coord_aligned`, `_shared_genes`)
+    # that belong on the silver / blob paths but make on-disk artifact
+    # dirs unwieldy. Falls back to `dataset_name` if a variant doesn't
+    # set a tag.
+    run_dataset_tag = cfg["dataset"].get(
+        "dataset_tag",
+        cfg["dataset"].get("dataset_name", DATASET_NAME),
+    )
+    run_dir = ARTIFACTS_DIR / run_dataset_tag / variant_slug / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = run_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -3053,6 +3955,95 @@ def train(variant: str):
 
     # ---- Dataset / Databatch / Datamodule ---------------------------------
     dataset_blob = initialize_dataset_blob(cfg)
+
+    # Translate `train_batches` / `val_batches` (which are stored as
+    # `adata_batch_id` values — what `SpatialBatchSplit` matches against
+    # `data.adata_batch_id`) into the position indices that
+    # `cfg["dataset"]["adata_batch_idx"]` actually expects. The mapping
+    # is dataset-dependent: it depends on the value of
+    # `data.adata_batch_id` for each section, which is only known after
+    # the blob is loaded. Doing this at runtime avoids hardcoded
+    # id-to-position helpers per dataset (which were fragile — e.g.
+    # mmb20 uses parsed `uns['batch']` ids while chl59 falls back to
+    # file alphabetical position).
+    #
+    # `test_batches` are NOT loaded — they're held out from training
+    # entirely and only consumed by predict().
+    #
+    # `train_batches` is OPTIONAL: when omitted (or empty) the training
+    # set defaults to every blob section that isn't in `test_batches` /
+    # `val_batches`. This lets variants only specify what's held out for
+    # evaluation; the train side is auto-derived from the blob. If neither
+    # train nor test is set, every section is used for training.
+    _ts_params = cfg["dataset"].get("train_transform_params", {})
+    _train_ids = list(_ts_params.get("train_batches", []) or [])
+    _val_ids   = list(_ts_params.get("val_batches",   []) or [])
+    _test_ids  = list(_ts_params.get("test_batches",  []) or [])
+
+    _id_to_pos: dict = {}
+    for _pos in range(len(dataset_blob)):
+        _d = dataset_blob[_pos]
+        _id_to_pos[int(_d.adata_batch_id)] = _pos
+    _all_blob_ids = sorted(_id_to_pos.keys())
+
+    if not _train_ids:
+        _excluded = set(int(i) for i in _test_ids) | set(int(i) for i in _val_ids)
+        _train_ids = [int(i) for i in _all_blob_ids if int(i) not in _excluded]
+        cfg["dataset"]["train_transform_params"]["train_batches"] = list(_train_ids)
+        print(
+            f"train_batches not specified -> defaulting to all blob "
+            f"sections except test+val: {_train_ids}"
+        )
+
+    _needed_ids = list(dict.fromkeys(_train_ids + _val_ids))
+    if _needed_ids:
+        _missing = [i for i in _needed_ids if int(i) not in _id_to_pos]
+        if _missing:
+            raise RuntimeError(
+                f"Requested adata_batch_ids {_missing} are not present "
+                f"in the dataset blob. Available ids (in the blob): "
+                f"{_all_blob_ids}. Either rebuild the blob or "
+                f"adjust the train/val/test ids in the variant patch."
+            )
+        cfg["dataset"]["adata_batch_idx"] = sorted(set(
+            _id_to_pos[int(i)] for i in _needed_ids
+        ))
+        print(
+            f"Resolved adata_batch_idx from train+val ids "
+            f"{_needed_ids} -> positions "
+            f"{cfg['dataset']['adata_batch_idx']} via blob's "
+            f"adata_batch_id mapping."
+        )
+
+    # Re-save the (now fully-resolved) config. The earlier dump at
+    # `config_path_in_run` was made BEFORE this block ran — at that
+    # point `adata_batch_idx=[]` (placeholder set by the dataset patch
+    # since positions can only be derived after the blob is loaded) and
+    # `train_batches` may have been empty (auto-default fills it from
+    # blob ids minus test/val). `predict()` reads
+    # `user_specified_config.yaml` to know which sections to run
+    # inference on; if we leave the placeholder there, predict() loads
+    # zero sections and crashes with
+    # `batch_size=0 (BatchSampler)` deep inside torch_geometric.
+    # The archive copy gets the same refresh so on-disk diffs across
+    # runs remain comparable.
+    with open(config_path_in_run, "w") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    with open(config_path_archive, "w") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+
+    # Re-init the blob now that `train_transform_params['train_batches']`
+    # is fully resolved. `initialize_dataset_blob` builds the
+    # `SpatialBatchSplit` transform from the cfg AT CONSTRUCTION TIME
+    # and stores it on the blob; mutating the cfg after the fact does
+    # NOT update the live transform, so the auto-defaulted train_batches
+    # would be ignored — every section's `SpatialBatchSplit.forward()`
+    # check would miss, no `train_mask` would be set, and the next step
+    # would AttributeError on `data.train_mask`.
+    # Re-initialising is cheap: the on-disk processed blob is reused, only
+    # the transform pipeline is rebuilt.
+    dataset_blob = initialize_dataset_blob(cfg)
+
     data_batch = initialize_databatch(config=cfg, dataset_blob=dataset_blob)
     datamodule_batch = initialize_datamodule(
         config=cfg,
@@ -3181,8 +4172,10 @@ def train(variant: str):
     if enable_checkpointing:
         monitor = cfg["trainer"]["monitor"]
         # filename templates known to ModelCheckpoint -> map monitor metric to
-        # a filename pattern PL can format. Fall back to val_pearson_cell_wise.
+        # a filename pattern PL can format. Fall back to val_loss.
         _filename_by_monitor = {
+            "val_loss":                                 "{epoch}-{val_loss:.3f}",
+            "train_loss":                               "{epoch}-{train_loss:.3f}",
             "val_pearson_cell_wise":                    "{epoch}-{val_pearson_cell_wise:.2f}",
             "val_pearson_1hop_nbr":                     "{epoch}-{val_pearson_1hop_nbr:.2f}",
             "val_pearson_gene_wise":                    "{epoch}-{val_pearson_gene_wise:.2f}",
@@ -3220,10 +4213,10 @@ def train(variant: str):
             "val_pearson_cell_wise_1hop_nbr_log1p_median":      "{epoch}-{val_pearson_cell_wise_1hop_nbr_log1p_median:.3f}",
         }
         filename = _filename_by_monitor.get(
-            monitor, "{epoch}-{val_pearson_cell_wise:.2f}"
+            monitor, "{epoch}-{val_loss:.3f}"
         )
         if monitor not in _filename_by_monitor:
-            monitor = "val_pearson_cell_wise"
+            monitor = "val_loss"
 
         checkpoint_params = cfg["trainer"]["checkpoint_params"]
         callbacks.append(
@@ -3298,22 +4291,66 @@ def _infer_adata_files_in_dir(silver_dir: Path) -> list[Path]:
 
 def _build_clean_adata_from_inference(
     inference_data: dict,
-    label_categories_dict: dict,
-    source_paths: list[Path],
-    gene_names: list[str] | None = None,
-    obs_per_batch_id: "dict | None" = None,
+    source_adatas: dict,
+    id_to_path: dict,
+    gene_names: list | None = None,
+    test_batch_ids: list | None = None,
+    # Legacy kwargs kept for signature back-compat — ignored.
+    label_categories_dict: dict | None = None,
+    source_paths: list | None = None,
+    obs_per_batch_id: dict | None = None,
+    obs_per_filename: dict | None = None,
 ) -> "ad.AnnData":
     """
-    Package the dict produced by `collate_predict_outputs` into a clean
-    AnnData where SQUINT outputs live in the conventional slots:
-        .obsm  for embeddings / per-cell vectors
-        .obs   for per-cell scalars
-        .layers for per-cell, per-gene matrices
-        .uns   for global metadata only
+    Build the predicted AnnData by starting from the source AnnDatas
+    themselves and bolting model outputs on top.
 
-    `gene_names`, if provided, is assigned to ``adata.var.index``. If omitted,
-    AnnData defaults to integer-string names ('0', '1', ...). The list length
-    must equal X.shape[1].
+    Strategy
+    --------
+    1. For each cell in the inference output (ordered by
+       `inference_data["adata_batch_ids"]` + `obs_row_index`), slice
+       the corresponding row out of its source AnnData. Sub-AnnDatas
+       are concatenated and reordered to match the inference cell order.
+    2. If `gene_names` is supplied (typically the canonical / HVG gene
+       panel saved at blob-build time), reindex `var` to that set so
+       `adata.X` matches the model's input dimensionality (and therefore
+       so do the model output layers).
+    3. Stamp model outputs into `obsm` / `obs` / `layers` / `uns`. The
+       `data_split` column is derived from `test_batch_ids` (which the
+       saved training config carries forward via `train_transform_params`'
+       `test_batches`).
+
+    Why this is preferable to synthesising an AnnData from torch tensors:
+    every original `obs` column (e.g. `cell_type`, `Sub_molecular_*`,
+    `ccf_region_name`, `donor_id`, …) and `var` metadata flows through
+    automatically. `ad.concat(..., join="outer")` handles partially-
+    present columns by NaN-filling cells from sources that don't carry
+    them. No manual obs propagation, no h5py dtype-coercion gymnastics,
+    no failure modes from mismatched id-derivations between
+    `obs_per_batch_id.pkl` and `dataset_blob.pt`.
+
+    Parameters
+    ----------
+    inference_data:
+        The collated dict produced by `collate_predict_outputs`. Must
+        contain `adata_batch_ids` and `obs_row_index` per cell.
+    source_adatas:
+        Mapping `adata_batch_id -> ad.AnnData` for every section the
+        cells in `inference_data` came from. The id derivation must
+        match `InMemoryDatasetBlob._derive_adata_batch_id`; use
+        `predict()`'s helper to build it.
+    id_to_path:
+        Mapping `adata_batch_id -> Path` of the source files. Used to
+        stamp `adata.obs["source_file"]` per cell.
+    gene_names:
+        Optional canonical gene panel (typically HVG-subset or full
+        panel) loaded from `dataset_blob.processed_dir/gene_panel.pkl`.
+        When set, `var` is reindexed to this list so model outputs in
+        `layers` (which are in this gene-space) match `var` length.
+    test_batch_ids:
+        `adata_batch_id` values that were held out from training; cells
+        from these sections get `obs["data_split"] = "test"`,
+        everything else is "train".
     """
     import anndata as ad
     import numpy as np
@@ -3322,132 +4359,143 @@ def _build_clean_adata_from_inference(
     def to_np(x):
         return x.cpu().numpy() if hasattr(x, "cpu") else np.asarray(x)
 
-    # ---- backbone ----
-    X = to_np(inference_data["X"])
-    adata = ad.AnnData(X=X)
-    if gene_names is not None:
-        if len(gene_names) != X.shape[1]:
-            raise ValueError(
-                f"gene_names has length {len(gene_names)} but X has "
-                f"{X.shape[1]} columns."
-            )
-        adata.var = pd.DataFrame(index=pd.Index(gene_names, name="gene"))
+    # ---- sanity checks on inputs ----
+    if "adata_batch_ids" not in inference_data:
+        raise RuntimeError(
+            "_build_clean_adata_from_inference: inference_data is missing "
+            "'adata_batch_ids' — cannot reconstruct cell -> source mapping."
+        )
+    if "obs_row_index" not in inference_data:
+        raise RuntimeError(
+            "_build_clean_adata_from_inference: inference_data is missing "
+            "'obs_row_index'. Rebuild the dataset blob with the latest "
+            "InMemoryDatasetBlob.process_anndata_batch (which stamps "
+            "obs_row_index per cell)."
+        )
 
-    # ---- spatial ----
+    batch_ids_np = to_np(inference_data["adata_batch_ids"]).astype(int)
+    row_idx_np   = to_np(inference_data["obs_row_index"]).astype(int)
+    n_cells      = len(batch_ids_np)
+    if len(row_idx_np) != n_cells:
+        raise RuntimeError(
+            f"adata_batch_ids has length {n_cells} but obs_row_index has "
+            f"length {len(row_idx_np)} — they must be aligned."
+        )
+
+    # ---- group cells by source section ----
+    by_bid: dict = {}
+    for k in range(n_cells):
+        by_bid.setdefault(int(batch_ids_np[k]), []).append(
+            (k, int(row_idx_np[k]))
+        )
+
+    missing = [b for b in by_bid if b not in source_adatas]
+    if missing:
+        raise RuntimeError(
+            f"Cells reference adata_batch_ids {sorted(missing)} but no "
+            f"source AnnData was provided for those ids. Available source "
+            f"ids: {sorted(source_adatas)}. Check that the silver dir "
+            f"contains the files used at blob-build time."
+        )
+
+    # ---- slice + var-reindex each source ----
+    sub_adatas = []
+    for bid in sorted(by_bid):
+        cells       = by_bid[bid]
+        inf_pos     = np.array([c[0] for c in cells], dtype=int)
+        src_rows    = [c[1] for c in cells]
+        source      = source_adatas[bid]
+
+        # Bounds check — better here than at concat time when the error
+        # would be opaque.
+        if any(r < 0 or r >= source.n_obs for r in src_rows):
+            bad = [r for r in src_rows if r < 0 or r >= source.n_obs]
+            raise RuntimeError(
+                f"obs_row_index out of bounds for adata_batch_id={bid} "
+                f"(n_obs in source = {source.n_obs}); offending rows: "
+                f"{bad[:5]}{'...' if len(bad) > 5 else ''}. Likely the "
+                f"silver file changed since the blob was built — rebuild."
+            )
+
+        sub = source[src_rows].copy()
+        if gene_names is not None and list(sub.var_names) != list(gene_names):
+            try:
+                sub = sub[:, list(gene_names)].copy()
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"Source for adata_batch_id={bid} (file "
+                    f"{id_to_path[bid].name}) is missing genes from the "
+                    f"canonical panel: {exc}"
+                )
+
+        # Track inference position so we can reorder after concat. Stored
+        # in obs (so it survives concat); deleted just before return.
+        sub.obs["_inf_pos"] = inf_pos
+        sub_adatas.append(sub)
+
+    # ---- concatenate + reorder to inference cell order ----
+    if len(sub_adatas) == 1:
+        adata = sub_adatas[0]
+    else:
+        # `join="outer"` so source-specific obs/var columns NaN-fill where
+        # absent. `index_unique="-"` makes obs_names globally unique even
+        # when sources share cell barcodes.
+        adata = ad.concat(
+            sub_adatas, axis=0, join="outer", index_unique="-",
+        )
+
+    perm = np.argsort(adata.obs["_inf_pos"].values)
+    adata = adata[perm].copy()
+    del adata.obs["_inf_pos"]
+
+    if adata.n_obs != n_cells:
+        raise RuntimeError(
+            f"Reconstructed adata.n_obs={adata.n_obs} != inference n_cells="
+            f"{n_cells}. Cell ordering broke during concat — this is a bug."
+        )
+
+    # ---- per-cell SQUINT outputs ---------------------------------------------
+
+    # Spatial coordinates (overwrite source's `spatial` if present, since
+    # the model emits its own copy of the same data).
     if "XY_coordinates" in inference_data:
         adata.obsm["spatial"] = to_np(inference_data["XY_coordinates"])
 
-    # ---- one-hot labels -> string categoricals ----
-    for key in inference_data:
-        if not key.startswith("y_"):
-            continue
-        label_name = key[2:]
-        cats = (label_categories_dict or {}).get(label_name)
-        oh = to_np(inference_data[key])
-        idx = oh.argmax(axis=1)
-        if cats is not None:
-            adata.obs[label_name] = [cats[i] for i in idx]
-        else:
-            adata.obs[label_name] = idx
+    # Per-cell scalars: which source section + filename + train/test.
+    adata.obs["adata_batch_id"] = batch_ids_np.astype(int)
+    name_for_id = {bid: id_to_path[bid].name for bid in id_to_path}
+    adata.obs["source_file"] = pd.Categorical(
+        [name_for_id[bid] for bid in batch_ids_np]
+    )
+    test_set = set(int(b) for b in (test_batch_ids or []))
+    adata.obs["data_split"] = pd.Categorical(
+        ["test" if int(b) in test_set else "train" for b in batch_ids_np],
+        categories=["train", "test"],
+    )
 
-    # ---- per-cell scalars ----
-    if "adata_batch_ids" in inference_data:
-        adata.obs["adata_batch_id"] = to_np(inference_data["adata_batch_ids"]).astype(int)
-
-    # ---- attach source-file column (which .h5ad each cell came from) ----
-    # The blob is sorted by adata_batch_id; we mirror that ordering here.
-    if "adata_batch_id" in adata.obs.columns and source_paths:
-        order = sorted(range(len(source_paths)),
-                       key=lambda i: source_paths[i].name)
-        ordered_names = [source_paths[i].name for i in order]
-        # Map dataset-position index -> filename
-        adata.obs["source_file"] = [
-            ordered_names[i] if 0 <= i < len(ordered_names) else "unknown"
-            for i in adata.obs["adata_batch_id"].astype(int).tolist()
-        ]
-
-    # ---- propagate every input AnnData's `.obs` columns ----
-    # Each cell carries `adata_batch_ids[k]` (which input AnnData) and
-    # `obs_row_index[k]` (its row in that AnnData's `.obs`). Together
-    # they form a unique join key into `obs_per_batch_id`, which the
-    # dataset blob captured at build time. The output adata gets the
-    # UNION of obs columns across all inputs; cells from a source that
-    # doesn't carry a given column are NaN-filled. Existing columns
-    # already written above (label one-hot decodings, `adata_batch_id`,
-    # `source_file`) are kept and not overwritten.
-    if (
-        obs_per_batch_id
-        and "obs_row_index" in inference_data
-        and "adata_batch_ids" in inference_data
-    ):
-        batch_ids_np = to_np(inference_data["adata_batch_ids"]).astype(int)
-        row_idx_np   = to_np(inference_data["obs_row_index"]).astype(int)
-
-        # Deterministic column order across runs.
-        union_cols: list = []
-        seen: set = set()
-        for bid in sorted(obs_per_batch_id.keys()):
-            df = obs_per_batch_id[bid]
-            for col in df.columns:
-                if col not in seen:
-                    seen.add(col)
-                    union_cols.append(col)
-
-        n_cells = len(batch_ids_np)
-        for col in union_cols:
-            if col in adata.obs.columns:
-                # Don't overwrite columns already written by the model
-                # (one-hot label decodings, adata_batch_id, source_file).
-                continue
-
-            values = [None] * n_cells
-            for k in range(n_cells):
-                bid = int(batch_ids_np[k])
-                df  = obs_per_batch_id.get(bid)
-                if df is None or col not in df.columns:
-                    continue        # NaN-fill (None -> NaN by pandas)
-                ridx = int(row_idx_np[k])
-                if 0 <= ridx < len(df):
-                    values[k] = df[col].iloc[ridx]
-            adata.obs[col] = pd.Series(
-                values, index=adata.obs.index, name=col
-            )
-
-    # ---- embeddings -> .obsm ----
+    # Embeddings -> obsm.
     if "H_latent" in inference_data:
-        adata.obsm["X_squint"] = to_np(inference_data["H_latent"])
+        adata.obsm["X_squint"]            = to_np(inference_data["H_latent"])
     if "H_quantized" in inference_data:
-        adata.obsm["X_squint_quantized"] = to_np(inference_data["H_quantized"])
+        adata.obsm["X_squint_quantized"]  = to_np(inference_data["H_quantized"])
     if "H_adj" in inference_data:
-        adata.obsm["X_squint_adj"] = to_np(inference_data["H_adj"])
-
-    # ---- VQNiche_Dual: cell- and niche-branch quantized embeddings ----
-    # Per design choice D6: keep them under the user-facing names
-    # 'cell_emb' and 'neighborhood_emb' so analysis tools can address each
-    # branch directly.
+        adata.obsm["X_squint_adj"]        = to_np(inference_data["H_adj"])
     if "H_quantized_cell" in inference_data:
-        adata.obsm["cell_emb"] = to_np(inference_data["H_quantized_cell"])
+        adata.obsm["cell_emb"]            = to_np(inference_data["H_quantized_cell"])
     if "H_quantized_niche" in inference_data:
-        adata.obsm["neighborhood_emb"] = to_np(inference_data["H_quantized_niche"])
-    # Also expose the pre-quantization continuous latents for diagnostics.
+        adata.obsm["neighborhood_emb"]    = to_np(inference_data["H_quantized_niche"])
     if "H_latent_cell" in inference_data:
-        adata.obsm["cell_latent"] = to_np(inference_data["H_latent_cell"])
+        adata.obsm["cell_latent"]         = to_np(inference_data["H_latent_cell"])
     if "H_latent_niche" in inference_data:
         adata.obsm["neighborhood_latent"] = to_np(inference_data["H_latent_niche"])
 
-    # ---- codebook indices -> .obs (single head) or .obsm (multi-head) ----
-    num_heads = int(inference_data.get("num_heads", 1))
+    # Codebook indices: 1D -> obs, multi-level -> obsm.
     if "Indices" in inference_data:
         idx = to_np(inference_data["Indices"])
         if idx.ndim == 1 or (idx.ndim == 2 and idx.shape[1] == 1):
             adata.obs["code_index"] = idx.reshape(-1).astype(int)
         else:
             adata.obsm["code_indices"] = idx.astype(int)
-
-    # ---- VQNiche_Dual: per-branch codebook indices ----
-    # Same single/multi-dim convention as for legacy 'Indices' — 1D goes to
-    # `obs[<prefix>_code_index]`, multi-level/multi-head to
-    # `obsm[<prefix>_code_indices]`. Prefixes match D6: 'cell' / 'neighborhood'.
     for src_key, prefix in [("Indices_cell", "cell"),
                             ("Indices_niche", "neighborhood")]:
         if src_key not in inference_data:
@@ -3458,43 +4506,43 @@ def _build_clean_adata_from_inference(
         else:
             adata.obsm[f"{prefix}_code_indices"] = idx.astype(int)
 
-    # ---- reconstructions + neighbourhood ground truth -> .layers ----
+    # Reconstructions + 1-hop neighbourhood ground truth -> layers.
     if "X_hat" in inference_data:
-        adata.layers["X_hat"] = to_np(inference_data["X_hat"])
+        adata.layers["X_hat"]     = to_np(inference_data["X_hat"])
     if "X_hat_nbr" in inference_data:
         adata.layers["X_hat_nbr"] = to_np(inference_data["X_hat_nbr"])
-    # Cache the 1-hop neighbourhood mean of the raw counts as well — same
-    # shape (n_cells, n_genes), and required by analysis tools that compare
-    # X_hat_nbr against its ground truth without rebuilding the spatial
-    # graph at analysis time.
     if "X_nbr" in inference_data:
-        adata.layers["X_nbr"] = to_np(inference_data["X_nbr"])
+        adata.layers["X_nbr"]     = to_np(inference_data["X_nbr"])
 
-    # ---- global metadata ----
+    # Global metadata.
     num_quantizers = int(inference_data.get("num_quantizers", 1))
     cb_sizes       = inference_data.get("codebook_sizes", None)
     squint_meta = {
         "codebook_size":     int(inference_data.get("codebook_size", 0)),
-        "num_heads":         num_heads,
+        "num_heads":         int(inference_data.get("num_heads", 1)),
         "num_quantizers":    num_quantizers,
         "codebook_sizes":    list(cb_sizes) if cb_sizes is not None else None,
         "separate_codebook": bool(inference_data.get("separate", False)),
     }
-    # If this is a dual-model run, also expose per-branch codebook metadata
-    # under explicit `cell` / `niche` keys so analysis code can branch on
-    # them without having to inspect the obs/obsm slots.
-    is_dual = ("H_quantized_cell" in inference_data) or ("H_quantized_niche" in inference_data)
+    is_dual = (
+        "H_quantized_cell"  in inference_data
+        or "H_quantized_niche" in inference_data
+    )
     if is_dual:
         squint_meta["dual"] = True
         for branch in ("cell", "niche"):
-            squint_meta[f"codebook_size_{branch}"]  = int(inference_data.get(f"codebook_size_{branch}", 0))
-            squint_meta[f"num_quantizers_{branch}"] = int(inference_data.get(f"num_quantizers_{branch}", 1))
+            squint_meta[f"codebook_size_{branch}"] = int(
+                inference_data.get(f"codebook_size_{branch}", 0)
+            )
+            squint_meta[f"num_quantizers_{branch}"] = int(
+                inference_data.get(f"num_quantizers_{branch}", 1)
+            )
             cb_sz = inference_data.get(f"codebook_sizes_{branch}", None)
             if cb_sz is not None:
                 squint_meta[f"codebook_sizes_{branch}"] = list(cb_sz)
     adata.uns["squint"] = squint_meta
     if "edge_index" in inference_data:
-        # Keep edges in .uns — they're a graph-level object, not per-cell.
+        # Graph-level object — keep in uns.
         adata.uns["edge_index"] = to_np(inference_data["edge_index"])
 
     return adata
@@ -3528,8 +4576,10 @@ def predict(
         is auto-selected from ``<run_dir>/checkpoints/`` (or the legacy
         ``<run_dir>/files/checkpoints/``).
     output_dir
-        Where to write predicted_adata.h5ad. Defaults to
-        ``<ARTIFACTS_DIR>/inference/<run_dir-basename>/``.
+        Where to write predicted_adata.h5ad. Defaults to ``run_dir`` itself
+        — predictions land alongside checkpoints / config /
+        ablation_summary.yaml so everything for one training run lives in
+        one folder.
     """
     # --- Imports done lazily so the script's CLI / config helpers don't
     #     pull torch on every invocation. ---
@@ -3539,6 +4589,7 @@ def predict(
         sys.path.insert(0, str(SQUINT_PKG / "src"))
 
     import pickle
+    import anndata as ad
     import torch
     import pytorch_lightning as pl
     from predict_model import collate_predict_outputs
@@ -3554,15 +4605,12 @@ def predict(
     torch.set_float32_matmul_precision("medium")
 
     run_dir = str(run_dir)
-    silver_dir = Path(silver_dir) if silver_dir else (DATA_ROOT / "silver" / DATASET_NAME)
 
-    # Sanity: list of .h5ad files (also used to label cells with their source).
-    source_paths = _infer_adata_files_in_dir(silver_dir)
-    print(f"Running inference on {len(source_paths)} file(s) under {silver_dir}:")
-    for p in source_paths:
-        print(f"  - {p.name}")
-
-    # Load the user-saved training config and resolve checkpoint.
+    # Load the user-saved training config FIRST so we can derive the
+    # silver_dir from the variant's chosen dataset (chl59-8b_1p,
+    # mmb0-1b_smb1-20b_1p_shared_genes, ...). Without this, predict() would
+    # always look under the module-level DATASET_NAME and miss non-default
+    # datasets.
     # NOTE: collect_test_configs takes a parameter named `wandb_run_dir` for
     # historical reasons; it now supports both the flat and legacy layouts.
     config = collect_test_configs(
@@ -3570,6 +4618,19 @@ def predict(
         model_ckpt_fname=model_ckpt_fname,
     )
     print(f"Using checkpoint: {config['model']['model_ckpt_fname']}")
+
+    if silver_dir:
+        silver_dir = Path(silver_dir)
+    else:
+        cfg_root = config["dataset"].get("root_data_dir") or str(DATA_ROOT)
+        cfg_name = config["dataset"].get("dataset_name") or DATASET_NAME
+        silver_dir = Path(cfg_root) / "silver" / cfg_name
+
+    # Sanity: list of .h5ad files (also used to label cells with their source).
+    source_paths = _infer_adata_files_in_dir(silver_dir)
+    print(f"Running inference on {len(source_paths)} file(s) under {silver_dir}:")
+    for p in source_paths:
+        print(f"  - {p.name}")
 
     # Determinism (mirrors predict_model.test).
     pl.seed_everything(config["experiment"]["seed"])
@@ -3645,17 +4706,211 @@ def predict(
         predict_dataloader=datamodule.predict_dataloader(),
     )
 
-    # Build the clean AnnData. `obs_per_batch_id` is the dataset_blob's
-    # captured-at-build-time mapping {adata_batch_id -> obs DataFrame};
-    # the builder uses it (together with `obs_row_index` from the
-    # inference cache) to write every input obs column onto adata.obs,
-    # NaN-filling cells from sources that don't carry a given column.
+    # ----------------------------------------------------------------------
+    # Two post-inference fixups in one pass over `predict_data_dict`:
+    #
+    # (1) Translate per-cell `adata_batch_ids` from DENSE (0..N-1) back to
+    #     RAW (`uns['batch']`-derived ints, e.g. 15, 82).
+    #     `initialize_databatch` overwrites `data_batch.adata_batch_ids`
+    #     with the dense indices that `build_batch_one_hot_from_obs`
+    #     produces (sorted-unique-label position), which the model needs
+    #     as one-hot indices. The inference output inherits those dense
+    #     ids — but `source_adatas` below is keyed by the raw blob ids.
+    #     Without translating, source-AnnData lookup fails:
+    #     "Cells reference adata_batch_ids [0, 1] but available source ids
+    #     are [15, 82]".
+    #
+    # (2) Undo PyG's auto-offset on `obs_row_index`. Any tensor whose key
+    #     contains the substring 'index' triggers PyG's
+    #     `Data.__inc__()` magic during `Batch.from_data_list` — it adds
+    #     `num_nodes` to make `edge_index` etc. contiguous across the
+    #     batched graph. `obs_row_index` is NOT an edge index but gets
+    #     caught by the same heuristic, so per-section indices in
+    #     [0, n_obs_section) get shifted by the cumulative node count of
+    #     all preceding sections. The cells starting at offset
+    #     `n_section + cum_offset > n_obs_section` then look out of
+    #     bounds in the source AnnData ("offending rows: [44686, 44687,
+    #     ...]"). Fixing this at the field-name level would require a
+    #     blob rebuild (rename to `obs_row_pos`); we recover the original
+    #     per-section index here instead — no rebuild needed.
+    #
+    # Both fixups derive their mapping from `data_batch.obs_batch`
+    # (per-section per-cell label list, populated by
+    # `process_anndata_batch` from `uns['batch']`) and
+    # `data_batch.adata_batch_id` (per-section raw id). The dense-id
+    # ordering mirrors `build_batch_one_hot_from_obs` (sorted unique
+    # labels). The PyG offset for a section equals the cumulative
+    # `n_obs` of all sections preceding it in concat order — which is
+    # how `data_batch.obs_batch` itself is laid out.
+    if hasattr(data_batch, "obs_batch") and data_batch.obs_batch is not None:
+        _all_labels: list = []
+        for _group in data_batch.obs_batch:
+            _all_labels.extend(str(_x) for _x in _group)
+        _label_to_dense = {lbl: i for i, lbl in enumerate(sorted(set(_all_labels)))}
+        _dense_to_raw: dict = {}
+        _raw_to_pyg_offset: dict = {}
+        _cum_offset = 0
+        for _sec_idx in range(len(data_batch.obs_batch)):
+            _group = data_batch.obs_batch[_sec_idx]
+            if not _group:
+                continue
+            _label = str(_group[0])
+            _dense_id = _label_to_dense[_label]
+            _raw_section_id = data_batch.adata_batch_id[_sec_idx]
+            _raw_id = int(
+                _raw_section_id.item() if hasattr(_raw_section_id, "item")
+                else _raw_section_id
+            )
+            _dense_to_raw[_dense_id] = _raw_id
+            _raw_to_pyg_offset[_raw_id] = _cum_offset
+            _cum_offset += len(_group)
+
+        if _dense_to_raw:
+            import numpy as _np
+            _ids = predict_data_dict["adata_batch_ids"]
+            _ids_np = _ids.cpu().numpy() if hasattr(_ids, "cpu") else _np.asarray(_ids)
+            _missing = sorted({int(d) for d in _ids_np} - _dense_to_raw.keys())
+            if _missing:
+                raise RuntimeError(
+                    f"Inference output references dense adata_batch_ids "
+                    f"{_missing} that have no raw-id mapping in data_batch "
+                    f"(known dense ids: {sorted(_dense_to_raw)}). This is a "
+                    f"bug in the dense->raw translation step in predict()."
+                )
+            _translated = _np.array([_dense_to_raw[int(d)] for d in _ids_np],
+                                    dtype=int)
+            predict_data_dict["adata_batch_ids"] = torch.tensor(
+                _translated, dtype=torch.long
+            )
+            print(
+                f"Translated per-cell adata_batch_ids from dense -> raw "
+                f"using mapping {_dense_to_raw}."
+            )
+
+            # Undo PyG's auto-offset on obs_row_index, using the now-
+            # translated raw ids to look up each cell's per-section
+            # offset.
+            if "obs_row_index" in predict_data_dict and any(
+                _v != 0 for _v in _raw_to_pyg_offset.values()
+            ):
+                _row = predict_data_dict["obs_row_index"]
+                _row_np = (_row.cpu().numpy() if hasattr(_row, "cpu")
+                           else _np.asarray(_row)).astype(int)
+                _offsets = _np.array(
+                    [_raw_to_pyg_offset[int(r)] for r in _translated],
+                    dtype=int,
+                )
+                predict_data_dict["obs_row_index"] = torch.tensor(
+                    _row_np - _offsets, dtype=torch.long
+                )
+                print(
+                    f"Undid PyG auto-offset on obs_row_index using "
+                    f"per-raw-id offsets {_raw_to_pyg_offset}."
+                )
+
+    # Build the clean AnnData.
+    #
+    # We start from the source AnnDatas themselves (concatenated in
+    # inference cell order) and bolt model outputs on top. This is far
+    # simpler than synthesising a fresh AnnData from torch tensors and
+    # then trying to graft labels back: every original `obs` / `var`
+    # column flows through automatically, including `cell_type`,
+    # `Sub_molecular_*`, `ccf_region_name`, `donor_id`, etc. Cells from
+    # a source that doesn't carry a given column get NaN via
+    # `ad.concat(..., join="outer")`.
+    #
+    # Build `id_to_path` (and `source_adatas`) by matching each silver
+    # file to a blob section via cell_id intersection — NOT by
+    # re-deriving the id from `uns['batch']` on the silver file. The
+    # latter is fragile: if the blob was built when `uns['batch']`
+    # wasn't parseable (e.g. the user added it later, or the format
+    # differs), the freshly-derived id won't match the id stamped on
+    # the cells in `dataset_blob.pt`. cell_id matching is robust because
+    # cell ids are stable across silver-file edits and survive the blob
+    # build verbatim.
+    #
+    # `test_batch_ids` comes from the saved training config — sections
+    # in this list were held out from training. The builder stamps
+    # `adata.obs["data_split"] = "test"` for cells whose source section
+    # is in this list (everything else is "train", with val cells folded
+    # in per the user spec). compute_inference_metrics.py reads it for
+    # stratified NMI / ARI / Pearson.
+    print(f"Loading {len(source_paths)} source AnnDatas + matching them "
+          f"to blob sections via cell_id ...")
+
+    # Step 1: read each blob section's first cell_id and adata_batch_id.
+    # The blob has the canonical id assignments (whatever they are).
+    blob_id_to_first_cell: dict = {}
+    for _pos in range(len(dataset_blob)):
+        _d = dataset_blob[_pos]
+        if hasattr(_d, "cell_id") and len(_d.cell_id) > 0:
+            blob_id_to_first_cell[int(_d.adata_batch_id)] = str(_d.cell_id[0])
+        else:
+            print(f"  WARN: blob position {_pos} has no cell_id list — "
+                  f"section can't be matched to a silver file by cell_id.")
+
+    # Step 2: for each silver file, read its first cell_id (backed mode
+    # for speed) and find the blob section it matches.
+    silver_first_cells: dict = {}
+    for p in source_paths:
+        try:
+            a = ad.read_h5ad(p, backed="r")
+            silver_first_cells[p] = str(a.obs["cell_id"].iloc[0])
+            if a.isbacked:
+                a.file.close()
+        except Exception as exc:
+            print(f"  WARN: could not read first cell_id from {p.name}: {exc}")
+
+    # Step 3: invert. id_to_path[bid] = the silver file whose first
+    # cell_id matches the blob's id-bid section.
+    id_to_path: dict = {}
+    unmatched_blob_ids: list = []
+    used_paths: set = set()
+    for bid, blob_first in blob_id_to_first_cell.items():
+        match_p = None
+        for p, silver_first in silver_first_cells.items():
+            if p in used_paths:
+                continue
+            if silver_first == blob_first:
+                match_p = p
+                break
+        if match_p is None:
+            unmatched_blob_ids.append(bid)
+        else:
+            id_to_path[bid] = match_p
+            used_paths.add(match_p)
+
+    if unmatched_blob_ids:
+        raise RuntimeError(
+            f"Could not match blob adata_batch_ids {unmatched_blob_ids} "
+            f"to any silver file via cell_id intersection. Available "
+            f"silver files: {[p.name for p in source_paths]}. "
+            f"Available blob ids: {sorted(blob_id_to_first_cell)}. "
+            f"Likely cause: silver dir contents differ from what was "
+            f"used to build the dataset blob."
+        )
+
+    # Step 4: load the matched source AnnDatas (full read; needed for
+    # row-slicing into the inference adata).
+    source_adatas: dict = {}
+    for bid, p in id_to_path.items():
+        source_adatas[bid] = ad.read_h5ad(p)
+        print(f"  adata_batch_id={bid:<3d}  {p.name}  "
+              f"(n_obs={source_adatas[bid].n_obs}, "
+              f"n_vars={source_adatas[bid].n_vars})")
+
+    test_batch_ids = (
+        config.get("dataset", {})
+              .get("train_transform_params", {})
+              .get("test_batches", [])
+        or []
+    )
     adata = _build_clean_adata_from_inference(
         inference_data=predict_data_dict,
-        label_categories_dict=label_categories,
-        source_paths=source_paths,
+        source_adatas=source_adatas,
+        id_to_path=id_to_path,
         gene_names=gene_names,
-        obs_per_batch_id=getattr(dataset_blob, "obs_per_batch_id", None),
+        test_batch_ids=list(test_batch_ids),
     )
     adata.uns["squint"]["run_dir"] = run_dir
     adata.uns["squint"]["ckpt"] = str(config["model"]["model_ckpt_fname"])
@@ -3674,33 +4929,14 @@ def predict(
             print(f"NOTE: could not read {summary_path} ({exc}); skipping variant tagging.")
 
     # Resolve output path.
+    # Default: write inference outputs (predicted_adata.h5ad + downstream
+    # plots / metrics) directly into the run_dir alongside checkpoints
+    # and the user-saved config — so everything for one training run
+    # lives in one folder
+    # (`<ARTIFACTS_DIR>/<dataset>/<variant>/<timestamp>/`). `--output-dir`
+    # still overrides if you want a separate location.
     if output_dir is None:
-        # We support three run-dir layouts and try to mirror the structure
-        # under <INFERENCE_DIR>/ so inference outputs are co-located with
-        # their training runs by variant:
-        #
-        #   (1) New (variant-aware):
-        #         <ARTIFACTS_DIR>/<DATASET>/<VARIANT>/<TIMESTAMP>/
-        #       -> ablation_summary.yaml is present at run_dir.
-        #       -> output: <INFERENCE_DIR>/<VARIANT>/<TIMESTAMP>/
-        #
-        #   (2) Old flat (pre-ablation):
-        #         <ARTIFACTS_DIR>/<DATASET>/<TIMESTAMP>/
-        #       -> output: <INFERENCE_DIR>/<TIMESTAMP>/
-        #
-        #   (3) Legacy wandb-controlled:
-        #         <ARTIFACTS_DIR>/.../<RUN_NAME>/files/
-        #       -> output: <INFERENCE_DIR>/<RUN_NAME>/
-        run_dir_path = Path(run_dir)
-        if (run_dir_path / "ablation_summary.yaml").exists():
-            # New layout: variant is the parent dir name.
-            variant_slug = run_dir_path.parent.name
-            run_name = run_dir_path.name
-            output_dir = INFERENCE_DIR / variant_slug / run_name
-        elif run_dir_path.name == "files":
-            output_dir = INFERENCE_DIR / run_dir_path.parent.name
-        else:
-            output_dir = INFERENCE_DIR / run_dir_path.name
+        output_dir = Path(run_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / "predicted_adata.h5ad"
@@ -3727,52 +4963,36 @@ def predict(
 # CLI
 # ---------------------------------------------------------------------------
 
-def run_all_pipeline(
-        variant: str,
+def run_inference_and_analysis(
+        run_dir: str,
         silver_dir: Optional[str] = None,
         output_dir: Optional[str] = None,
         model_ckpt_fname: Optional[str] = None,
-        label_keys: str = "cell_type",
+        label_keys: str = "cell_type,niche,Sub_molecular_tissue_region,ccf_region_name",
         batch_rename: Optional[str] = None,
         cell_label_keys: Optional[str] = None,
         niche_label_keys: Optional[str] = None,
-    ) -> None:
+    ) -> Path:
     """
-    End-to-end pipeline:
+    Steps 2-6 of the end-to-end pipeline (everything AFTER `train()`):
 
-      1. train(variant)            -> writes <ARTIFACTS_DIR>/<dataset>/<variant>/<TS>/
-      2. predict(run_dir=auto)     -> writes <ARTIFACTS_DIR>/inference/<run-name>/
-                                       predicted_adata.h5ad
+      2. predict(run_dir)          -> writes predicted_adata.h5ad into the
+                                       run_dir itself
       3. plot_code_indices_spatial -> per-batch spatial plots of code indices
       4. plot_svg_reconstruction   -> SVG vs. reconstruction sanity plots
       5. plot_latent_umap          -> UMAP of each latent slot
       6. compute_inference_metrics -> NMI/ARI vs. ground-truth labels +
                                        batch integration (iLISI, ASW, MMD)
-                                       + avg cosine similarity, written
-                                       under <inference dir>/metrics/
+                                       + avg cosine similarity
 
-    Plot scripts run via subprocess so each gets a clean process / cuda
-    state and the output of one doesn't pollute the others. They write
-    SVGs/PNGs into subdirectories of the predict output folder.
+    Plot + metrics scripts run via subprocess so each gets a clean
+    process / cuda state and one's output doesn't pollute the others.
+    Output files (subdirs of the predict folder) are written next to
+    `predicted_adata.h5ad` in the run_dir.
+
+    Returns the resolved `predict_dir` (= output_dir if set, else run_dir).
     """
     import subprocess
-
-    # ------------------------------------------------------------------
-    # 1. Train
-    # ------------------------------------------------------------------
-    print("=" * 78)
-    print(f"[1/5] Train  variant={variant!r}")
-    print("=" * 78)
-    run_dir = train(variant)
-    if run_dir is None:
-        # Older train() signatures didn't return; fall back to looking up
-        # the most recent run dir for this variant.
-        variant_slug = variant.replace("/", "_")
-        candidates = sorted((ARTIFACTS_DIR / DATASET_NAME / variant_slug).glob("*/"))
-        if not candidates:
-            raise RuntimeError(f"Could not auto-locate run_dir for variant {variant}")
-        run_dir = str(candidates[-1])
-    print(f"[1/5] Done. run_dir={run_dir}")
 
     # ------------------------------------------------------------------
     # 2. Predict
@@ -3787,13 +5007,10 @@ def run_all_pipeline(
         model_ckpt_fname=model_ckpt_fname,
         output_dir=output_dir,
     )
-    # Resolve where the predicted_adata.h5ad landed.
+    # Resolve where predicted_adata.h5ad landed. `predict()` defaults to
+    # writing inside run_dir alongside checkpoints/config.
     if output_dir is None:
-        run_name = Path(run_dir).name
-        # Match the naming convention used inside `predict()`:
-        # variant slug parent of run_dir + run-name child.
-        variant_slug = Path(run_dir).parent.name
-        predict_dir = INFERENCE_DIR / variant_slug / run_name
+        predict_dir = Path(run_dir)
     else:
         predict_dir = Path(output_dir)
     predicted_adata_path = predict_dir / "predicted_adata.h5ad"
@@ -3881,6 +5098,180 @@ def run_all_pipeline(
     print(f"  Plots:             {predict_dir}/{{code_index_plots,svg_plots,umap_plots}}/")
     print(f"  Metrics:           {predict_dir}/metrics/")
     print("=" * 78)
+    return predict_dir
+
+
+def run_all_pipeline(
+        variant: str,
+        silver_dir: Optional[str] = None,
+        output_dir: Optional[str] = None,
+        model_ckpt_fname: Optional[str] = None,
+        label_keys: str = "cell_type,niche,Sub_molecular_tissue_region,ccf_region_name",
+        batch_rename: Optional[str] = None,
+        cell_label_keys: Optional[str] = None,
+        niche_label_keys: Optional[str] = None,
+    ) -> None:
+    """
+    End-to-end pipeline:
+
+      1. train(variant) -> writes <ARTIFACTS_DIR>/<dataset>/<variant>/<TS>/
+      2-6. inference + plots + metrics (see run_inference_and_analysis)
+
+    To re-run only steps 2-6 against an already-trained checkpoint, use
+    `examples/run_inference.py --variant <V> --timestamp <TS>` (it calls
+    `run_inference_and_analysis` directly).
+    """
+    # ------------------------------------------------------------------
+    # 1. Train
+    # ------------------------------------------------------------------
+    print("=" * 78)
+    print(f"[1/5] Train  variant={variant!r}")
+    print("=" * 78)
+    run_dir = train(variant)
+    if run_dir is None:
+        # Older train() signatures didn't return; fall back to looking up
+        # the most recent run dir for this variant. Resolve the variant's
+        # dataset tag from its build so the lookup lands in the same dir
+        # train() would have created (chl59 / mmb20 don't live under the
+        # mmb-smb default).
+        variant_slug = variant.replace("/", "_")
+        _variant_cfg = VARIANTS[variant]["build"]()
+        _variant_tag = _variant_cfg["dataset"].get(
+            "dataset_tag",
+            _variant_cfg["dataset"].get("dataset_name", DATASET_NAME),
+        )
+        candidates = sorted((ARTIFACTS_DIR / _variant_tag / variant_slug).glob("*/"))
+        if not candidates:
+            raise RuntimeError(f"Could not auto-locate run_dir for variant {variant}")
+        run_dir = str(candidates[-1])
+    print(f"[1/5] Done. run_dir={run_dir}")
+
+    run_inference_and_analysis(
+        run_dir=run_dir,
+        silver_dir=silver_dir,
+        output_dir=output_dir,
+        model_ckpt_fname=model_ckpt_fname,
+        label_keys=label_keys,
+        batch_rename=batch_rename,
+        cell_label_keys=cell_label_keys,
+        niche_label_keys=niche_label_keys,
+    )
+
+
+def resolve_run_dir(variant: str, timestamp: str) -> Path:
+    """
+    Look up the run_dir for a given (variant, timestamp).
+
+    Maps to `<ARTIFACTS_DIR>/<dataset_tag>/<variant_slug>/<timestamp>`,
+    where `dataset_tag` is read from the variant's build config (the
+    short identifier — `mmb0-1b_smb1-1b_1p`, `chl59-8b_1p`,
+    `mmb0-1b_smb1-20b_1p`). Falls back to `dataset_name` if a variant
+    doesn't set a tag.
+
+    Raises if the variant doesn't exist or the resolved directory is
+    missing on disk (probably the timestamp is wrong, or the run was
+    deleted).
+    """
+    if variant not in VARIANTS:
+        raise KeyError(
+            f"Unknown variant {variant!r}. Use --list-variants on "
+            f"run_squint.py to see registered variants."
+        )
+    variant_slug = variant.replace("/", "_").replace(" ", "_")
+    cfg = VARIANTS[variant]["build"]()
+    dataset_tag = cfg["dataset"].get(
+        "dataset_tag",
+        cfg["dataset"].get("dataset_name", DATASET_NAME),
+    )
+    run_dir = ARTIFACTS_DIR / dataset_tag / variant_slug / timestamp
+    if not run_dir.exists():
+        # Surface neighbouring timestamps so the user sees what's
+        # available without having to ls the directory themselves.
+        parent = ARTIFACTS_DIR / dataset_tag / variant_slug
+        siblings = (
+            sorted(p.name for p in parent.glob("*") if p.is_dir())
+            if parent.exists() else []
+        )
+        raise FileNotFoundError(
+            f"Run dir not found: {run_dir}. "
+            f"Available timestamps under {parent}: "
+            f"{siblings if siblings else '<none>'}"
+        )
+    return run_dir
+
+
+def run_dataset_pipeline(
+        dataset: str,
+        variants: Optional[List[str]] = None,
+        continue_on_error: bool = True,
+        **pipeline_kwargs,
+    ) -> dict:
+    """
+    Run `run_all_pipeline` for every variant in DATASET_VARIANTS[dataset].
+
+    Use this for overnight per-HPC-node sweeps (one node per dataset):
+      python examples/run_squint.py --all-dataset mmb0-1b_smb1-1b_1p
+      python examples/run_squint.py --all-dataset chl59-8b_1p
+      python examples/run_squint.py --all-dataset mmb0-1b_smb1-20b_1p
+
+    Parameters
+    ----------
+    dataset : short dataset tag (key of DATASET_VARIANTS).
+    variants : optional explicit subset of variant names to run; defaults
+        to the full DATASET_VARIANTS[dataset] list.
+    continue_on_error : if True (default), a failure in one variant prints
+        the traceback and proceeds to the next. Set False to abort on the
+        first failure.
+    pipeline_kwargs : forwarded to run_all_pipeline (silver_dir,
+        output_dir, model_ckpt_fname, label_keys, batch_rename,
+        cell_label_keys, niche_label_keys).
+
+    Returns
+    -------
+    A dict {variant_name: "ok" | "<error message>"} summarising the run,
+    also printed to stdout at the end.
+    """
+    import traceback as _tb
+
+    if dataset not in DATASET_VARIANTS:
+        raise ValueError(
+            f"Unknown dataset {dataset!r}. Choose from "
+            f"{sorted(DATASET_VARIANTS.keys())}."
+        )
+    todo = list(variants) if variants else list(DATASET_VARIANTS[dataset])
+
+    print("=" * 78)
+    print(f"Dataset sweep: {dataset}  ({len(todo)} variants)")
+    for v in todo:
+        print(f"  - {v}")
+    print("=" * 78)
+
+    results: dict = {}
+    for i, variant in enumerate(todo, 1):
+        print()
+        print("#" * 78)
+        print(f"# [{i}/{len(todo)}] {variant}")
+        print("#" * 78)
+        try:
+            run_all_pipeline(variant=variant, **pipeline_kwargs)
+            results[variant] = "ok"
+        except Exception as exc:  # noqa: BLE001
+            err = f"{type(exc).__name__}: {exc}"
+            results[variant] = err
+            print(f"\n!!! Variant {variant!r} FAILED: {err}")
+            _tb.print_exc()
+            if not continue_on_error:
+                print("Aborting sweep (continue_on_error=False).")
+                break
+
+    print()
+    print("=" * 78)
+    print(f"Dataset sweep complete: {dataset}")
+    for v in todo:
+        status = results.get(v, "skipped")
+        print(f"  {status:30s}  {v}")
+    print("=" * 78)
+    return results
 
 
 def main():
@@ -3893,13 +5284,21 @@ def main():
     p.add_argument("--build-blob", action="store_true",
                    help="Build the in-memory PyG DatasetBlob (one-time). "
                         "Use --build-blob-dataset to pick which dataset.")
-    p.add_argument("--build-blob-dataset", type=str, default="mmb-smb",
-                   choices=["mmb-smb", "chl59", "mmb20"],
-                   help="Which dataset to build (default: mmb-smb). "
-                        "'chl59' = /nfs/team361/sb75/DATASETS/silver/chl59-8b_1p "
-                        "(CosMx Lung, 8 samples). "
-                        "'mmb20' = /lustre/.../silver/mmb0-1b_smb1-20b_1p_shared_genes "
-                        "(MERFISH + 20 STARmap, harmonised by "
+    p.add_argument("--build-blob-dataset", type=str,
+                   default="mmb0-1b_smb1-1b_1p",
+                   choices=[
+                       "mmb0-1b_smb1-1b_1p",
+                       "chl59-8b_1p",
+                       "mmb0-1b_smb1-20b_1p",
+                   ],
+                   help="Which dataset to build (default: "
+                        "mmb0-1b_smb1-1b_1p — MERFISH + STARmap mouse "
+                        "brain, 1+1 sections). "
+                        "'chl59-8b_1p' = /nfs/team361/sb75/DATASETS/"
+                        "silver/chl59-8b_1p (CosMx Lung, 8 samples). "
+                        "'mmb0-1b_smb1-20b_1p' = /lustre/.../silver/"
+                        "mmb0-1b_smb1-20b_1p_shared_genes (MERFISH + 20 "
+                        "STARmap, harmonised by "
                         "examples/harmonize_mmb_smb20_panels.py first).")
     p.add_argument("--train", action="store_true",
                    help="Train SQUINT on the WHOLE dataset blob (logs to wandb project 'squint').")
@@ -3908,6 +5307,16 @@ def main():
                         "Use --list-variants to see all registered variants.")
     p.add_argument("--list-variants", action="store_true",
                    help="Print all registered ablation variants and exit.")
+    p.add_argument("--list-dataset-sweeps", action="store_true",
+                   help="Print the per-dataset sweep matrix (DATASET_VARIANTS) "
+                        "and exit. The 10 variant names per dataset are what "
+                        "--all-dataset iterates over.")
+    p.add_argument("--variants-for-dataset", type=str, default=None,
+                   help="Print just the variant names for one DATASET_VARIANTS "
+                        "key (one per line, no decoration) and exit. Intended "
+                        "for shell-script consumption (e.g. LSF submitters that "
+                        "bsub one job per variant). Use --list-dataset-sweeps "
+                        "for the human-readable form.")
     p.add_argument("--predict", action="store_true",
                    help="Run inference on a folder of .h5ad files using a trained checkpoint.")
     p.add_argument("--all", action="store_true",
@@ -3918,12 +5327,32 @@ def main():
                         "integration + avg cosine similarity). Convenience "
                         "wrapper for `--train --variant <V>` followed by "
                         "`--predict --run-dir <auto>`.")
+    p.add_argument("--all-dataset", type=str, default=None,
+                   choices=sorted(DATASET_VARIANTS.keys()),
+                   help="Run --all (full pipeline) for EVERY variant in the "
+                        "given dataset's 10-axis sweep, sequentially. "
+                        "Submit one HPC job per dataset (one node each) for "
+                        "an overnight sweep. Use --list-dataset-sweeps to "
+                        "see the variant names. Failures within the sweep "
+                        "are logged but the loop continues (set "
+                        "--abort-on-error to stop instead).")
+    p.add_argument("--abort-on-error", action="store_true",
+                   help="With --all-dataset, abort the sweep on the first "
+                        "variant that errors out instead of continuing to the "
+                        "next one.")
     p.add_argument("--batch-rename", type=str, default=None,
                    help="Optional comma-separated rename for adata_batch_id "
                         "categories in UMAP plots (e.g. 'MERFISH,STARmap PLUS').")
-    p.add_argument("--label-keys", type=str, default="cell_type",
-                   help="Comma-separated obs columns to color UMAPs and code-index "
-                        "plots by (default: cell_type).")
+    p.add_argument(
+        "--label-keys", type=str,
+        default="cell_type,niche,Sub_molecular_tissue_region,ccf_region_name",
+        help="Comma-separated obs columns to color UMAPs and code-index "
+             "plots by. Default covers both the mouse-brain (cell_type, "
+             "Sub_molecular_tissue_region, ccf_region_name) and CosMx Lung "
+             "(cell_type, niche) niche label conventions; "
+             "missing columns are silently skipped per UMAP. One UMAP "
+             "panel is emitted per label per latent slot.",
+    )
     p.add_argument("--cell-label-keys", type=str, default=None,
                    help="Comma-separated obs columns to compare CELL codes against "
                         "in the post-inference NMI/ARI metrics (default: lets the "
@@ -3947,8 +5376,10 @@ def main():
                    help="Optional path to a specific .ckpt; otherwise the best "
                         "checkpoint is auto-selected.")
     p.add_argument("--output-dir", type=str, default=None,
-                   help="Where to write predicted_adata.h5ad (default: "
-                        "<ARTIFACTS_DIR>/inference/<run-name>/).")
+                   help="Where to write predicted_adata.h5ad and downstream "
+                        "plot/metrics output. Defaults to the run_dir itself "
+                        "so all artifacts for one training run live in one "
+                        "folder.")
     args = p.parse_args()
 
     if args.list_variants:
@@ -3959,8 +5390,32 @@ def main():
             print(f"    patches:     {spec['patches']}")
         return
 
+    if args.list_dataset_sweeps:
+        print("Per-dataset sweep matrix (DATASET_VARIANTS):")
+        print("Run all variants of one dataset sequentially via:")
+        print("  python examples/run_squint.py --all-dataset <DATASET>")
+        print()
+        for ds in sorted(DATASET_VARIANTS.keys()):
+            names = DATASET_VARIANTS[ds]
+            print(f"  {ds}  ({len(names)} variants)")
+            for n in names:
+                print(f"    - {n}")
+            print()
+        return
+
+    if args.variants_for_dataset is not None:
+        if args.variants_for_dataset not in DATASET_VARIANTS:
+            raise SystemExit(
+                f"Unknown DATASET key {args.variants_for_dataset!r}. "
+                f"Available: {sorted(DATASET_VARIANTS.keys())}."
+            )
+        for n in DATASET_VARIANTS[args.variants_for_dataset]:
+            print(n)
+        return
+
     if not (args.patch_uns or args.harmonize_var or args.build_blob
-            or args.train or args.predict or args.all):
+            or args.train or args.predict or args.all
+            or args.all_dataset):
         p.print_help()
         return
 
@@ -3989,6 +5444,20 @@ def main():
     if args.all:
         run_all_pipeline(
             variant=args.variant,
+            silver_dir=args.silver_dir,
+            output_dir=args.output_dir,
+            model_ckpt_fname=args.model_ckpt_fname,
+            label_keys=args.label_keys,
+            batch_rename=args.batch_rename,
+            cell_label_keys=args.cell_label_keys,
+            niche_label_keys=args.niche_label_keys,
+        )
+
+    # --all-dataset: loop --all over every variant in the dataset's sweep.
+    if args.all_dataset:
+        run_dataset_pipeline(
+            dataset=args.all_dataset,
+            continue_on_error=not args.abort_on_error,
             silver_dir=args.silver_dir,
             output_dir=args.output_dir,
             model_ckpt_fname=args.model_ckpt_fname,

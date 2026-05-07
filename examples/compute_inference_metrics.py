@@ -1,23 +1,51 @@
 """
 Post-inference metrics for SQUINT predicted AnnData.
 
-Three metric families, each saved as a CSV in `<predict_dir>/metrics/`:
+Four metric families, each saved as a CSV in `<predict_dir>/metrics/`:
 
   1. Niche / cell-type identification (NMI, ARI)
-       Discrete codebook indices vs. ground-truth obs labels.
-       - cell codes      vs. {cell_type, cell_types}
-       - niche codes     vs. {niche, Sub_molecular_tissue_region,
-                              ccf_region_name}
-       - legacy codes    vs. all of the above
-     Cells where the label is NaN are dropped before scoring; pairs with
-     zero usable cells are skipped silently.
+       Discrete codebook indices vs. ground-truth obs labels. Each set
+       of codes (cell / niche / legacy) is scored against EVERY label
+       in `cell_label_keys ∪ niche_label_keys` — so the output covers
+       both the diagonal (cell codes vs cell-type, niche codes vs niche
+       labels — the codes' "designed" target) AND the cross
+       (cell codes vs niche labels, niche codes vs cell-type — quantifies
+       leak between the two branches; a healthy dual-VQ has high
+       diagonal, low cross).
+       Default label sets:
+         cell  : {cell_type, cell_types}
+         niche : {niche, Sub_molecular_tissue_region, ccf_region_name}
+       Cells where the label is NaN are dropped before scoring; pairs
+       with zero usable cells are skipped silently.
+
+       Aggregate "niche" row: an extra `label_key="niche"` row is
+       emitted per (split, code_key) carrying the cell-count-weighted
+       average NMI/ARI across all niche_label_keys. This gives one
+       comparable niche metric even when different AnnData sections
+       in the inference output carry different niche label columns
+       (e.g. some have `ccf_region_name`, others have
+       `Sub_molecular_tissue_region`).
+
+     When `adata.obs['data_split']` is present (stamped by the predict
+     pipeline from the saved training config's `test_batches`), rows
+     are also emitted stratified by split — `split = "all"`, `"train"`,
+     and `"test"` — so train-set vs. held-out-test agreement can be
+     read off the same CSV. Val cells are folded into "train" per the
+     project convention (early-stopping val is in-distribution so it's
+     part of the trained-on signal at inference time).
 
      RVQ / multi-level codebooks: the per-cell cluster id is the COMPOSITE
      index over all levels (`pd.factorize(tuple(per_level))`), which is
      the natural cluster assignment for residual quantizers (each unique
      tuple is a leaf cluster).
 
-  2. Batch integration on continuous + quantized embeddings
+  2. Pearson reconstruction (cell + niche branch, gene-wise + cell-wise,
+       log1p + raw, all genes + top-N HVG). Stratified by `data_split`
+       when present. Mirrors the training-time `compute_benchmarking_metrics`
+       set so train-time and post-inference numbers are directly
+       comparable.
+
+  3. Batch integration on continuous + quantized embeddings
        - iLISI  (kNN inverse Simpson; needs pynndescent; falls back to
                  a simple inline implementation if scib_metrics is missing)
        - ASW    (silhouette score on a sub-sample, sklearn)
@@ -25,10 +53,11 @@ Three metric families, each saved as a CSV in `<predict_dir>/metrics/`:
                  standardised embeddings; uses scipy.spatial.distance.cdist
                  to avoid the O(n^2 * d) memory blow-up of pairwise broadcast)
 
-  3. Average cosine similarity per embedding (concentration sanity check)
+  4. Average cosine similarity per embedding (concentration sanity check)
 
 Outputs:
     <predict_dir>/metrics/niche_identification_metrics.csv
+    <predict_dir>/metrics/pearson_reconstruction_metrics.csv
     <predict_dir>/metrics/batch_integration_metrics.csv
     <predict_dir>/metrics/avg_cosine_similarity.csv
     <predict_dir>/metrics/analysis_summary.json    (consolidated)
@@ -47,13 +76,44 @@ Usage:
 
 import argparse
 import json
+import warnings
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+# Silence two upstream FutureWarnings: dask's legacy DataFrame and
+# anndata's deprecated `read_text` re-export. Both fire at import time
+# of transitive dependencies; filter before they're imported.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Importing read_text from `anndata` is deprecated.*",
+    category=FutureWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*legacy Dask DataFrame implementation is deprecated.*",
+    category=FutureWarning,
+)
 
 import anndata as ad
 import numpy as np
 import pandas as pd
+from scipy.sparse import issparse
 from scipy.spatial.distance import cdist
+
+
+def _to_dense_2d(x) -> np.ndarray:
+    """
+    Densify a matrix-like to a 2D numpy array.
+
+    `np.asarray(scipy_sparse)` returns a 0-dim object array wrapping the
+    sparse matrix instead of densifying — which crashes downstream
+    fancy-indexing with cryptic "too many indices for 0-dimensional
+    array" errors. Treat sparse explicitly via `.toarray()` and pass
+    everything else through `np.asarray`.
+    """
+    if issparse(x):
+        return x.toarray()
+    return np.asarray(x)
 from sklearn.metrics import (
     adjusted_rand_score,
     normalized_mutual_info_score,
@@ -151,16 +211,39 @@ def _flatten_codes(
 def compute_nmi_ari(
         adata: ad.AnnData,
         code_label_pairs: List[Tuple[np.ndarray, str, str]],
+        cell_mask: Optional[np.ndarray] = None,
+        split_label: str = "all",
     ) -> pd.DataFrame:
     """
     code_label_pairs: list of (codes_per_cell, code_name, label_obs_key).
+
+    cell_mask, split_label:
+        Optional 1D boolean array of length `adata.n_obs`. When provided,
+        NMI/ARI are computed ONLY on cells where `cell_mask` is True. The
+        emitted rows carry `split = split_label` ("all" / "train" /
+        "test") for downstream filtering. Defaults compute on all cells.
+
     Returns a DataFrame with columns:
-        code_key, label_key, NMI, ARI, n_cells, n_true_clusters, n_pred_clusters
+        split, code_key, label_key, NMI, ARI, n_cells,
+        n_true_clusters, n_pred_clusters
     """
+    if cell_mask is None:
+        cell_mask = np.ones(adata.n_obs, dtype=bool)
+    cell_mask = np.asarray(cell_mask, dtype=bool)
+    if cell_mask.shape[0] != adata.n_obs:
+        raise ValueError(
+            f"cell_mask has length {cell_mask.shape[0]} but adata has "
+            f"{adata.n_obs} cells."
+        )
+    if cell_mask.sum() == 0:
+        print(f"  [{split_label}] no cells in this split; skipping all pairs")
+        return pd.DataFrame()
+
     rows = []
     for codes, code_name, label_key in code_label_pairs:
         if label_key not in adata.obs.columns:
-            print(f"  skip ({code_name}, {label_key}): label column missing")
+            print(f"  [{split_label}] skip ({code_name}, {label_key}): "
+                  f"label column missing")
             continue
         labels = adata.obs[label_key]
         # Drop NaN AND the literal string "nan" (pandas converts None -> "None"
@@ -169,23 +252,29 @@ def compute_nmi_ari(
         labels_str = labels.astype("object").map(
             lambda v: None if (v is None or (isinstance(v, float) and np.isnan(v))) else str(v)
         )
-        mask = labels_str.notna() & (labels_str != "nan") & (labels_str != "None")
-        n = int(mask.sum())
+        valid = (
+            labels_str.notna() & (labels_str != "nan") & (labels_str != "None")
+        ).to_numpy()
+        # Combine label-validity with the split mask.
+        keep = valid & cell_mask
+        n = int(keep.sum())
         if n == 0:
-            print(f"  skip ({code_name}, {label_key}): all cells NaN/missing")
+            print(f"  [{split_label}] skip ({code_name}, {label_key}): "
+                  f"no valid cells in this split")
             continue
-        true = labels_str.loc[mask].to_numpy()
-        pred = codes[mask.to_numpy()]
+        true = labels_str.to_numpy()[keep]
+        pred = codes[keep]
         nmi = float(normalized_mutual_info_score(true, pred))
         ari = float(adjusted_rand_score(true, pred))
         n_true = int(len(np.unique(true)))
         n_pred = int(len(np.unique(pred)))
         print(
-            f"  {code_name:<28s} vs {label_key:<28s} "
+            f"  [{split_label}] {code_name:<28s} vs {label_key:<28s} "
             f"NMI={nmi:.4f}  ARI={ari:.4f}  "
             f"(n={n}, true_k={n_true}, pred_k={n_pred})"
         )
         rows.append({
+            "split":            split_label,
             "code_key":         code_name,
             "label_key":        label_key,
             "NMI":              nmi,
@@ -194,6 +283,165 @@ def compute_nmi_ari(
             "n_true_clusters":  n_true,
             "n_pred_clusters":  n_pred,
         })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Pearson reconstruction metrics
+# ---------------------------------------------------------------------------
+
+def _pearson_pairwise(
+        a: np.ndarray,
+        b: np.ndarray,
+        axis: int,
+    ) -> np.ndarray:
+    """
+    Pairwise Pearson correlation between rows (axis=1) or columns (axis=0)
+    of `a` and `b`. Returns a 1D array of correlations. NaN-safe: pairs
+    with zero variance produce NaN (filtered out by the caller).
+    """
+    if axis not in (0, 1):
+        raise ValueError(f"axis must be 0 or 1, got {axis}")
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    if a.shape != b.shape:
+        raise ValueError(f"shape mismatch: {a.shape} vs {b.shape}")
+    a_mean = a.mean(axis=axis, keepdims=True)
+    b_mean = b.mean(axis=axis, keepdims=True)
+    a_c = a - a_mean
+    b_c = b - b_mean
+    num = (a_c * b_c).sum(axis=axis)
+    den = np.sqrt((a_c ** 2).sum(axis=axis) * (b_c ** 2).sum(axis=axis))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return num / den
+
+
+def compute_pearson_metrics(
+        adata: ad.AnnData,
+        cell_mask: Optional[np.ndarray] = None,
+        split_label: str = "all",
+        log1p: bool = True,
+        n_hvg: int = 50,
+    ) -> pd.DataFrame:
+    """
+    Pearson correlation between predicted and observed expression on
+    `cell_mask` cells. Two branches when both are present in the
+    predicted adata:
+      - cell branch:  X_hat   vs. X (raw counts)
+      - niche branch: X_hat_nbr vs. X_nbr (1-hop neighborhood mean)
+
+    Reported variants per branch (mirrors the training-time
+    `compute_benchmarking_metrics`):
+      - axis:        gene_wise (Pearson per gene over cells, then
+                                aggregated)
+                  +  cell_wise (Pearson per cell over genes, then
+                                aggregated)
+      - transform:   log1p     (default; robust to mean-count dominance)
+                  +  raw       (raw counts; tracked for back-compat)
+      - gene_subset: all       (every gene in `var`)
+                  +  hvg{N}    (top-N highly-variable genes by per-gene
+                                variance on the log1p target — N defaults
+                                to 50 to match the training metrics)
+    `cell_wise × hvg{N}` is intentionally NOT reported (Pearson per cell
+    over only N genes is statistically noisy and the training-time
+    metric set agrees).
+
+    Returns one row per (branch, axis, transform, gene_subset) for the
+    given `split_label`; columns:
+        split, branch, axis, transform, gene_subset,
+        pearson_mean, pearson_median, n_cells, n_genes
+    """
+    if cell_mask is None:
+        cell_mask = np.ones(adata.n_obs, dtype=bool)
+    cell_mask = np.asarray(cell_mask, dtype=bool)
+    if cell_mask.sum() == 0:
+        return pd.DataFrame()
+
+    rows: List[dict] = []
+    for branch, pred_key in [
+        ("cell",  "X_hat"),
+        ("niche", "X_hat_nbr"),
+    ]:
+        # Cell-branch ground truth lives in adata.X; niche-branch lives in
+        # adata.layers["X_nbr"] (or adata.uns["X_nbr"] for back-compat).
+        # Both predicted tensors live in adata.layers.
+        if branch == "cell":
+            target = _to_dense_2d(adata.X)
+        else:
+            if "X_nbr" in adata.layers:
+                target = _to_dense_2d(adata.layers["X_nbr"])
+            elif "X_nbr" in adata.uns:
+                target = _to_dense_2d(adata.uns["X_nbr"])
+            else:
+                continue
+        if pred_key not in adata.layers:
+            continue
+        pred = _to_dense_2d(adata.layers[pred_key])
+
+        # Subset to cells in this split.
+        target = target[cell_mask]
+        pred   = pred[cell_mask]
+        if target.size == 0:
+            continue
+        n_cells, n_genes = target.shape
+
+        # HVG indices: top-N genes by variance on the log1p target. Only
+        # used for the `gene_wise × hvg{N}` rows; computed once per branch.
+        n_hvg_eff = min(int(n_hvg), n_genes)
+        if n_hvg_eff > 0:
+            target_log_for_hvg = np.log1p(np.clip(target, 0, None))
+            gene_var = target_log_for_hvg.var(axis=0)
+            hvg_idx = np.argpartition(-gene_var, n_hvg_eff - 1)[:n_hvg_eff]
+            hvg_idx.sort()
+        else:
+            hvg_idx = np.array([], dtype=int)
+
+        # Iterate (transform, axis, gene_subset). Skip the cell_wise ×
+        # hvg subset combination intentionally.
+        transforms = (("log1p",) if log1p else ()) + ("raw",)
+        for transform in transforms:
+            if transform == "log1p":
+                t_full = np.log1p(np.clip(target, 0, None))
+                p_full = np.log1p(np.clip(pred,   0, None))
+            else:
+                t_full, p_full = target, pred
+
+            for axis_name, axis in (("gene_wise", 0), ("cell_wise", 1)):
+                gene_subsets = ["all"]
+                if axis_name == "gene_wise" and n_hvg_eff > 0:
+                    gene_subsets.append(f"hvg{n_hvg_eff}")
+
+                for gene_subset in gene_subsets:
+                    if gene_subset == "all":
+                        t_sub, p_sub = t_full, p_full
+                        n_genes_sub = n_genes
+                    else:
+                        t_sub = t_full[:, hvg_idx]
+                        p_sub = p_full[:, hvg_idx]
+                        n_genes_sub = int(hvg_idx.size)
+
+                    vec = _pearson_pairwise(p_sub, t_sub, axis=axis)
+                    vec = vec[np.isfinite(vec)]
+                    if vec.size == 0:
+                        continue
+                    rows.append({
+                        "split":            split_label,
+                        "branch":           branch,
+                        "axis":             axis_name,
+                        "transform":        transform,
+                        "gene_subset":      gene_subset,
+                        "pearson_mean":     float(vec.mean()),
+                        "pearson_median":   float(np.median(vec)),
+                        "n_cells":          int(n_cells),
+                        "n_genes":          n_genes_sub,
+                    })
+                    print(
+                        f"  [{split_label}] {branch:<5s} {axis_name:<9s} "
+                        f"{transform:<5s} {gene_subset:<7s} "
+                        f"mean={float(vec.mean()):.4f}  "
+                        f"median={float(np.median(vec)):.4f}  "
+                        f"(n_cells={n_cells}, n_genes={n_genes_sub})"
+                    )
     return pd.DataFrame(rows)
 
 
@@ -404,11 +652,27 @@ def main() -> None:
     print("\n=== Niche / cell-type identification (NMI, ARI) ===")
     code_label_pairs: List[Tuple[np.ndarray, str, str]] = []
 
+    # Score each branch's codes against BOTH label families (cell-type
+    # AND niche). The "natural" pairing — cell codes vs cell-type labels,
+    # niche codes vs niche labels — is the diagonal: codes should match
+    # the labels they were designed to capture. The cross pairing — cell
+    # codes vs niche labels, niche codes vs cell-type labels — is also
+    # informative: it quantifies how much "leak" there is between
+    # branches (a healthy dual-VQ should have HIGH diagonal, LOW cross).
+    # Combine both label families into one de-duplicated list so each
+    # set of codes gets scored against every available label key.
+    seen: set = set()
+    all_label_keys: List[str] = []
+    for lab in cell_label_keys + niche_label_keys:
+        if lab and lab not in seen:
+            seen.add(lab)
+            all_label_keys.append(lab)
+
     if args.cell_code_key:
         cell_views = _flatten_codes(adata, args.cell_code_key)
         if cell_views:
             for codes, name in cell_views:
-                for lab in cell_label_keys:
+                for lab in all_label_keys:
                     code_label_pairs.append((codes, name, lab))
         else:
             print(f"  cell-branch codes not found "
@@ -418,7 +682,7 @@ def main() -> None:
         niche_views = _flatten_codes(adata, args.niche_code_key)
         if niche_views:
             for codes, name in niche_views:
-                for lab in niche_label_keys:
+                for lab in all_label_keys:
                     code_label_pairs.append((codes, name, lab))
         else:
             print(f"  niche-branch codes not found "
@@ -427,23 +691,113 @@ def main() -> None:
     if args.legacy_code_key:
         legacy_views = _flatten_codes(adata, args.legacy_code_key)
         if legacy_views:
-            seen = set()
-            all_labels = []
-            for lab in cell_label_keys + niche_label_keys:
-                if lab not in seen:
-                    seen.add(lab)
-                    all_labels.append(lab)
             for codes, name in legacy_views:
-                for lab in all_labels:
+                for lab in all_label_keys:
                     code_label_pairs.append((codes, name, lab))
 
-    nmi_ari_df = compute_nmi_ari(adata, code_label_pairs)
+    # Always compute on the full adata ("all"). Additionally, when the
+    # predict pipeline stamped `data_split` (train/test split inferred
+    # from the saved training config's `test_batches`), emit per-split
+    # rows so the user can read off train- vs test-set NMI/ARI directly.
+    # Per the user spec, val cells are folded into "train" upstream — so
+    # only "train" and "test" splits exist (in addition to "all").
+    nmi_ari_frames: List[pd.DataFrame] = [
+        compute_nmi_ari(adata, code_label_pairs, cell_mask=None, split_label="all"),
+    ]
+    if "data_split" in adata.obs.columns:
+        split_col = adata.obs["data_split"].astype("object")
+        for split_name in ("train", "test"):
+            mask = (split_col == split_name).to_numpy()
+            if mask.any():
+                nmi_ari_frames.append(
+                    compute_nmi_ari(
+                        adata, code_label_pairs,
+                        cell_mask=mask, split_label=split_name,
+                    )
+                )
+    nmi_ari_df = pd.concat(
+        [df for df in nmi_ari_frames if not df.empty],
+        ignore_index=True,
+    ) if any(not df.empty for df in nmi_ari_frames) else pd.DataFrame()
+
+    # Aggregate niche labels into a single weighted "niche" row.
+    # Rationale: different AnnData objects in the inference output may
+    # carry DIFFERENT niche label columns (e.g. one section uses
+    # `ccf_region_name`, another uses `Sub_molecular_tissue_region`). A
+    # cell-count-weighted average across all niche_label_keys yields one
+    # comparable "niche" NMI/ARI per (split, code_key) regardless of
+    # which specific column was populated for which cells. The
+    # n_cells weighting matters because each per-label row already
+    # restricts to the cells where THAT label is non-NaN, so n varies.
+    if not nmi_ari_df.empty and niche_label_keys:
+        agg_rows: List[dict] = []
+        niche_set = set(niche_label_keys)
+        for (split, code_key), grp in nmi_ari_df[
+            nmi_ari_df["label_key"].isin(niche_set)
+        ].groupby(["split", "code_key"], sort=False):
+            n_cells_total = int(grp["n_cells"].sum())
+            if n_cells_total <= 0:
+                continue
+            w_nmi = float((grp["NMI"] * grp["n_cells"]).sum() / n_cells_total)
+            w_ari = float((grp["ARI"] * grp["n_cells"]).sum() / n_cells_total)
+            print(
+                f"  [{split}] {code_key:<28s} vs {'niche (weighted)':<28s} "
+                f"NMI={w_nmi:.4f}  ARI={w_ari:.4f}  "
+                f"(n={n_cells_total}, "
+                f"sources={list(grp['label_key'])})"
+            )
+            agg_rows.append({
+                "split":            split,
+                "code_key":         code_key,
+                "label_key":        "niche",
+                "NMI":              w_nmi,
+                "ARI":              w_ari,
+                "n_cells":          n_cells_total,
+                # Aggregate doesn't have a meaningful single
+                # n_true_clusters / n_pred_clusters — leave NaN to make
+                # it obvious this row is an aggregate.
+                "n_true_clusters":  pd.NA,
+                "n_pred_clusters":  pd.NA,
+            })
+        if agg_rows:
+            nmi_ari_df = pd.concat(
+                [nmi_ari_df, pd.DataFrame(agg_rows)],
+                ignore_index=True,
+            )
+
     if not nmi_ari_df.empty:
         nmi_ari_csv = out_dir / "niche_identification_metrics.csv"
         nmi_ari_df.to_csv(nmi_ari_csv, index=False)
         print(f"  -> {nmi_ari_csv}")
     else:
         print("  (no valid (code, label) pairs to score)")
+
+    # ----------------------------------------------- Pearson reconstruction
+    print("\n=== Pearson reconstruction (cell + niche branch) ===")
+    pearson_frames: List[pd.DataFrame] = [
+        compute_pearson_metrics(adata, cell_mask=None, split_label="all"),
+    ]
+    if "data_split" in adata.obs.columns:
+        split_col = adata.obs["data_split"].astype("object")
+        for split_name in ("train", "test"):
+            mask = (split_col == split_name).to_numpy()
+            if mask.any():
+                pearson_frames.append(
+                    compute_pearson_metrics(
+                        adata, cell_mask=mask, split_label=split_name,
+                    )
+                )
+    pearson_df = pd.concat(
+        [df for df in pearson_frames if not df.empty],
+        ignore_index=True,
+    ) if any(not df.empty for df in pearson_frames) else pd.DataFrame()
+    if not pearson_df.empty:
+        pearson_csv = out_dir / "pearson_reconstruction_metrics.csv"
+        pearson_df.to_csv(pearson_csv, index=False)
+        print(f"  -> {pearson_csv}")
+    else:
+        print("  (no Pearson metrics computed — X_hat / X_hat_nbr / X_nbr "
+              "may be missing from the predicted adata)")
 
     # -------------------------------------------------------- Batch integration
     print("\n=== Batch integration (iLISI, ASW, MMD) ===")
@@ -523,12 +877,13 @@ def main() -> None:
 
     # ------------------------------------------------------- consolidated JSON
     summary = {
-        "predicted_adata":              str(adata_path),
-        "n_obs":                        int(adata.n_obs),
-        "batch_key":                    args.batch_key,
-        "niche_identification_metrics": nmi_ari_df.to_dict(orient="records"),
-        "batch_integration_metrics":    batch_int_df.to_dict(orient="records"),
-        "avg_cosine_similarity":        cos_df.to_dict(orient="records"),
+        "predicted_adata":                  str(adata_path),
+        "n_obs":                            int(adata.n_obs),
+        "batch_key":                        args.batch_key,
+        "niche_identification_metrics":     nmi_ari_df.to_dict(orient="records"),
+        "pearson_reconstruction_metrics":   pearson_df.to_dict(orient="records"),
+        "batch_integration_metrics":        batch_int_df.to_dict(orient="records"),
+        "avg_cosine_similarity":            cos_df.to_dict(orient="records"),
     }
     summary_path = out_dir / "analysis_summary.json"
     with open(summary_path, "w") as f:

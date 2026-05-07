@@ -760,6 +760,17 @@ class BaseModel(pl.LightningModule):
             metrics_list = self.test_metrics_list
 
         if len(metrics_list) > 0:
+            # Guard: if the dataloader for this mode produced no batches
+            # (e.g. val_dataloader is empty because `val_batches=[]` AND
+            # `train_val_cell_split=0`), the cache lists are empty and
+            # `torch.cat([])` would raise. Return an empty metrics dict
+            # so the caller's logging loop is a no-op for this mode.
+            if any(len(inference_data_cache[k]) == 0 for k in self.cache_keys):
+                # Reset the cache for the next epoch and bail out.
+                for key in self.cache_keys:
+                    inference_data_cache[key] = []
+                return {}
+
             # 3) Concatenate the inference data cache
             for key in self.cache_keys:
                 inference_data_cache[key] = torch.cat(inference_data_cache[key], dim=0)

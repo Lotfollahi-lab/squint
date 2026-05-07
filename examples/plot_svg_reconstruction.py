@@ -3,7 +3,7 @@ Sanity-check plot: spatially variable genes — ground truth vs reconstruction.
 
 Strategy
 --------
-1. Load the predicted AnnData written by `run_squint_mmb_smb.py --predict`.
+1. Load the predicted AnnData written by `run_squint.py --predict`.
 2. Build an 8-NN spatial graph PER BATCH (the two batches live at unrelated
    coordinate frames).
 3. Rank genes by Moran's I on log1p(X). Moran's I measures spatial
@@ -32,7 +32,7 @@ Why this is a good second sanity check
   NB loss). What would be a problem: the GT shows a sharp pattern and
   the recon shows a uniform smear or a different pattern.
 
-Storage layout (set by `run_squint_mmb_smb.py --predict`):
+Storage layout (set by `run_squint.py --predict`):
     adata.X                  -> cell raw counts (sparse)
     adata.layers["X_hat"]    -> cell reconstruction (NB rate * read depth)
     adata.uns["X_nbr"]       -> 1-hop neighborhood mean of raw counts
@@ -58,7 +58,21 @@ Useful flags:
 """
 
 import argparse
+import warnings
 from pathlib import Path
+
+# Silence two upstream FutureWarnings (dask legacy DataFrame, anndata
+# `read_text` re-export); see run_squint.py for context.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Importing read_text from `anndata` is deprecated.*",
+    category=FutureWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*legacy Dask DataFrame implementation is deprecated.*",
+    category=FutureWarning,
+)
 
 import anndata as ad
 import matplotlib.pyplot as plt

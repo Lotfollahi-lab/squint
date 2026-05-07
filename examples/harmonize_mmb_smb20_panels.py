@@ -31,7 +31,7 @@ What this script does:
      dataset folders don't collide.
 
 After this, point the dataset blob builder at the output folder. The
-existing `make_dataset_blob_config()` in run_squint_mmb_smb.py expects
+existing `make_dataset_blob_config()` in run_squint.py expects
 all 21 files to share a panel — this script's output is that input.
 
 Usage:
@@ -132,7 +132,7 @@ def _stamp_uns_and_cell_id(
 
     # MERFISH vs STARmap: pick a stable dataset_id for downstream FiLM /
     # decoder-covariate code. Convention matches the existing
-    # patch_anndata_uns() in run_squint_mmb_smb.py: 'mmb0' for MERFISH,
+    # patch_anndata_uns() in run_squint.py: 'mmb0' for MERFISH,
     # 'smb1' for STARmap.
     if "merfish" in filename.lower():
         dataset_id = "mmb0"
@@ -381,10 +381,10 @@ def main() -> None:
     if not args.no_plot:
         print(f"  Spatial plots:    {plot_dir}")
     print(f"\nNext steps:")
-    print(f"  1. Add make_dataset_blob_config_<name>() in run_squint_mmb_smb.py")
+    print(f"  1. Add make_dataset_blob_config_<name>() in run_squint.py")
     print(f"     pointing data_directory_path at {out_dir.parent} and dataset")
     print(f"     name at {out_dir.name!r}.")
-    print(f"  2. Build the blob: python examples/run_squint_mmb_smb.py "
+    print(f"  2. Build the blob: python examples/run_squint.py "
           f"--build-blob --build-blob-dataset <name>")
     print(f"  3. Add a holdout-aware ablation patch (e.g. train on STARmap "
           f"batches 1..20 with adata_batch_idx=[1..20], hold out the "
