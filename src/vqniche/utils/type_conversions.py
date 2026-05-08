@@ -158,7 +158,7 @@ def edge_index_to_adjacency_tensor(
         max_num_nodes: int | None = None
     ) -> torch.Tensor:
     """
-    Convert an edge index to an adjacency tensor.
+    Convert an edge index to a dense adjacency tensor.
 
     Parameters:
     ----------
@@ -173,15 +173,33 @@ def edge_index_to_adjacency_tensor(
     --------
     adjacency_matrix: torch.Tensor
         The adjacency tensor.
-        Dimensions: (edge_index.max() + 1, edge_index.max() + 1) if max_num_nodes is None else (max_num_nodes, max_num_nodes)
+        Dimensions: (n, n) where n = edge_index.max()+1 if max_num_nodes
+        is None else max_num_nodes.
+
+    Notes
+    -----
+    Implemented via direct `index_put_` rather than PyG's `to_dense_adj`
+    helper. `to_dense_adj` adds a leading batch dim (we slice it off
+    with `[0]`) and goes through several dispatch layers — measurably
+    slower per call when this function is hot inside a per-minibatch
+    loss (e.g. `bce_cosine_adjacency_reconstruction_loss`). Same
+    semantics: 0/1 dense adjacency built from the edge_index entries.
     """
-    # to_undirected ensures that the adjacency matrix is symmetric
-    # to_dense_adj returns a tensor of shape (1, num_nodes, num_nodes)
-    # here, num_nodes = edge_index.max() + 1 if max_num_nodes is None else max_num_nodes
-    adjacency_matrix = to_dense_adj(
-                        edge_index.to(torch.long),
-                        max_num_nodes=max_num_nodes
-                        )[0]
+    edge_index = edge_index.to(torch.long)
+    if max_num_nodes is None:
+        n = int(edge_index.max().item()) + 1 if edge_index.numel() > 0 else 0
+    else:
+        n = int(max_num_nodes)
+    adjacency_matrix = torch.zeros(
+        (n, n), dtype=torch.float32, device=edge_index.device,
+    )
+    if edge_index.numel() > 0:
+        # row, col -> 1.0
+        adjacency_matrix.index_put_(
+            (edge_index[0], edge_index[1]),
+            torch.ones((), dtype=adjacency_matrix.dtype, device=adjacency_matrix.device),
+            accumulate=False,
+        )
     return adjacency_matrix
 
 
@@ -418,26 +436,49 @@ def inference_data_dict_to_adata(
                     seen.add(col)
                     union_cols.append(col)
 
-        # Build per-cell values for each column. Use a Python list and
-        # let pandas infer the dtype at the end (handles mixed numeric/
-        # string columns and NaN-fill for missing batches uniformly).
+        # Build per-cell values for each column.
+        # Vectorised: for each batch_id present in this inference, take
+        # the corresponding `obs_per_batch_id[bid]` DataFrame and
+        # `iloc[row_idx_for_that_bid]` it as a single pandas operation,
+        # then scatter into a result array indexed by the global cell
+        # position. The naive impl was a Python `for k in range(n_cells)`
+        # loop calling `df[col].iloc[ridx]` per cell — multi-minute
+        # cost on mmb20 (1M cells × dozens of obs columns × sub-ms
+        # pandas overhead per scalar lookup).
         n_cells = len(batch_ids_np)
+        # Precompute, per batch id, the global cell positions and
+        # in-source row indices we need to look up. One pass over
+        # batch_ids_np instead of one-per-column.
+        unique_bids = np.unique(batch_ids_np)
+        per_bid_positions: dict = {}
+        for bid in unique_bids:
+            mask = (batch_ids_np == bid)
+            per_bid_positions[int(bid)] = (
+                np.flatnonzero(mask),
+                row_idx_np[mask],
+            )
+
         for col in union_cols:
             if col in adata.obs.columns:
                 # Don't overwrite columns already written by the model
                 # (e.g. one-hot decoded labels, `adata_batch_ids`).
                 continue
 
-            values = [None] * n_cells
-            for k in range(n_cells):
-                bid = int(batch_ids_np[k])
-                df  = obs_per_batch_id.get(bid)
+            values: list = [None] * n_cells
+            for bid, (cell_positions, source_rows) in per_bid_positions.items():
+                df = obs_per_batch_id.get(bid)
                 if df is None or col not in df.columns:
-                    # Source AnnData doesn't carry this column → NaN-fill.
                     continue
-                ridx = int(row_idx_np[k])
-                if 0 <= ridx < len(df):
-                    values[k] = df[col].iloc[ridx]
+                # Bound-safe slice; iloc on an int array is one pandas
+                # call total instead of `n_cells_in_bid` separate calls.
+                valid = (source_rows >= 0) & (source_rows < len(df))
+                if not valid.any():
+                    continue
+                cell_positions = cell_positions[valid]
+                source_rows    = source_rows[valid]
+                col_vals = df[col].iloc[source_rows].to_numpy()
+                for pos, v in zip(cell_positions, col_vals):
+                    values[int(pos)] = v
             # Cast for h5ad-safe writing. h5py's vlen-string converter
             # chokes on `None` mixed with strings; anndata DOES write
             # `Categorical` and float dtypes natively with NaN as

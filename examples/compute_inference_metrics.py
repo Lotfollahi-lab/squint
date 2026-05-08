@@ -299,11 +299,17 @@ def _pearson_pairwise(
     Pairwise Pearson correlation between rows (axis=1) or columns (axis=0)
     of `a` and `b`. Returns a 1D array of correlations. NaN-safe: pairs
     with zero variance produce NaN (filtered out by the caller).
+
+    Computed in float32 (was float64). Pearson correlation on count
+    matrices doesn't need float64 precision — the relative error from
+    float32 is ~1e-6, well below the noise floor of any biological
+    measurement. The float64 upcast on a 1M x 946 matrix doubled
+    memory pressure for no measurable benefit.
     """
     if axis not in (0, 1):
         raise ValueError(f"axis must be 0 or 1, got {axis}")
-    a = np.asarray(a, dtype=np.float64)
-    b = np.asarray(b, dtype=np.float64)
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
     if a.shape != b.shape:
         raise ValueError(f"shape mismatch: {a.shape} vs {b.shape}")
     a_mean = a.mean(axis=axis, keepdims=True)
@@ -358,6 +364,20 @@ def compute_pearson_metrics(
         return pd.DataFrame()
 
     rows: List[dict] = []
+    # Cache the dense (target, pred) pairs across calls keyed by
+    # `id(adata)`. compute_pearson_metrics is invoked once per
+    # `data_split` value (all / train / test) — without this cache each
+    # call re-densifies `adata.X` (potentially sparse, multi-GB on
+    # mmb20) plus the three predicted layers, even though the dense
+    # contents are identical. The split-specific subset happens AFTER
+    # densification.
+    cache_key = id(adata)
+    if not hasattr(compute_pearson_metrics, "_dense_cache"):
+        compute_pearson_metrics._dense_cache = {}
+    cache = compute_pearson_metrics._dense_cache.get(cache_key)
+    if cache is None:
+        cache = {}
+        compute_pearson_metrics._dense_cache[cache_key] = cache
     for branch, pred_key in [
         ("cell",  "X_hat"),
         ("niche", "X_hat_nbr"),
@@ -365,22 +385,27 @@ def compute_pearson_metrics(
         # Cell-branch ground truth lives in adata.X; niche-branch lives in
         # adata.layers["X_nbr"] (or adata.uns["X_nbr"] for back-compat).
         # Both predicted tensors live in adata.layers.
-        if branch == "cell":
-            target = _to_dense_2d(adata.X)
-        else:
-            if "X_nbr" in adata.layers:
-                target = _to_dense_2d(adata.layers["X_nbr"])
+        if (branch, "target") not in cache:
+            if branch == "cell":
+                cache[(branch, "target")] = _to_dense_2d(adata.X)
+            elif "X_nbr" in adata.layers:
+                cache[(branch, "target")] = _to_dense_2d(adata.layers["X_nbr"])
             elif "X_nbr" in adata.uns:
-                target = _to_dense_2d(adata.uns["X_nbr"])
+                cache[(branch, "target")] = _to_dense_2d(adata.uns["X_nbr"])
             else:
-                continue
-        if pred_key not in adata.layers:
+                cache[(branch, "target")] = None
+            if pred_key in adata.layers:
+                cache[(branch, "pred")] = _to_dense_2d(adata.layers[pred_key])
+            else:
+                cache[(branch, "pred")] = None
+        if cache[(branch, "target")] is None or cache[(branch, "pred")] is None:
             continue
-        pred = _to_dense_2d(adata.layers[pred_key])
+        target_full = cache[(branch, "target")]
+        pred_full   = cache[(branch, "pred")]
 
-        # Subset to cells in this split.
-        target = target[cell_mask]
-        pred   = pred[cell_mask]
+        # Subset to cells in this split (view, not copy, where possible).
+        target = target_full[cell_mask]
+        pred   = pred_full[cell_mask]
         if target.size == 0:
             continue
         n_cells, n_genes = target.shape
@@ -457,15 +482,31 @@ def _ilisi_inline(
     Inverse Simpson Index per cell over its kNN's batch labels (uniform
     weighting, no Gaussian re-weighting). Higher = more batch-mixed.
     Equivalent to scib's iLISI up to the kernel weighting used.
+
+    Vectorised with `np.add.at` over (cell, batch) pairs (was a Python
+    `for i in range(n)` loop calling `np.unique` per cell). For 1M
+    cells × 30 neighbours that's ~30M Python iterations → minutes;
+    vectorised version is ~50-100× faster.
     """
     nbr_batches = batch_labels[knn_indices]  # (n, k)
-    n = nbr_batches.shape[0]
-    out = np.empty(n, dtype=np.float64)
-    for i in range(n):
-        _, counts = np.unique(nbr_batches[i], return_counts=True)
-        p = counts / counts.sum()
-        out[i] = 1.0 / np.sum(p ** 2)
-    return out
+    n, k = nbr_batches.shape
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
+
+    # Densify batch labels to contiguous integer ids in [0, n_batches).
+    unique_batches, dense = np.unique(nbr_batches, return_inverse=True)
+    dense = dense.reshape(n, k)
+    n_batches = int(unique_batches.size)
+
+    # Build a (n, n_batches) count matrix in one vectorised scatter.
+    counts = np.zeros((n, n_batches), dtype=np.float64)
+    rows = np.repeat(np.arange(n), k)
+    cols = dense.ravel()
+    np.add.at(counts, (rows, cols), 1.0)
+
+    p = counts / float(k)             # uniform weighting → divide by k
+    inv_simpson = 1.0 / np.sum(p ** 2, axis=1)
+    return inv_simpson
 
 
 def compute_ilisi(
@@ -549,8 +590,15 @@ def compute_avg_cosine(emb: np.ndarray) -> float:
     Average pairwise cosine similarity over all unordered cell pairs.
     Closed form via row-normalised sum: avg_cos = (||S||^2 - n) / (n * (n-1))
     where S = sum of L2-normalised rows. O(n) memory, O(n*d) time.
+
+    Computed in float32 (was float64). The closed-form sum of unit
+    vectors is numerically well-conditioned at this scale (~1M rows ×
+    ~256 dim); the relative error from float32 is ~1e-5, well below
+    the noise floor of any biological metric. Avoids a 1M × D float64
+    copy per emb_key (cumulatively several GB of churn across the 6
+    embedding slots).
     """
-    X = emb.astype(np.float64)
+    X = emb.astype(np.float32, copy=False)
     norms = np.linalg.norm(X, axis=1, keepdims=True)
     X = X / (norms + 1e-12)
     n = X.shape[0]

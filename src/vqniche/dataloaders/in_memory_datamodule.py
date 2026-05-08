@@ -204,6 +204,15 @@ class InMemoryDataModule(LightningNodeData):
         if getattr(data, 'adata_batch_ids_unseen_mask', None) is not None:
             base_data['adata_batch_ids_unseen_mask'] = data.adata_batch_ids_unseen_mask
 
+        # `adata_batch_ids_raw` (per-cell long): the SECTION-level raw
+        # adata_batch_id (parsed from uns['batch']) broadcast per cell.
+        # Used by predict() to map cells back to their source AnnData
+        # without inverting the train-time densification (which is
+        # ambiguous when multiple held-out batches share dense=0 via
+        # the unknown-label fallback).
+        if getattr(data, 'adata_batch_ids_raw', None) is not None:
+            base_data['adata_batch_ids_raw'] = data.adata_batch_ids_raw
+
         optional_data_keys = [
             # 'y_cell_types',
             # 'y_niche_types',
@@ -288,6 +297,28 @@ class InMemoryDataModule(LightningNodeData):
             raise NotImplementedError(f"{custom_sampler_name} not implemented.")
 
 
+    def _loader_perf_kwargs(self) -> dict:
+        """
+        Performance kwargs forwarded to NeighborLoader (and underlying
+        torch DataLoader). Centralised so train / val / test / predict
+        loaders all get the same tuning:
+          - persistent_workers=True keeps the worker pool alive across
+            epochs (avoids fork+import cost per epoch). Requires
+            num_workers > 0; falls back to False otherwise.
+          - pin_memory=True lets the data side overlap H2D copies with
+            the GPU forward pass.
+          - prefetch_factor=4 lets each worker pre-build several batches
+            ahead of the current one. PyG's NeighborSampler is
+            CPU-bound, so this hides sampling latency behind GPU work.
+        Total expected speedup: 1.3-2x wall-clock on CPU-sampler-heavy
+        datasets (mmb20).
+        """
+        kw: dict = {"pin_memory": True}
+        if int(self.num_workers) > 0:
+            kw["persistent_workers"] = True
+            kw["prefetch_factor"] = 4
+        return kw
+
     def train_dataloader(self):
         """
         This function constructs the DataLoader object for training based on the settings defined in the constructor of the InMemoryDataModule class. If the loader_name is set to 'DefaultFullLoader' or 'DefaultNodeLoader', the function will call the parent class' train_dataloader() function. Otherwise, it will instantiate `self.loader_class` with `self.sampler_class`.
@@ -315,6 +346,7 @@ class InMemoryDataModule(LightningNodeData):
                                         shuffle=False,
                                         **self.loader_params,
                                         **self.sampler_params,
+                                        **self._loader_perf_kwargs(),
                                     )
             return train_loader
 
@@ -355,6 +387,7 @@ class InMemoryDataModule(LightningNodeData):
                                 shuffle=False,
                                 **self.loader_params,
                                 **sampler_params,
+                                **self._loader_perf_kwargs(),
                             )
             return val_loader
 
@@ -395,6 +428,7 @@ class InMemoryDataModule(LightningNodeData):
                                 shuffle=False,
                                 **self.loader_params,
                                 **sampler_params,
+                                **self._loader_perf_kwargs(),
                             )
             return test_loader
 
@@ -433,5 +467,6 @@ class InMemoryDataModule(LightningNodeData):
                                     shuffle=False,
                                     **self.loader_params,
                                     **sampler_params,
+                                    **self._loader_perf_kwargs(),
                                 )
         return infer_loader

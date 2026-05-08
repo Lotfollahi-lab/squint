@@ -557,6 +557,17 @@ class VQNiche_Dual(BaseModel):
         # Cache inference data for this split.
         cache_dict = getattr(self, f"{mode}_inference_data_cache", None)
         if cache_dict is not None:
+            # Reuse the niche aggregations already computed in the loss
+            # path (when nbr_hops==1). They are exactly X_nbr and
+            # X_hat_nbr (1-hop mean of batch.x and xhat_niche, sliced to
+            # batch_size) — the cache writer would otherwise recompute
+            # the same `index_add_` scatters.
+            X_nbr_for_cache = (
+                target_attr_nbr.detach() if nbr_hops == 1 else None
+            )
+            X_hat_nbr_for_cache = (
+                pred_attr_nbr.detach() if nbr_hops == 1 else None
+            )
             self._cache_inference_data(
                 batch=batch,
                 batch_size=batch_size,
@@ -569,6 +580,8 @@ class VQNiche_Dual(BaseModel):
                 xhat_cell=xhat_cell.detach(),
                 xhat_niche=xhat_niche.detach(),
                 cache_dict=cache_dict,
+                X_nbr_cached=X_nbr_for_cache,
+                X_hat_nbr_cached=X_hat_nbr_for_cache,
             )
 
         return loss_value
@@ -648,6 +661,7 @@ class VQNiche_Dual(BaseModel):
     # Inference-data cache
     # ------------------------------------------------------------------
 
+    @torch.no_grad()
     def _cache_inference_data(
             self,
             batch,
@@ -661,20 +675,54 @@ class VQNiche_Dual(BaseModel):
             xhat_cell,
             xhat_niche,
             cache_dict: Optional[dict] = None,
+            X_nbr_cached: Optional[torch.Tensor] = None,
+            X_hat_nbr_cached: Optional[torch.Tensor] = None,
         ) -> dict:
+        """
+        Stitch per-batch inference outputs into a cache dict (keyed by
+        `self.cache_keys`).
+
+        Optimizations vs. the naive impl:
+          - `@torch.no_grad()` keeps the autograd graph clean (was using
+            `.detach()` per tensor at every call site; same effect, less
+            verbose).
+          - When the caller (`_step` with `nbr_hops==1`) has already
+            computed the niche-branch aggregations as part of the loss
+            path, it passes them in via `X_nbr_cached` / `X_hat_nbr_cached`
+            and the writer skips the recompute. Otherwise (test_step /
+            predict_step), the writer fuses the two aggregations into a
+            single `index_add_` over the stacked `[batch.x, xhat_niche]`
+            tensor — half the kernel launches and only one degree
+            computation vs. two separate calls.
+        """
         if cache_dict is None:
             cache_dict = {key: [] for key in self.cache_keys}
 
-        # ---- inputs / context ------------------------------------------------
-        cache_dict['X'].append(batch.x[:batch_size])
-        cache_dict['X_nbr'].append(
-            aggregate_1hop_neighbor_features(
-                X=batch.x,
+        # ---- niche-branch aggregations (X_nbr, X_hat_nbr) -------------------
+        # Three branches, in order of cheapest first:
+        #   (a) caller passed them in -> append directly.
+        #   (b) only one is available (rare; e.g. nbr_hops != 1 from
+        #       _step) -> fall back to one aggregation call here.
+        #   (c) neither is available (test_step, predict_step) -> ONE
+        #       fused aggregation on stacked [X, xhat_niche], split.
+        if X_nbr_cached is not None and X_hat_nbr_cached is not None:
+            x_nbr_out      = X_nbr_cached
+            x_hat_nbr_out  = X_hat_nbr_cached
+        else:
+            n_genes_x = batch.x.size(1)
+            stacked = torch.cat([batch.x, xhat_niche], dim=-1)
+            stacked_nbr = aggregate_1hop_neighbor_features(
+                X=stacked,
                 edge_index=batch.edge_index,
                 return_mean=True,
                 batch_size=batch_size,
             )
-        )
+            x_nbr_out     = stacked_nbr[:, :n_genes_x]
+            x_hat_nbr_out = stacked_nbr[:, n_genes_x:]
+
+        # ---- inputs / context ------------------------------------------------
+        cache_dict['X'].append(batch.x[:batch_size])
+        cache_dict['X_nbr'].append(x_nbr_out)
         # Optional one-hot label tensors (named y_*) — propagate as-is
         # (matches the convention used in VQNiche._cache_inference_data).
         for key in batch.keys():
@@ -686,6 +734,20 @@ class VQNiche_Dual(BaseModel):
                 cache_dict[key].append(getattr(batch, key)[:batch_size])
         cache_dict['XY_coordinates'].append(batch.xy_coordinates[:batch_size])
         cache_dict['adata_batch_ids'].append(batch.adata_batch_ids[:batch_size])
+        # Optional per-cell RAW adata_batch_id (= the int parsed from
+        # uns['batch'], broadcast per cell). Predict-time consumer:
+        # `_build_clean_adata_from_inference` uses these to look up
+        # source AnnDatas without having to invert the densification
+        # (ambiguous when multiple held-out batches collapse to
+        # dense=0 via the unknown-label fallback).
+        if getattr(batch, 'adata_batch_ids_raw', None) is not None:
+            if 'adata_batch_ids_raw' not in cache_dict:
+                cache_dict['adata_batch_ids_raw'] = []
+                if 'adata_batch_ids_raw' not in self.cache_keys:
+                    self.cache_keys.append('adata_batch_ids_raw')
+            cache_dict['adata_batch_ids_raw'].append(
+                batch.adata_batch_ids_raw[:batch_size]
+            )
         # Optional per-cell row index INTO the source AnnData's `.obs`.
         # Only present when the dataset blob was built with the new
         # `process_anndata_batch` (and only flows through if the dataloader
@@ -707,15 +769,6 @@ class VQNiche_Dual(BaseModel):
         cache_dict['H_latent_niche'].append(z_gnn[:batch_size])
         cache_dict['H_quantized_niche'].append(z_q_niche[:batch_size])
         cache_dict['Indices_niche'].append(idx_niche[:batch_size])
-        # X_hat_nbr is the per-cell aggregated neighborhood mean of the niche
-        # decoder's output — directly comparable to X_nbr (cached above).
-        cache_dict['X_hat_nbr'].append(
-            aggregate_1hop_neighbor_features(
-                X=xhat_niche,
-                edge_index=batch.edge_index,
-                return_mean=True,
-                batch_size=batch_size,
-            )
-        )
+        cache_dict['X_hat_nbr'].append(x_hat_nbr_out)
 
         return cache_dict

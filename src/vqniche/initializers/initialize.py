@@ -386,7 +386,21 @@ def initialize_databatch(
               else d.adata_batch_id.view(-1)[0].item())
          for d in data_list],
         dtype=torch.long
-    )    
+    )
+
+    # PER-CELL raw `adata_batch_id` (broadcast from per-section vector
+    # via PyG's auto-built `data_batch.batch` index). Used by predict()
+    # to look up source AnnDatas WITHOUT having to invert the train-
+    # time `label_to_dense` densification. Inverting is impossible when
+    # held-out batches all map to dense=0 (the unknown-label fallback);
+    # tracking the raw IDs as a separate per-cell field side-steps the
+    # ambiguity entirely. The model still uses the densified
+    # `data_batch.adata_batch_ids` for embedding lookup; this raw
+    # tensor is read-only metadata for the predict path.
+    if hasattr(data_batch, "batch") and data_batch.batch is not None:
+        data_batch.adata_batch_ids_raw = (
+            data_batch.adata_batch_id[data_batch.batch].long()
+        )
 
     # TODO: fix this hard-coding
     data_batch.num_features = safe_int_conversion(data_batch.num_features)

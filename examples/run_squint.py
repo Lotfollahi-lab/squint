@@ -1418,6 +1418,53 @@ def _patch_dual_dropout(cfg: dict, p: float = 0.1) -> dict:
     return cfg
 
 
+def _patch_dual_encoder_deeper(
+        cfg: dict,
+        hidden_channels: Optional[List[int]] = None,
+    ) -> dict:
+    """
+    Deepen the encoder MLP trunk: from `[400, 256]` (2 hidden layers)
+    to `[400, 400, 256]` (3 hidden layers) by default. Latent dim
+    (= last layer = 256) is preserved so codebook + GNN dims don't
+    shift; only the depth grows. The extra layer adds ~160k params
+    and a bit of FLOPs but lets the encoder learn richer non-linear
+    feature mixes before quantisation.
+    """
+    enc = cfg["model"]["encoder_params"]
+    target = list(hidden_channels) if hidden_channels else [400, 400, 256]
+    enc["mlp_params"]["hidden_channels"] = target
+    return cfg
+
+
+def _patch_dual_gnn_hidden(
+        cfg: dict,
+        hidden: int = 384,
+    ) -> dict:
+    """
+    Bump the niche-branch GNN hidden width (default 256 -> 384).
+    Note: this changes the GNN's *internal* dim AND the niche latent
+    dim (= GNN output) — codebook embedding dim follows. Larger spatial
+    capacity at modest cost (~1.5x params on the GNN).
+    """
+    cfg["model"]["encoder_params"]["gnn_params"]["hidden_channels"] = int(hidden)
+    return cfg
+
+
+def _patch_dual_sampler_neighbors(
+        cfg: dict,
+        num_neighbors: Optional[List[int]] = None,
+    ) -> dict:
+    """
+    Override the `NeighborLoader.num_neighbors` per layer (default
+    `[8]` for 1-hop). Increasing to `[16]` doubles the niche
+    aggregation neighborhood, often improving spatial-domain coherence
+    at the cost of larger per-step memory.
+    """
+    target = list(num_neighbors) if num_neighbors else [16]
+    cfg["datamodule"]["sampler_params"]["num_neighbors"] = target
+    return cfg
+
+
 def _patch_dual_adversarial(
         cfg: dict,
         alpha: float = 1.0,
@@ -2189,6 +2236,449 @@ VARIANTS: dict = {
                         _patch_dual_rvq(_BD(),
                             branch="niche", codebook_sizes=(30, 90)),
                         branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            weight=250.0,
+        ),
+    },
+    # ========================================================================
+    # mmb0-1b_smb1-1b_1p 1-layer-spine ablation matrix v2.
+    # ========================================================================
+    # Eight more ablations on top of the spine
+    # (dualvq+rvq-both+decoder-cov+adv, 1-layer GNN), picked for
+    # plausible upside on a small dataset (~85k cells, 431 genes).
+    # Each varies ONE knob; group via
+    # `--all-dataset mmb0-1b_smb1-1b_1p-ablations-v2`.
+    "dualvq+rvq-both-large+decoder-cov+adv+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Spine ablation — RVQ levels (30, 90) -> (50, 150). Bigger "
+            "primary + residual codebook capacity; tests whether the "
+            "default 30/90 is the bottleneck on Pearson."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[50, 150])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(_BD(),
+                        branch="niche", codebook_sizes=(50, 150)),
+                    branch="cell", codebook_sizes=(50, 150),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+    },
+    "dualvq+rvq-both-3level+decoder-cov+adv+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Spine ablation — 2-level RVQ (30, 90) -> 3-level RVQ "
+            "(30, 60, 120). Finer hierarchical decomposition; each "
+            "successive residual layer captures finer-grained variation. "
+            "Worth trying when a 2-level RVQ saturates on Pearson."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 60, 120])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(_BD(),
+                        branch="niche", codebook_sizes=(30, 60, 120)),
+                    branch="cell", codebook_sizes=(30, 60, 120),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+latent-128+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Spine ablation — latent / codebook embedding dim 256 -> 128 "
+            "(only the encoder MLP last hidden + GNN hidden shrink; "
+            "decoder hidden widths and codebook sizes are unchanged). "
+            "Tighter bottleneck à la NicheCompass / scvi; forces each "
+            "code's embedding to be more semantically concentrated."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+small-latent(latent_dim=128)",
+        ],
+        "build": lambda: _patch_dual_small_latent(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 90)),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            latent_dim=128,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+dropout+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Spine ablation — dropout p=0.1 on encoder MLP, GNN, and "
+            "both decoders. Cheap regularization. Particularly relevant "
+            "on a small dataset (~85k cells) where the model can over-"
+            "fit; pair with val_loss-based early stopping for clear "
+            "wandb diagnostics."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+dropout(p=0.1)",
+        ],
+        "build": lambda: _patch_dual_dropout(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 90)),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            p=0.1,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+batch-emb32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Spine ablation — learned batch embedding dim 16 -> 32. "
+            "More capacity for the decoder's per-batch covariate to "
+            "absorb cross-platform / cross-replicate gene-pattern "
+            "differences. Encoder is unchanged (codes still batch-"
+            "invariant by construction); only the decoder side gets "
+            "a richer batch context."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate(embed_dim=32)",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(_BD(),
+                        branch="niche", codebook_sizes=(30, 90)),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+                embed_dim=32,
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+sampler16+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Spine ablation — NeighborLoader.num_neighbors [8] -> [16]. "
+            "Doubles the per-step niche-aggregation neighborhood; the "
+            "GNN sees richer spatial context per cell, at the cost of "
+            "~2x larger sampled subgraph (memory + step time). Often "
+            "improves spatial-domain coherence on dense tissues."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+sampler(num_neighbors=[16])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 90)),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            num_neighbors=[16],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Spine ablation — encoder MLP [400, 256] -> [400, 400, 256] "
+            "(2 hidden layers -> 3 hidden layers; latent dim preserved "
+            "at 256). Lets the encoder learn richer non-linear feature "
+            "mixes before the VQ bottleneck."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 90)),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+gnn-h384+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Spine ablation — GNN hidden 256 -> 384. Wider niche-branch "
+            "GNN; larger spatial-aggregation capacity. Note: this also "
+            "widens the niche latent dim (= GNN output) so the niche "
+            "codebook embedding is wider too. Modest param + memory "
+            "increase (~1.5x on the GNN); likely upside on datasets "
+            "with rich spatial domain structure."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+gnn-h(384)",
+        ],
+        "build": lambda: _patch_dual_gnn_hidden(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 90)),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            hidden=384,
+        ),
+    },
+    # ========================================================================
+    # mmb0-1b_smb1-1b_1p 2-layer-spine ablation matrix v3 (codebook scan).
+    # ========================================================================
+    # Spine combines the v1 winners: +wide (best on niche ID) + adj-w250
+    # (best on batch integration), plus the standard RVQ-both +
+    # decoder-cov + adv. Each variant ablates one knob from this spine,
+    # focused on CODEBOOK CAPACITY + STRUCTURE — the lever most likely
+    # to push niche ID further now that the spatial-context (wide) and
+    # batch-correction (w250) axes are pinned to their winners. Group
+    # via `--all-dataset mmb0-1b_smb1-1b_1p-ablations-v3`.
+    "dualvq+wide+rvq-both+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v3 spine — combine the v1 winners. +wide (2-layer GNN, "
+            "sampler [8,8], 2-hop nbr aggregation) was best on niche "
+            "identification; +adj-w250 (cosine adjacency BCE weight "
+            "1000 -> 250) was best on batch integration. Stack both; "
+            "everything else is the standard recipe (RVQ-both 30/90, "
+            "decoder covariate, adversarial GRL alpha=1.0 wt=150)."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+adj(weight=250)",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            weight=250.0,
+        ),
+    },
+    "dualvq+wide+rvq-both-50-90+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v3 spine + RVQ k1: 30 -> 50. Same residual layer (k2=90); "
+            "macro codebook gets ~1.7x more entries. Targets niche ID "
+            "headroom: with `+wide` already capturing more spatial "
+            "context, a finer macro partition is the natural next step."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[50, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+adj(weight=250)",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(50, 90),
+                        ),
+                        branch="cell", codebook_sizes=(50, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            weight=250.0,
+        ),
+    },
+    "dualvq+wide+rvq-both-80-90+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v3 spine + RVQ k1: 30 -> 80. Aggressive scan on the macro "
+            "codebook; k1=80 is roughly the empirical n_unique cell "
+            "subtypes in mouse-brain MERFISH/STARmap atlases. If 50 "
+            "isn't enough, this should saturate the metric."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[80, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+adj(weight=250)",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(80, 90),
+                        ),
+                        branch="cell", codebook_sizes=(80, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            weight=250.0,
+        ),
+    },
+    "dualvq+wide+rvq-both-50-150+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v3 spine + RVQ levels 30/90 -> 50/150. Bumps BOTH layers "
+            "(macro + residual). Tests whether the extra residual "
+            "headroom helps or just adds redundant codes."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[50, 150])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+adj(weight=250)",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(50, 150),
+                        ),
+                        branch="cell", codebook_sizes=(50, 150),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            weight=250.0,
+        ),
+    },
+    "dualvq+wide+rvq-both-80-200+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v3 spine + RVQ levels 30/90 -> 80/200. Most aggressive "
+            "codebook scan; most likely to overfit on a 2-section "
+            "dataset (~85k cells), but worth knowing where the cliff "
+            "is for the wide+w250 spine."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[80, 200])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+adj(weight=250)",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(80, 200),
+                        ),
+                        branch="cell", codebook_sizes=(80, 200),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            weight=250.0,
+        ),
+    },
+    "dualvq+wide+rvq-both-3level+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v3 spine + 3-level RVQ (30, 60, 120) instead of 2-level "
+            "(30, 90). Same total nominal capacity (3*60 vs 1*90 "
+            "residual entries) but split across two refinement layers, "
+            "encouraging hierarchical decomposition."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 60, 120])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+adj(weight=250)",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 60, 120),
+                        ),
+                        branch="cell", codebook_sizes=(30, 60, 120),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            weight=250.0,
+        ),
+    },
+    "dualvq+wide+cvq-both-30-10+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v3 spine + ConditionalVQ (tree-structured) on both branches "
+            "in place of RVQ. K1=30 macro buckets, K2=10 sub-children "
+            "per bucket = 300 effective codes per branch. Different "
+            "inductive bias from RVQ: each level-2 entry is "
+            "CONDITIONAL on the level-1 macro bucket (strict tree), "
+            "while RVQ refines additively. Fits when the data is "
+            "naturally hierarchical (cell type -> cell state)."
+        ),
+        "patches": [
+            "+wide", "+cvq(branch=both, k1=30, k2=10)",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+adj(weight=250)",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_cvq(
+                        _patch_dual_wide(_BD()),
+                        branch="both", k1=30, k2=10,
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            weight=250.0,
+        ),
+    },
+    "dualvq+wide+cvq-both-50-10+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v3 spine + larger ConditionalVQ. K1=50 macro buckets, "
+            "K2=10 sub-children = 500 effective codes per branch. "
+            "Direct A/B against `+cvq-both-30-10` to scan macro "
+            "capacity within the tree-VQ family."
+        ),
+        "patches": [
+            "+wide", "+cvq(branch=both, k1=50, k2=10)",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+adj(weight=250)",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_cvq(
+                        _patch_dual_wide(_BD()),
+                        branch="both", k1=50, k2=10,
                     ),
                 ),
                 alpha=1.0, wt_adv_batch=150.0,
@@ -2972,6 +3462,42 @@ VARIANTS: dict = {
             ),
         ),
     },
+    # Alias for the mmb20 narrow baseline under the dataset-agnostic
+    # recipe name (`dualvq+rvq-both+decoder-cov+adv+<dataset_tag>`,
+    # same name pattern as the mmb-smb / chl59 1-layer baselines). The
+    # build is identical to `dualvq+narrow+rvq-both+decoder-cov+adv+...`
+    # — the mmb20 dataset patch enforces narrow (1-layer GNN) for
+    # memory regardless of whether `+wide` is applied, so dropping the
+    # `+narrow` tag from the variant name doesn't change the model.
+    "dualvq+rvq-both+decoder-cov+adv+mmb0-1b_smb1-20b_1p": {
+        "description": (
+            "mmb0-1b_smb1-20b_1p baseline with RVQ on both branches + "
+            "decoder covariate + adversarial GRL. Same recipe name as "
+            "the mmb-smb / chl59 1-layer baselines; the underlying GNN "
+            "is 1-layer (enforced by `_patch_dual_mmb20` regardless of "
+            "+wide/+narrow tag, due to memory)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+mmb0-1b_smb1-20b_1p(test_ids=[15,82])",
+        ],
+        "build": lambda: _patch_dual_mmb20_holdout(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _BD(),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
     "dualvq+narrow+rvq-both+adv+mmb0-1b_smb1-20b_1p": {
         "description": (
             "mmb0-1b_smb1-20b_1p with adversarial-only batch correction "
@@ -3674,6 +4200,47 @@ DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations"] = [
     # Adjacency BCE weight axis: 1000 -> {3000, 250}
     "dualvq+rvq-both+decoder-cov+adv+adj-w3000+mmb0-1b_smb1-1b_1p",
     "dualvq+rvq-both+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p",
+]
+
+# mmb-smb 1-layer ablation matrix v2: capacity / regularization /
+# batch-correction / spatial-context axes. Each variant ablates ONE
+# knob from the same RVQ-both + decoder-cov + adv + 1-layer-GNN spine
+# the v1 ablations use. Submit all 8 via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v2
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v2"] = [
+    # codebook capacity
+    "dualvq+rvq-both-large+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+    "dualvq+rvq-both-3level+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+    # latent / regularization
+    "dualvq+rvq-both+decoder-cov+adv+latent-128+mmb0-1b_smb1-1b_1p",
+    "dualvq+rvq-both+decoder-cov+adv+dropout+mmb0-1b_smb1-1b_1p",
+    # batch correction
+    "dualvq+rvq-both+decoder-cov+adv+batch-emb32+mmb0-1b_smb1-1b_1p",
+    # spatial context / encoder capacity
+    "dualvq+rvq-both+decoder-cov+adv+sampler16+mmb0-1b_smb1-1b_1p",
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
+    "dualvq+rvq-both+decoder-cov+adv+gnn-h384+mmb0-1b_smb1-1b_1p",
+]
+
+# mmb-smb 2-layer-spine ablation matrix v3: codebook capacity / structure
+# scan on top of the v1 winners' combined spine
+# (+wide [best on niche ID] + adj-w250 [best on batch integration]).
+# Submit all 8 via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v3
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v3"] = [
+    # spine baseline (winners combined)
+    "dualvq+wide+rvq-both+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p",
+    # RVQ macro-codebook scan (k1)
+    "dualvq+wide+rvq-both-50-90+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both-80-90+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p",
+    # RVQ both-layer scan
+    "dualvq+wide+rvq-both-50-150+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both-80-200+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p",
+    # 3-level RVQ
+    "dualvq+wide+rvq-both-3level+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p",
+    # CVQ (tree-structured) family
+    "dualvq+wide+cvq-both-30-10+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+cvq-both-50-10+decoder-cov+adv+adj-w250+mmb0-1b_smb1-1b_1p",
 ]
 
 # Held-out-region downstream task. Currently a single variant — the
@@ -4404,7 +4971,14 @@ def _build_clean_adata_from_inference(
     import pandas as pd
 
     def to_np(x):
-        return x.cpu().numpy() if hasattr(x, "cpu") else np.asarray(x)
+        # Avoid an unnecessary GPU->CPU copy when the tensor is already
+        # on CPU. The predict-collator path already moves cached
+        # tensors to CPU; an extra .cpu() call is a no-op semantically
+        # but allocates a fresh tensor under the hood (multi-GB on
+        # mmb20 across several layers + obsm slots).
+        if hasattr(x, "cpu"):
+            return x.numpy() if not x.is_cuda else x.cpu().numpy()
+        return np.asarray(x)
 
     # ---- sanity checks on inputs ----
     if "adata_batch_ids" not in inference_data:
@@ -4873,16 +5447,17 @@ def predict(
     # ----------------------------------------------------------------------
     # Two post-inference fixups in one pass over `predict_data_dict`:
     #
-    # (1) Translate per-cell `adata_batch_ids` from DENSE (0..N-1) back to
-    #     RAW (`uns['batch']`-derived ints, e.g. 15, 82).
-    #     `initialize_databatch` overwrites `data_batch.adata_batch_ids`
-    #     with the dense indices that `build_batch_one_hot_from_obs`
-    #     produces (sorted-unique-label position), which the model needs
-    #     as one-hot indices. The inference output inherits those dense
-    #     ids — but `source_adatas` below is keyed by the raw blob ids.
-    #     Without translating, source-AnnData lookup fails:
-    #     "Cells reference adata_batch_ids [0, 1] but available source ids
-    #     are [15, 82]".
+    # (1) Replace per-cell `adata_batch_ids` (DENSE, what the model used
+    #     for one-hot indexing) with per-cell RAW ids (`uns['batch']`-
+    #     derived ints, e.g. 15, 82). `source_adatas` below is keyed by
+    #     raw blob ids; without this swap the source-AnnData lookup
+    #     fails ("Cells reference adata_batch_ids [0, 1] but available
+    #     source ids are [15, 82]"). The raw ids come straight from
+    #     `data_batch.adata_batch_ids_raw` — set in `initialize_databatch`
+    #     via `data_batch.adata_batch_id[data_batch.batch]` and cached
+    #     by `_cache_inference_data`. We do NOT invert the train-time
+    #     densification: that's ambiguous when held-out batches all
+    #     collapse to dense=0 via the unknown-label fallback.
     #
     # (2) Undo PyG's auto-offset on `obs_row_index`. Any tensor whose key
     #     contains the substring 'index' triggers PyG's
@@ -4891,77 +5466,63 @@ def predict(
     #     batched graph. `obs_row_index` is NOT an edge index but gets
     #     caught by the same heuristic, so per-section indices in
     #     [0, n_obs_section) get shifted by the cumulative node count of
-    #     all preceding sections. The cells starting at offset
-    #     `n_section + cum_offset > n_obs_section` then look out of
-    #     bounds in the source AnnData ("offending rows: [44686, 44687,
-    #     ...]"). Fixing this at the field-name level would require a
-    #     blob rebuild (rename to `obs_row_pos`); we recover the original
-    #     per-section index here instead — no rebuild needed.
-    #
-    # Both fixups derive their mapping from `data_batch.obs_batch`
-    # (per-section per-cell label list, populated by
-    # `process_anndata_batch` from `uns['batch']`) and
-    # `data_batch.adata_batch_id` (per-section raw id). The dense-id
-    # ordering mirrors `build_batch_one_hot_from_obs` (sorted unique
-    # labels). The PyG offset for a section equals the cumulative
-    # `n_obs` of all sections preceding it in concat order — which is
-    # how `data_batch.obs_batch` itself is laid out.
+    #     all preceding sections. We recover the original per-section
+    #     index by subtracting `cum_offset_for_that_section[raw_id]`.
     if hasattr(data_batch, "obs_batch") and data_batch.obs_batch is not None:
-        _all_labels: list = []
-        for _group in data_batch.obs_batch:
-            _all_labels.extend(str(_x) for _x in _group)
-        _label_to_dense = {lbl: i for i, lbl in enumerate(sorted(set(_all_labels)))}
-        _dense_to_raw: dict = {}
+        # Build the per-raw-id PyG offset (cumulative n_cells of all
+        # sections preceding this raw id in concat order). Drives the
+        # obs_row_index unshift below.
         _raw_to_pyg_offset: dict = {}
         _cum_offset = 0
         for _sec_idx in range(len(data_batch.obs_batch)):
             _group = data_batch.obs_batch[_sec_idx]
             if not _group:
                 continue
-            _label = str(_group[0])
-            _dense_id = _label_to_dense[_label]
             _raw_section_id = data_batch.adata_batch_id[_sec_idx]
             _raw_id = int(
                 _raw_section_id.item() if hasattr(_raw_section_id, "item")
                 else _raw_section_id
             )
-            _dense_to_raw[_dense_id] = _raw_id
             _raw_to_pyg_offset[_raw_id] = _cum_offset
             _cum_offset += len(_group)
 
-        if _dense_to_raw:
+        if "adata_batch_ids_raw" in predict_data_dict:
             import numpy as _np
-            _ids = predict_data_dict["adata_batch_ids"]
-            _ids_np = _ids.cpu().numpy() if hasattr(_ids, "cpu") else _np.asarray(_ids)
-            _missing = sorted({int(d) for d in _ids_np} - _dense_to_raw.keys())
-            if _missing:
-                raise RuntimeError(
-                    f"Inference output references dense adata_batch_ids "
-                    f"{_missing} that have no raw-id mapping in data_batch "
-                    f"(known dense ids: {sorted(_dense_to_raw)}). This is a "
-                    f"bug in the dense->raw translation step in predict()."
-                )
-            _translated = _np.array([_dense_to_raw[int(d)] for d in _ids_np],
-                                    dtype=int)
+            _raw_ids = predict_data_dict["adata_batch_ids_raw"]
+            _raw_ids_np = (
+                _raw_ids.cpu().numpy() if hasattr(_raw_ids, "cpu")
+                else _np.asarray(_raw_ids)
+            ).astype(int)
+            # (1) point downstream code at the raw ids — overwrites the
+            #     dense ids with raw ids; downstream consumers
+            #     (`_build_clean_adata_from_inference`, the data_split
+            #     tagger) all expect raw ids.
             predict_data_dict["adata_batch_ids"] = torch.tensor(
-                _translated, dtype=torch.long
+                _raw_ids_np, dtype=torch.long
             )
             print(
-                f"Translated per-cell adata_batch_ids from dense -> raw "
-                f"using mapping {_dense_to_raw}."
+                f"Set per-cell adata_batch_ids from cached raw ids "
+                f"(unique: {sorted(set(_raw_ids_np.tolist()))})."
             )
 
-            # Undo PyG's auto-offset on obs_row_index, using the now-
-            # translated raw ids to look up each cell's per-section
-            # offset.
+            # (2) Undo PyG's auto-offset on obs_row_index using the
+            #     per-raw-id cumulative offset.
             if "obs_row_index" in predict_data_dict and any(
                 _v != 0 for _v in _raw_to_pyg_offset.values()
             ):
                 _row = predict_data_dict["obs_row_index"]
                 _row_np = (_row.cpu().numpy() if hasattr(_row, "cpu")
                            else _np.asarray(_row)).astype(int)
+                _missing_raw = sorted(set(_raw_ids_np.tolist()) - _raw_to_pyg_offset.keys())
+                if _missing_raw:
+                    raise RuntimeError(
+                        f"Cells reference raw adata_batch_ids "
+                        f"{_missing_raw} that have no offset in "
+                        f"data_batch (known raw ids: "
+                        f"{sorted(_raw_to_pyg_offset)})."
+                    )
                 _offsets = _np.array(
-                    [_raw_to_pyg_offset[int(r)] for r in _translated],
+                    [_raw_to_pyg_offset[int(r)] for r in _raw_ids_np],
                     dtype=int,
                 )
                 predict_data_dict["obs_row_index"] = torch.tensor(
@@ -4971,6 +5532,14 @@ def predict(
                     f"Undid PyG auto-offset on obs_row_index using "
                     f"per-raw-id offsets {_raw_to_pyg_offset}."
                 )
+        else:
+            print(
+                "WARN: predict_data_dict has no `adata_batch_ids_raw`. "
+                "The dataset blob predates the per-cell-raw-id field; "
+                "dense ids will be passed through unchanged. If you "
+                "have whole-section holdouts, source-AnnData lookup may "
+                "fail — rebuild the blob to populate the field."
+            )
 
     # Build the clean AnnData.
     #
@@ -5013,17 +5582,24 @@ def predict(
             print(f"  WARN: blob position {_pos} has no cell_id list — "
                   f"section can't be matched to a silver file by cell_id.")
 
-    # Step 2: for each silver file, read its first cell_id (backed mode
-    # for speed) and find the blob section it matches.
+    # Steps 2 + 3 (fused): each silver file is read in FULL only once.
+    # The previous version opened every file twice — first in
+    # `backed='r'` mode to lift `obs['cell_id'].iloc[0]`, then again in
+    # full-read mode for row-slicing in `_build_clean_adata_from_inference`.
+    # On mmb20 (21 files, multi-GB each on NFS) the second read pass
+    # alone added 30-60 s. Read once into a per-path cache, do the
+    # cell_id matching against the in-memory copy, then point
+    # `source_adatas` at the same objects.
     silver_first_cells: dict = {}
+    silver_full_adata: dict = {}
     for p in source_paths:
         try:
-            a = ad.read_h5ad(p, backed="r")
-            silver_first_cells[p] = str(a.obs["cell_id"].iloc[0])
-            if a.isbacked:
-                a.file.close()
+            a = ad.read_h5ad(p)  # FULL read; needed by _build_clean_adata_from_inference anyway
         except Exception as exc:
-            print(f"  WARN: could not read first cell_id from {p.name}: {exc}")
+            print(f"  WARN: could not read {p.name}: {exc}")
+            continue
+        silver_full_adata[p] = a
+        silver_first_cells[p] = str(a.obs["cell_id"].iloc[0])
 
     # Step 3: invert. id_to_path[bid] = the silver file whose first
     # cell_id matches the blob's id-bid section.
@@ -5054,11 +5630,10 @@ def predict(
             f"used to build the dataset blob."
         )
 
-    # Step 4: load the matched source AnnDatas (full read; needed for
-    # row-slicing into the inference adata).
+    # Step 4: point source_adatas at the cached, already-loaded AnnDatas.
     source_adatas: dict = {}
     for bid, p in id_to_path.items():
-        source_adatas[bid] = ad.read_h5ad(p)
+        source_adatas[bid] = silver_full_adata[p]
         print(f"  adata_batch_id={bid:<3d}  {p.name}  "
               f"(n_obs={source_adatas[bid].n_obs}, "
               f"n_vars={source_adatas[bid].n_vars})")
@@ -5118,7 +5693,12 @@ def predict(
     # We keep the dict but cast values to writeable types.
     adata.uns["squint"] = {k: (str(v) if not isinstance(v, (int, float, bool)) else v)
                           for k, v in adata.uns["squint"].items()}
-    adata.write_h5ad(out_path)
+    # gzip compression shrinks the predicted_adata.h5ad 3-10x at
+    # negligible CPU cost — matters most when the file lives on shared
+    # NFS (network transfer dominates). compression_opts=4 is a sane
+    # default (level 4: balanced compression / write speed). h5py
+    # accepts integers 0-9; raise for higher ratio at write-time cost.
+    adata.write_h5ad(out_path, compression="gzip", compression_opts=4)
 
     print()
     print("=" * 78)
