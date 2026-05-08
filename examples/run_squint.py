@@ -5039,14 +5039,30 @@ def _build_clean_adata_from_inference(
             )
 
         sub = source[src_rows].copy()
-        if gene_names is not None and list(sub.var_names) != list(gene_names):
-            try:
-                sub = sub[:, list(gene_names)].copy()
-            except KeyError as exc:
+        if gene_names is not None:
+            if list(sub.var_names) != list(gene_names):
+                try:
+                    sub = sub[:, list(gene_names)].copy()
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"Source for adata_batch_id={bid} (file "
+                        f"{id_to_path[bid].name}) is missing genes from the "
+                        f"canonical panel: {exc}"
+                    )
+            # After reindex, var_names MUST match the canonical panel
+            # exactly (same order, same set). Mismatch here means the
+            # earlier reindex failed silently — better to crash than to
+            # write a misaligned predicted_adata.h5ad whose `.X` and
+            # `.layers['X_hat']` live in different gene orders.
+            if list(sub.var_names) != list(gene_names):
                 raise RuntimeError(
-                    f"Source for adata_batch_id={bid} (file "
-                    f"{id_to_path[bid].name}) is missing genes from the "
-                    f"canonical panel: {exc}"
+                    f"Gene-order mismatch after reindex for "
+                    f"adata_batch_id={bid} (file {id_to_path[bid].name}): "
+                    f"sub.var_names[:5]={list(sub.var_names)[:5]}, "
+                    f"gene_names[:5]={list(gene_names)[:5]}. The source "
+                    f"AnnData's `.var` is incompatible with the canonical "
+                    f"gene panel; rebuild the dataset blob or restore the "
+                    f"silver file's gene order."
                 )
 
         # Track inference position so we can reorder after concat. Stored
@@ -5393,10 +5409,23 @@ def predict(
         obs_per_batch_id=getattr(dataset_blob, 'obs_per_batch_id', None),
     )
 
-    # Recover the post-HVG gene names (if available). SubsetHVG stores the
-    # surviving column indices on each Data section as `hvg_indices`. Indexing
-    # the dataset_blob applies the transform pipeline; the resulting Data has
-    # `.hvg_indices` (LongTensor) we can use to look up names in gene_panel.
+    # Recover the gene names the MODEL was trained on. The model's X_hat
+    # output (and `inference_data['X']` cache) is in `gene_panel.index`
+    # column order — every section is reindexed to that canonical panel
+    # at blob-build time (`process_anndata_batch` line 367-371). The
+    # source AnnDatas on disk may have a *different* native `var_names`
+    # order (different platforms / different upstream tools); without a
+    # reindex, `adata.X` from the source slice and `adata.layers['X_hat']`
+    # from the model output land in different gene orders → cell-wise
+    # pearson tanks because columns are paired wrong.
+    #
+    # Two cases:
+    #   - SubsetHVG transform was applied: `hvg_indices` is stored per
+    #     section; gene_names = canonical panel sliced to those indices.
+    #   - No HVG transform: gene_names = the FULL canonical panel.
+    #
+    # `_build_clean_adata_from_inference` then reindexes every source
+    # slice to `gene_names`, guaranteeing X_hat and X share gene order.
     gene_names = None
     if gene_panel is not None:
         try:
@@ -5417,6 +5446,14 @@ def predict(
                         break
                 gene_names = [str(gene_panel.index[j]) for j in idxs]
                 print(f"Resolved gene names for {len(gene_names)} HVGs from gene_panel.pkl.")
+            else:
+                # No HVG transform: pin to the full canonical gene panel so
+                # the source slice is reindexed to match X_hat's column order.
+                gene_names = [str(g) for g in gene_panel.index]
+                print(
+                    f"Resolved gene names for {len(gene_names)} genes from "
+                    f"gene_panel.pkl (no HVG; using full canonical panel)."
+                )
         except Exception as exc:  # noqa: BLE001
             print(f"NOTE: could not recover gene names ({exc}); falling back to integer-string names.")
 
