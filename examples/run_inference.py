@@ -130,6 +130,23 @@ def main() -> None:
         help="Override niche-code label set for compute_inference_metrics. "
              "Default: niche,Sub_molecular_tissue_region,ccf_region_name.",
     )
+    # Step-skipping flags. Each maps onto the matching parameter of
+    # `run_inference_and_analysis()`. Useful when re-running the pipeline
+    # against an existing predicted_adata.h5ad (e.g. to refresh metrics
+    # after a metrics-only fix) or when one of the heavy steps (UMAP) was
+    # already done satisfactorily and you only need the cheap ones.
+    p.add_argument("--skip-predict", action="store_true",
+                   help="Reuse the existing predicted_adata.h5ad in run_dir / "
+                        "output_dir (errors if missing). Skips step 2.")
+    p.add_argument("--skip-code-index-plots", action="store_true",
+                   help="Skip plot_code_indices_spatial (step 3).")
+    p.add_argument("--skip-svg-plots", action="store_true",
+                   help="Skip plot_svg_reconstruction (step 4).")
+    p.add_argument("--skip-umap", action="store_true",
+                   help="Skip plot_latent_umap (step 5). The slowest step; "
+                        "skip when prior UMAPs are still valid.")
+    p.add_argument("--skip-metrics", action="store_true",
+                   help="Skip compute_inference_metrics (step 6).")
     args = p.parse_args()
 
     if args.list_variants:
@@ -150,6 +167,11 @@ def main() -> None:
         batch_rename=args.batch_rename,
         cell_label_keys=args.cell_label_keys,
         niche_label_keys=args.niche_label_keys,
+        skip_predict=args.skip_predict,
+        skip_code_index_plots=args.skip_code_index_plots,
+        skip_svg_plots=args.skip_svg_plots,
+        skip_umap=args.skip_umap,
+        skip_metrics=args.skip_metrics,
     )
 
 

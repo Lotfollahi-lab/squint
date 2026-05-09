@@ -622,6 +622,11 @@ def initialize_model(
         adv_hidden = config['model'].get('adversarial_hidden_channels')
         if adv_hidden is not None:
             model_param_dict['adversarial_hidden_channels'] = list(adv_hidden)
+        # Number of train epochs to suppress encoder-side adversarial
+        # gradient (alpha=0 inside the GRL). Default 0 = legacy.
+        model_param_dict['adversarial_warmup_epochs'] = int(
+            config['model'].get('adversarial_warmup_epochs', 0)
+        )
 
     if model_name in ('VQNiche', 'VQNiche_Dual'):
         # Both VQNiche variants accept imputation_params (VQNiche_Dual

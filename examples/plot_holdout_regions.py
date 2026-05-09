@@ -59,17 +59,65 @@ warnings.filterwarnings(
 )
 
 import anndata as ad
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import scanpy as sc
 import yaml
 
+# Make SVG text editable in Illustrator / Inkscape / browsers.
+# Default `svg.fonttype='path'` converts every glyph to an outlined path,
+# so labels can no longer be edited as text downstream. `'none'` keeps
+# text elements as <text> nodes referring to the system font by name —
+# the SVG then opens with editable text wherever the font is available
+# (or any reasonable substitute). `pdf.fonttype=42` is the analogous
+# setting for PDF saves (TrueType embed instead of Type-3 outlines).
+mpl.rcParams['svg.fonttype'] = 'none'
+mpl.rcParams['pdf.fonttype'] = 42
+mpl.rcParams['ps.fonttype']  = 42
+
 
 def _save_dual(fig, out_path, **savefig_kwargs) -> None:
-    """Save the figure as BOTH `.png` and `.svg` siblings."""
+    """Save the figure as BOTH `.png` and `.svg` siblings.
+
+    Per-extension overrides:
+      - SVG saves never use `dpi` (vector format; the kwarg is ignored
+        for the rasterised parts but matplotlib still warns occasionally).
+      - PNG saves keep whatever was passed in.
+    """
     out_path = Path(out_path)
-    for ext in (".png", ".svg"):
-        fig.savefig(out_path.with_suffix(ext), **savefig_kwargs)
+    png_kwargs = dict(savefig_kwargs)
+    svg_kwargs = {k: v for k, v in savefig_kwargs.items() if k != "dpi"}
+    fig.savefig(out_path.with_suffix(".png"), **png_kwargs)
+    fig.savefig(out_path.with_suffix(".svg"), **svg_kwargs)
+
+
+# Platform detection: filename substring -> display name.
+# Used to build per-panel titles + the combined figure suptitle. Keys are
+# lowercased substrings; first match wins. Override per-call via the
+# CLI `--platforms` flag.
+_DEFAULT_PLATFORM_PATTERNS = [
+    ("merfish",  "MERFISH"),
+    ("starmap",  "STARmap"),
+    ("cosmx",    "CosMx"),
+    ("xenium",   "Xenium"),
+    ("visium",   "Visium"),
+]
+
+
+def _detect_platform(filename: str, overrides: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Return a display name for the platform inferred from `filename`,
+    or None if no match. `overrides` lets the caller add / override
+    patterns (lowercase substring -> display name)."""
+    name_lc = filename.lower()
+    if overrides:
+        for substr, display in overrides.items():
+            if substr.lower() in name_lc:
+                return display
+    for substr, display in _DEFAULT_PLATFORM_PATTERNS:
+        if substr in name_lc:
+            return display
+    return None
 
 
 def _resolve_region_bounds(region: dict, x_lo, x_hi, y_lo, y_hi) -> tuple:
@@ -164,7 +212,41 @@ def main() -> None:
                    help="Forwarded to sc.pl.spatial. Default lets scanpy "
                         "auto-pick.")
     p.add_argument("--dpi", type=int, default=150)
+    p.add_argument(
+        "--combined-out", type=str, default="holdout_preview",
+        help="Stem for the combined figure with one panel per section, "
+             "written as <out_dir>/<stem>.{png,svg}. Set to '' to skip. "
+             "Default: 'holdout_preview'.",
+    )
+    p.add_argument(
+        "--combined-title", type=str, default=None,
+        help='Suptitle for the combined figure. Default: " and ".join '
+             "of detected platform names (e.g. 'MERFISH and STARmap').",
+    )
+    p.add_argument(
+        "--platforms", type=str, default=None,
+        help="Optional override mapping <filename-substring>=<display>, "
+             "comma-separated. Example: 'merfish=MERFISH,starmap=STARmap'. "
+             "Built-in detection covers MERFISH/STARmap/CosMx/Xenium/Visium "
+             "by default; this flag is only needed for unusual filenames.",
+    )
+    p.add_argument(
+        "--no-per-section", action="store_true",
+        help="Skip the per-section .holdout.{png,svg} files (only emit "
+             "the combined figure).",
+    )
     args = p.parse_args()
+
+    # Parse --platforms into a dict.
+    platform_overrides: Optional[Dict[str, str]] = None
+    if args.platforms:
+        platform_overrides = {}
+        for token in args.platforms.split(","):
+            token = token.strip()
+            if not token or "=" not in token:
+                continue
+            k, v = token.split("=", 1)
+            platform_overrides[k.strip()] = v.strip()
 
     config: dict = {}
     if args.run_dir:
@@ -218,7 +300,10 @@ def main() -> None:
 
     sc.settings.set_figure_params(dpi=args.dpi, frameon=False)
 
-    n_plotted = 0
+    # First pass: load + mark every section that has a region. Keep the
+    # marked AnnDatas so we can render BOTH per-section files and a
+    # combined figure without re-reading h5ad twice.
+    rendered: list[dict] = []  # entries: {bid, filename, adata, platform, spot_size}
     for f in silver_files:
         a = ad.read_h5ad(f)
         bid = _derive_adata_batch_id(a, f)
@@ -241,36 +326,107 @@ def main() -> None:
             "category"
         ).cat.set_categories(["train", "test"])
 
-        title = f"batch {bid} — {f.name}\nheld-out cells in red"
-        plot_kwargs = dict(
-            color="data_split",
-            palette={"train": "#cccccc", "test": "#d62728"},
-            title=title,
-            show=False,
-            return_fig=True,
-        )
         if args.spot_size is not None:
-            plot_kwargs["spot_size"] = float(args.spot_size)
+            spot = float(args.spot_size)
         else:
             # Auto-pick a spot size proportional to coord range so cells
             # don't render as 1 pixel each.
             xy = np.asarray(a.obsm["spatial"], dtype=float)[:, :2]
             extent = max(xy[:, 0].ptp(), xy[:, 1].ptp())
-            plot_kwargs["spot_size"] = max(extent / 200.0, 1.0)
+            spot = max(extent / 200.0, 1.0)
 
-        fig = sc.pl.spatial(a, **plot_kwargs)
-        out_path = out_dir / f"{f.stem}.holdout.png"
-        _save_dual(fig, out_path, dpi=args.dpi, bbox_inches="tight")
-        plt.close(fig)
-        n_plotted += 1
+        platform = _detect_platform(f.name, platform_overrides)
+        rendered.append({
+            "bid": bid, "filename": f.name, "adata": a,
+            "platform": platform, "spot_size": spot,
+        })
 
-    if n_plotted == 0:
+    if not rendered:
         raise SystemExit(
             "No sections matched test_regions. Make sure the silver "
             "files have uns['batch'] set and that the keys match "
             f"{sorted(test_regions)}."
         )
-    print(f"Wrote {n_plotted} plot(s) to {out_dir}")
+
+    palette = {"train": "#cccccc", "test": "#d62728"}
+
+    # ---- per-section files (one .png + .svg per section) ----------------
+    if not args.no_per_section:
+        for r in rendered:
+            # Title precedence: detected platform > "batch <bid>".
+            title = r["platform"] if r["platform"] else f"batch {r['bid']}"
+            fig = sc.pl.spatial(
+                r["adata"],
+                color="data_split",
+                palette=palette,
+                title=title,
+                spot_size=r["spot_size"],
+                show=False,
+                return_fig=True,
+            )
+            out_path = out_dir / f"{Path(r['filename']).stem}.holdout.png"
+            _save_dual(fig, out_path, dpi=args.dpi, bbox_inches="tight")
+            plt.close(fig)
+        print(f"Wrote {len(rendered)} per-section plot(s) to {out_dir}")
+
+    # ---- combined figure (one figure, one panel per section) ------------
+    if args.combined_out:
+        # Suptitle: explicit override > " and ".join of detected platforms.
+        if args.combined_title:
+            suptitle = args.combined_title
+        else:
+            platforms_seen = [r["platform"] for r in rendered if r["platform"]]
+            suptitle = (" and ".join(platforms_seen) if platforms_seen
+                        else "Held-out regions")
+
+        n = len(rendered)
+        fig, axes = plt.subplots(
+            1, n,
+            figsize=(5.5 * n, 5.5),
+            squeeze=False,
+        )
+        axes = axes.ravel()
+        for ax, r in zip(axes, rendered):
+            xy = np.asarray(r["adata"].obsm["spatial"], dtype=float)[:, :2]
+            split = r["adata"].obs["data_split"].astype(str).to_numpy()
+            colors = np.array([palette[s] for s in split])
+            # Direct scatter so we control marker size and the SVG
+            # contains a single Path collection (small file, all text
+            # nodes intact). sc.pl.spatial wraps matplotlib but injects
+            # a lot of ax-level decorations we don't need here.
+            ax.scatter(
+                xy[:, 0], xy[:, 1],
+                c=colors, s=max(r["spot_size"] / 4.0, 0.4),
+                linewidths=0, marker="o",
+            )
+            ax.set_aspect("equal")
+            ax.invert_yaxis()  # match scanpy/scanpy.spatial convention
+            ax.set_xticks([]); ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            panel_title = r["platform"] if r["platform"] else f"batch {r['bid']}"
+            ax.set_title(panel_title, fontsize=14)
+
+        # Single combined legend, top-right of the figure (avoids
+        # cluttering each panel; the colour mapping is shared).
+        from matplotlib.lines import Line2D
+        legend_handles = [
+            Line2D([0], [0], marker='o', color='w', markerfacecolor=palette['train'],
+                   markersize=8, label='train'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor=palette['test'],
+                   markersize=8, label='test (held out)'),
+        ]
+        fig.legend(
+            handles=legend_handles, loc="upper right",
+            bbox_to_anchor=(0.99, 0.97), frameon=False, fontsize=11,
+        )
+        fig.suptitle(suptitle, fontsize=16, y=0.99)
+        fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+        combined_path = out_dir / args.combined_out
+        _save_dual(fig, combined_path, dpi=args.dpi, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Wrote combined plot to {combined_path}.{{png,svg}}")
 
 
 if __name__ == "__main__":

@@ -233,15 +233,26 @@ class VQNiche_Dual(BaseModel):
                 dropout=0.0,
             )
             self.adversarial_alpha = float(adversarial_alpha)
+            # Number of TRAIN epochs before the adversary contributes to
+            # the loss. During warmup the adversary head still exists but
+            # `_step` skips its forward + loss-data wiring entirely, so
+            # the encoder's gradient comes from reconstruction / commit /
+            # adjacency only. This lets codes settle on biology before
+            # batch-invariance pressure kicks in (mitigates the
+            # "early-training adversary scrubs biological signal"
+            # failure mode). Default 0 = legacy behaviour.
+            self.adversarial_warmup_epochs = int(adversarial_warmup_epochs)
             print(
                 f"6. Batch-adversary head: z_mlp[{self.encoder.cell_dim}] -> "
                 f"{adversarial_batch_dim} batches "
                 f"(hidden={adversarial_hidden_channels or [128]}, "
-                f"alpha={adversarial_alpha})."
+                f"alpha={adversarial_alpha}, "
+                f"warmup_epochs={self.adversarial_warmup_epochs})."
             )
         else:
             self.batch_adversary = None
             self.adversarial_alpha = 0.0
+            self.adversarial_warmup_epochs = 0
 
         # ---- separate NB dispersion for the niche branch -------------------
         # BaseModel already created `self.dispersion` (per-gene, learnable);
@@ -500,8 +511,22 @@ class VQNiche_Dual(BaseModel):
                     "that initialize_databatch is being called for this "
                     "variant."
                 )
+            # Warmup: during the first `adversarial_warmup_epochs` the
+            # GRL is run with alpha=0 so the gradient flowing back to
+            # the encoder is zero. The classifier still trains
+            # (learns to predict batch from a frozen z_mlp), and the
+            # adversary CE term still contributes to total_loss for
+            # logging — but the encoder is shielded from
+            # batch-invariance pressure until codes have settled on
+            # biology. Default warmup=0 = legacy behaviour
+            # (alpha = self.adversarial_alpha from epoch 0).
+            warmup = getattr(self, "adversarial_warmup_epochs", 0)
+            effective_alpha = (
+                0.0 if self.current_epoch < warmup
+                else self.adversarial_alpha
+            )
             batch_logits_for_loss = self.batch_adversary(
-                z_mlp, alpha=self.adversarial_alpha,
+                z_mlp, alpha=effective_alpha,
             )
 
         loss_data = {
