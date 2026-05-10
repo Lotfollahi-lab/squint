@@ -37,6 +37,16 @@ SQUINT_REPO="${4:-/nfs/team361/sb75/squint}"
 # Defensive: scrub PYTHONPATH/PYTHONHOME (see _run_one_variant.sh).
 unset PYTHONPATH PYTHONHOME
 
+# Force TMPDIR to node-local /tmp/$USER. Multiprocessing tempdirs on
+# NFS hit `.nfsXXXX` silly-rename races at process exit ("OSError:
+# [Errno 16] Device or resource busy"), which clobber the inference
+# loop with cleanup tracebacks even when the actual work succeeded.
+# Setting TMPDIR here (BEFORE the WANDB_BASE/tmp default below) means
+# every subprocess (DataLoader workers, rapids UMAP, etc.) puts its
+# tempdirs on local SSD instead of NFS.
+export TMPDIR="/tmp/${USER:-$(id -un)}"
+mkdir -p "$TMPDIR"
+
 # Wandb / TMPDIR redirects identical to the train runner. predict() doesn't
 # upload artifacts, but the rapids UMAP subprocess (when not skipped) and
 # subprocess scripts can still write to TMPDIR; keep them off $HOME.
