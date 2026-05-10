@@ -99,6 +99,9 @@ class VQNiche_Dual(BaseModel):
             adversarial_alpha: float = 1.0,
             adversarial_hidden_channels: Optional[List[int]] = None,
             adversarial_warmup_epochs: int = 0,
+            adversarial_schedule: Literal["constant", "cosine"] = "constant",
+            adversarial_total_epochs: int = 100,
+            adversarial_apply_to: Literal["full", "cell"] = "full",
         ):
         # BaseModel.__init__ stores names + builds the loss-fn dispatcher.
         # We pass placeholder values for adjacency_decoder_name (unused)
@@ -242,17 +245,41 @@ class VQNiche_Dual(BaseModel):
             # "early-training adversary scrubs biological signal"
             # failure mode). Default 0 = legacy behaviour.
             self.adversarial_warmup_epochs = int(adversarial_warmup_epochs)
+            # `adversarial_schedule` controls how the effective alpha
+            # evolves over training. 'constant' (default) is the legacy
+            # behaviour: alpha = adversarial_alpha after warmup. 'cosine'
+            # ramps alpha up then down with a half-cosine envelope —
+            # peaks at the midpoint of the post-warmup phase, decays to
+            # ~0 at `adversarial_total_epochs`. The decay phase lets the
+            # cell token consolidate its features without active gradient
+            # reversal in the late training epochs.
+            self.adversarial_schedule = str(adversarial_schedule)
+            self.adversarial_total_epochs = int(adversarial_total_epochs)
+            # `adversarial_apply_to` selects WHICH rows of z_mlp the
+            # adversary classifies. 'full' (default) classifies the
+            # full tensor (seeds + sampled neighbours) — pushes both
+            # cell and niche branches toward batch-invariance. 'cell'
+            # restricts to the seed prefix `z_mlp[:batch_size]`, which
+            # only pressures the CELL branch; the niche-branch GNN
+            # consumes z_mlp via aggregation over neighbours that are
+            # NOT classified, so the niche pathway is left un-adv'd.
+            self.adversarial_apply_to = str(adversarial_apply_to)
             print(
                 f"6. Batch-adversary head: z_mlp[{self.encoder.cell_dim}] -> "
                 f"{adversarial_batch_dim} batches "
                 f"(hidden={adversarial_hidden_channels or [128]}, "
                 f"alpha={adversarial_alpha}, "
-                f"warmup_epochs={self.adversarial_warmup_epochs})."
+                f"warmup_epochs={self.adversarial_warmup_epochs}, "
+                f"schedule={self.adversarial_schedule}, "
+                f"apply_to={self.adversarial_apply_to})."
             )
         else:
             self.batch_adversary = None
             self.adversarial_alpha = 0.0
             self.adversarial_warmup_epochs = 0
+            self.adversarial_schedule = "constant"
+            self.adversarial_total_epochs = 100
+            self.adversarial_apply_to = "full"
 
         # ---- separate NB dispersion for the niche branch -------------------
         # BaseModel already created `self.dispersion` (per-gene, learnable);
@@ -521,12 +548,47 @@ class VQNiche_Dual(BaseModel):
             # biology. Default warmup=0 = legacy behaviour
             # (alpha = self.adversarial_alpha from epoch 0).
             warmup = getattr(self, "adversarial_warmup_epochs", 0)
-            effective_alpha = (
-                0.0 if self.current_epoch < warmup
-                else self.adversarial_alpha
-            )
+            schedule = getattr(self, "adversarial_schedule", "constant")
+            total_epochs = getattr(self, "adversarial_total_epochs", 100)
+
+            if self.current_epoch < warmup:
+                effective_alpha = 0.0
+            elif schedule == "cosine":
+                # Cosine envelope after warmup: alpha rises from 0,
+                # peaks at the midpoint of `[warmup, total_epochs]`,
+                # decays back to ~0 at `total_epochs`. Past
+                # `total_epochs` (in case training over-runs), alpha
+                # stays at 0 — the cell token can consolidate without
+                # any further gradient reversal.
+                span = max(1, total_epochs - warmup)
+                phase = (self.current_epoch - warmup) / span  # 0..1
+                if phase >= 1.0:
+                    envelope = 0.0
+                else:
+                    # Half-sine: 0 -> 1 (peak at phase=0.5) -> 0
+                    envelope = float(
+                        torch.sin(torch.tensor(phase * 3.14159265358979)).item()
+                    )
+                effective_alpha = self.adversarial_alpha * envelope
+            else:
+                effective_alpha = self.adversarial_alpha
+
+            # `adversarial_apply_to` selects which rows of z_mlp the
+            # adversary classifies. 'full' = legacy behaviour (the
+            # full tensor of seeds + sampled neighbours). 'cell' =
+            # seed-prefix only (= the cell-branch input pre-VQ); the
+            # niche-branch GNN consumes the un-classified neighbour
+            # rows so the niche pathway is left un-adv'd.
+            apply_to = getattr(self, "adversarial_apply_to", "full")
+            if apply_to == "cell":
+                z_for_adv = z_mlp[:batch_size]
+                adv_labels = adata_batch_ids[:batch_size].long()
+            else:
+                z_for_adv = z_mlp
+                adv_labels = adata_batch_ids.long()
+
             batch_logits_for_loss = self.batch_adversary(
-                z_mlp, alpha=effective_alpha,
+                z_for_adv, alpha=effective_alpha,
             )
 
         loss_data = {
@@ -567,11 +629,24 @@ class VQNiche_Dual(BaseModel):
 
         # Adversarial batch loss data (only when the adversary is built).
         # Loss dispatcher reads `batch_logits` and `batch_labels` keys.
-        # FULL-batch labels (seeds + sampled neighbours) — paired 1:1 with
-        # the FULL `z_mlp` we just classified above.
+        # `adv_labels` was sliced above to match `z_for_adv` (full or
+        # cell-only) so logits and labels are paired 1:1.
         if batch_logits_for_loss is not None:
             loss_data['batch_logits'] = batch_logits_for_loss
-            loss_data['batch_labels'] = adata_batch_ids.long()
+            loss_data['batch_labels'] = adv_labels
+
+        # MMD-batch loss data — populated unconditionally (the loss is
+        # only consumed if `mmd_batch_loss` is in `loss_names`). Target:
+        # the cell-token input pre-VQ, restricted to seed cells. MMD on
+        # the seed prefix is the right scope for the cell-branch since
+        # z_q_cell = vq_cell(z_mlp[:batch_size]). The dispatcher reads
+        # `mmd_target_labels` (a separate key from `batch_labels` so
+        # MMD and the adversarial CE can coexist with different label
+        # slices — adversary may use full-tensor labels when
+        # apply_to='full', MMD always uses seed-only).
+        if adata_batch_ids is not None:
+            loss_data['mmd_target'] = z_mlp[:batch_size]
+            loss_data['mmd_target_labels'] = adata_batch_ids[:batch_size].long()
 
         loss_value = self.common_step(
             batch_loss_data=loss_data,

@@ -22,6 +22,7 @@ from vqniche.loss import (
     bce_adjacency_reconstruction_loss,
     bce_cosine_adjacency_reconstruction_loss,
     adversarial_batch_loss,
+    mmd_batch_loss,
     mse_joint_code_commit_loss,
     ce_spatial_prior_loss,
     mse_commit_loss,
@@ -323,6 +324,33 @@ class BaseModel(pl.LightningModule):
                 wt_adv_batch = loss_kwargs.get('wt_adv_batch')
                 if wt_adv_batch is not None:
                     loss_fn_params['wt_adv_batch'] = wt_adv_batch
+
+            elif loss_fn_name == 'mmd_batch_loss':
+                # Non-adversarial batch-invariance loss. Computes
+                # differentiable MMD between the per-batch distributions
+                # of `mmd_target` (typically z_mlp[:batch_size], the
+                # cell-token input pre-VQ) and adds it to the total
+                # loss. Unlike the adversarial CE, MMD has no min-max
+                # game — backprop directly minimises the kernel-based
+                # distribution distance, so it doesn't suffer the
+                # warmup pathology where the cell token learns
+                # batch-correlated features early and the late-arriving
+                # adversary can't remove them.
+                #
+                # We read `mmd_target_labels` (NOT `batch_labels`)
+                # because the adversarial CE may also be active and
+                # populate `batch_labels` with the FULL-tensor variant
+                # (seeds + sampled neighbours), whereas MMD always
+                # operates on the seed prefix only — so it needs the
+                # seed-only label slice.
+                loss_fn = mmd_batch_loss
+                loss_fn_data_keys = ['mmd_target', 'mmd_target_labels']
+                wt_mmd_batch = loss_kwargs.get('wt_mmd_batch')
+                if wt_mmd_batch is not None:
+                    loss_fn_params['wt_mmd_batch'] = wt_mmd_batch
+                mmd_n_sub = loss_kwargs.get('mmd_n_sub')
+                if mmd_n_sub is not None:
+                    loss_fn_params['n_sub'] = int(mmd_n_sub)
 
             elif loss_fn_name == 'mse_commit_loss_cell':
                 # Commit loss for the CELL branch of VQNiche_Dual. Pulls

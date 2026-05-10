@@ -16,6 +16,7 @@ from .mse_adjacency_reconstruction import mse_adjacency_reconstruction_loss
 from .bce_adjacency_reconstruction import bce_adjacency_reconstruction_loss
 from .bce_cosine_adjacency_reconstruction import bce_cosine_adjacency_reconstruction_loss
 from .adversarial_batch import adversarial_batch_loss
+from .mmd_batch import mmd_batch_loss
 from .spatial_prior_loss import ce_spatial_prior_loss
 from .codebook_losses import (
     mse_commit_loss,
@@ -40,6 +41,7 @@ __all__ = [
     "bce_adjacency_reconstruction_loss",
     "bce_cosine_adjacency_reconstruction_loss",
     "adversarial_batch_loss",
+    "mmd_batch_loss",
     "ce_spatial_prior_loss",
     "mse_commit_loss",
     "mse_code_loss",

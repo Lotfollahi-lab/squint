@@ -627,6 +627,25 @@ def initialize_model(
         model_param_dict['adversarial_warmup_epochs'] = int(
             config['model'].get('adversarial_warmup_epochs', 0)
         )
+        # Adversarial-alpha schedule. 'constant' (default = legacy)
+        # holds alpha at `adversarial_alpha` after warmup.
+        # 'cosine' uses a half-sine envelope that peaks at the
+        # midpoint of the post-warmup phase and decays back to ~0
+        # at `adversarial_total_epochs`.
+        model_param_dict['adversarial_schedule'] = str(
+            config['model'].get('adversarial_schedule', 'constant')
+        )
+        model_param_dict['adversarial_total_epochs'] = int(
+            config['model'].get('adversarial_total_epochs', 100)
+        )
+        # Whether the adversarial classifier sees the full z_mlp
+        # tensor (legacy 'full') or only the seed prefix
+        # `z_mlp[:batch_size]` ('cell'). 'cell' restricts the
+        # adversary's pressure to the cell branch and leaves the
+        # niche pathway unpressured by the GRL.
+        model_param_dict['adversarial_apply_to'] = str(
+            config['model'].get('adversarial_apply_to', 'full')
+        )
 
     if model_name in ('VQNiche', 'VQNiche_Dual'):
         # Both VQNiche variants accept imputation_params (VQNiche_Dual

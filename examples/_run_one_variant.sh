@@ -35,6 +35,17 @@ SQUINT_REPO="${3:-/nfs/team361/sb75/squint}"
 # venv's site-packages and break `import torch` even after activation.
 unset PYTHONPATH PYTHONHOME
 
+# Force TMPDIR to node-local /tmp/$USER. Multiprocessing tempdirs on
+# NFS hit `.nfsXXXX` silly-rename races at process exit ("OSError:
+# [Errno 16] Device or resource busy"), which clobber the training
+# loop with cleanup tracebacks even after early-stopping fired and
+# the run completed cleanly. Setting TMPDIR here (BEFORE the
+# WANDB_BASE/tmp default below) means every subprocess (DataLoader
+# workers, etc.) puts its tempdirs on local SSD instead of NFS.
+# Sibling fix to the same patch in `_run_one_variant_inference.sh`.
+export TMPDIR="/tmp/${USER:-$(id -un)}"
+mkdir -p "$TMPDIR"
+
 # ----------------------------------------------------------------------------
 # Redirect wandb / tmp caches off $HOME — HPC home dirs are typically
 # quota-limited (10–50 GB) and the run config has `log_model=True`, so

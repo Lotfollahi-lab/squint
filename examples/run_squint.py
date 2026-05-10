@@ -674,16 +674,21 @@ def make_train_config_poc() -> dict:
             # generalisation rather than the optimisation objective on
             # the training set, which matters in particular for the
             # adversarial variants where train_loss can keep declining
-            # while val performance silently degrades. patience=15 epochs
-            # ≈ 6k gradient steps at batch_size=256 / ~100k cells —
+            # while val performance silently degrades. patience=20 epochs
+            # ≈ 8k gradient steps at batch_size=256 / ~100k cells —
             # enough to distinguish a true plateau from a codebook
-            # reshuffle. min_delta=0.1: small absolute, but val_loss in
-            # this codebase ranges ~140-170 so 0.1 ≈ 0.07% relative.
+            # reshuffle, and enough to ride through the adversarial
+            # alpha ramp-up that comes after `adv-warmup10` (otherwise
+            # patience=15 can fire during the 10-epoch warm-up + ~5
+            # post-warm-up epochs, before the adv-driven val_loss drift
+            # has had time to stabilise). min_delta=0.1: small absolute,
+            # but val_loss in this codebase ranges ~140-170 so 0.1 ≈
+            # 0.07% relative.
             "early_stopping_params": {
                 "enabled":    True,
                 "monitor":    "val_loss",
                 "mode":       "min",
-                "patience":   15,
+                "patience":   20,
                 "min_delta":  0.1,
             },
         },
@@ -1272,6 +1277,23 @@ def _patch_dual_rvq(cfg: dict,
     return cfg
 
 
+def _patch_dual_vq(cfg: dict,
+                   branch: str = "cell",
+                   codebook_size: int = 30) -> dict:
+    """
+    Swap one or both VQ slots for a single-level (non-hierarchical)
+    `VectorQuantize` with the specified codebook_size. Mirrors
+    `_patch_dual_rvq` but for the single-level case — useful for v7
+    ablations that hold one branch at a non-hierarchical VQ while the
+    other uses RVQ. `branch` may be 'cell', 'niche', or 'both'.
+    """
+    if branch in ("cell", "both"):
+        cfg["model"]["encoder_params"]["vq_cell_params"]  = _default_vq_params(codebook_size=codebook_size)
+    if branch in ("niche", "both"):
+        cfg["model"]["encoder_params"]["vq_niche_params"] = _default_vq_params(codebook_size=codebook_size)
+    return cfg
+
+
 def _patch_dual_cvq(cfg: dict,
                     branch: str = "both",
                     k1: int = 30,
@@ -1592,6 +1614,228 @@ def _patch_dual_adversarial(
     if "adversarial_batch_loss" not in losses:
         losses.append("adversarial_batch_loss")
     cfg["model"]["loss_params"]["loss_kwargs"]["wt_adv_batch"] = float(wt_adv_batch)
+    return cfg
+
+
+def _patch_dual_adversarial_cosine(
+        cfg: dict,
+        total_epochs: int = 100,
+    ) -> dict:
+    """
+    Switch the adversarial alpha to a cosine schedule (vs the legacy
+    constant). After warmup, alpha follows a half-sine envelope: rises
+    from 0 at `warmup_epochs`, peaks at the midpoint of the post-warmup
+    phase, decays back to ~0 at `total_epochs`. Past `total_epochs` the
+    alpha stays at 0.
+
+    Why use this: the constant schedule keeps adversarial pressure on
+    the encoder until the very last epoch. Combined with `adv-warmup`,
+    the cell token doesn't get a "consolidation phase" to refine
+    cell-type-discriminative features without the gradient reversal
+    pulling them apart. The cosine decay creates that consolidation
+    phase in the final ~25% of training, while still giving strong
+    integration pressure mid-training.
+
+    Pair with `_patch_dual_adversarial(warmup_epochs=10, ...)` and an
+    `adv-warmup10` variant tag for the intended use case.
+
+    NOTE: requires `_patch_dual_adversarial` to have been called first
+    on the cfg (this patch only flips the schedule flag — the
+    adversarial head itself is built by the prior patch).
+    """
+    if "adversarial_batch_dim_request" not in cfg["model"]:
+        raise RuntimeError(
+            "_patch_dual_adversarial_cosine: call "
+            "_patch_dual_adversarial() first to enable the adversarial "
+            "head, then chain this patch on top."
+        )
+    cfg["model"]["adversarial_schedule"] = "cosine"
+    cfg["model"]["adversarial_total_epochs"] = int(total_epochs)
+    return cfg
+
+
+def _patch_dual_adversarial_cell_only(cfg: dict) -> dict:
+    """
+    Restrict the adversarial classifier to the SEED prefix of z_mlp
+    (i.e. the per-cell embedding before VQ), instead of classifying
+    the full tensor (seeds + sampled neighbours).
+
+    Why: the niche-branch GNN aggregates over neighbour z_mlp rows to
+    produce z_gnn. With the legacy `apply_to='full'` setting, the
+    adversarial gradient reaches BOTH the cell pathway (z_mlp[:B] -> VQ
+    cell) and the niche pathway (z_mlp[B:] -> GNN -> VQ niche). Both
+    branches lose batch-correlated info. With `apply_to='cell'`, only
+    the seed rows feed the adversary's CE — the niche branch is left
+    un-pressured by the adversary, keeping its spatial-aggregation
+    capacity intact.
+
+    Hypothesis: cell-type identification benefits from concentrating
+    the adversarial "budget" on the cell branch where it matters most;
+    the niche branch's batch-mixing is achieved instead by the
+    decoder covariate + adjacency reconstruction (which already
+    absorb batch-specific patterns elsewhere).
+
+    NOTE: requires `_patch_dual_adversarial` to have been called first.
+    """
+    if "adversarial_batch_dim_request" not in cfg["model"]:
+        raise RuntimeError(
+            "_patch_dual_adversarial_cell_only: call "
+            "_patch_dual_adversarial() first to enable the adversarial "
+            "head, then chain this patch on top."
+        )
+    cfg["model"]["adversarial_apply_to"] = "cell"
+    return cfg
+
+
+def _patch_dual_mmd_batch(
+        cfg: dict,
+        wt_mmd_batch: float = 50.0,
+        n_sub: int = 512,
+    ) -> dict:
+    """
+    Add a non-adversarial MMD batch-invariance loss on the cell-token
+    input (z_mlp[:batch_size]).
+
+    Computes a kernel-based MMD between per-batch distributions on
+    each mini-batch and adds it directly to the total loss. Unlike
+    the adversarial CE — which involves a min-max game between the
+    classifier and the encoder, and can fail to remove
+    batch-correlated features that were learned during a warmup phase —
+    MMD applies a deterministic distribution-matching pressure on
+    every step.
+
+    Recipe (mirrors `mmd_comparable` in compute_inference_metrics.py
+    so train-time pressure and test-time evaluation use the same
+    kernel):
+      - z-score per-dim normalisation
+      - RBF kernel with sigma chosen by median pairwise distance
+      - Pairwise MMD^2 across all batches present, summed
+
+    Use cases:
+      1. Pair with `_patch_dual_adversarial(warmup_epochs=10)` to give
+         a non-adversarial integration safety-net during the warmup
+         period (during which the GRL alpha is 0).
+      2. Replace the adversarial CE entirely (drop
+         `_patch_dual_adversarial`) to test whether MMD alone is
+         sufficient for batch alignment — simpler architecture, no
+         classifier to tune.
+
+    Parameters
+    ----------
+    wt_mmd_batch
+        Loss weight for the MMD term. Default 50.0. The unweighted
+        MMD^2 is in [0, 2] for a normalised kernel; values around
+        50-200 put it on a comparable scale to the adversarial CE
+        (which sits at log(2) * wt_adv_batch ≈ 100 for wt=150).
+    n_sub
+        Sub-sample size per batch. Default 512 — keeps the pairwise
+        kernel matrix at ~1 MB.
+    """
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    if "mmd_batch_loss" not in losses:
+        losses.append("mmd_batch_loss")
+    cfg["model"]["loss_params"]["loss_kwargs"]["wt_mmd_batch"] = float(wt_mmd_batch)
+    cfg["model"]["loss_params"]["loss_kwargs"]["mmd_n_sub"] = int(n_sub)
+    # The model's `_step` populates `mmd_target` and `mmd_target_labels`
+    # from `z_mlp[:batch_size]` and `adata_batch_ids[:batch_size]`
+    # unconditionally; the dispatcher only consumes them when
+    # `mmd_batch_loss` is in `loss_names`.
+    return cfg
+
+
+def _patch_dual_encoder_shallow(
+        cfg: dict,
+        hidden_channels: Optional[List[int]] = None,
+    ) -> dict:
+    """
+    Shrink the encoder MLP trunk: from `[400, 256]` (2 hidden layers,
+    the default) to `[256]` (1 hidden layer) by default. Latent dim
+    (= last layer output = 256) is preserved so codebook + GNN dims
+    don't shift; only the depth shrinks.
+
+    Hypothesis: a smaller-capacity encoder has less room to memorise
+    batch-specific features, which (combined with a brief warmup
+    phase) may push the cell-type discriminative signal up while
+    keeping the integration cost manageable. Sibling of
+    `_patch_dual_encoder_deeper`; both target the same MLP trunk
+    inside the encoder.
+
+    NOTE: this is the trunk only — the GNN depth and decoder MLP
+    width are controlled separately by `_patch_dual_wide` / the
+    sampler patches / `_patch_dual_small`. For an even more
+    aggressive capacity bottleneck, pair with `_patch_dual_small`.
+    """
+    enc = cfg["model"]["encoder_params"]
+    target = list(hidden_channels) if hidden_channels else [256]
+    enc["mlp_params"]["hidden_channels"] = target
+    return cfg
+
+
+def _patch_dual_commit_cell_weight(
+        cfg: dict,
+        wt_commit_cell: float = 2.0,
+    ) -> dict:
+    """
+    Increase the cell-branch commit-loss weight from the default 1.0
+    (set per-loss inside `_make_default_dual_config`) to `wt_commit_cell`.
+
+    The commit loss pulls `z_mlp[:batch_size]` (the cell-branch input
+    pre-VQ) toward `z_q_cell` (the post-VQ embedding). Higher weight
+    means z_mlp commits more aggressively to discrete codes — codes
+    are sharper / less smeared, and within-class variance in the
+    cell-token shrinks.
+
+    Hypothesis: with the cell-token discrete codes "sharpened", cells
+    of the same cell-type cluster around fewer codes, raising the
+    NMI(cell-token, cell_type). Trade-off: higher cell-commit can
+    starve the niche-branch GNN, which consumes the SAME z_mlp tensor
+    (sampled neighbours) — if z_mlp is dominated by sharp cell-cluster
+    geometry, the GNN's spatial aggregation may degrade. Pair with
+    a weaker niche-branch lever (e.g. lower wt_commit_niche) if you
+    see niche-NMI regress.
+    """
+    cfg["model"]["loss_params"]["loss_kwargs"]["wt_commit_cell"] = float(wt_commit_cell)
+    return cfg
+
+
+def _patch_dual_cross_entropy(
+        cfg: dict,
+        wt_cross_entropy: float = 10.0,
+    ) -> dict:
+    """
+    Turn ON the supervised cell-type cross-entropy loss on the
+    Linear predictor head (z_mlp[:batch_size] -> n_cell_types) with
+    weight `wt_cross_entropy`.
+
+    NOTE on methodological framing: this makes the variant
+    SEMI-SUPERVISED — it consumes ground-truth `cell_type` labels
+    at training time. The other SQUINT variants are unsupervised
+    (reconstruction + commit + adjacency + adversarial only). Reporting
+    a semi-supervised variant alongside the unsupervised ones is fair
+    iff clearly labeled in the methods — it gives an empirical upper
+    bound for "how much can cell-NMI improve if we directly optimise
+    for it?", which scaffolds the unsupervised story.
+
+    Mechanism: the Linear predictor is already built by `BaseModel`
+    (256 -> n_cell_types) but its output is unused unless
+    `cross_entropy_loss` is in `loss_names`. This patch flips it on
+    and sets the weight. The loss data dispatcher in
+    `BaseModel.criterion` already reads `logits` and `labels` from
+    loss_data, both of which `VQNiche_Dual._step` populates from
+    `predictor(z_mlp[:batch_size])` and `batch.y` respectively.
+
+    Weight calibration: typical NB attribute-reconstruction loss is
+    ~150 nats, CE on a 49-way classifier is bounded by log(49) ≈ 3.9.
+    A weight of 10 puts the CE gradient at ~10 × 3.9 / 150 ≈ 0.26x
+    the NB gradient — comparable to wt_adv_batch's effective scale —
+    so the predictor's signal is significant but doesn't dominate.
+    Lower (5) for more conservative; higher (50, 100) if cell-NMI
+    isn't the bottleneck.
+    """
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    if "cross_entropy_loss" not in losses:
+        losses.append("cross_entropy_loss")
+    cfg["model"]["loss_params"]["loss_kwargs"]["wt_cross_entropy"] = float(wt_cross_entropy)
     return cfg
 
 
@@ -2940,6 +3184,448 @@ VARIANTS: dict = {
             ),
         ),
     },
+    # ========================================================================
+    # mmb0-1b_smb1-1b_1p ablations v6 — push cell-token NMI on cell_type
+    # WITHOUT regressing batch integration. Diagnostic from summary_long.csv:
+    #   - `adv-warmup10` family: best cell-NMI (~0.50) but iLISI ≈ 0
+    #     (warm-up lets the cell token learn batch-correlated features
+    #     early; the late-arriving adversary can't remove them).
+    #   - `enc-deeper` family: best iLISI (~0.50) but cell-NMI ~0.40
+    #     (strong adv from epoch 0 keeps the cell token batch-clean
+    #     but never lets it commit batch-discriminating features).
+    # The 8 variants below test orthogonal mechanisms for restoring
+    # integration AFTER a warmup phase, plus capacity-bottleneck
+    # variants with built-in protection. Group via
+    # `--all-dataset mmb0-1b_smb1-1b_1p-ablations-v6`.
+    # ========================================================================
+    # Group A — smaller encoder + warmup
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-shallow+adv-warmup5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v6 — encoder MLP shrunk to 1 hidden layer ([256] vs the "
+            "default [400, 256]) + 5-epoch warmup. Hypothesis: capacity "
+            "bottleneck reduces room to memorise batch-specific features; "
+            "short warmup gives cell token a head start but limits how "
+            "much batch-correlated info it can encode before the "
+            "adversary kicks in. Expected: cell-NMI 0.42-0.46; "
+            "iLISI 0.15-0.25."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=5)",
+            "+enc-shallow(mlp=[256])",
+        ],
+        "build": lambda: _patch_dual_encoder_shallow(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=5,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-shallow+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v6 — same as above but warmup extended to 10 epochs. "
+            "Tests whether the capacity bottleneck is enough to keep "
+            "iLISI alive at the longer warmup that previously killed "
+            "integration entirely. Expected: cell-NMI 0.46-0.50; "
+            "iLISI 0.10-0.20."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-shallow(mlp=[256])",
+        ],
+        "build": lambda: _patch_dual_encoder_shallow(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+        ),
+    },
+    "dualvq+small+rvq-both+decoder-cov+adv+adv-warmup5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v6 — `+small` (scvi-style 1-layer encoder + narrow GNN + "
+            "narrow decoders) + warmup 5. The most aggressive capacity "
+            "limit; tests whether a much smaller model finds a sweet "
+            "spot. Existing `+small+rvq+adv` (no warmup) already gave "
+            "cell-NMI 0.465 / iLISI 0.071; warmup should push cell-NMI "
+            "higher. Expected: cell-NMI 0.46-0.50; iLISI 0.05-0.15."
+        ),
+        "patches": [
+            "+small(hidden=128)", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=5)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_small(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0, warmup_epochs=5,
+        ),
+    },
+    # Group B — warmup paired with non-adversarial integration mechanism (MMD)
+    "dualvq+wide+rvq-both+decoder-cov+adv+adv-warmup10+mmd-w50+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v6 — best-performing warmup10 spine + MMD-batch loss "
+            "(λ=50) on the cell-token input z_mlp[:B]. MMD has no "
+            "min-max game so it doesn't suffer the warmup pathology: "
+            "it pushes per-batch distributions together by ordinary "
+            "backprop on every step, including during the adversarial "
+            "warmup window. Expected: the breakthrough variant — "
+            "cell-NMI 0.48-0.51; iLISI 0.15-0.30."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+mmd_batch(wt=50, n_sub=512)",
+        ],
+        "build": lambda: _patch_dual_mmd_batch(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+            wt_mmd_batch=50.0, n_sub=512,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+adv-warmup10+mmd-w200+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v6 — same as above but MMD λ=200 (4x stronger). Tests "
+            "whether aggressive MMD makes integration a hard "
+            "constraint. Risk: kills the cell-type signal if too "
+            "strong. Expected: cell-NMI 0.45-0.50; iLISI 0.25-0.40."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+mmd_batch(wt=200, n_sub=512)",
+        ],
+        "build": lambda: _patch_dual_mmd_batch(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+            wt_mmd_batch=200.0, n_sub=512,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+mmd-w100+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v6 — REPLACE adversary with MMD (λ=100), no warmup needed. "
+            "Critical comparison: tests whether the adversary is even "
+            "necessary, or whether MMD alone gives both integration "
+            "and a clean cell-token. Simpler architecture (no "
+            "classifier to tune). Expected: cell-NMI 0.42-0.48; "
+            "iLISI 0.20-0.35."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+mmd_batch(wt=100, n_sub=512)",
+        ],
+        "build": lambda: _patch_dual_mmd_batch(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            wt_mmd_batch=100.0, n_sub=512,
+        ),
+    },
+    # Group C — schedule + asymmetric adversary
+    "dualvq+wide+rvq-both+decoder-cov+adv-cell-only+adv-w300+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v6 — adversarial classifier sees ONLY z_mlp[:B] (the "
+            "cell-branch input pre-VQ) instead of the full tensor. "
+            "Niche-branch GNN consumes un-classified neighbour rows "
+            "of z_mlp, leaving the niche pathway un-pressured by "
+            "GRL. Adv weight bumped to 300 to compensate for the "
+            "smaller per-step adversarial signal. Hypothesis: "
+            "concentrating the adversary on the cell branch where "
+            "batch-correction matters most, while letting niche keep "
+            "spatial info. Expected: cell-NMI 0.43-0.48; "
+            "iLISI 0.30-0.45 on cell branch."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=300.0, apply_to=cell)",
+        ],
+        "build": lambda: _patch_dual_adversarial_cell_only(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=300.0,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv-cosine+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v6 — cosine schedule for adversarial alpha + warmup 10. "
+            "Alpha = 0 during warmup, then ramps up via half-sine "
+            "envelope to peak at the midpoint of the post-warmup "
+            "phase, decays to ~0 at total_epochs=100. The decay "
+            "phase lets the cell token consolidate cell-type-"
+            "discriminative features WITHOUT active gradient reversal "
+            "in the final epochs. Expected: cell-NMI 0.47-0.51; "
+            "iLISI 0.10-0.25."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10, schedule=cosine)",
+        ],
+        "build": lambda: _patch_dual_adversarial_cosine(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+            total_epochs=100,
+        ),
+    },
+    # ========================================================================
+    # mmb0-1b_smb1-1b_1p ablations v6b — second wave targeting cell-token NMI.
+    # The first v6 wave (3 MMD variants + enc-shallow + small + adv-cell-only +
+    # adv-cosine) had the MMD variants error out on a kwarg name mismatch
+    # (now fixed) and the rest underperform. v6b re-runs the 3 MMD ones
+    # and adds 5 new mechanisms that ablate different parts of the
+    # warmup-NMI / integration trade-off:
+    #   - Post-warmup adv-weight scan (w50, w300) — does the ceiling come
+    #     from the warmup phase or the post-warmup adversarial pressure?
+    #   - Sharper cell VQ commit (commit-cell-w2) — discrete codes more
+    #     concentrated, less smearing of cell-type clusters across codes.
+    #   - Semi-supervised cell-type CE (ce-w10) — empirical upper bound
+    #     for "what if we directly optimise cell-NMI?". Trains the
+    #     existing Linear predictor head; CLEARLY LABELED as
+    #     semi-supervised in methods.
+    #   - Combo safety stack (enc-shallow + warmup10 + mmd-w50) — pulls
+    #     the three best individual mechanisms together.
+    # Group via `--all-dataset mmb0-1b_smb1-1b_1p-ablations-v6b`.
+    # ========================================================================
+    "dualvq+wide+rvq-both+decoder-cov+adv-w50+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v6b — adv weight 50 (vs default 150) + 10-epoch warmup. "
+            "Tests whether the warmup-NMI ceiling at ~0.50 comes from "
+            "the post-warmup adversarial pressure being too strong "
+            "(scrubbing cell-type signal) vs too weak (failing to "
+            "remove batch info). Light adv after warmup = cell branch "
+            "barely loses cell-type-discriminative signal. Expected: "
+            "cell-NMI 0.50-0.53; iLISI 0.05-0.15 (low integration is "
+            "the cost; report alongside MMD variants)."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=50.0, warmup=10)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=50.0, warmup_epochs=10,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv-w300+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v6b — adv weight 300 (2x default) + 10-epoch warmup. "
+            "Other half of the post-warmup-adv scan: tests whether "
+            "STRONGER adversary after warmup recovers integration "
+            "without fully scrubbing the cell-type signal that warmup "
+            "established. Expected: cell-NMI 0.46-0.50; iLISI 0.10-"
+            "0.25 (better integration than w50, lower NMI than w50)."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=300.0, warmup=10)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=300.0, warmup_epochs=10,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+commit-cell-w2+adv+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v6b — cell-branch commit weight 2 (vs default 1) + 10-"
+            "epoch warmup. Sharpens the VQ assignment: z_mlp pulled "
+            "harder toward z_q_cell, codes become more concentrated "
+            "(less smearing of within-cell-type variance across codes). "
+            "Hypothesis: cells of the same cell-type collapse to fewer "
+            "codes -> NMI(cell-token, cell_type) up. Risk: niche "
+            "branch's GNN consumes the SAME z_mlp tensor (sampled "
+            "neighbours), so a sharper z_mlp may degrade niche "
+            "aggregation. Expected: cell-NMI 0.50-0.55; niche-NMI "
+            "potentially down 0.02-0.05; iLISI similar to baseline."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+commit_cell(weight=2.0)",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+        ],
+        "build": lambda: _patch_dual_commit_cell_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+            wt_commit_cell=2.0,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+ce-w10+adv+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v6b — auxiliary cross-entropy on the Linear predictor head "
+            "(z_mlp[:B] -> n_cell_types) with weight 10. Adds direct "
+            "supervised cell-type signal — the Linear predictor was "
+            "always built but its loss was never enabled. SEMI-"
+            "SUPERVISED: uses ground-truth cell_type at training time. "
+            "Empirical upper bound for cell-NMI; CLEARLY LABEL as "
+            "semi-supervised in paper methods (the rest of SQUINT, "
+            "scVI, NicheCompass, the foundation-model baselines, etc. "
+            "are unsupervised or zero-shot). Expected: cell-NMI 0.55-"
+            "0.65 (large bump); iLISI varies based on adv-warmup "
+            "interaction."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+cross_entropy_loss(weight=10.0)",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+        ],
+        "build": lambda: _patch_dual_cross_entropy(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+            wt_cross_entropy=10.0,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-shallow+adv-warmup10+mmd-w50+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v6b — combination safety stack: shallow encoder + 10-epoch "
+            "warmup + MMD λ=50 for integration. Pulls together the "
+            "three mechanisms expected to cooperate:\n"
+            "  1. enc-shallow: capacity bottleneck reduces batch "
+            "memorisation\n"
+            "  2. adv-warmup10: cell token learns rich features early\n"
+            "  3. mmd-w50: non-adversarial integration during warmup, "
+            "stays active throughout\n"
+            "Expected: cell-NMI 0.47-0.51; iLISI 0.20-0.35. The "
+            "headline target — both axes simultaneously above the "
+            "current Pareto frontier."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-shallow(mlp=[256])",
+            "+mmd_batch(wt=50, n_sub=512)",
+        ],
+        "build": lambda: _patch_dual_mmd_batch(
+            _patch_dual_encoder_shallow(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(
+                                _patch_dual_wide(_BD()),
+                                branch="niche", codebook_sizes=(30, 90),
+                            ),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            wt_mmd_batch=50.0, n_sub=512,
+        ),
+    },
     "dualvq+wide+rvq-both+decoder-cov+adv+nbr-hops-3+mmb0-1b_smb1-1b_1p": {
         "description": (
             "v3 spine + 3-hop neighbourhood mean as the niche target "
@@ -3252,6 +3938,286 @@ VARIANTS: dict = {
                     _patch_dual_cvq(
                         _patch_dual_wide(_BD()),
                         branch="both", k1=50, k2=15, k3=5,
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
+    # ========================================================================
+    # mmb0-1b_smb1-1b_1p ablations v7 — push cell-token NMI on cell_type
+    # by varying the CELL codebook structure while NICHE is held fixed at
+    # 3-level RVQ (30, 60, 120). All variants use a fixed level-1 size of
+    # 30 (matches niche level 1), and explicitly DROP the 10-epoch
+    # adversarial warmup that the v6/v6b families relied on — empirically
+    # the post-warmup loss spiked dramatically as the late-arriving
+    # adversary tried to undo features the encoder committed during
+    # warmup. v7 sticks with adv-from-epoch-0 (alpha=1.0, wt=150.0) and
+    # asks: with a fixed niche codebook, what cell-side codebook
+    # configuration maximises cell→cell_type NMI?
+    #
+    # Spine (all 8 share):
+    #   +wide (2-layer GNN + sampler [8,8] + nbr_aggregation_hops=2)
+    #   +rvq(niche, levels=[30, 60, 120])     # 3-level RVQ, fixed
+    #   +decoder-cov                           # NicheCompass-style
+    #   +adv(alpha=1.0, wt=150.0)              # NO warmup
+    #   +enc-deeper                            # mlp=[400,400,256]
+    #
+    # Cell codebook varies across:
+    #   1-level VQ:   k=30 / k=60 / k=200       (3 variants)
+    #   2-level RVQ:  (30,60) / (30,90) / (30,200)  (3 variants)
+    #   3-level RVQ:  (30,60,120) / (30,90,270)     (2 variants)
+    #
+    # Group via `--all-dataset mmb0-1b_smb1-1b_1p-ablations-v7`.
+    # ========================================================================
+    "dualvq+wide+rvq-niche-30-60-120+vq-cell-30+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v7 — niche 3-level RVQ (30, 60, 120) + cell SINGLE-level "
+            "VQ k=30. Tightest cell bottleneck (30 effective codes). "
+            "Tests whether cell-type signal can be fully captured at "
+            "level-1 granularity alone, matching the niche level 1. "
+            "Empirical question: is the 30-code level-1 codebook "
+            "sufficient for cell-type discrimination, or does extra "
+            "residual capacity help?"
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=niche, levels=[30, 60, 120])",
+            "+vq(branch=cell, k=30)",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, no warmup)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_vq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 60, 120),
+                        ),
+                        branch="cell", codebook_size=30,
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-niche-30-60-120+vq-cell-60+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v7 — niche 3-level RVQ (30, 60, 120) + cell SINGLE-level "
+            "VQ k=60. 2x the level-1 capacity. Tests whether widening "
+            "the single-level cell codebook past 30 helps disentangle "
+            "cell types that share level-1 niche structure."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=niche, levels=[30, 60, 120])",
+            "+vq(branch=cell, k=60)",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, no warmup)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_vq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 60, 120),
+                        ),
+                        branch="cell", codebook_size=60,
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-niche-30-60-120+vq-cell-200+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v7 — niche 3-level RVQ (30, 60, 120) + cell SINGLE-level "
+            "VQ k=200. Wide single-level cell codebook at the same "
+            "scale as the legacy 2-level RVQ second tier (30, 200). "
+            "A/B test against `+rvq-cell-30-200` to disentangle "
+            "'capacity' from 'residual hierarchy' on the cell side."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=niche, levels=[30, 60, 120])",
+            "+vq(branch=cell, k=200)",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, no warmup)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_vq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 60, 120),
+                        ),
+                        branch="cell", codebook_size=200,
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-niche-30-60-120+rvq-cell-30-60+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v7 — niche 3-level RVQ (30, 60, 120) + cell 2-level RVQ "
+            "(30, 60) — i.e. cell shares niche's first two levels. "
+            "Effective cell capacity 30 × 60 = 1 800 codes. Tightest "
+            "2-level cell variant; tests minimum residual depth needed "
+            "for cell-NMI."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=niche, levels=[30, 60, 120])",
+            "+rvq(branch=cell, levels=[30, 60])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, no warmup)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 60, 120),
+                        ),
+                        branch="cell", codebook_sizes=(30, 60),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-niche-30-60-120+rvq-cell-30-90+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v7 — niche 3-level RVQ (30, 60, 120) + cell 2-level RVQ "
+            "(30, 90). Replicates the legacy v3 spine cell codebook "
+            "while niche moves to the v5 3-level structure. Effective "
+            "cell capacity 30 × 90 = 2 700 codes. Closest to the "
+            "well-characterised v3 cell side; useful as the v7 "
+            "reference point for the asymmetric (3-level niche, "
+            "2-level cell) design."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=niche, levels=[30, 60, 120])",
+            "+rvq(branch=cell, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, no warmup)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 60, 120),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-niche-30-60-120+rvq-cell-30-200+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v7 — niche 3-level RVQ (30, 60, 120) + cell 2-level RVQ "
+            "(30, 200). Matches `_default_rvq_params` defaults for the "
+            "cell side; widest 2-level cell variant. Effective cell "
+            "capacity 30 × 200 = 6 000 codes. Tests whether a wider "
+            "level-2 (vs (30, 90) / (30, 60)) helps cell-NMI when the "
+            "level-1 is bottlenecked at 30."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=niche, levels=[30, 60, 120])",
+            "+rvq(branch=cell, levels=[30, 200])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, no warmup)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 60, 120),
+                        ),
+                        branch="cell", codebook_sizes=(30, 200),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-niche-30-60-120+rvq-cell-30-60-120+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v7 — niche AND cell at MATCHED 3-level RVQ (30, 60, 120). "
+            "Same shape as the v5 anchor; included here as the v7 "
+            "reference point so the asymmetric variants can be "
+            "compared against a symmetric baseline run with the v7 "
+            "harness (no warmup). Effective cell capacity 30 × 60 × "
+            "120 = 216 k codes."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=niche, levels=[30, 60, 120])",
+            "+rvq(branch=cell, levels=[30, 60, 120])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, no warmup)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 60, 120),
+                        ),
+                        branch="cell", codebook_sizes=(30, 60, 120),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-niche-30-60-120+rvq-cell-30-90-270+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v7 — niche 3-level RVQ (30, 60, 120) + cell 3-level RVQ "
+            "(30, 90, 270). Cell is widened relative to niche at every "
+            "post-level-1 tier — niche stays at the v5 anchor for fair "
+            "comparison. Effective cell capacity 30 × 90 × 270 = 729 k "
+            "codes (~3.4x the v5 anchor cell). Tests whether the cell "
+            "side benefits from MORE residual capacity than niche."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=niche, levels=[30, 60, 120])",
+            "+rvq(branch=cell, levels=[30, 90, 270])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, no warmup)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 60, 120),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90, 270),
                     ),
                 ),
                 alpha=1.0, wt_adv_batch=150.0,
@@ -4861,6 +5827,85 @@ DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v5"] = [
     "dualvq+wide+cvq-both-3level-50-15-5+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
 ]
 
+# v6 — 8 ablations targeted at improving cell-token NMI on cell_type
+# WITHOUT regressing batch integration. See descriptions on each
+# variant for the per-experiment hypothesis. Three orthogonal
+# mechanisms are tested:
+#   - Capacity bottleneck (smaller encoder) + warmup    (3 variants)
+#   - Warmup paired with a non-adversarial integration   (3 variants)
+#     mechanism (MMD-batch loss): two strengths + an
+#     MMD-only ablation (no adversary at all).
+#   - Schedule + asymmetric adversary                    (2 variants)
+# Submit all 8 via:
+#   bash examples/submit_mmb_smb_ablations_v6.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v6"] = [
+    # Group A — smaller encoder + warmup (user hypothesis).
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-shallow+adv-warmup5+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-shallow+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+small+rvq-both+decoder-cov+adv+adv-warmup5+mmb0-1b_smb1-1b_1p",
+    # Group B — warmup paired with MMD batch-invariance (3 variants).
+    "dualvq+wide+rvq-both+decoder-cov+adv+adv-warmup10+mmd-w50+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+adv-warmup10+mmd-w200+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+mmd-w100+mmb0-1b_smb1-1b_1p",
+    # Group C — schedule + asymmetric adversary.
+    "dualvq+wide+rvq-both+decoder-cov+adv-cell-only+adv-w300+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv-cosine+adv-warmup10+mmb0-1b_smb1-1b_1p",
+]
+
+# v6b — second wave targeting cell-token NMI on cell_type. The 3 MMD
+# variants from v6 errored on a kwarg name mismatch (now fixed); we
+# re-run them here. The other 5 v6 variants underperformed; we replace
+# them with new mechanisms ablating different parts of the
+# warmup-NMI / integration trade-off:
+#   - Post-warmup adv-weight scan (adv-w50, adv-w300 with warmup10)
+#   - Sharper cell VQ commit (commit-cell-w2 + warmup10)
+#   - Semi-supervised cell-type CE (ce-w10 + warmup10) — empirical
+#     upper bound; CLEARLY LABEL as semi-supervised in paper
+#   - Combo safety stack (enc-shallow + warmup10 + mmd-w50)
+# Submit all 8 via:
+#   bash examples/submit_mmb_smb_ablations_v6b.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v6b"] = [
+    # Re-runs of the 3 MMD variants (now that mmd_target arg-name is fixed).
+    "dualvq+wide+rvq-both+decoder-cov+adv+adv-warmup10+mmd-w50+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+adv-warmup10+mmd-w200+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+mmd-w100+mmb0-1b_smb1-1b_1p",
+    # 5 NEW mechanisms.
+    "dualvq+wide+rvq-both+decoder-cov+adv-w50+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv-w300+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+commit-cell-w2+adv+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+ce-w10+adv+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-shallow+adv-warmup10+mmd-w50+mmb0-1b_smb1-1b_1p",
+]
+
+# v7 — 8 ablations targeted at improving cell-token NMI on cell_type by
+# varying ONLY the cell codebook structure. Niche is held fixed at
+# 3-level RVQ (30, 60, 120). Level-1 size is 30 across all variants
+# (matches niche level 1). The 10-epoch adv-warmup family from v6/v6b
+# is dropped — the post-warmup loss spiked dramatically in those runs
+# as the late-arriving adversary tried to undo features the encoder
+# had committed during warmup. v7 uses adv-from-epoch-0 (alpha=1.0,
+# wt=150.0) throughout.
+#
+# Cell codebook sweep (level 1 = 30 always):
+#   - 1-level VQ:   k ∈ {30, 60, 200}
+#   - 2-level RVQ:  (30, 60) / (30, 90) / (30, 200)
+#   - 3-level RVQ:  (30, 60, 120) [matches niche] / (30, 90, 270)
+# Submit all 8 via:
+#   bash examples/submit_mmb_smb_ablations_v7.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v7"] = [
+    # 1-level VQ on the cell side (single codebook, no residual depth).
+    "dualvq+wide+rvq-niche-30-60-120+vq-cell-30+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-niche-30-60-120+vq-cell-60+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-niche-30-60-120+vq-cell-200+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
+    # 2-level RVQ on the cell side (level 1 = 30; level 2 varies).
+    "dualvq+wide+rvq-niche-30-60-120+rvq-cell-30-60+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-niche-30-60-120+rvq-cell-30-90+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-niche-30-60-120+rvq-cell-30-200+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
+    # 3-level RVQ on the cell side: matches-niche, then wider.
+    "dualvq+wide+rvq-niche-30-60-120+rvq-cell-30-60-120+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-niche-30-60-120+rvq-cell-30-90-270+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
+]
+
 # Held-out-region downstream task. Currently a single variant — the
 # 1-layer-spine baseline (RVQ-both + decoder-cov + adv) with per-batch
 # spatial holdout patches. Add more entries here later (e.g. larger
@@ -5456,7 +6501,7 @@ def train(variant: str):
             pl.callbacks.EarlyStopping(
                 monitor   = es_cfg.get("monitor", "train_nb_attribute_reconstruction_loss"),
                 mode      = es_cfg.get("mode", "min"),
-                patience  = es_cfg.get("patience", 15),
+                patience  = es_cfg.get("patience", 20),
                 min_delta = es_cfg.get("min_delta", 0.1),
                 verbose   = True,
             )
