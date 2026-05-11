@@ -4225,6 +4225,550 @@ VARIANTS: dict = {
         ),
     },
     # ========================================================================
+    # mmb0-1b_smb1-1b_1p ablations v8 — 8 variants split into two groups of 4:
+    #
+    # Spine (all 8 share — v5-anchor minus +enc-deeper to leave a clean
+    # baseline for the encoder/decoder size sweep):
+    #   +wide (2-layer GNN + sampler [8,8] + nbr_aggregation_hops=2)
+    #   +rvq(branch=both, levels=[30, 60, 120])     # 3-level RVQ both sides
+    #   +decoder-cov                                 # NicheCompass-style
+    #   +adv(alpha=1.0, wt=150.0, no warmup)         # only Group B varies
+    #
+    # Group A — smaller encoder/decoder MLPs. The v5 default is enc=[400, 256]
+    # / dec=[400, 400]. v8-A asks: how aggressively can we shrink the trunks
+    # before cell/niche-NMI regress? Four shrink axes, picked to be
+    # mechanistically distinct (depth vs width vs latent-dim vs full compact):
+    #   A1. enc-shallow:   encoder 2-layer [400,256] -> 1-layer [256]
+    #   A2. mlp-h256:      encoder [400,256] -> [256,256]; decoder [400,400] -> [256,256]
+    #   A3. small-latent:  encoder [400,256] -> [400,128]; latent + GNN hidden -> 128
+    #   A4. small:         scvi-style compact (hidden=128 in encoder + GNN + decoders;
+    #                       drops +wide because +small re-sets GNN num_layers=1)
+    #
+    # Group B — MMD + adversarial batch-integration sweep. Replaces or
+    # supplements the default adversary with MMD on the cell-token input
+    # (z_mlp[:B]). Designed as a 2x2 grid so each variant can be read as
+    # one axis of {MMD-only vs adv+MMD} x {weak (50) vs strong (200)}:
+    #   B1. mmd-w50, NO adv         (MMD-only, weak)
+    #   B2. mmd-w200, NO adv        (MMD-only, strong)
+    #   B3. adv + mmd-w50           (combo, weak MMD)
+    #   B4. adv + mmd-w200          (combo, strong MMD)
+    #
+    # Group via `--all-dataset mmb0-1b_smb1-1b_1p-ablations-v8`.
+    # ========================================================================
+    # ------ Group A: encoder/decoder size sweep (4 variants) ----------------
+    "dualvq+wide+rvq-both-3level+decoder-cov+adv+enc-shallow+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v8-A1 — v5 spine without +enc-deeper; instead the encoder "
+            "trunk is SHRUNK from 2 layers [400, 256] to 1 layer [256]. "
+            "Latent dim (= last layer = 256), GNN, decoders, and codebook "
+            "all unchanged. Tests whether reducing encoder capacity "
+            "(fewer hidden layers) helps cell-NMI by preventing the "
+            "encoder from memorising batch-correlated features, without "
+            "the adversarial-warmup pathology that bit v6/v6b."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=both, levels=[30, 60, 120])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, no warmup)",
+            "+enc-shallow(mlp=[256])",
+        ],
+        "build": lambda: _patch_dual_encoder_shallow(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 60, 120),
+                        ),
+                        branch="cell", codebook_sizes=(30, 60, 120),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-both-3level+decoder-cov+adv+mlp-h256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v8-A2 — v5 spine without +enc-deeper; encoder + decoder MLPs "
+            "are NARROWED in lockstep. Encoder [400, 256] -> [256, 256] "
+            "(latent dim preserved, intermediate width shrunk); both cell "
+            "and niche decoders [400, 400] -> [256, 256]. Same depth as "
+            "the v5 default, just narrower hidden widths. Tests the "
+            "width axis of MLP capacity, holding depth fixed at 2."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=both, levels=[30, 60, 120])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, no warmup)",
+            "+mlp-h256(enc=[256, 256], dec=[256, 256])",
+        ],
+        "build": lambda: _patch_dual_mlp_width(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 60, 120),
+                        ),
+                        branch="cell", codebook_sizes=(30, 60, 120),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            encoder_hidden=[256, 256],
+            decoder_hidden=[256, 256],
+        ),
+    },
+    "dualvq+wide+rvq-both-3level+decoder-cov+adv+small-latent+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v8-A3 — v5 spine + half-sized latent / codebook-embedding "
+            "dim. Encoder last layer 256 -> 128, GNN hidden 256 -> 128, "
+            "codebook embedding dim 256 -> 128. Encoder depth (2 layers) "
+            "and decoder widths ([400, 400]) are unchanged. Tests the "
+            "BOTTLENECK axis: fewer dims for codes to spread across "
+            "forces each code's embedding to be more semantically "
+            "concentrated. NicheCompass / scvi typically use 10-32; 128 "
+            "still leaves headroom but halves the SQUINT default."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=both, levels=[30, 60, 120])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, no warmup)",
+            "+small-latent(latent_dim=128)",
+        ],
+        "build": lambda: _patch_dual_small_latent(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 60, 120),
+                        ),
+                        branch="cell", codebook_sizes=(30, 60, 120),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            latent_dim=128,
+        ),
+    },
+    "dualvq+small+rvq-both-3level+decoder-cov+adv+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v8-A4 — fully compact scvi-style architecture. Replaces "
+            "+wide with +small(hidden=128): encoder MLP [128], GNN 1 "
+            "layer hidden=128, both decoders [128]. Latent / codebook "
+            "embedding dim become 128. Drops the deeper spatial context "
+            "from +wide (sampler=[8], nbr_hops=1) — this is the most "
+            "aggressive capacity ablation on the v5 spine and tests "
+            "whether SQUINT's gains over scvi require the wider "
+            "architecture or come from RVQ + decoder-cov + adv alone."
+        ),
+        "patches": [
+            "+small(hidden=128)",
+            "+rvq(branch=both, levels=[30, 60, 120])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, no warmup)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_small(_BD()),
+                        branch="niche", codebook_sizes=(30, 60, 120),
+                    ),
+                    branch="cell", codebook_sizes=(30, 60, 120),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+    },
+    # ------ Group B: MMD + adversarial batch-integration sweep (4 variants) -
+    "dualvq+wide+rvq-both-3level+decoder-cov+mmd-w50+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v8-B1 — REPLACE adversary with MMD (λ=50, n_sub=512), no "
+            "warmup. MMD-only weak corner of the 2x2 mmd-x-adv grid. "
+            "MMD applies a deterministic distribution-matching pressure "
+            "on the cell-token input every step (no min-max instability "
+            "from the GRL). Tests whether weak MMD alone is enough to "
+            "integrate batches at this codebook structure."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=both, levels=[30, 60, 120])",
+            "+decoder_covariate",
+            "+mmd_batch(wt=50, n_sub=512)",
+        ],
+        "build": lambda: _patch_dual_mmd_batch(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 60, 120),
+                    ),
+                    branch="cell", codebook_sizes=(30, 60, 120),
+                ),
+            ),
+            wt_mmd_batch=50.0, n_sub=512,
+        ),
+    },
+    "dualvq+wide+rvq-both-3level+decoder-cov+mmd-w200+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v8-B2 — REPLACE adversary with MMD (λ=200, n_sub=512), no "
+            "warmup. MMD-only strong corner of the 2x2 grid. 4x B1; "
+            "tests whether aggressive MMD makes integration a hard "
+            "constraint without an adversary. Risk: kills cell-type "
+            "signal if too strong, just as a heavy adv does."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=both, levels=[30, 60, 120])",
+            "+decoder_covariate",
+            "+mmd_batch(wt=200, n_sub=512)",
+        ],
+        "build": lambda: _patch_dual_mmd_batch(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 60, 120),
+                    ),
+                    branch="cell", codebook_sizes=(30, 60, 120),
+                ),
+            ),
+            wt_mmd_batch=200.0, n_sub=512,
+        ),
+    },
+    "dualvq+wide+rvq-both-3level+decoder-cov+adv+mmd-w50+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v8-B3 — v5 spine adv (α=1.0, wt=150.0, no warmup) PLUS MMD "
+            "(λ=50, n_sub=512) on the cell-token input. Weak combo "
+            "corner of the 2x2 grid. Tests whether a light non-adv "
+            "regulariser, working alongside the adv, gives smoother "
+            "integration than adv alone — without the warmup pathology "
+            "from v6/v6b. Both losses target z_mlp[:B] but via "
+            "different mechanisms (CE-based min-max vs kernel MMD)."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=both, levels=[30, 60, 120])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, no warmup)",
+            "+mmd_batch(wt=50, n_sub=512)",
+        ],
+        "build": lambda: _patch_dual_mmd_batch(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 60, 120),
+                        ),
+                        branch="cell", codebook_sizes=(30, 60, 120),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            wt_mmd_batch=50.0, n_sub=512,
+        ),
+    },
+    "dualvq+wide+rvq-both-3level+decoder-cov+adv+mmd-w200+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v8-B4 — same as v8-B3 but MMD λ=200 (4x stronger). Strong "
+            "combo corner of the 2x2 grid. Adv + strong MMD: tests "
+            "whether stacking both batch-integration pressures gives "
+            "the BEST iLISI without collapsing cell-NMI, or whether "
+            "the encoder loses too much cell-type signal under "
+            "combined pressure."
+        ),
+        "patches": [
+            "+wide",
+            "+rvq(branch=both, levels=[30, 60, 120])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, no warmup)",
+            "+mmd_batch(wt=200, n_sub=512)",
+        ],
+        "build": lambda: _patch_dual_mmd_batch(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 60, 120),
+                        ),
+                        branch="cell", codebook_sizes=(30, 60, 120),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            wt_mmd_batch=200.0, n_sub=512,
+        ),
+    },
+    # ========================================================================
+    # mmb0-1b_smb1-1b_1p ablations v9 — 8 variants on a SMALLER + FASTER
+    # architecture, organised as a 2 x 4 grid:
+    #
+    #   architectural size   ∈ {"compact"  (h32 + codebook (30, 10, 10)),
+    #                           "medium"   (h64 + codebook (30, 20, 10))}
+    #
+    #   batch integration    ∈ {adv (wt=150),         # default
+    #                           adv-w300,             # boosted adv
+    #                           adv + mmd-w50,        # combo (adv + MMD)
+    #                           mmd-w100 (no adv)}    # MMD only
+    #
+    # = 8 variants. The architectural size axis pairs encoder dim with
+    # codebook width (compact uses both smaller; medium uses both larger)
+    # — this is intentional because we want to read each "size scale" as
+    # a single point rather than disentangling encoder dim from codebook
+    # capacity within this sweep. The batch-integration axis is the
+    # main thing being varied at each size scale.
+    #
+    # Shared spine (NO +wide so 1-hop GNN/sampler=[8]/nbr_hops=1):
+    #   +small(hidden=N)                  # encoder MLP, GNN, decoders all -> N
+    #   +rvq(branch=both, levels=[30, L1, L2])
+    #   +decoder_covariate                # NicheCompass-shape batch slot
+    #   (per-variant batch-integration loss combination)
+    #
+    # Effective codebook sizes:
+    #   (30, 10, 10) -> 3,000 codes  (vs v5 anchor 216k)
+    #   (30, 20, 10) -> 6,000 codes
+    #
+    # Motivation: smaller / shallower encoders helped niche-NMI in past
+    # ablations but hurt iLISI. The four batch-integration strategies
+    # span the space from default adv pressure to MMD-only — pairing
+    # each strategy at TWO size scales lets us read "does compact
+    # architecture work AND how much batch-integration pressure does
+    # it need?" off the resulting 4x2 metric grid.
+    #
+    # Submit all 8 via:
+    #   bash examples/submit_mmb_smb_ablations_v9.sh
+    # ========================================================================
+    # ------ compact size: hidden=32, codebook (30, 10, 10) ------------------
+    "dualvq+small-h32+rvq-both-3level-30-10-10+decoder-cov+adv+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v9 (compact size, default adv) — scvi-style compact "
+            "architecture (hidden=32 in encoder MLP, GNN, decoders) + "
+            "smallest 3-level RVQ (30, 10, 10) + default adv (wt=150). "
+            "Floor of the sweep on every capacity axis; tests whether "
+            "the very tightest config still produces useful niche / "
+            "cell-type signal under default batch pressure."
+        ),
+        "patches": [
+            "+small(hidden=32)",
+            "+rvq(branch=both, levels=[30, 10, 10])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_small(_BD(), hidden=32),
+                        branch="niche", codebook_sizes=(30, 10, 10),
+                    ),
+                    branch="cell", codebook_sizes=(30, 10, 10),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+    },
+    "dualvq+small-h32+rvq-both-3level-30-10-10+decoder-cov+adv-w300+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v9 (compact size, boosted adv) — hidden=32 + (30, 10, 10) "
+            "with adversarial weight 2x the default (wt=300). Tests "
+            "whether the compact encoder needs extra batch-integration "
+            "pressure to recover iLISI."
+        ),
+        "patches": [
+            "+small(hidden=32)",
+            "+rvq(branch=both, levels=[30, 10, 10])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=300.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_small(_BD(), hidden=32),
+                        branch="niche", codebook_sizes=(30, 10, 10),
+                    ),
+                    branch="cell", codebook_sizes=(30, 10, 10),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=300.0,
+        ),
+    },
+    "dualvq+small-h32+rvq-both-3level-30-10-10+decoder-cov+adv+mmd-w50+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v9 (compact size, adv + MMD combo) — hidden=32 + "
+            "(30, 10, 10) with default adv PLUS a light MMD on the "
+            "cell-token input (lambda=50). MMD applies deterministic "
+            "distribution-matching every step (no min-max instability), "
+            "so the combo gives the encoder two complementary "
+            "batch-mixing signals."
+        ),
+        "patches": [
+            "+small(hidden=32)",
+            "+rvq(branch=both, levels=[30, 10, 10])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+mmd_batch(wt=50, n_sub=512)",
+        ],
+        "build": lambda: _patch_dual_mmd_batch(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=32),
+                            branch="niche", codebook_sizes=(30, 10, 10),
+                        ),
+                        branch="cell", codebook_sizes=(30, 10, 10),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            wt_mmd_batch=50.0, n_sub=512,
+        ),
+    },
+    "dualvq+small-h32+rvq-both-3level-30-10-10+decoder-cov+mmd-w100+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v9 (compact size, MMD only) — hidden=32 + (30, 10, 10) with "
+            "REPLACED adv: kernel MMD (lambda=100, n_sub=512) on the "
+            "cell-token input and NO adversarial classifier. Tests "
+            "whether the compact encoder can integrate batches via "
+            "MMD alone — simpler architecture (no classifier to tune), "
+            "no min-max game."
+        ),
+        "patches": [
+            "+small(hidden=32)",
+            "+rvq(branch=both, levels=[30, 10, 10])",
+            "+decoder_covariate",
+            "+mmd_batch(wt=100, n_sub=512)",
+        ],
+        "build": lambda: _patch_dual_mmd_batch(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_small(_BD(), hidden=32),
+                        branch="niche", codebook_sizes=(30, 10, 10),
+                    ),
+                    branch="cell", codebook_sizes=(30, 10, 10),
+                ),
+            ),
+            wt_mmd_batch=100.0, n_sub=512,
+        ),
+    },
+    # ------ medium size: hidden=64, codebook (30, 20, 10) -------------------
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+adv+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v9 (medium size, default adv) — hidden=64 (twice the compact "
+            "encoder) + (30, 20, 10) (twice the effective codes) + "
+            "default adv. Mid-size baseline; tests whether doubling "
+            "both capacity axes recovers any NMI lost at the compact "
+            "size under default batch-integration pressure."
+        ),
+        "patches": [
+            "+small(hidden=64)",
+            "+rvq(branch=both, levels=[30, 20, 10])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_small(_BD(), hidden=64),
+                        branch="niche", codebook_sizes=(30, 20, 10),
+                    ),
+                    branch="cell", codebook_sizes=(30, 20, 10),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+    },
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+adv-w300+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v9 (medium size, boosted adv) — hidden=64 + (30, 20, 10) + "
+            "adv wt=300. Same boosted-pressure question as the compact "
+            "h32 sibling but at higher capacity."
+        ),
+        "patches": [
+            "+small(hidden=64)",
+            "+rvq(branch=both, levels=[30, 20, 10])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=300.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_small(_BD(), hidden=64),
+                        branch="niche", codebook_sizes=(30, 20, 10),
+                    ),
+                    branch="cell", codebook_sizes=(30, 20, 10),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=300.0,
+        ),
+    },
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+adv+mmd-w50+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v9 (medium size, adv + MMD combo) — hidden=64 + "
+            "(30, 20, 10) with default adv plus MMD lambda=50. "
+            "Combo-pressure question at the higher capacity."
+        ),
+        "patches": [
+            "+small(hidden=64)",
+            "+rvq(branch=both, levels=[30, 20, 10])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+mmd_batch(wt=50, n_sub=512)",
+        ],
+        "build": lambda: _patch_dual_mmd_batch(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=64),
+                            branch="niche", codebook_sizes=(30, 20, 10),
+                        ),
+                        branch="cell", codebook_sizes=(30, 20, 10),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            wt_mmd_batch=50.0, n_sub=512,
+        ),
+    },
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+mmd-w100+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v9 (medium size, MMD only) — hidden=64 + (30, 20, 10) with "
+            "MMD lambda=100 replacing the adversary. Simpler architecture "
+            "(no classifier), no min-max game; same MMD-only question "
+            "as the compact h32 sibling but at higher capacity."
+        ),
+        "patches": [
+            "+small(hidden=64)",
+            "+rvq(branch=both, levels=[30, 20, 10])",
+            "+decoder_covariate",
+            "+mmd_batch(wt=100, n_sub=512)",
+        ],
+        "build": lambda: _patch_dual_mmd_batch(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_small(_BD(), hidden=64),
+                        branch="niche", codebook_sizes=(30, 20, 10),
+                    ),
+                    branch="cell", codebook_sizes=(30, 20, 10),
+                ),
+            ),
+            wt_mmd_batch=100.0, n_sub=512,
+        ),
+    },
+    # ========================================================================
     # mmb0-1b_smb1-1b_1p held-out region (downstream gene-reconstruction
     # task, NicheCompass / MLGenX-style). Both batches stay in training
     # but a contiguous patch in each is masked out cell-wise; Pearson is
@@ -5904,6 +6448,46 @@ DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v7"] = [
     # 3-level RVQ on the cell side: matches-niche, then wider.
     "dualvq+wide+rvq-niche-30-60-120+rvq-cell-30-60-120+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
     "dualvq+wide+rvq-niche-30-60-120+rvq-cell-30-90-270+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
+]
+
+# v8 — 8 ablations split into two groups of 4 on the v5-anchor spine
+# (+wide +rvq-both-3level +decoder-cov +adv, no warmup, no +enc-deeper).
+# Group A varies encoder/decoder MLP size (depth, width, latent-dim,
+# fully compact); Group B varies batch-integration mechanism on a 2x2
+# {MMD-only vs adv+MMD} x {weak 50 vs strong 200} grid.
+# Submit all 8 via:
+#   bash examples/submit_mmb_smb_ablations_v8.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v8"] = [
+    # Group A — encoder/decoder size sweep (4 variants).
+    "dualvq+wide+rvq-both-3level+decoder-cov+adv+enc-shallow+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both-3level+decoder-cov+adv+mlp-h256+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both-3level+decoder-cov+adv+small-latent+mmb0-1b_smb1-1b_1p",
+    "dualvq+small+rvq-both-3level+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+    # Group B — MMD + adversarial batch-integration sweep (4 variants, 2x2).
+    "dualvq+wide+rvq-both-3level+decoder-cov+mmd-w50+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both-3level+decoder-cov+mmd-w200+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both-3level+decoder-cov+adv+mmd-w50+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both-3level+decoder-cov+adv+mmd-w200+mmb0-1b_smb1-1b_1p",
+]
+
+# v9 — 8 ablations on a SMALLER + FASTER architecture, organised as
+# a 2 x 4 grid: { compact (h32 + (30,10,10)), medium (h64 + (30,20,10)) }
+# crossed with 4 batch-integration strategies { default adv, boosted adv,
+# adv+MMD combo, MMD-only }. Shared spine: NO +wide (1-hop GNN),
+# +small(hidden=N), +rvq-both-3level (L0=30, symmetric), +decoder-cov.
+# Submit all 8 via:
+#   bash examples/submit_mmb_smb_ablations_v9.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v9"] = [
+    # Compact size: hidden=32 + (30, 10, 10).
+    "dualvq+small-h32+rvq-both-3level-30-10-10+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+    "dualvq+small-h32+rvq-both-3level-30-10-10+decoder-cov+adv-w300+mmb0-1b_smb1-1b_1p",
+    "dualvq+small-h32+rvq-both-3level-30-10-10+decoder-cov+adv+mmd-w50+mmb0-1b_smb1-1b_1p",
+    "dualvq+small-h32+rvq-both-3level-30-10-10+decoder-cov+mmd-w100+mmb0-1b_smb1-1b_1p",
+    # Medium size: hidden=64 + (30, 20, 10).
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+adv-w300+mmb0-1b_smb1-1b_1p",
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+adv+mmd-w50+mmb0-1b_smb1-1b_1p",
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+mmd-w100+mmb0-1b_smb1-1b_1p",
 ]
 
 # Held-out-region downstream task. Currently a single variant — the
