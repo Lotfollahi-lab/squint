@@ -25,7 +25,7 @@
 #                   (default: /nfs/team361/sb75/squint-reproducibility/artifacts/logs)
 #   LSF_GROUP     — bsub -G group              (default: s10396)
 #   LSF_QUEUE     — bsub -q queue              (default: training-parallel)
-#   LSF_CORES     — bsub -n / -R span ptile    (default: 6)
+#   LSF_CORES     — bsub -n / -R span ptile    (default: 20)
 #   LSF_MEM_MB    — bsub -M / mem rusage in MB (default: 128000 = 128 GB)
 #   LSF_GPU       — bsub -gpu spec             (default: mode=exclusive_process:num=1:block=yes)
 #   LSF_WALL      — bsub -W wallclock          (default: 24:00 = 24 h)
@@ -69,7 +69,12 @@ LOG_ROOT="${LOG_ROOT:-/nfs/team361/sb75/squint-reproducibility/artifacts/logs}"
 
 LSF_GROUP="${LSF_GROUP:-s10396}"
 LSF_QUEUE="${LSF_QUEUE:-training-parallel}"
-LSF_CORES="${LSF_CORES:-6}"
+# 20 cores per job: leaves room for the 16 DataLoader workers configured
+# in `make_train_config_dualvq().datamodule.loader_params.num_workers`,
+# the main training thread, plus ~3 cores of headroom for the BLAS /
+# NCCL threads PyTorch spins up. Drop to 16 (workers + main + 0 spare)
+# or even 10 (legacy default) if a queue is selective about job size.
+LSF_CORES="${LSF_CORES:-20}"
 LSF_MEM_MB="${LSF_MEM_MB:-128000}"
 LSF_GPU="${LSF_GPU:-mode=exclusive_process:num=1:block=yes}"
 LSF_WALL="${LSF_WALL:-24:00}"

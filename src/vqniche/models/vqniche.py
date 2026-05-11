@@ -908,7 +908,28 @@ class VQNiche(BaseModel):
         """
         if cache_dict is None:
             cache_dict = {key: [] for key in self.cache_keys}
-            
+
+        # Skip the appends if the caller is one of the persistent
+        # train/val/test caches AND nobody is going to consume it.
+        # `BaseModel.compute_metrics` only drains those caches at
+        # epoch boundaries; with `train_metrics_list = []` (the
+        # SQUINT_WITH_PEARSON=0 default) the consumer short-circuits
+        # AND the per-step appends pile up GPU tensors until OOM.
+        # Symptom: linear upward slope in the wandb GPU memory panel,
+        # ending in `torch.cuda.OutOfMemoryError` inside the adjacency
+        # BCE loss after ~75 s on a 140 GiB H100 at batch_size=1024.
+        # `predict()` passes `cache_dict=None` and gets a fresh local
+        # dict back — we always populate that (skip only fires for
+        # the persistent caches).
+        train_metrics_empty = not getattr(self, 'train_metrics_list', None)
+        test_metrics_empty  = not getattr(self, 'test_metrics_list',  None)
+        if cache_dict is getattr(self, 'train_inference_data_cache', None) and train_metrics_empty:
+            return cache_dict
+        if cache_dict is getattr(self, 'val_inference_data_cache',   None) and train_metrics_empty:
+            return cache_dict
+        if cache_dict is getattr(self, 'test_inference_data_cache',  None) and test_metrics_empty:
+            return cache_dict
+
         cache_dict['X'].append(batch.x[:batch_size])
         cache_dict['X_nbr'].append(
             aggregate_1hop_neighbor_features(

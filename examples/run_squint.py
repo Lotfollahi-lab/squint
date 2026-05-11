@@ -126,6 +126,7 @@ Each .h5ad must contain:
 If any of these are missing, run `--patch-uns` once.
 """
 import argparse
+import os
 import sys
 import warnings
 from pathlib import Path
@@ -197,6 +198,73 @@ LOG_ROOT = ARTIFACTS_DIR / "wandb"
 
 # Project name in wandb.
 WANDB_PROJECT = "squint"
+
+
+# ---------------------------------------------------------------------------
+# In-training metric toggle (Pearson correlations)
+# ---------------------------------------------------------------------------
+# The model's `on_validation_epoch_end` hook calls
+# `compute_benchmarking_metrics(adata)` for every entry in the config's
+# `train_metrics_list` (which is also used for val mode, see
+# `BaseModel.compute_metrics`). Each Pearson metric reconstructs the full
+# val AnnData from the inference cache and runs a cells x genes
+# correlation, costing 5-15 s per metric on the 100k-cell datasets.
+# With the 14-entry list below that compounds to 100-200 s of pure CPU
+# work per val epoch, completely starving the GPU.
+#
+# DEFAULT: empty lists -> losses-only tracking during training. Final
+# Pearson metrics for the benchmark CSVs are produced by the
+# `compute_inference_metrics.py` step at the end of the pipeline,
+# which is the source of truth that benchmark figure scripts read
+# from. The per-epoch values were only ever for live wandb diagnostics.
+#
+# OPT-IN: set environment variable `SQUINT_WITH_PEARSON=1` (or pass
+# `--with-pearson` to `run_squint.py`) to populate train/test
+# `*_metrics_list` with the 14 Pearson variants. Use this for one-off
+# diagnostic runs when investigating training instabilities — expect
+# 10-20x slower epochs.
+_PEARSON_METRICS_LIST = [
+    "codebook_utilization",
+    # cell branch — gene-wise
+    "pearson_gene_wise_log1p",
+    "pearson_gene_wise_log1p_median",
+    "pearson_gene_wise_hvg50_log1p",
+    "pearson_gene_wise_hvg50_log1p_median",
+    # cell branch — cell-wise
+    "pearson_cell_wise_log1p",
+    "pearson_cell_wise_log1p_median",
+    # neighbourhood branch — gene-wise
+    "pearson_gene_wise_1hop_nbr_log1p",
+    "pearson_gene_wise_1hop_nbr_log1p_median",
+    "pearson_gene_wise_hvg50_1hop_nbr_log1p",
+    "pearson_gene_wise_hvg50_1hop_nbr_log1p_median",
+    # neighbourhood branch — cell-wise
+    "pearson_cell_wise_1hop_nbr_log1p",
+    "pearson_cell_wise_1hop_nbr_log1p_median",
+    # legacy raw-count metric
+    "pearson_gene_wise",
+]
+
+
+def _resolve_metrics_list() -> list:
+    """Return the in-training metrics list for the current run.
+
+    - `SQUINT_WITH_PEARSON=1` (or `--with-pearson` on the CLI, which
+      exports this env var in `main()`): returns the full Pearson
+      list. Per-epoch Pearson appears in wandb again at the cost of
+      10-20x slower epochs.
+    - Anything else (including unset): returns `[]`. Training runs
+      losses-only; final Pearson breakdown still comes from
+      `compute_inference_metrics.py` at the end of the pipeline.
+
+    Evaluated at config-build time (inside `make_train_config*`), so
+    the env var must be set BEFORE `train(variant)` is called. `main()`
+    handles that for the `--with-pearson` flag; manual env-var
+    invocations also work (`SQUINT_WITH_PEARSON=1 python ...`).
+    """
+    if os.environ.get("SQUINT_WITH_PEARSON", "0") == "1":
+        return list(_PEARSON_METRICS_LIST)
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -474,10 +542,65 @@ def make_train_config_poc() -> dict:
         },
         "datamodule": {
             "loader_name": "NeighborLoader",
-            "loader_params": {"batch_size": 256},
+            "loader_params": {
+                # batch_size bumped from 256 -> 1024 after wandb showed
+                # the GPU peaking at ~25 % utilization with batch=256:
+                # the model is too cheap per step to saturate a modern
+                # GPU at that batch size, and the GPU memory was only
+                # ~5 % allocated, so there's plenty of headroom. With
+                # batch=1024 the GPU does 4x more work per forward pass,
+                # raising the duty cycle without hitting OOM.
+                # NOTE: batch_size CHANGES training dynamics (effective
+                # learning rate scales with batch size). Pre-v11 runs at
+                # batch=256 are NOT directly comparable to post-v11
+                # results at batch=1024 — re-benchmark before drawing
+                # cross-run conclusions. If you want apples-to-apples,
+                # override via a patch (e.g. `_patch_dual_batch_size(256)`)
+                # for the comparison runs.
+                "batch_size":         1024,
+                # 16 workers to feed the 4x larger batches. The
+                # DataModule's auto-derivation
+                # (`LSB_DJOB_NUMPROC // 2`) yields ~10 at LSF_CORES=20;
+                # explicit override here pins it at 16 so the GPU
+                # stays fed even on hosts where LSB_DJOB_NUMPROC
+                # reports less than expected. `pin_memory=True`,
+                # `persistent_workers=True`, and `prefetch_factor=4`
+                # are added automatically by
+                # `InMemoryDataModule._loader_perf_kwargs()` — don't
+                # set them here, that produces a `got multiple values
+                # for keyword argument` TypeError on the loader call.
+                "num_workers":        16,
+            },
             "sampler_name": "NeighborSampler",
             "sampler_params": {"num_neighbors": [8]},  # 1 hop = num_layers
-            "inference_params": {"sample_neighbors_for_inference": False},
+            # Flipped from False to True (was the GPU-utilization
+            # bottleneck): the val + test + inference loaders all share
+            # this flag, and `False` made them sample `num_neighbors=[-1]`
+            # (every neighbor) — for a 100k-cell graph with ~10-50
+            # neighbors per node, that's 10-100x more sampler work per
+            # batch than training (which uses the `[8]`-fanout
+            # configured below). With val running every epoch, the
+            # heavy val pass stalled the GPU between train epochs,
+            # producing the spike-then-long-gap utilization pattern.
+            # `True` makes val/test/inference use the same `[8]`
+            # sampler as training — apples-to-apples, much faster.
+            #
+            # Implications worth knowing:
+            #   - val_loss numerical values shift slightly (val sees a
+            #     sparser neighborhood). Early stopping still works,
+            #     but the absolute val_loss curves are not comparable
+            #     to pre-v11 runs.
+            #   - predict()-time inference also uses `[8]`: each cell
+            #     sees ONE random sample of 8 neighbors at predict
+            #     time. Per-cell X_hat is now stochastic across
+            #     repeated predict() calls (was deterministic before).
+            #     For benchmarks across seeds this just adds a small
+            #     amount of additional variance to NMI / iLISI / Pearson
+            #     — within the existing inter-seed spread.
+            #   - If you specifically need deterministic, all-context
+            #     inference for a paper figure, override per-variant via
+            #     `cfg["datamodule"]["inference_params"]["sample_neighbors_for_inference"] = False`.
+            "inference_params": {"sample_neighbors_for_inference": True},
         },
         "model": {
             "model_name": "VQNiche",
@@ -497,45 +620,27 @@ def make_train_config_poc() -> dict:
             # All Pearson metrics are reported on every variant.
             # Neighbourhood metrics (1hop_nbr) are silently skipped when
             # X_nbr / X_hat_nbr are absent (recon_mode='cell' variants).
-            # Primary monitor: pearson_gene_wise_log1p (literature standard).
-            "train_metrics_list": [
-                "codebook_utilization",
-                # cell branch — gene-wise
-                "pearson_gene_wise_log1p",
-                "pearson_gene_wise_log1p_median",
-                "pearson_gene_wise_hvg50_log1p",
-                "pearson_gene_wise_hvg50_log1p_median",
-                # cell branch — cell-wise
-                "pearson_cell_wise_log1p",
-                "pearson_cell_wise_log1p_median",
-                # neighbourhood branch — gene-wise
-                "pearson_gene_wise_1hop_nbr_log1p",
-                "pearson_gene_wise_1hop_nbr_log1p_median",
-                "pearson_gene_wise_hvg50_1hop_nbr_log1p",
-                "pearson_gene_wise_hvg50_1hop_nbr_log1p_median",
-                # neighbourhood branch — cell-wise
-                "pearson_cell_wise_1hop_nbr_log1p",
-                "pearson_cell_wise_1hop_nbr_log1p_median",
-                # legacy raw-count metrics
-                "pearson_gene_wise",
-            ],
-            "test_metrics_list": [
-                "codebook_utilization",
-                "pearson_gene_wise_log1p",
-                "pearson_gene_wise_log1p_median",
-                "pearson_gene_wise_hvg50_log1p",
-                "pearson_gene_wise_hvg50_log1p_median",
-                "pearson_cell_wise_log1p",
-                "pearson_cell_wise_log1p_median",
-                "pearson_gene_wise_1hop_nbr_log1p",
-                "pearson_gene_wise_1hop_nbr_log1p_median",
-                "pearson_gene_wise_hvg50_1hop_nbr_log1p",
-                "pearson_gene_wise_hvg50_1hop_nbr_log1p_median",
-                "pearson_cell_wise_1hop_nbr_log1p",
-                "pearson_cell_wise_1hop_nbr_log1p_median",
-                "pearson_gene_wise",
-                "pearson_cell_wise",
-            ],
+            # In-training metric computation is OFF by default. Both
+            # lists are populated by `_resolve_metrics_list()`, which
+            # returns `[]` unless `SQUINT_WITH_PEARSON=1` is set
+            # (passing `--with-pearson` to `main()` exports that env
+            # var automatically). See the module-level docstring for
+            # `_resolve_metrics_list()` for the full rationale.
+            #
+            # Why both lists use the same source:
+            #   - train_metrics_list is consumed by
+            #     BaseModel.compute_metrics(mode='train' | 'val'),
+            #     fired from on_validation_epoch_end.
+            #   - test_metrics_list is consumed by the same helper
+            #     with mode='test', fired from trainer.test().
+            # The standard pipeline doesn't call trainer.test() (we
+            # use predict + compute_inference_metrics.py instead), so
+            # test_metrics_list is essentially dormant. But aligning
+            # it with train avoids surprise behaviour if anyone wires
+            # in a test loop later, and keeps a single switch for
+            # "Pearson on / off everywhere during PL hooks".
+            "train_metrics_list": _resolve_metrics_list(),
+            "test_metrics_list":  _resolve_metrics_list(),
             "encoder_params": {
                 "gnn_name": "SAGEConv",
                 "mlp_params": {
@@ -665,7 +770,14 @@ def make_train_config_poc() -> dict:
             # the drift.
             "monitor": "val_loss",
             "checkpoint_params": {"mode": "min", "save_top_k": 1, "save_last": True},
-            "max_epochs": 80,
+            # max_epochs bumped 80 -> 200 when batch_size went 256 -> 1024.
+            # Each epoch now contains ~4x fewer gradient steps (~97 vs
+            # ~390 for a 100k-cell dataset), so 200 epochs at batch=1024
+            # is roughly equivalent in total gradient-step budget to
+            # 50 epochs at batch=256 — still less than the original 80,
+            # but early stopping below will cap things in practice if
+            # val_loss plateaus earlier.
+            "max_epochs": 200,
             "enable_checkpointing": True,
             "ckpt_path": "best",
             # Early stopping: watch the val_loss (= sum of all weighted
@@ -1258,6 +1370,43 @@ def _patch_dual_no_cell_recon(cfg: dict) -> dict:
     """
     losses = cfg["model"]["loss_params"]["loss_names"]
     for ln in ("nb_attribute_reconstruction_loss", "mse_commit_loss_cell"):
+        if ln in losses:
+            losses.remove(ln)
+    return cfg
+
+
+def _patch_dual_no_spatial(cfg: dict) -> dict:
+    """
+    Drop EVERY spatial-supervision loss term so the model trains as a
+    pure cell-branch VQ-VAE + (whatever batch-integration loss is set).
+    Removes:
+      - nb_attribute_reconstruction_loss_nbr_dual  (niche-branch NB recon)
+      - mse_commit_loss_niche                       (niche VQ commit)
+      - bce_cosine_adjacency_reconstruction_loss    (adjacency BCE)
+
+    The niche-side modules (GNN, vq_niche, niche decoder, adjacency
+    decoder) are still instantiated by the model and run forward, but
+    receive zero gradient signal — they're effectively idle. This is
+    the DIAGNOSTIC variant for the hypothesis "spatial losses are
+    pulling the cell encoder away from cell-type-discriminative features".
+    Under this patch, training conditions match scVI / Harmony shape:
+    pure cell-NB + cell-commit + adversarial/MMD batch integration.
+
+    Sibling of `_patch_dual_no_adj` (drops only adjacency) and
+    `_patch_dual_no_cell_recon` (drops only cell-side). When all three
+    are needed together for ablations, apply this LAST so the niche
+    losses get removed regardless of order.
+    """
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    for ln in (
+        "nb_attribute_reconstruction_loss_nbr_dual",
+        "nb_attribute_reconstruction_loss_nbr",   # legacy single-codebook name
+        "mse_commit_loss_niche",
+        "bce_cosine_adjacency_reconstruction_loss",
+        # The vanilla (non-dual) adjacency-BCE name, in case earlier patches
+        # left it in the loss list.
+        "bce_adjacency_reconstruction_loss",
+    ):
         if ln in losses:
             losses.remove(ln)
     return cfg
@@ -4769,6 +4918,155 @@ VARIANTS: dict = {
         ),
     },
     # ========================================================================
+    # mmb0-1b_smb1-1b_1p ablations v10 — "is spatial supervision hurting
+    # cell-type NMI?" diagnostic. 4 variants on a fixed medium-size
+    # architecture (h64 + codebook (30, 20, 10)), crossed over:
+    #
+    #   batch integration       ∈ { adv (wt=150),  mmd-w100 (no adv) }
+    #   spatial-loss treatment  ∈ { +no-spatial   (drops nbr-NB + niche-commit + adj-BCE),
+    #                                +no-adj        (keeps nbr-NB + niche-commit;
+    #                                                drops ONLY the adjacency BCE) }
+    #
+    # = 2 x 2 = 4 variants. Architectural size is held constant so the
+    # diagnostic isolates the effect of LOSSES (not capacity) on
+    # cell-type NMI. h64 + (30,20,10) was chosen as a balance: small
+    # enough to be fast, large enough not to be the bottleneck.
+    #
+    # Read of the 4 outcomes:
+    #   - +no-adj alone recovers cell-NMI -> adjacency BCE is the
+    #     specific culprit; niche NB recon is fine.
+    #   - Only +no-spatial recovers -> all spatial supervision contributes;
+    #     the full two-stage train (cell first, then frozen-cell +
+    #     spatial) is the right next step.
+    #   - Neither recovers -> bottleneck is elsewhere (codebook structure,
+    #     encoder capacity, adversary calibration). Don't build two-stage.
+    #
+    # Submit all 4 via:
+    #   bash examples/submit_mmb_smb_ablations_v10.sh
+    # ========================================================================
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+adv+no-spatial+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v10 — medium (h64 + (30,20,10)) + default adv + NO spatial "
+            "losses. Trains as a pure cell-branch VQ-VAE + adversarial "
+            "batch integration, matching scVI / Harmony training shape "
+            "on the cell branch. Tests whether spatial supervision is "
+            "pulling cell-NMI down."
+        ),
+        "patches": [
+            "+small(hidden=64)",
+            "+rvq(branch=both, levels=[30, 20, 10])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+no-spatial",
+        ],
+        "build": lambda: _patch_dual_no_spatial(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=64),
+                            branch="niche", codebook_sizes=(30, 20, 10),
+                        ),
+                        branch="cell", codebook_sizes=(30, 20, 10),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+mmd-w100+no-spatial+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v10 — medium (h64 + (30,20,10)) + MMD-only (wt=100) + NO "
+            "spatial losses. Same diagnostic as the +adv sibling but with "
+            "MMD instead (no adversarial min-max game)."
+        ),
+        "patches": [
+            "+small(hidden=64)",
+            "+rvq(branch=both, levels=[30, 20, 10])",
+            "+decoder_covariate",
+            "+mmd_batch(wt=100, n_sub=512)",
+            "+no-spatial",
+        ],
+        "build": lambda: _patch_dual_no_spatial(
+            _patch_dual_mmd_batch(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=64),
+                            branch="niche", codebook_sizes=(30, 20, 10),
+                        ),
+                        branch="cell", codebook_sizes=(30, 20, 10),
+                    ),
+                ),
+                wt_mmd_batch=100.0, n_sub=512,
+            ),
+        ),
+    },
+    # ------ v10 "no-adj only" variants: keeps niche NB recon + niche
+    # commit, drops ONLY the cosine adjacency BCE. Tests whether the
+    # adjacency loss specifically is the cell-NMI drag, vs `+no-spatial`
+    # which drops every spatial supervision term at once. -------------------
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+adv+no-adj+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v10 — medium (h64 + (30,20,10)) + default adv with the "
+            "ADJACENCY BCE dropped. Niche NB recon + niche VQ commit "
+            "are kept, so the niche branch still receives gradient — "
+            "but the encoder no longer has the cosine-adjacency loss "
+            "pulling z_q_niche toward local spatial topology. Partners "
+            "with the `+no-spatial` sibling: if `+no-adj` alone recovers "
+            "cell-NMI, adjacency is the specific culprit; if only "
+            "`+no-spatial` recovers, all spatial supervision contributes."
+        ),
+        "patches": [
+            "+small(hidden=64)",
+            "+rvq(branch=both, levels=[30, 20, 10])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+no-adj",
+        ],
+        "build": lambda: _patch_dual_no_adj(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=64),
+                            branch="niche", codebook_sizes=(30, 20, 10),
+                        ),
+                        branch="cell", codebook_sizes=(30, 20, 10),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+mmd-w100+no-adj+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v10 — medium (h64 + (30,20,10)) + MMD-only (wt=100) with the "
+            "adjacency BCE dropped. Niche NB recon + niche commit kept."
+        ),
+        "patches": [
+            "+small(hidden=64)",
+            "+rvq(branch=both, levels=[30, 20, 10])",
+            "+decoder_covariate",
+            "+mmd_batch(wt=100, n_sub=512)",
+            "+no-adj",
+        ],
+        "build": lambda: _patch_dual_no_adj(
+            _patch_dual_mmd_batch(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=64),
+                            branch="niche", codebook_sizes=(30, 20, 10),
+                        ),
+                        branch="cell", codebook_sizes=(30, 20, 10),
+                    ),
+                ),
+                wt_mmd_batch=100.0, n_sub=512,
+            ),
+        ),
+    },
+    # ========================================================================
     # mmb0-1b_smb1-1b_1p held-out region (downstream gene-reconstruction
     # task, NicheCompass / MLGenX-style). Both batches stay in training
     # but a contiguous patch in each is masked out cell-wise; Pearson is
@@ -5456,6 +5754,47 @@ VARIANTS: dict = {
                     branch="cell", codebook_sizes=(30, 90),
                 ),
                 alpha=1.0, wt_adv_batch=150.0,
+            ),
+            test_batch_idx=[2, 3],
+        ),
+    },
+    # ------------------------------------------------------------------------
+    # chl59 port of the mmb-smb winner variant.
+    # Same spine as `dualvq+rvq-both+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p`
+    # (NO +wide -> 1-hop GNN; rvq-both with codebook sizes (30, 90);
+    # decoder-covariate; adversarial-batch (alpha=1.0, wt=150.0); enc-deeper
+    # MLP [400, 400, 256]) — only the dataset patch differs. Standard
+    # chl59-8b_1p train/test split: train on adata_batch_id 0+1+4+5+6+7,
+    # hold out 2+3 (replicate + new donor) for downstream evaluation.
+    # ------------------------------------------------------------------------
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+chl59-8b_1p": {
+        "description": (
+            "chl59-8b_1p port of the mmb-smb winner variant "
+            "(`dualvq+rvq-both+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p`). "
+            "1-hop GNN spine + RVQ-both (30, 90) + decoder-covariate + "
+            "adversarial-batch (alpha=1.0, wt=150.0) + deeper encoder MLP "
+            "[400, 400, 256]. Train: adata_batch_id 0+1+4+5+6+7. "
+            "Test: 2+3 (held-out replicate + new donor)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+chl59-8b_1p(test_ids=[2,3])",
+        ],
+        "build": lambda: _patch_dual_chl59_lung5(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
             ),
             test_batch_idx=[2, 3],
         ),
@@ -6488,6 +6827,35 @@ DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v9"] = [
     "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+adv-w300+mmb0-1b_smb1-1b_1p",
     "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+adv+mmd-w50+mmb0-1b_smb1-1b_1p",
     "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+mmd-w100+mmb0-1b_smb1-1b_1p",
+]
+
+# v11 — single-variant smoke-test sweep used to verify the updated
+# DataLoader config (num_workers=8 / persistent_workers=True /
+# pin_memory=True) and the 10-CPU LSF allocation actually take effect.
+# Picks one representative variant from v9 (medium architecture +
+# default adversarial); the exact choice is incidental — any variant
+# would do. Useful as the first job to submit after the DataLoader
+# change lands, before re-running the full sweeps.
+# Submit via:
+#   bash examples/submit_mmb_smb_ablations_v11.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v11"] = [
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+]
+
+# v10 — "is spatial supervision hurting cell-type NMI?" diagnostic.
+# 4 variants on a fixed medium architecture (h64 + codebook (30, 20, 10))
+# crossed over { adv vs mmd-w100 } x { +no-spatial vs +no-adj }.
+# Architectural size is held constant so the diagnostic isolates the
+# effect of LOSSES (not capacity) on cell-type NMI.
+# Submit all 4 via:
+#   bash examples/submit_mmb_smb_ablations_v10.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v10"] = [
+    # +no-spatial: drops nbr-NB + niche-commit + adj-BCE (all spatial losses).
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+adv+no-spatial+mmb0-1b_smb1-1b_1p",
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+mmd-w100+no-spatial+mmb0-1b_smb1-1b_1p",
+    # +no-adj: keeps nbr-NB + niche-commit, drops ONLY adjacency BCE.
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+adv+no-adj+mmb0-1b_smb1-1b_1p",
+    "dualvq+small-h64+rvq-both-3level-30-20-10+decoder-cov+mmd-w100+no-adj+mmb0-1b_smb1-1b_1p",
 ]
 
 # Held-out-region downstream task. Currently a single variant — the
@@ -8510,7 +8878,33 @@ def main():
                         "plot/metrics output. Defaults to the run_dir itself "
                         "so all artifacts for one training run live in one "
                         "folder.")
+    # Opt-in switch for the heavy per-epoch Pearson metrics. Off by
+    # default since `compute_inference_metrics.py` produces the
+    # benchmark CSVs at the end of training anyway. See
+    # `_resolve_metrics_list()` for what gets enabled.
+    p.add_argument(
+        "--with-pearson", action="store_true",
+        help="Compute the full Pearson metrics list every val epoch "
+             "during training (turns the in-flight wandb Pearson curves "
+             "back on). OFF by default — expect ~10-20x slower epochs "
+             "when enabled, because each metric reconstructs the full "
+             "val AnnData and runs a cells x genes correlation. The "
+             "final benchmark CSVs are produced by "
+             "`compute_inference_metrics.py` at the end of the "
+             "pipeline regardless of this flag. Equivalent to setting "
+             "the env var SQUINT_WITH_PEARSON=1.",
+    )
     args = p.parse_args()
+
+    # Propagate the CLI flag to the env-var that `_resolve_metrics_list()`
+    # checks at config-build time. Setting the env var here (before any
+    # `train()` call below materialises a cfg) ensures the new
+    # `train_metrics_list` / `test_metrics_list` reflect the chosen
+    # behaviour for this invocation. Setting it directly via env var on
+    # the command line (`SQUINT_WITH_PEARSON=1 python ...`) also works
+    # — this just bridges from CLI flag to env var.
+    if args.with_pearson:
+        os.environ["SQUINT_WITH_PEARSON"] = "1"
 
     if args.list_variants:
         print("Registered ablation variants:")

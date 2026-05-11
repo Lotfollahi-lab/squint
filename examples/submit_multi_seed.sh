@@ -45,7 +45,7 @@
 #   OUT_DIR           <auto: <ARTIFACTS>/<dataset_tag>/<variant>__multiseed/<TS>/>
 #   LSF_GROUP         s10396
 #   LSF_QUEUE         inference         # USER REQUEST: inference queue by default
-#   LSF_CORES         6
+#   LSF_CORES         20  (16 DataLoader workers + 1 main + 3 headroom)
 #   LSF_MEM_MB        128000
 #   LSF_GPU           mode=exclusive_process:num=1:block=yes
 #   LSF_WALL          24:00
@@ -104,7 +104,7 @@ LOG_ROOT="${LOG_ROOT:-/nfs/team361/sb75/squint-reproducibility/artifacts/logs}"
 # Per-seed (GPU) LSF resources
 LSF_GROUP="${LSF_GROUP:-s10396}"
 LSF_QUEUE="${LSF_QUEUE:-inference}"
-LSF_CORES="${LSF_CORES:-6}"
+LSF_CORES="${LSF_CORES:-20}"
 LSF_MEM_MB="${LSF_MEM_MB:-128000}"
 LSF_GPU="${LSF_GPU:-mode=exclusive_process:num=1:block=yes}"
 LSF_WALL="${LSF_WALL:-24:00}"

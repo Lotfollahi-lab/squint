@@ -762,9 +762,17 @@ class BaseModel(pl.LightningModule):
     def compute_metrics(
         self,
         mode: Literal['train', 'val', 'test'] = 'val',
-    ) -> None:
+    ) -> dict:
         """
         Compute metrics for a given mode. The mode determines the dataloader and inference data cache used to compute the metrics.
+
+        Returns
+        -------
+        dict
+            Metric-name -> value. Returns `{}` when the relevant
+            `*_metrics_list` is empty (e.g. losses-only training mode
+            where Pearson computation is turned off) — callers can
+            iterate the dict unconditionally.
 
         Parameters
         ----------
@@ -834,6 +842,27 @@ class BaseModel(pl.LightningModule):
                 inference_data_cache[key] = []
 
             return metrics_dict
+
+        # `metrics_list` was empty (e.g. losses-only training mode set
+        # via the SQUINT_WITH_PEARSON=0 default, where `train_metrics_list`
+        # / `test_metrics_list` are both `[]`). Skip the AnnData
+        # reconstruction + Pearson loop entirely and return an empty
+        # dict so callers can keep iterating unconditionally — earlier
+        # the implicit `None` return crashed `on_validation_epoch_end`'s
+        # `for key, value in metrics_dict.items():` loop.
+        #
+        # CRITICAL: even though we're skipping the metrics computation,
+        # we MUST still drain the inference cache. `_step` appends to
+        # this cache on every training/val step (cell_emb, X_hat, etc. —
+        # GPU tensors), and the metrics path was the only consumer that
+        # cleared it. Without this clear, GPU memory grows linearly
+        # until OOM (~75 s on a ~140 GiB H100 at batch_size=1024). The
+        # symptom is a steady upward slope in the wandb GPU memory
+        # panel, ending in `torch.cuda.OutOfMemoryError` deep inside
+        # the adjacency-BCE loss (the largest per-step allocation).
+        for key in self.cache_keys:
+            inference_data_cache[key] = []
+        return {}
 
 
     def on_train_epoch_start(self) -> None:

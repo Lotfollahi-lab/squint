@@ -75,6 +75,25 @@ class InMemoryDataModule(LightningNodeData):
                                 NUM_CORES
                                 ))
 
+        # Honour an explicit `num_workers` passed via `loader_params` if
+        # present. Pop it here BEFORE the per-loader branch logic so it
+        # (a) survives the per-branch `loader_params` reassignment below
+        # (DefaultFullLoader / DefaultNodeLoader both rebuild
+        # `loader_params` from scratch, which would otherwise drop the
+        # caller's value), and (b) isn't passed twice to
+        # `super().__init__()` — the parent class declares `num_workers`
+        # as an explicit kwarg AND we expand `**self.loader_params`
+        # there, so leaving `num_workers` in both would raise
+        # `TypeError: got multiple values for keyword argument 'num_workers'`.
+        # Note: `DefaultFullLoader` deliberately forces `num_workers=0`
+        # (incompatible with full-graph loading) — the explicit override
+        # is NOT honoured for that path.
+        explicit_num_workers = (
+            loader_params.pop('num_workers', None)
+            if isinstance(loader_params, dict)
+            else None
+        )
+
         # Loaders will be instantiated in self.train_dataloader(), self.val_dataloader(), and self.test_dataloader()
         print(f"Loader Name: {loader_name}")
 
@@ -99,8 +118,14 @@ class InMemoryDataModule(LightningNodeData):
 
         # setting parameters for backward compatibility with the default LightningNodeData implementation of NodeLoader + NeighborSampler
         elif loader_name == 'DefaultNodeLoader':
-            # set num_workers to half of the available cores
-            num_workers = max(num_cores_available // 2, NUM_WORKERS)
+            # set num_workers to half of the available cores (or honour
+            # the caller-pinned `loader_params['num_workers']` popped
+            # above, if any).
+            num_workers = (
+                explicit_num_workers
+                if explicit_num_workers is not None
+                else max(num_cores_available // 2, NUM_WORKERS)
+            )
 
             # set loader_type to 'neighbor' for DefaultNodeLoader
             loader_type = 'neighbor'
@@ -127,8 +152,14 @@ class InMemoryDataModule(LightningNodeData):
 
         # setting parameters for custom Loader and Sampler
         else:
-            # set num_workers to half of the available cores
-            num_workers = max(num_cores_available // 2, NUM_WORKERS)
+            # set num_workers to half of the available cores (or honour
+            # the caller-pinned `loader_params['num_workers']` popped
+            # above, if any).
+            num_workers = (
+                explicit_num_workers
+                if explicit_num_workers is not None
+                else max(num_cores_available // 2, NUM_WORKERS)
+            )
 
             # train_loader will be set to a custom Callable in self.train_dataloader()
             # this is necessary to indicate to LightningNodeData that the train_loader is a custom DataLoader
@@ -312,11 +343,27 @@ class InMemoryDataModule(LightningNodeData):
             CPU-bound, so this hides sampling latency behind GPU work.
         Total expected speedup: 1.3-2x wall-clock on CPU-sampler-heavy
         datasets (mmb20).
+
+        If a caller passed any of these kwargs explicitly via
+        `loader_params` (e.g. the run_squint base config), DO NOT
+        re-add them here — that would land on
+        `NeighborLoader(..., **self.loader_params, **self._loader_perf_kwargs())`
+        with each key set twice, raising `TypeError: got multiple
+        values for keyword argument '<key>'`. Caller-provided settings
+        win silently.
         """
         kw: dict = {"pin_memory": True}
         if int(self.num_workers) > 0:
             kw["persistent_workers"] = True
             kw["prefetch_factor"] = 4
+        # Drop any keys the caller already set in `loader_params` so
+        # the eventual unpack at the loader call site can't see
+        # duplicates. `getattr` with a default keeps this safe before
+        # `self.loader_params` is assigned (e.g. if a subclass calls
+        # this helper during its own __init__).
+        for k in list(kw):
+            if k in getattr(self, "loader_params", {}):
+                del kw[k]
         return kw
 
     def train_dataloader(self):
