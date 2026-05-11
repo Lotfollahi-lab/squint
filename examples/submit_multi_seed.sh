@@ -38,28 +38,41 @@
 # Optional positional:
 #   SEEDS    — Comma-separated seed list. Default: '0,1,2,3,4'.
 #
+# Optional CLI flags:
+#   --queue / -q QUEUE   LSF queue (default: gpu-lotfollahi).
+#                        Per-seed jobs AND the chained aggregator both
+#                        land on this queue (unless AGG_QUEUE env
+#                        override is set). Also overridable via the
+#                        LSF_QUEUE env var.
+#   --group / -g GROUP   LSF cost-code group (default: team361).
+#                        Also overridable via LSF_GROUP env var.
+#   --help  / -h         Print this usage block and exit.
+#
+# Precedence for queue/group: CLI flag > env var > script default.
+#
 # Optional environment overrides:
 #   VENV_PATH         /nfs/team361/sb75/.venvs/squint
 #   SQUINT_REPO       <auto: this script's repo root>
 #   LOG_ROOT          /nfs/team361/sb75/squint-reproducibility/artifacts/logs
 #   OUT_DIR           <auto: <ARTIFACTS>/<dataset_tag>/<variant>__multiseed/<TS>/>
-#   LSF_GROUP         s10396
-#   LSF_QUEUE         inference         # USER REQUEST: inference queue by default
+#   LSF_GROUP         team361             (also: --group / -g)
+#   LSF_QUEUE         gpu-lotfollahi      (also: --queue / -q)
 #   LSF_CORES         20  (16 DataLoader workers + 1 main + 3 headroom)
 #   LSF_MEM_MB        128000
 #   LSF_GPU           mode=exclusive_process:num=1:block=yes
 #   LSF_WALL          24:00
-#   AGG_QUEUE         inference         # only one queue available on this cluster
+#   AGG_QUEUE         <mirrors LSF_QUEUE>  # override to send the aggregator
+#                                          # to a different queue than the
+#                                          # per-seed jobs. The aggregator
+#                                          # is CPU-only work but most
+#                                          # queues require a GPU spec —
+#                                          # AGG_GPU below provides one
+#                                          # (set AGG_GPU="" to opt out
+#                                          # on flexible queues).
 #   AGG_CORES         2
 #   AGG_MEM_MB        16000
 #   AGG_WALL          1:00
 #   AGG_GPU           mode=exclusive_process:num=1:block=yes
-#                                       # the aggregator is CPU-only work, but
-#                                       # the inference queue requires a GPU
-#                                       # spec — request one anyway so the
-#                                       # job gets accepted. Set AGG_GPU=""
-#                                       # to skip the -gpu flag (only safe
-#                                       # on a queue that permits CPU jobs).
 #   SKIP_UMAP                 1         # default ON (matches user recommendation)
 #   SKIP_CODE_INDEX_PLOTS     1         # default ON
 #   SKIP_SVG_PLOTS            1         # default ON
@@ -68,13 +81,17 @@
 #   DRY_RUN                   0
 #
 # Examples:
-#   # Default: 5 seeds, queue=inference, plots skipped, aggregator chained.
+#   # Default: 5 seeds, queue=gpu-lotfollahi, group=team361, plots skipped.
 #   bash examples/submit_multi_seed.sh \\
 #       dualvq+rvq-both+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p
 #
 #   # Custom seed list:
 #   bash examples/submit_multi_seed.sh \\
 #       dualvq+rvq-both+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p 0,1,2
+#
+#   # Switch queue + group at submission time:
+#   bash examples/submit_multi_seed.sh <VARIANT> \\
+#       --queue inference --group s10396
 #
 #   # Dry-run to inspect what would submit:
 #   DRY_RUN=1 bash examples/submit_multi_seed.sh dualvq+...
@@ -87,6 +104,66 @@
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
+
+# --- Defaults ---------------------------------------------------------------
+# Match the (queue, group) pairing used by v9 / v10 / v11 wrappers.
+# Env vars still work for backward compatibility; CLI flags below win.
+DEFAULT_QUEUE="gpu-lotfollahi"
+DEFAULT_GROUP="team361"
+
+QUEUE_ARG="${LSF_QUEUE:-$DEFAULT_QUEUE}"
+GROUP_ARG="${LSF_GROUP:-$DEFAULT_GROUP}"
+# Aggregator queue: if the user explicitly set AGG_QUEUE via env, honour
+# that. Otherwise it mirrors the per-seed queue (resolved below after
+# flag parsing) so the aggregator always lands on a queue the user can
+# actually submit to.
+AGG_QUEUE_OVERRIDE="${AGG_QUEUE:-}"
+
+# --- Parse CLI flags --------------------------------------------------------
+# Accept --queue / -q and --group / -g anywhere in argv; everything else
+# is kept in positional order so VARIANT (=$1) and SEEDS_CSV (=$2) still
+# work after.
+POSITIONAL_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --queue|-q)
+            shift
+            if [[ $# -eq 0 ]]; then
+                echo "ERROR: --queue / -q requires a value." >&2
+                exit 2
+            fi
+            QUEUE_ARG="$1"
+            shift
+            ;;
+        --queue=*)
+            QUEUE_ARG="${1#--queue=}"
+            shift
+            ;;
+        --group|-g)
+            shift
+            if [[ $# -eq 0 ]]; then
+                echo "ERROR: --group / -g requires a value." >&2
+                exit 2
+            fi
+            GROUP_ARG="$1"
+            shift
+            ;;
+        --group=*)
+            GROUP_ARG="${1#--group=}"
+            shift
+            ;;
+        --help|-h)
+            awk '/^[^#]/ {exit} {print}' "$0"
+            exit 0
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+# Restore positionals so VARIANT / SEEDS_CSV indexing below stays simple.
+set -- ${POSITIONAL_ARGS[@]+"${POSITIONAL_ARGS[@]}"}
 
 VARIANT="${1:-}"
 if [[ -z "$VARIANT" ]]; then
@@ -101,26 +178,30 @@ SQUINT_REPO="${SQUINT_REPO:-"$( cd -- "$SCRIPT_DIR/.." &> /dev/null && pwd )"}"
 VENV_PATH="${VENV_PATH:-/nfs/team361/sb75/.venvs/squint}"
 LOG_ROOT="${LOG_ROOT:-/nfs/team361/sb75/squint-reproducibility/artifacts/logs}"
 
-# Per-seed (GPU) LSF resources
-LSF_GROUP="${LSF_GROUP:-s10396}"
-LSF_QUEUE="${LSF_QUEUE:-inference}"
+# --- Per-seed (GPU) LSF resources -------------------------------------------
+# Apply the resolved queue / group (flag > env > default).
+LSF_GROUP="$GROUP_ARG"
+LSF_QUEUE="$QUEUE_ARG"
 LSF_CORES="${LSF_CORES:-20}"
 LSF_MEM_MB="${LSF_MEM_MB:-128000}"
 LSF_GPU="${LSF_GPU:-mode=exclusive_process:num=1:block=yes}"
 LSF_WALL="${LSF_WALL:-24:00}"
 
-# Aggregator LSF resources. There's only ONE queue on this cluster
-# ("inference"), and it requires a GPU spec — so the aggregator runs
-# on the same queue as the per-seed jobs and asks for a GPU even
-# though it doesn't use one (the alternative is a queue rejection).
-# Resources are kept minimal — 2 cores, 16 GB, 1 h wall — because the
-# work is just CSV concatenation.
-AGG_QUEUE="${AGG_QUEUE:-inference}"
+# --- Aggregator LSF resources -----------------------------------------------
+# CPU-only work (CSV concat). Mirror the per-seed queue by default so the
+# aggregator lands on a queue the user can actually submit to. If the queue
+# requires a GPU spec (e.g. gpu-lotfollahi), AGG_GPU below provides one;
+# set AGG_GPU="" to opt out on flexible queues.
+AGG_QUEUE="${AGG_QUEUE_OVERRIDE:-$LSF_QUEUE}"
 AGG_CORES="${AGG_CORES:-2}"
 AGG_MEM_MB="${AGG_MEM_MB:-16000}"
 AGG_WALL="${AGG_WALL:-1:00}"
 AGG_GPU="${AGG_GPU:-mode=exclusive_process:num=1:block=yes}"
 SUBMIT_AGGREGATOR="${SUBMIT_AGGREGATOR:-1}"
+
+echo "[multi-seed] LSF_QUEUE = $LSF_QUEUE"
+echo "[multi-seed] LSF_GROUP = $LSF_GROUP"
+echo "[multi-seed] AGG_QUEUE = $AGG_QUEUE"
 
 # Step skipping (forwarded to _run_one_seed.py via SEED_EXTRA_ARGS).
 SKIP_UMAP="${SKIP_UMAP:-1}"

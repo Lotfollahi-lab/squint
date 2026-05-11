@@ -543,64 +543,68 @@ def make_train_config_poc() -> dict:
         "datamodule": {
             "loader_name": "NeighborLoader",
             "loader_params": {
-                # batch_size bumped from 256 -> 1024 after wandb showed
-                # the GPU peaking at ~25 % utilization with batch=256:
-                # the model is too cheap per step to saturate a modern
-                # GPU at that batch size, and the GPU memory was only
-                # ~5 % allocated, so there's plenty of headroom. With
-                # batch=1024 the GPU does 4x more work per forward pass,
-                # raising the duty cycle without hitting OOM.
-                # NOTE: batch_size CHANGES training dynamics (effective
-                # learning rate scales with batch size). Pre-v11 runs at
-                # batch=256 are NOT directly comparable to post-v11
-                # results at batch=1024 — re-benchmark before drawing
-                # cross-run conclusions. If you want apples-to-apples,
-                # override via a patch (e.g. `_patch_dual_batch_size(256)`)
-                # for the comparison runs.
-                "batch_size":         1024,
-                # 16 workers to feed the 4x larger batches. The
-                # DataModule's auto-derivation
-                # (`LSB_DJOB_NUMPROC // 2`) yields ~10 at LSF_CORES=20;
-                # explicit override here pins it at 16 so the GPU
-                # stays fed even on hosts where LSB_DJOB_NUMPROC
-                # reports less than expected. `pin_memory=True`,
-                # `persistent_workers=True`, and `prefetch_factor=4`
-                # are added automatically by
-                # `InMemoryDataModule._loader_perf_kwargs()` — don't
-                # set them here, that produces a `got multiple values
-                # for keyword argument` TypeError on the loader call.
+                # batch_size pinned at 256.
+                # History: a v11 GPU-utilization push briefly bumped
+                # this to 1024 (with `max_epochs` 80 -> 200) to chase
+                # GPU duty cycle. The bigger-batch dynamics turned out
+                # to silently regress batch integration: with `lr`
+                # unchanged at 5e-4, the per-sample gradient
+                # contribution dropped 4x, the adversarial
+                # discriminator under-trained, and `neighborhood_emb`
+                # iLISI collapsed to numerical noise across seeds.
+                # Reverting to 256 (paired with `max_epochs=200`)
+                # restores the training dynamics the multi-seed
+                # benchmark numbers were originally tuned on. If you
+                # want to explore bigger batches again, scale `lr`
+                # linearly (5e-4 * (new_batch/256)) and validate
+                # end-to-end iLISI before publishing the comparison.
+                "batch_size":         256,
+                # 16 workers leaves a few idle at batch=256 but is
+                # safe — `InMemoryDataModule._loader_perf_kwargs()`
+                # adds `pin_memory=True`, `persistent_workers=True`,
+                # and `prefetch_factor=4` automatically, so don't
+                # set those here (that triggers
+                # `TypeError: got multiple values for keyword
+                # argument` on the loader call).
                 "num_workers":        16,
             },
             "sampler_name": "NeighborSampler",
             "sampler_params": {"num_neighbors": [8]},  # 1 hop = num_layers
-            # Flipped from False to True (was the GPU-utilization
-            # bottleneck): the val + test + inference loaders all share
-            # this flag, and `False` made them sample `num_neighbors=[-1]`
-            # (every neighbor) — for a 100k-cell graph with ~10-50
-            # neighbors per node, that's 10-100x more sampler work per
-            # batch than training (which uses the `[8]`-fanout
-            # configured below). With val running every epoch, the
-            # heavy val pass stalled the GPU between train epochs,
-            # producing the spike-then-long-gap utilization pattern.
-            # `True` makes val/test/inference use the same `[8]`
-            # sampler as training — apples-to-apples, much faster.
+            # Two-knob inference-sampling config:
             #
-            # Implications worth knowing:
-            #   - val_loss numerical values shift slightly (val sees a
-            #     sparser neighborhood). Early stopping still works,
-            #     but the absolute val_loss curves are not comparable
-            #     to pre-v11 runs.
-            #   - predict()-time inference also uses `[8]`: each cell
-            #     sees ONE random sample of 8 neighbors at predict
-            #     time. Per-cell X_hat is now stochastic across
-            #     repeated predict() calls (was deterministic before).
-            #     For benchmarks across seeds this just adds a small
-            #     amount of additional variance to NMI / iLISI / Pearson
-            #     — within the existing inter-seed spread.
-            #   - If you specifically need deterministic, all-context
-            #     inference for a paper figure, override per-variant via
-            #     `cfg["datamodule"]["inference_params"]["sample_neighbors_for_inference"] = False`.
-            "inference_params": {"sample_neighbors_for_inference": True},
+            #   `sample_neighbors_for_inference`: VAL + TEST loaders.
+            #     `True`  (current): val/test use the training `[8]`
+            #             fanout. Cheap per step → GPU stays fed
+            #             between training epochs. Was the v11 fix
+            #             for the spike-then-long-gap GPU pattern.
+            #     `False` (legacy): val/test sample
+            #             `num_neighbors=[-1]` (every neighbor).
+            #             Heavier per step, slow val epochs, but
+            #             deterministic and identical to predict.
+            #
+            #   `predict_sample_neighbors_for_inference`: PREDICT loader
+            #             only — i.e. the final pass that writes
+            #             `neighborhood_emb` / `cell_emb` to the
+            #             output AnnData consumed by the benchmark
+            #             figures.
+            #     `False` (current, DEFAULT): fan out `[-1]` → every
+            #             neighbor → deterministic per-cell niche
+            #             embedding. Required for iLISI / MMD /
+            #             NMI to be meaningful (with `[8]` the
+            #             niche embedding picks up the
+            #             sampling-noise-correlated-with-batch
+            #             signature and iLISI collapses to 0).
+            #     `True`: stochastic predict (e.g. dropout-style
+            #             uncertainty). Don't enable for figure runs.
+            #
+            # Split rationale: val running every epoch wants the
+            # cheap sampler for throughput, but the single final
+            # predict pass should be the heavy deterministic one —
+            # those are different cost-vs-correctness trade-offs.
+            "inference_params": {
+                "sample_neighbors_for_inference":         True,
+                "predict_sample_neighbors_for_inference": False,
+            },
         },
         "model": {
             "model_name": "VQNiche",
@@ -770,13 +774,26 @@ def make_train_config_poc() -> dict:
             # the drift.
             "monitor": "val_loss",
             "checkpoint_params": {"mode": "min", "save_top_k": 1, "save_last": True},
-            # max_epochs bumped 80 -> 200 when batch_size went 256 -> 1024.
-            # Each epoch now contains ~4x fewer gradient steps (~97 vs
-            # ~390 for a 100k-cell dataset), so 200 epochs at batch=1024
-            # is roughly equivalent in total gradient-step budget to
-            # 50 epochs at batch=256 — still less than the original 80,
-            # but early stopping below will cap things in practice if
-            # val_loss plateaus earlier.
+            # max_epochs is the universal training budget cap — every
+            # individual / multi-seed / ablation run picks this value
+            # up from the base config. At batch=256 / ~100k-cell
+            # dataset that's ~390 gradient steps/epoch, so 200 epochs
+            # ≈ 78k total gradient steps. Early stopping (below)
+            # cuts runs short when val_loss plateaus; the 200 cap is
+            # the safety ceiling for the adversarial variants whose
+            # val_loss can drift up after a long stable phase.
+            #
+            # PAIRED WITH batch_size: the v11 1024/200 config silently
+            # regressed batch integration because `lr` wasn't rescaled
+            # with the 4x bigger batch — the per-sample gradient
+            # contribution dropped 4x and the adversarial discriminator
+            # under-trained, collapsing `neighborhood_emb` iLISI to
+            # numerical noise. Sticking with batch=256 keeps the
+            # per-sample dynamics on the curve this 200-epoch budget
+            # was originally tuned against. If you ever bump
+            # batch_size again, scale `lr` linearly (5e-4 *
+            # (new_batch/256)) and re-validate end-to-end iLISI
+            # before drawing cross-run conclusions.
             "max_epochs": 200,
             "enable_checkpointing": True,
             "ckpt_path": "best",

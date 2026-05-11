@@ -47,6 +47,7 @@ class InMemoryDataModule(LightningNodeData):
             sampler_name: Optional[Literal['NeighborSampler']] = 'NeighborSampler',
             sampler_params: Optional[dict] = {},
             sample_neighbors_for_inference: bool = False,
+            predict_sample_neighbors_for_inference: bool = False,
             obs_per_batch_id: Optional[dict] = None,
         ) -> None:
         """
@@ -65,7 +66,27 @@ class InMemoryDataModule(LightningNodeData):
         - sampler_params: Optional[dict]
             Dictionary that contains the arguments that will be passed to the Sampler class, e.g. `num_neighbors`.
         - sample_neighbors_for_inference: bool
-            Whether to sample neighbors for inference or not. This is implemented by setting the number of neighbors to the maximum number of neighbors for inference.
+            Whether to sample neighbors for the VALIDATION and TEST
+            dataloaders. When False (legacy default), val/test fan out
+            with `num_neighbors=[-1]` (every neighbor). When True, val/test
+            re-use the training sampler's `num_neighbors` so the GPU
+            stays fed during validation (the per-step cost matches
+            training instead of being 10-100x heavier).
+        - predict_sample_neighbors_for_inference: bool
+            Independent toggle for the PREDICT dataloader. Default
+            `False`: the final predict pass always fans out with
+            `num_neighbors=[-1]` so the embeddings written to AnnData
+            are deterministic and aggregate every neighbor — that's
+            what downstream batch-integration metrics (iLISI, MMD)
+            and clustering metrics (NMI, ARI) expect. Set to `True`
+            only if you specifically want stochastic predict-time
+            sampling (e.g. dropout-style uncertainty estimates).
+
+            The split exists because val/test can legitimately want
+            cheap sampling for training-loop throughput, while the
+            single final predict pass should be heavy + deterministic.
+            Setting `sample_neighbors_for_inference=True` alone (the
+            common case) leaves predict on the safe default.
         """
         assert isinstance(data, Data), f"data must be of type torch_geometric.data.Data, but got {type(data)}."
 
@@ -203,9 +224,15 @@ class InMemoryDataModule(LightningNodeData):
         print(f"Sampler Class: {self.sampler_class}")
         print(f"Sampler Params: {self.sampler_params}")
 
-        # set whether to sample neighbors for inference
+        # set whether to sample neighbors for inference. val/test and
+        # the final predict pass each get their own switch — see the
+        # constructor docstring for the rationale.
         self.sample_neighbors_for_inference = sample_neighbors_for_inference
-        print(f"Sample Neighbors for Inference: {self.sample_neighbors_for_inference}")
+        self.predict_sample_neighbors_for_inference = predict_sample_neighbors_for_inference
+        print(f"Sample Neighbors for Inference (val/test): "
+              f"{self.sample_neighbors_for_inference}")
+        print(f"Sample Neighbors for Inference (predict):  "
+              f"{self.predict_sample_neighbors_for_inference}")
 
         # build the data dictionary for the loader after data transforms
         base_data = {
@@ -412,8 +439,10 @@ class InMemoryDataModule(LightningNodeData):
             return super().val_dataloader()
 
         else:
-            # reuse user-defined sampler parameters
-            sampler_params = self.sampler_params
+            # Shallow copy so the `[-1]` override below doesn't mutate
+            # `self.sampler_params` and leak into other dataloaders
+            # (predict can have a different fanout from val/test now).
+            sampler_params = dict(self.sampler_params)
 
             if not self.sample_neighbors_for_inference:
                 # update num_neighbors to -1 so that the neighbors are not sampled.
@@ -453,8 +482,9 @@ class InMemoryDataModule(LightningNodeData):
             return super().test_dataloader()
 
         else:
-            # reuse user-defined sampler parameters
-            sampler_params = self.sampler_params
+            # Shallow copy so the `[-1]` override below doesn't mutate
+            # `self.sampler_params` and leak into other dataloaders.
+            sampler_params = dict(self.sampler_params)
 
             if not self.sample_neighbors_for_inference:
                 # update num_neighbors to -1 so that the neighbors are not sampled.
@@ -487,15 +517,20 @@ class InMemoryDataModule(LightningNodeData):
 
         Notes:
         ------
-        - If `sample_neighbors_for_inference` is set to True, the neighbors are sampled during inference.
-        - If `sample_neighbors_for_inference` is set to False, the neighbors are not sampled during inference.
+        - The PREDICT path consults `predict_sample_neighbors_for_inference`
+          (NOT `sample_neighbors_for_inference` — that's for val/test).
+          Default is `False` → fans out with `num_neighbors=[-1]` (every
+          neighbor) so the embeddings written to AnnData are
+          deterministic and aggregate the full neighborhood. Set the
+          flag to `True` if you want stochastic predict-time sampling.
         - `predict_dataloader` loops over all the nodes in the graph.
         """
-        # reuse user-defined sampler parameters
-        sampler_params = self.sampler_params
+        # Shallow copy so the `[-1]` override below doesn't mutate
+        # `self.sampler_params` (val/test may want a different fanout).
+        sampler_params = dict(self.sampler_params)
 
         # update num_neighbors to -1 so that the neighbors are not sampled.
-        if not self.sample_neighbors_for_inference:
+        if not self.predict_sample_neighbors_for_inference:
             sampler_params['num_neighbors'] = [-1] * len(self.sampler_params['num_neighbors'])
 
         # instantiate the sampler class to control the behavior of the loader

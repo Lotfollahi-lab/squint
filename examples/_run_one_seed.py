@@ -3,20 +3,38 @@
 Single-seed runner for the multi-seed SQUINT submission. Invoked by
 `_run_one_seed.sh` inside one LSF job.
 
-Responsibilities:
-  1. Monkey-patch the variant's `build()` so `cfg["experiment"]["seed"]`
-     is set to the seed we got from argv.
-  2. Call `train(variant)` -> writes a fresh
-     <ARTIFACTS_DIR>/<dataset_tag>/<variant>/<TS_seed_N>/ run dir.
-  3. Call `run_inference_and_analysis(run_dir, ...)` -> writes
-     `<run_dir>/metrics/*.csv` (+ optional plots).
-  4. Stamp the resulting run_dir + wall-clock runtime into the sweep
-     output dir so the aggregator (a separate LSF job, possibly running
-     long after this seed finished) can find it::
+Two-phase design (motivated by apples-to-apples runtime comparison vs
+baseline methods):
 
-         <OUT_DIR>/seed_runs/seed_<N>_run_dir.txt
-         <OUT_DIR>/seed_runs/seed_<N>_runtime_seconds.txt
-         <OUT_DIR>/seed_runs/seed_<N>_status.txt    ("OK" or error msg)
+  Phase 1 (TIMED — recorded in seed_<N>_runtime_seconds.txt):
+    1. Monkey-patch the variant's `build()` so `cfg["experiment"]["seed"]`
+       is set to the seed we got from argv.
+    2. `train(variant)` -> writes a fresh
+       <ARTIFACTS_DIR>/<dataset_tag>/<variant>/<TS_seed_N>/ run dir.
+    3. `run_inference_and_analysis(... skip_plots=True, skip_metrics=True)`
+       -> runs ONLY `predict()`, which writes `cell_code_index` /
+       `neighborhood_code_index` to `predicted_adata.h5ad`. Those
+       codes ARE the model's clusters — no downstream Leiden needed.
+
+  Phase 2 (UNTIMED — for benchmark CSVs):
+    4. `run_inference_and_analysis(skip_predict=True, skip_metrics=False)`
+       -> populates `<run_dir>/metrics/*.csv` so the aggregator has
+       per-seed NMI / ARI / iLISI / MMD / Pearson numbers to fold into
+       the long-format `per_seed_*.csv` files. Optional plot steps
+       (UMAP / code-index spatial / SVG reconstruction) also run here
+       IF the caller enabled them via flags.
+
+Why split: the recorded `runtime_seconds` should be a fair "time to
+obtain clusters" number, comparable across methods. Metric computation
+is benchmark scaffolding (not method cost), and visualisation plots
+are downstream of the clusters — neither should be charged to the
+method's runtime.
+
+Stamps written to <OUT_DIR>/seed_runs/:
+    seed_<N>_run_dir.txt              SQUINT run dir produced this seed
+    seed_<N>_runtime_seconds.txt      phase 1 wall-clock (train + predict)
+    seed_<N>_status.txt               "OK" / error message
+    seed_<N>_runtime_methodology.txt  one-line explainer of what runtime_seconds covers
 
 Usage (always invoked by `_run_one_seed.sh`, but works standalone too):
 
@@ -26,7 +44,10 @@ Any extra args after OUT_DIR are forwarded to
 `run_inference_and_analysis()` via the same flag names as
 `run_inference.py` (`--skip-predict`, `--skip-code-index-plots`,
 `--skip-svg-plots`, `--skip-umap`, `--skip-metrics`,
-`--silver-dir`, `--label-keys`).
+`--silver-dir`, `--label-keys`). `--skip-*-plots` and `--skip-umap`
+only affect phase 2 since phase 1 always skips them. `--skip-metrics`
+turns off the metric-CSV write in phase 2 (don't pass this unless
+you want to re-aggregate from existing CSVs only).
 """
 from __future__ import annotations
 
@@ -137,6 +158,20 @@ def main() -> int:
     print(f"  stamps dir    : {seed_runs_dir}")
     print("=" * 78)
 
+    # ---- Phase 1 (TIMED): train + predict only ----------------------------
+    # The recorded `runtime_seconds` covers ONLY the steps required to
+    # produce the model's clusters from scratch. For SQUINT that's
+    # `train()` (model fit) + `predict()` (writes
+    # `cell_code_index` / `neighborhood_code_index` to
+    # `predicted_adata.h5ad`). The codes ARE the clusters — no
+    # downstream Leiden / UMAP needed.
+    #
+    # Metric computation (compute_inference_metrics) and any optional
+    # plot steps run in phase 2 below, OUTSIDE the timer, so the
+    # reported runtime is apples-to-apples with the per-seed numbers
+    # produced by the baseline runners (after they're refactored to
+    # the same convention: time only "model + clustering", drop
+    # metric/plot cost). See `runtime_methodology.txt` written below.
     t0 = time.time()
     original_build = _patch_seed(args.variant, args.seed)
     try:
@@ -169,24 +204,28 @@ def main() -> int:
 
         run_dir = str(run_dir)
         print(f"\n[seed {args.seed}] train complete, run_dir={run_dir}")
-        # Stamp the run_dir EARLY (before inference) so the aggregator
-        # can still find the training artifacts even if inference fails.
+        # Stamp the run_dir EARLY (before predict) so the aggregator
+        # can still find the training artifacts even if predict fails.
         _write_stamp(seed_runs_dir, args.seed, "run_dir", run_dir)
 
+        # Phase-1 inference: run ONLY predict() (writes predicted_adata.h5ad
+        # containing the code-index obs columns). Force-skip every other
+        # step — plots and metrics belong in the untimed phase 2.
         try:
             run_inference_and_analysis(
                 run_dir=run_dir,
                 silver_dir=args.silver_dir,
                 label_keys=args.label_keys,
-                skip_predict=args.skip_predict,
-                skip_code_index_plots=args.skip_code_index_plots,
-                skip_svg_plots=args.skip_svg_plots,
-                skip_umap=args.skip_umap,
-                skip_metrics=args.skip_metrics,
+                skip_predict=args.skip_predict,    # respect --skip-predict
+                                                   # if user pre-ran predict
+                skip_code_index_plots=True,        # untimed: phase 2
+                skip_svg_plots=True,               # untimed: phase 2
+                skip_umap=True,                    # untimed: phase 2
+                skip_metrics=True,                 # untimed: phase 2
             )
         except Exception as e:  # noqa: BLE001
             tb = traceback.format_exc()
-            print(f"\nINFERENCE FAILED on seed {args.seed}: "
+            print(f"\nINFERENCE (predict) FAILED on seed {args.seed}: "
                   f"{type(e).__name__}: {e}")
             print(tb)
             _write_stamp(seed_runs_dir, args.seed, "status",
@@ -198,8 +237,70 @@ def main() -> int:
 
     seconds = time.time() - t0
     _write_stamp(seed_runs_dir, args.seed, "runtime_seconds", f"{seconds:.3f}")
+    print(f"\n[seed {args.seed}] phase 1 (train + predict) done in "
+          f"{seconds:.1f}s -> {run_dir}")
+
+    # ---- Phase 2 (UNTIMED): metrics + any user-requested plots -----------
+    # Decoupled from the runtime stamp on purpose: metrics produce the
+    # benchmark CSVs (NMI / ARI / iLISI / MMD / Pearson) that the
+    # aggregator reads, but per the apples-to-apples runtime principle,
+    # the time spent producing those CSVs shouldn't be charged to the
+    # method. Plots are skipped by default (`SKIP_*=1` in
+    # `submit_multi_seed.sh`); if the caller re-enabled them via flags
+    # they also run here, untimed. If everything is skipped, this is a
+    # no-op (the function returns early without re-reading the predicted
+    # adata).
+    phase2_needed = not (
+        args.skip_metrics
+        and args.skip_code_index_plots
+        and args.skip_svg_plots
+        and args.skip_umap
+    )
+    if phase2_needed:
+        print(f"\n[seed {args.seed}] phase 2 (metrics + optional plots, "
+              f"UNTIMED) starting...")
+        try:
+            run_inference_and_analysis(
+                run_dir=run_dir,
+                silver_dir=args.silver_dir,
+                label_keys=args.label_keys,
+                skip_predict=True,                # already done in phase 1
+                skip_code_index_plots=args.skip_code_index_plots,
+                skip_svg_plots=args.skip_svg_plots,
+                skip_umap=args.skip_umap,
+                skip_metrics=args.skip_metrics,
+            )
+        except Exception as e:  # noqa: BLE001
+            tb = traceback.format_exc()
+            print(f"\nMETRICS / PLOTS FAILED on seed {args.seed}: "
+                  f"{type(e).__name__}: {e}")
+            print(tb)
+            # Phase-1 runtime stamp is intentionally kept (training +
+            # predict DID succeed; only metric/plot generation failed).
+            # Status reflects the partial state so the aggregator can
+            # decide whether to include this seed via `--seeds` override.
+            _write_stamp(seed_runs_dir, args.seed, "status",
+                         f"metrics_failed: {type(e).__name__}: {e}")
+            return 4
+
+    # Drop a sidecar describing what `runtime_seconds` measures, for
+    # any future reader of this sweep dir. Same content for every seed;
+    # writing per-seed keeps the file co-located with the stamp it
+    # documents.
+    _write_stamp(
+        seed_runs_dir, args.seed, "runtime_methodology",
+        "runtime_seconds covers train() + predict() ONLY. "
+        "Metric computation (NMI/ARI/iLISI/MMD/Pearson) and any plot "
+        "steps run in a second, untimed phase of _run_one_seed.py. "
+        "For apples-to-apples comparison with baseline runners, those "
+        "runners should also exclude metric/plot cost from the per-seed "
+        "timer (and add their shared embedding-compute cost back so "
+        "the per-seed number reflects 'time to obtain clusters from "
+        "scratch for this seed').",
+    )
     _write_stamp(seed_runs_dir, args.seed, "status", "OK")
-    print(f"\n[seed {args.seed}] done in {seconds:.1f}s -> {run_dir}")
+    print(f"\n[seed {args.seed}] all done. runtime_seconds = {seconds:.1f}s "
+          f"(train + predict only); metrics + plots ran untimed.")
     return 0
 
 

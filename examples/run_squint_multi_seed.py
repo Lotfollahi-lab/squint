@@ -17,7 +17,8 @@ Input layout (created by `submit_multi_seed.sh` + `_run_one_seed.py`):
         manifest.yaml                                  # variant, seeds, ...
         seed_runs/
             seed_0_run_dir.txt                         # SQUINT run dir
-            seed_0_runtime_seconds.txt                 # wall-clock seconds
+            seed_0_runtime_seconds.txt                 # train + predict only (apples-to-apples)
+            seed_0_runtime_methodology.txt             # explainer of what runtime covers
             seed_0_status.txt                          # "OK" or error msg
             seed_1_run_dir.txt
             ...
@@ -74,7 +75,9 @@ import pandas as pd
 # Stamp-file discovery
 # ---------------------------------------------------------------------------
 
-_STAMP_RE = re.compile(r"^seed_(\d+)_(run_dir|runtime_seconds|status)\.txt$")
+_STAMP_RE = re.compile(
+    r"^seed_(\d+)_(run_dir|runtime_seconds|runtime_methodology|status)\.txt$"
+)
 
 
 def _discover_seed_stamps(
@@ -189,6 +192,13 @@ def _aggregate(
                 "min_seconds":   float(secs.min()),
                 "max_seconds":   float(secs.max()),
                 "total_seconds": float(secs.sum()),
+                # Bake the methodology into the summary so it travels
+                # with the CSV. Cross-method runtime comparisons live or
+                # die on getting this right.
+                "runtime_includes":
+                    "train + inference (predict); excludes metric "
+                    "computation, UMAP, and downstream plots — the "
+                    "produced codes ARE the clusters",
             }])
             out = metrics_dir / "runtime_summary.csv"
             summary.to_csv(out, index=False)
