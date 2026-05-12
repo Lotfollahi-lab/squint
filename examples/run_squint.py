@@ -610,27 +610,23 @@ def make_train_config_poc() -> dict:
                 # irrelevant and the cost is dominated by kernel-launch
                 # overhead at small batch sizes.
                 #
-                # 16384 (= 64x training batch) further reduces the
-                # number of predict batches to ~6-7 on a 100k-cell
-                # graph, so per-step overhead becomes negligible.
-                # Bumped up from 4096 after seeing GPU utilization
-                # stay low during predict.
+                # DEFAULT: 1024  (REVERTED 2026-05-12).
                 #
-                # Memory math on the mmb-smb graph with `[-1]` predict
-                # fanout (avg degree ~12 after symmetrization):
-                #   nodes_per_batch ≈ batch_size × (1 + avg_degree)
-                #                   ≈ 16384 × 13 ≈ ~213k nodes/batch
-                # Forward activations (no autograd, no optimizer state)
-                # at that node count on the dual model: ~3-6 GiB after
-                # the CUDA caching allocator overhead. Fits
-                # comfortably on any H100/H200 (80+ GiB) and trivially
-                # on the gpu_high_memory (384 GiB) node class.
+                # Was previously 16384 (=64× training batch). Reverted
+                # in the same investigation as the precision flip
+                # above — a multi-seed sweep showed metric drops vs
+                # historic, and 16384 at full `[-1]` fanout means
+                # ~213k nodes per predict batch in bf16 autocast,
+                # which is a plausible second source of numerical
+                # drift on the codebook argmin. 1024 is the
+                # known-good value from before the optimisation pass
+                # (and matches what historic baselines were predicted
+                # under).
                 #
-                # If you ever see OOM during predict (most likely on
-                # a denser dataset like chl59-8b_1p, or on mmb20 with
-                # 20+ sections), the safe fallback chain is
-                # 16384 → 8192 → 4096 → 2048 → 1024 → 512.
-                "predict_batch_size":                     16384,
+                # Re-bump in increments (1024 → 2048 → 4096 → 8192 →
+                # 16384) once the bf16-vs-32 question is settled. The
+                # safe fallback chain still applies on OOM.
+                "predict_batch_size":                     1024,
                 # Val/test batch-size override. Val runs every
                 # `check_val_every_n_epoch` (see trainer config below
                 # — currently every 2 train epochs), and the per-val-
@@ -645,6 +641,48 @@ def make_train_config_poc() -> dict:
                 # you ever see val-time OOM:
                 # 4096 → 2048 → 1024 → 512.
                 "val_batch_size":                         4096,
+                # Pre-cache one full epoch of training batches on the
+                # first `train_dataloader()` call, then serve them from
+                # CPU memory on every subsequent epoch (reshuffled order,
+                # fixed content).
+                #
+                # DEFAULT: False  (BACKED OFF 2026-05-12).
+                #
+                # The cache path was on briefly with an internal
+                # `num_neighbors=[-1]` override (every cell sees its
+                # full neighborhood, frozen for all 80 epochs). Multi-
+                # seed runs on that config dropped niche / cell metrics
+                # severely vs the s17_v2 historic numbers — most
+                # plausibly because:
+                #   (a) The niche-branch GNN was trained with
+                #       stochastic `[8]`-fanout sampling, so the
+                #       per-epoch resampling acted as data
+                #       augmentation. Freezing the neighbourhood
+                #       (let alone freezing the FULL neighbourhood)
+                #       removed that and pushed nbr_NMI / nbr_iLISI
+                #       down.
+                #   (b) The cached batches are ~2× bigger in node
+                #       count than the live-sampled batches, which
+                #       changes the per-step gradient and possibly
+                #       OOM behaviour on smaller GPUs.
+                # Neither (a) nor (b) was caught by a smoke test —
+                # only the full multi-seed sweep surfaced the
+                # regression. Default reverted to False until we have
+                # a clean A/B vs the historic baseline.
+                #
+                # The plumbing (the kwarg in `InMemoryDataModule`, the
+                # internal `[-1]` override, the `.cpu()` defensive
+                # copy) is kept in place; opt back in by setting
+                # `cache_train_batches: True` here or in a per-variant
+                # patch once we trust it again. For sampler-heavy
+                # datasets (chl59, mmb20) it's also worth keeping the
+                # option visible.
+                #
+                # Lives in `inference_params` only because that's the
+                # dict the initialiser unpacks into `InMemoryDataModule`'s
+                # kwargs. It's a TRAIN-side flag (val/test/predict are
+                # unaffected) — don't read meaning into the name.
+                "cache_train_batches":                    False,
             },
         },
         "model": {
@@ -854,6 +892,30 @@ def make_train_config_poc() -> dict:
             #     via SQUINT_WITH_PEARSON=1) AND verify post-hoc
             #     niche NMI before publishing.
             "max_epochs": 80,
+            # Training precision. DEFAULT: "32-true" (REVERTED 2026-05-12).
+            #
+            # Originally set to "bf16-mixed" for ~20-40% wall-clock
+            # saving on Ampere/Hopper. Reverted to "32-true" after a
+            # multi-seed sweep showed severe metric drops vs historic
+            # numbers despite training losses looking normal — leading
+            # hypothesis: bf16-mantissa precision shifts the codebook
+            # entries enough to flip ~5-10% of cell→code assignments,
+            # which crashes NMI/ARI even when reconstruction NB loss
+            # looks unchanged. VQ models amplify small parameter
+            # drifts into discrete output flips, so even "0.1 nat
+            # loss diff" can mean visible cluster reshuffling.
+            #
+            # Opt back into bf16 per-run via `--precision bf16-mixed`
+            # on the CLI (run_squint.py main flag); the multi-seed
+            # runner (_run_one_seed.py) currently doesn't forward
+            # that flag — flip the value here for a global multi-
+            # seed bf16 test if you want.
+            #
+            # If you re-adopt bf16 as default, A/B test against a
+            # fp32 control on at least one seed of the canonical
+            # baseline (s17_v2) and confirm NMI/iLISI match within
+            # 0.01 before pushing cluster-wide.
+            "precision": "32-true",
             # Run validation every 2 train epochs (Lightning default
             # would be every epoch). Each val pass is a sub-pass over
             # `val_dataloader` (cell-level 10% holdout from the train
@@ -1704,6 +1766,50 @@ def _patch_dual_adj_weight(cfg: dict, weight: float) -> dict:
     return cfg
 
 
+def _patch_dual_attr_recon_weight(cfg: dict, weight: float) -> dict:
+    """
+    Override the CELL-branch NB attribute-reconstruction weight
+    (`wt_attr_reconstr` in `loss_kwargs`; default 1.0).
+
+    Lowering this weight loosens how tightly the cell embedding is
+    anchored to per-batch gene means → opens room for batch-invariance
+    signals (adversarial / MMD) to move the cell embedding around →
+    can lift cell_iLISI at the cost of cell-branch NB reconstruction
+    quality. Raising it does the opposite. See `_patch_dual_attr_recon_nbr_weight`
+    for the niche-branch sibling.
+    """
+    cfg["model"]["loss_params"]["loss_kwargs"]["wt_attr_reconstr"] = float(weight)
+    return cfg
+
+
+def _patch_dual_attr_recon_nbr_weight(cfg: dict, weight: float) -> dict:
+    """
+    Override the NICHE-branch NB attribute-reconstruction weight
+    (`wt_attr_reconstr_nbr` in `loss_kwargs`; default 1.0).
+
+    The niche NB term reconstructs the K-hop neighbourhood-mean gene
+    expression from `z_q_niche`. At weight=1.0 this is the dominant
+    pull on the niche embedding alongside the cosine adjacency BCE
+    (`wt_adj_reconstr=1000`) — both anchor the niche embedding to
+    per-batch gene statistics, which fights batch integration on the
+    neighborhood embedding (low nbr_iLISI).
+
+    Lowering this weight is the easiest way to free `z_gnn` /
+    `z_q_niche` for batch integration without disabling the niche
+    reconstruction entirely (which `_patch_dual_no_nbr_recon` would
+    do, dropping nbr_NMI hard — see s19_v3 in the historic results).
+
+    Use cases:
+      - weight=0.3-0.5: aggressive — niche embedding can integrate
+        more freely, expect nbr_iLISI to rise. Watch nbr_NMI: too
+        low and niche structure collapses (like s19_v3 at weight=0).
+      - weight=2.0+: tighter anchor — niche embedding stays close to
+        per-batch gene means, nbr_iLISI suffers further.
+    """
+    cfg["model"]["loss_params"]["loss_kwargs"]["wt_attr_reconstr_nbr"] = float(weight)
+    return cfg
+
+
 def _patch_dual_wide(
         cfg: dict,
         cell_codebook_size:  int = 50,
@@ -1744,6 +1850,81 @@ def _patch_dual_wide(
 # ---------------------------------------------------------------------------
 # Architecture ablations (mouse data)
 # ---------------------------------------------------------------------------
+
+def _patch_dual_scvi_compact(
+        cfg: dict,
+        encoder_hidden: int = 128,
+        latent_dim:     int = 32,
+        decoder_hidden: int = 128,
+    ) -> dict:
+    """
+    Tight scVI-style architecture: 1 hidden layer per MLP + small
+    latent dim. The whole geometry is collapsed onto `latent_dim`:
+
+      - encoder MLP: hidden_channels = [encoder_hidden, latent_dim]
+                    → 431 input → encoder_hidden hidden → latent_dim
+                      output. 1 intermediate layer; output IS the
+                      cell-VQ codebook input.
+      - GNN:        SAGEConv, hidden_channels = latent_dim,
+                      num_layers = 1 (stays at the dual-base default).
+                      The niche-VQ codebook input.
+      - cell decoder:  hidden_channels = [decoder_hidden]
+                    → latent_dim (+ covariate) → decoder_hidden → 431
+                      genes. 1 hidden layer; matches the encoder geometry
+                      mirror-symmetrically.
+      - niche decoder: same as cell decoder.
+
+    Codebook embedding dim = latent_dim for BOTH branches (cell-VQ
+    embedding dim = MLP output, niche-VQ embedding dim = GNN hidden).
+    Compose with `_patch_dual_rvq(branch=..., codebook_sizes=...)` to
+    set codebook geometry on top.
+
+    Why bother:
+      - At the SQUINT default (latent=256 + decoder [400, 400]) the
+        decoder has room to absorb batch-specific patterns even with
+        a `+decoder-cov` covariate, so the encoder doesn't NEED to
+        produce batch-invariant z to keep reconstruction good. A
+        tighter bottleneck (32) removes that escape hatch: there's
+        no longer enough capacity for the decoder to memorise
+        per-batch noise, so the encoder has to discard it. scVI's
+        20-30 dim latent is the canonical example.
+      - Smaller latent also means the cosine-distance VQ codebook
+        operates in a lower-dim sphere, where the geometry is
+        sharper and code assignment is less affected by random
+        per-batch axes.
+
+    Does NOT touch:
+      - sampler_params (stays at the base default `[8]` since GNN
+        depth stays at 1).
+      - nbr_aggregation_hops (stays at 1 in the dual base).
+      - decoder_covariate (compose `_patch_dual_decoder_covariate` on
+        top — pass `embed_dim=latent_dim` for the symmetric variant
+        the user prefers).
+      - codebook sizes (compose `_patch_dual_rvq` on top).
+
+    Parameters
+    ----------
+    encoder_hidden
+        Width of the encoder MLP's hidden layer (default 128, like
+        scVI's encoder).
+    latent_dim
+        Bottleneck dim (= MLP output = GNN hidden = codebook embedding).
+        Default 32. scVI uses 10-30; 32 is a safe spatial-VQ analogue.
+    decoder_hidden
+        Width of the decoder MLP's hidden layer (default 128, mirrors
+        the encoder).
+    """
+    enc = cfg["model"]["encoder_params"]
+    enc["mlp_params"]["hidden_channels"]   = [int(encoder_hidden), int(latent_dim)]
+    enc["gnn_params"]["hidden_channels"]   = int(latent_dim)
+    # GNN num_layers stays at the dual-base default (=1) — caller
+    # should compose `_patch_dual_gnn2` etc. on top if they want
+    # 2-hop spatial context.
+    for dec_key in ("attribute_decoder_cell_params",
+                    "attribute_decoder_niche_params"):
+        cfg["model"][dec_key]["mlp_params"]["hidden_channels"] = [int(decoder_hidden)]
+    return cfg
+
 
 def _patch_dual_small(cfg: dict, hidden: int = 128) -> dict:
     """
@@ -8560,6 +8741,1009 @@ _register_alias(
 )
 
 
+# ---- Sweep 23: loss-weight grid for batch integration / NMI Pareto ---
+# Goal: improve cell_emb + neighborhood_emb iLISI while preserving (or
+# improving) the niche / cell-type NMI numbers.
+#
+# Diagnosis from the s17-s22 result table:
+#   - Baseline s17_v2 (`+wide+rvq-both+decoder-cov+adv`):
+#       nbr_NMI=0.68, cell_NMI=0.41, cell_iLISI=0.29, nbr_iLISI=0.04
+#   - cell_iLISI is decent (the adv head moves the cell embedding)
+#     but nbr_iLISI is consistently near zero.
+#   - The cosine adjacency BCE (`wt_adj_reconstr=1000`) and the niche
+#     NB reconstruction (`wt_attr_reconstr_nbr=1.0`) BOTH anchor
+#     `z_gnn` / `z_q_niche` to per-batch spatial + gene statistics,
+#     swamping the adversarial signal (alpha=1, wt_adv_batch=150).
+#   - The "no-adj" extreme (s19_v2) lifted nbr_iLISI to 0.18 but
+#     tanked nbr_NMI 0.68 → 0.46. The "sampler4" extreme (s20_v4)
+#     pushed nbr_iLISI to 0.64 but collapsed nbr_NMI to 0.11.
+#
+# We want the Pareto frontier in between. 16 variants, all on the
+# s17_v2 spine, organised in 4 hypothesis groups:
+#
+#   Group A (v1-v4): adjacency BCE weight sweep
+#     v1: adj-w100   v2: adj-w300   v3: adj-w500   v4: adj-w2000
+#     Sweep the dominant niche-side anchor. v1-v3 loosen it (expect
+#     nbr_iLISI ↑, nbr_NMI ↓ — find the inflexion). v4 is the
+#     control: does heavier adj actually help any metric?
+#
+#   Group B (v5-v8): stronger adversarial pressure
+#     v5: alpha=2, wt=300     (≈4× effective encoder gradient)
+#     v6: alpha=3, wt=300     (≈6× effective encoder gradient)
+#     v7: alpha=5, wt=150     (5× via alpha only)
+#     v8: alpha=1, wt=500     (3.3× via wt_adv_batch only)
+#     Hold anchors at baseline. Tests how much iLISI you can buy
+#     just by turning up the adversarial gradient. Risk: alpha>2
+#     historically caused codebook collapse on smaller setups; the
+#     wide+rvq spine should tolerate it but watch nbr_NMI.
+#
+#   Group C (v9-v12): NB reconstruction balance
+#     v9:  nbr-w0.3            (3.3× looser niche NB)
+#     v10: nbr-w0.5            (2× looser niche NB)
+#     v11: nbr-w2.0            (tighter niche NB — control)
+#     v12: cell-w0.5 + nbr-w0.5  (loosen BOTH branches)
+#     Loosening the gene-anchor frees the latent for integration
+#     without dropping the NB term entirely.
+#
+#   Group D (v13-v16): combined sweet-spot candidates
+#     v13: adj-w300 + alpha=2, wt=300
+#     v14: adj-w300 + nbr-w0.5
+#     v15: adj-w200 + alpha=3, wt=300                  (aggressive)
+#     v16: adj-w500 + alpha=2, wt=300 + nbr-w0.7       (balanced)
+#     Pareto candidates layering the most promising A/B/C levers.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v23
+
+# --- Group A: adjacency weight sweep --------------------------------
+
+VARIANTS["s23_v1_dualvq+wide+rvq-both+decoder-cov+adv+adj-w100+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s23 sweep, variant 1: s17_v2 spine with wt_adj_reconstr lowered "
+        "10× from 1000 → 100. Tests whether dropping the dominant niche-"
+        "side anchor lifts nbr_iLISI substantially while keeping nbr_NMI "
+        "in the 0.55-0.65 range. Group A: adj-weight Pareto sweep."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+adj-w100",
+    ],
+    "build": lambda: _patch_dual_adj_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        weight=100.0,
+    ),
+}
+
+VARIANTS["s23_v2_dualvq+wide+rvq-both+decoder-cov+adv+adj-w300+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s23 sweep, variant 2: s17_v2 spine with wt_adj_reconstr lowered "
+        "from 1000 → 300. Mid-point of the Group A sweep — usually the "
+        "best-balanced point in a log-spaced reduction. Submit alongside "
+        "v1 and v3 to read the iLISI/NMI Pareto."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+adj-w300",
+    ],
+    "build": lambda: _patch_dual_adj_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        weight=300.0,
+    ),
+}
+
+VARIANTS["s23_v3_dualvq+wide+rvq-both+decoder-cov+adv+adj-w500+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s23 sweep, variant 3: s17_v2 spine with wt_adj_reconstr lowered "
+        "from 1000 → 500. Mild reduction — tests whether even a modest "
+        "loosening of the spatial anchor lifts nbr_iLISI."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+adj-w500",
+    ],
+    "build": lambda: _patch_dual_adj_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        weight=500.0,
+    ),
+}
+
+VARIANTS["s23_v4_dualvq+wide+rvq-both+decoder-cov+adv+adj-w2000+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s23 sweep, variant 4: s17_v2 spine with wt_adj_reconstr DOUBLED "
+        "from 1000 → 2000. Control: does heavier spatial anchoring help "
+        "any metric, or does it just push nbr_iLISI further toward 0? "
+        "s17_v5 (adj-w3000) suggested it doesn't lift NMI either; this "
+        "is the gentler upweight."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+adj-w2000",
+    ],
+    "build": lambda: _patch_dual_adj_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        weight=2000.0,
+    ),
+}
+
+# --- Group B: stronger adversarial pressure --------------------------
+
+VARIANTS["s23_v5_dualvq+wide+rvq-both+decoder-cov+adv-alpha2-wt300+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s23 sweep, variant 5: s17_v2 spine with adversarial alpha 1→2 "
+        "AND wt_adv_batch 150→300 (≈4× effective encoder gradient). "
+        "Group B: turn up adversarial pressure without touching the "
+        "niche-side anchors. Risk: alpha>=2 historically caused "
+        "codebook collapse on h32 setups; the wide+rvq spine should "
+        "tolerate it."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=2.0, wt=300.0)",
+    ],
+    "build": lambda: _patch_dual_adversarial(
+        _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+                _patch_dual_rvq(
+                    _patch_dual_wide(_BD()),
+                    branch="niche", codebook_sizes=(30, 90),
+                ),
+                branch="cell", codebook_sizes=(30, 90),
+            ),
+        ),
+        alpha=2.0, wt_adv_batch=300.0,
+    ),
+}
+
+VARIANTS["s23_v6_dualvq+wide+rvq-both+decoder-cov+adv-alpha3-wt300+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s23 sweep, variant 6: s17_v2 spine with adversarial alpha 1→3 "
+        "AND wt_adv_batch 150→300 (≈6× effective encoder gradient). "
+        "More aggressive Group B variant. If nbr_iLISI still doesn't "
+        "lift here, the adversarial path can't beat the adjacency BCE "
+        "alone — combine with Group A reductions in Group D."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=3.0, wt=300.0)",
+    ],
+    "build": lambda: _patch_dual_adversarial(
+        _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+                _patch_dual_rvq(
+                    _patch_dual_wide(_BD()),
+                    branch="niche", codebook_sizes=(30, 90),
+                ),
+                branch="cell", codebook_sizes=(30, 90),
+            ),
+        ),
+        alpha=3.0, wt_adv_batch=300.0,
+    ),
+}
+
+VARIANTS["s23_v7_dualvq+wide+rvq-both+decoder-cov+adv-alpha5+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s23 sweep, variant 7: s17_v2 spine with adversarial alpha 1→5 "
+        "(5× via alpha only, wt_adv_batch unchanged at 150). Isolates "
+        "the alpha axis from the wt_adv_batch axis. alpha and wt are "
+        "multiplicative in the effective encoder gradient — splitting "
+        "v5/v6/v7 vs v8 tells us which knob the classifier responds "
+        "to more cleanly."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=5.0, wt=150.0)",
+    ],
+    "build": lambda: _patch_dual_adversarial(
+        _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+                _patch_dual_rvq(
+                    _patch_dual_wide(_BD()),
+                    branch="niche", codebook_sizes=(30, 90),
+                ),
+                branch="cell", codebook_sizes=(30, 90),
+            ),
+        ),
+        alpha=5.0, wt_adv_batch=150.0,
+    ),
+}
+
+VARIANTS["s23_v8_dualvq+wide+rvq-both+decoder-cov+adv-wt500+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s23 sweep, variant 8: s17_v2 spine with wt_adv_batch 150→500 "
+        "(3.3× via wt_adv_batch only, alpha unchanged at 1.0). Companion "
+        "to v7 — tests the alpha vs wt_adv_batch split. wt_adv_batch "
+        "also accelerates the classifier (sharper adversary), so this "
+        "variant should give a more confident batch signal back to the "
+        "encoder."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=500.0)",
+    ],
+    "build": lambda: _patch_dual_adversarial(
+        _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+                _patch_dual_rvq(
+                    _patch_dual_wide(_BD()),
+                    branch="niche", codebook_sizes=(30, 90),
+                ),
+                branch="cell", codebook_sizes=(30, 90),
+            ),
+        ),
+        alpha=1.0, wt_adv_batch=500.0,
+    ),
+}
+
+# --- Group C: NB reconstruction balance ------------------------------
+
+VARIANTS["s23_v9_dualvq+wide+rvq-both+decoder-cov+adv+nbr-w0.3+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s23 sweep, variant 9: s17_v2 spine with wt_attr_reconstr_nbr "
+        "1.0 → 0.3 (3.3× looser niche NB). Group C: loosen the per-cell "
+        "gene-mean anchor on the niche embedding. The niche NB term "
+        "lives at ~150 nats and competes with the adjacency BCE for "
+        "z_gnn's directionality — dropping it should free the niche "
+        "embedding for integration without disabling reconstruction "
+        "entirely (which s19_v3 +no-nbr at weight=0 did, with nbr_NMI=0.46)."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+nbr-w0.3",
+    ],
+    "build": lambda: _patch_dual_attr_recon_nbr_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        weight=0.3,
+    ),
+}
+
+VARIANTS["s23_v10_dualvq+wide+rvq-both+decoder-cov+adv+nbr-w0.5+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s23 sweep, variant 10: s17_v2 spine with wt_attr_reconstr_nbr "
+        "1.0 → 0.5 (2× looser niche NB). Gentler than v9 — tests the "
+        "Group C inflexion point. If both v9 and v10 lift nbr_iLISI "
+        "without losing nbr_NMI, weight=0.5 is the safer publication-"
+        "ready setting."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+nbr-w0.5",
+    ],
+    "build": lambda: _patch_dual_attr_recon_nbr_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        weight=0.5,
+    ),
+}
+
+VARIANTS["s23_v11_dualvq+wide+rvq-both+decoder-cov+adv+nbr-w2.0+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s23 sweep, variant 11: s17_v2 spine with wt_attr_reconstr_nbr "
+        "1.0 → 2.0 (2× tighter niche NB). Group C control — does "
+        "anchoring the niche embedding HARDER to per-batch gene means "
+        "help nbr_NMI, or just push nbr_iLISI lower? Likely the latter, "
+        "but worth confirming."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+nbr-w2.0",
+    ],
+    "build": lambda: _patch_dual_attr_recon_nbr_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        weight=2.0,
+    ),
+}
+
+VARIANTS["s23_v12_dualvq+wide+rvq-both+decoder-cov+adv+cell-w0.5+nbr-w0.5+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s23 sweep, variant 12: s17_v2 spine with BOTH NB reconstruction "
+        "weights halved (wt_attr_reconstr 1.0→0.5 AND wt_attr_reconstr_nbr "
+        "1.0→0.5). Tests symmetric loosening — frees both cell and niche "
+        "embeddings for integration. Combine with high adversarial in "
+        "Group D if v12 lifts iLISI on both."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+cell-w0.5", "+nbr-w0.5",
+    ],
+    "build": lambda: _patch_dual_attr_recon_nbr_weight(
+        _patch_dual_attr_recon_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            weight=0.5,
+        ),
+        weight=0.5,
+    ),
+}
+
+# --- Group D: combined sweet-spot candidates -------------------------
+
+VARIANTS["s23_v13_dualvq+wide+rvq-both+decoder-cov+adj-w300+adv-alpha2-wt300+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s23 sweep, variant 13 (Pareto candidate 1): adj-w300 (Group A "
+        "winner candidate) + alpha=2 wt=300 (Group B v5). Layers the "
+        "best two single-axis levers together. Hypothesis: relaxed "
+        "adjacency lets adversarial actually move the niche embedding. "
+        "Expect biggest nbr_iLISI lift in the sweep."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=2.0, wt=300.0)",
+        "+adj-w300",
+    ],
+    "build": lambda: _patch_dual_adj_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=2.0, wt_adv_batch=300.0,
+        ),
+        weight=300.0,
+    ),
+}
+
+VARIANTS["s23_v14_dualvq+wide+rvq-both+decoder-cov+adv+adj-w300+nbr-w0.5+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s23 sweep, variant 14 (Pareto candidate 2): adj-w300 (Group A) "
+        "+ nbr-w0.5 (Group C v10). Two independent niche-side "
+        "loosenings, default adversarial. Tests whether you can lift "
+        "nbr_iLISI without pushing adversarial hard — gentler choice "
+        "if v13's adv=2 destabilises training."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+adj-w300", "+nbr-w0.5",
+    ],
+    "build": lambda: _patch_dual_attr_recon_nbr_weight(
+        _patch_dual_adj_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            weight=300.0,
+        ),
+        weight=0.5,
+    ),
+}
+
+VARIANTS["s23_v15_dualvq+wide+rvq-both+decoder-cov+adj-w200+adv-alpha3-wt300+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s23 sweep, variant 15 (Pareto candidate 3, aggressive): adj-w200 "
+        "(5× looser than baseline) + alpha=3 wt=300 (≈6× adv gradient). "
+        "Maximum integration pressure short of full adversarial collapse. "
+        "Expect highest nbr_iLISI of the sweep; if nbr_NMI survives "
+        "above 0.55 this is the win."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=3.0, wt=300.0)",
+        "+adj-w200",
+    ],
+    "build": lambda: _patch_dual_adj_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=3.0, wt_adv_batch=300.0,
+        ),
+        weight=200.0,
+    ),
+}
+
+VARIANTS["s23_v16_dualvq+wide+rvq-both+decoder-cov+adj-w500+adv-alpha2-wt300+nbr-w0.7+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s23 sweep, variant 16 (Pareto candidate 4, balanced): adj-w500 "
+        "(2× looser) + alpha=2 wt=300 (≈4× adv) + nbr-w0.7 (slightly "
+        "looser niche NB). All three levers nudged gently rather than "
+        "any pushed hard. If the s17_v2 → s23_v* improvements are "
+        "broadly distributed across levers, v16 should be the "
+        "publication-ready point: stable training, modest gains on "
+        "every axis."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=2.0, wt=300.0)",
+        "+adj-w500", "+nbr-w0.7",
+    ],
+    "build": lambda: _patch_dual_attr_recon_nbr_weight(
+        _patch_dual_adj_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=2.0, wt_adv_batch=300.0,
+            ),
+            weight=500.0,
+        ),
+        weight=0.7,
+    ),
+}
+
+
+# ---- Sweep 24: scVI-style tight bottleneck architecture -----------
+# Hypothesis: SQUINT's current latent dim (256) gives the decoder
+# enough capacity to absorb per-batch noise even with `+decoder-cov`,
+# so the encoder doesn't NEED to produce batch-invariant z. Tightening
+# the bottleneck (scVI uses 10-30; we test 16/32/64) removes the
+# decoder's escape hatch — the encoder is forced to discard batch-
+# specific features to keep reconstruction quality. Side benefit:
+# smaller latent → sharper cosine-VQ geometry → cleaner codes.
+#
+# Architecture (s24_v1 reference):
+#   - Encoder MLP:    [128, 32]    (1 hidden, output 32 latent)
+#   - GNN:            SAGE h=32, 1 layer  (already the dual base)
+#   - Cell decoder:   [128]         (1 hidden, mirror of encoder)
+#   - Niche decoder:  [128]         (1 hidden, mirror of encoder)
+#   - Codebook:       RVQ 3-level (30, 20, 10) on BOTH branches
+#                      → 30 × 20 × 10 = 6000 distinct composite codes
+#                      per branch (vs the s17 spine's 2700)
+#   - Decoder covariate: learned embedding, embed_dim=32
+#                       (up from default 16; matches latent dim)
+#
+# Compared to the s17_v2 spine (256-dim latent, [400, 400] decoders,
+# RVQ (30, 90)), this is ~10× fewer parameters in the encoder + decoder
+# trunk — a real bet on "smaller helps".
+#
+# 12 variants in 3 groups of 4:
+#
+#   Group A (v1-v4): architecture / codebook variations
+#     v1: the reference (latent=32, RVQ (30,20,10))
+#     v2: latent=16  (even tighter — closer to scVI's z=10)
+#     v3: latent=64  (looser — does the bottleneck need to be THIS tight?)
+#     v4: latent=32 + bigger codebook RVQ (50, 30, 20)
+#
+#   Group B (v5-v8): batch integration on the tight architecture
+#     v5: + adv (alpha=1, wt=150)   (canonical adv on tight arch)
+#     v6: + adv (alpha=2, wt=300)   (stronger adv from s23 group B)
+#     v7: + mmd-w200                 (MMD only, no adv — see whether
+#                                     MMD finally works on small latent)
+#     v8: + adv + mmd-w100           (combined batch-int signal)
+#
+#   Group C (v9-v12): adv + the best s23-flavoured loss-weight levers
+#     v9:  + adv + adj-w300         (s23 winner candidate)
+#     v10: + adv + nbr-w0.5         (loosened niche NB)
+#     v11: + adv + adj-w300 + nbr-w0.5   (combined)
+#     v12: + adv (alpha=2, wt=300) + adj-w300  (stronger adv + relaxed adj)
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v24
+
+# --- Group A: architecture / codebook variations ---------------------
+
+VARIANTS["s24_v1_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s24 sweep, variant 1 (REFERENCE): scVI-style tight architecture. "
+        "Encoder MLP [128, 32], GNN SAGE h=32 / 1 layer, both decoders "
+        "[128] (single hidden, mirror geometry). Codebook RVQ 3-level "
+        "(30, 20, 10) on both branches = 6000 composite codes. Decoder "
+        "covariate embed_dim=32 (matches latent dim, up from default 16). "
+        "NO batch-integration loss yet (groups B/C add adv/mmd on top)."
+    ),
+    "patches": [
+        "+compact(encoder=[128,32], decoder=[128], gnn=32/1L)",
+        "+rvq(branch=both, levels=[30, 20, 10])",
+        "+decoder_covariate(embed_dim=32)",
+    ],
+    "build": lambda: _patch_dual_decoder_covariate(
+        _patch_dual_rvq(
+            _patch_dual_rvq(
+                _patch_dual_scvi_compact(
+                    _BD(),
+                    encoder_hidden=128, latent_dim=32, decoder_hidden=128,
+                ),
+                branch="niche", codebook_sizes=(30, 20, 10),
+            ),
+            branch="cell", codebook_sizes=(30, 20, 10),
+        ),
+        embed_dim=32,
+    ),
+}
+
+VARIANTS["s24_v2_dualvq+compact-l16+rvq-both-30-20-10+decoder-cov-e16+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s24 sweep, variant 2: even tighter latent = 16 (closer to "
+        "scVI's z_dim ≈ 10). Encoder MLP [128, 16], GNN h=16 / 1L, "
+        "both decoders [128]. RVQ (30, 20, 10) on both. Decoder "
+        "covariate embed_dim=16 (matches new latent). Tests how far "
+        "the bottleneck can be pushed before reconstruction NMI breaks."
+    ),
+    "patches": [
+        "+compact(encoder=[128,16], decoder=[128], gnn=16/1L)",
+        "+rvq(branch=both, levels=[30, 20, 10])",
+        "+decoder_covariate(embed_dim=16)",
+    ],
+    "build": lambda: _patch_dual_decoder_covariate(
+        _patch_dual_rvq(
+            _patch_dual_rvq(
+                _patch_dual_scvi_compact(
+                    _BD(),
+                    encoder_hidden=128, latent_dim=16, decoder_hidden=128,
+                ),
+                branch="niche", codebook_sizes=(30, 20, 10),
+            ),
+            branch="cell", codebook_sizes=(30, 20, 10),
+        ),
+        embed_dim=16,
+    ),
+}
+
+VARIANTS["s24_v3_dualvq+compact-l64+rvq-both-30-20-10+decoder-cov-e32+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s24 sweep, variant 3: looser latent = 64. Encoder MLP [128, 64], "
+        "GNN h=64 / 1L, both decoders [128]. RVQ (30, 20, 10) on both. "
+        "Decoder covariate embed_dim=32 (kept). Mid-ground between the "
+        "s17 spine (256) and the v1 reference (32) — does a 4× looser "
+        "bottleneck recover any signal that v1 may sacrifice?"
+    ),
+    "patches": [
+        "+compact(encoder=[128,64], decoder=[128], gnn=64/1L)",
+        "+rvq(branch=both, levels=[30, 20, 10])",
+        "+decoder_covariate(embed_dim=32)",
+    ],
+    "build": lambda: _patch_dual_decoder_covariate(
+        _patch_dual_rvq(
+            _patch_dual_rvq(
+                _patch_dual_scvi_compact(
+                    _BD(),
+                    encoder_hidden=128, latent_dim=64, decoder_hidden=128,
+                ),
+                branch="niche", codebook_sizes=(30, 20, 10),
+            ),
+            branch="cell", codebook_sizes=(30, 20, 10),
+        ),
+        embed_dim=32,
+    ),
+}
+
+VARIANTS["s24_v4_dualvq+compact-l32+rvq-both-50-30-20+decoder-cov-e32+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s24 sweep, variant 4: reference latent=32 but BIGGER codebook "
+        "RVQ (50, 30, 20) = 30000 composite codes (5× v1's 6000). Tests "
+        "whether the tight latent + richer codebook combination gives "
+        "more discrete capacity without re-introducing batch leakage. "
+        "Pair-compare with v1 to read 'does code count matter at this "
+        "geometry?'."
+    ),
+    "patches": [
+        "+compact(encoder=[128,32], decoder=[128], gnn=32/1L)",
+        "+rvq(branch=both, levels=[50, 30, 20])",
+        "+decoder_covariate(embed_dim=32)",
+    ],
+    "build": lambda: _patch_dual_decoder_covariate(
+        _patch_dual_rvq(
+            _patch_dual_rvq(
+                _patch_dual_scvi_compact(
+                    _BD(),
+                    encoder_hidden=128, latent_dim=32, decoder_hidden=128,
+                ),
+                branch="niche", codebook_sizes=(50, 30, 20),
+            ),
+            branch="cell", codebook_sizes=(50, 30, 20),
+        ),
+        embed_dim=32,
+    ),
+}
+
+# --- Group B: batch integration on the tight architecture ------------
+
+VARIANTS["s24_v5_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+adv+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s24 sweep, variant 5: v1 reference + canonical adversarial "
+        "head (alpha=1, wt=150). Tests whether the tight bottleneck "
+        "AMPLIFIES adversarial integration (less capacity to ignore "
+        "the adversarial gradient) or starves it (too few dims to "
+        "spread batch information across)."
+    ),
+    "patches": [
+        "+compact(encoder=[128,32], decoder=[128], gnn=32/1L)",
+        "+rvq(branch=both, levels=[30, 20, 10])",
+        "+decoder_covariate(embed_dim=32)",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+    ],
+    "build": lambda: _patch_dual_adversarial(
+        _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+                _patch_dual_rvq(
+                    _patch_dual_scvi_compact(
+                        _BD(),
+                        encoder_hidden=128, latent_dim=32, decoder_hidden=128,
+                    ),
+                    branch="niche", codebook_sizes=(30, 20, 10),
+                ),
+                branch="cell", codebook_sizes=(30, 20, 10),
+            ),
+            embed_dim=32,
+        ),
+        alpha=1.0, wt_adv_batch=150.0,
+    ),
+}
+
+VARIANTS["s24_v6_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+adv-alpha2-wt300+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s24 sweep, variant 6: v1 reference + stronger adversarial "
+        "(alpha=2, wt=300; ≈4× effective encoder gradient). Mirrors "
+        "s23_v5 on the new tight architecture. If the small latent + "
+        "strong adv combination is the publication target, v6 is the "
+        "first place it'd land."
+    ),
+    "patches": [
+        "+compact(encoder=[128,32], decoder=[128], gnn=32/1L)",
+        "+rvq(branch=both, levels=[30, 20, 10])",
+        "+decoder_covariate(embed_dim=32)",
+        "+adversarial_batch(alpha=2.0, wt=300.0)",
+    ],
+    "build": lambda: _patch_dual_adversarial(
+        _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+                _patch_dual_rvq(
+                    _patch_dual_scvi_compact(
+                        _BD(),
+                        encoder_hidden=128, latent_dim=32, decoder_hidden=128,
+                    ),
+                    branch="niche", codebook_sizes=(30, 20, 10),
+                ),
+                branch="cell", codebook_sizes=(30, 20, 10),
+            ),
+            embed_dim=32,
+        ),
+        alpha=2.0, wt_adv_batch=300.0,
+    ),
+}
+
+VARIANTS["s24_v7_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+mmd-w200+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s24 sweep, variant 7: v1 reference + MMD-only batch integration "
+        "(wt_mmd_batch=200, no adversarial head). On the s17 spine, MMD "
+        "underperformed adv on iLISI; tests whether the smaller latent "
+        "lets MMD's distribution-matching pressure actually reach the "
+        "encoder (deterministic per-step signal, no min-max instability)."
+    ),
+    "patches": [
+        "+compact(encoder=[128,32], decoder=[128], gnn=32/1L)",
+        "+rvq(branch=both, levels=[30, 20, 10])",
+        "+decoder_covariate(embed_dim=32)",
+        "+mmd-w200",
+    ],
+    "build": lambda: _patch_dual_mmd_batch(
+        _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+                _patch_dual_rvq(
+                    _patch_dual_scvi_compact(
+                        _BD(),
+                        encoder_hidden=128, latent_dim=32, decoder_hidden=128,
+                    ),
+                    branch="niche", codebook_sizes=(30, 20, 10),
+                ),
+                branch="cell", codebook_sizes=(30, 20, 10),
+            ),
+            embed_dim=32,
+        ),
+        wt_mmd_batch=200.0,
+    ),
+}
+
+VARIANTS["s24_v8_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+adv+mmd-w100+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s24 sweep, variant 8: v1 reference + adv (alpha=1, wt=150) + "
+        "MMD-w100. Combined adversarial + MMD batch-integration on the "
+        "tight architecture. The two pressures are different in nature "
+        "(min-max game vs deterministic distribution match) — stacking "
+        "may give a more stable integration signal than either alone."
+    ),
+    "patches": [
+        "+compact(encoder=[128,32], decoder=[128], gnn=32/1L)",
+        "+rvq(branch=both, levels=[30, 20, 10])",
+        "+decoder_covariate(embed_dim=32)",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+mmd-w100",
+    ],
+    "build": lambda: _patch_dual_mmd_batch(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_scvi_compact(
+                            _BD(),
+                            encoder_hidden=128, latent_dim=32, decoder_hidden=128,
+                        ),
+                        branch="niche", codebook_sizes=(30, 20, 10),
+                    ),
+                    branch="cell", codebook_sizes=(30, 20, 10),
+                ),
+                embed_dim=32,
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        wt_mmd_batch=100.0,
+    ),
+}
+
+# --- Group C: adv + the best s23-flavoured loss-weight levers --------
+
+VARIANTS["s24_v9_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+adv+adj-w300+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s24 sweep, variant 9: v5 (tight + adv) + adj-w300 (the s23 "
+        "winner candidate). Combines the new architecture with the "
+        "best-bet loss weight from s23. Expect highest nbr_iLISI of "
+        "the s24 sweep — small latent CAN'T memorise batch info, AND "
+        "the niche embedding is no longer over-anchored to spatial "
+        "structure."
+    ),
+    "patches": [
+        "+compact(encoder=[128,32], decoder=[128], gnn=32/1L)",
+        "+rvq(branch=both, levels=[30, 20, 10])",
+        "+decoder_covariate(embed_dim=32)",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+adj-w300",
+    ],
+    "build": lambda: _patch_dual_adj_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_scvi_compact(
+                            _BD(),
+                            encoder_hidden=128, latent_dim=32, decoder_hidden=128,
+                        ),
+                        branch="niche", codebook_sizes=(30, 20, 10),
+                    ),
+                    branch="cell", codebook_sizes=(30, 20, 10),
+                ),
+                embed_dim=32,
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        weight=300.0,
+    ),
+}
+
+VARIANTS["s24_v10_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+adv+nbr-w0.5+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s24 sweep, variant 10: v5 (tight + adv) + nbr-w0.5 (loosened "
+        "niche NB anchor). Tests whether the tight-latent setup needs "
+        "MORE niche-NB looseness or LESS (the small bottleneck already "
+        "limits how much per-batch noise the niche embedding can carry)."
+    ),
+    "patches": [
+        "+compact(encoder=[128,32], decoder=[128], gnn=32/1L)",
+        "+rvq(branch=both, levels=[30, 20, 10])",
+        "+decoder_covariate(embed_dim=32)",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+nbr-w0.5",
+    ],
+    "build": lambda: _patch_dual_attr_recon_nbr_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_scvi_compact(
+                            _BD(),
+                            encoder_hidden=128, latent_dim=32, decoder_hidden=128,
+                        ),
+                        branch="niche", codebook_sizes=(30, 20, 10),
+                    ),
+                    branch="cell", codebook_sizes=(30, 20, 10),
+                ),
+                embed_dim=32,
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        weight=0.5,
+    ),
+}
+
+VARIANTS["s24_v11_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+adv+adj-w300+nbr-w0.5+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s24 sweep, variant 11: v5 (tight + adv) + adj-w300 + nbr-w0.5. "
+        "Stacks the two s23 loss-weight winners on the tight architecture. "
+        "Most aggressive Pareto candidate of the s24 sweep — if v11 "
+        "wins, this is the publication-ready config."
+    ),
+    "patches": [
+        "+compact(encoder=[128,32], decoder=[128], gnn=32/1L)",
+        "+rvq(branch=both, levels=[30, 20, 10])",
+        "+decoder_covariate(embed_dim=32)",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+adj-w300", "+nbr-w0.5",
+    ],
+    "build": lambda: _patch_dual_attr_recon_nbr_weight(
+        _patch_dual_adj_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_scvi_compact(
+                                _BD(),
+                                encoder_hidden=128, latent_dim=32, decoder_hidden=128,
+                            ),
+                            branch="niche", codebook_sizes=(30, 20, 10),
+                        ),
+                        branch="cell", codebook_sizes=(30, 20, 10),
+                    ),
+                    embed_dim=32,
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            weight=300.0,
+        ),
+        weight=0.5,
+    ),
+}
+
+VARIANTS["s24_v12_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+adv-alpha2-wt300+adj-w300+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s24 sweep, variant 12: v6 (tight + stronger adv) + adj-w300. "
+        "Like v11 but trades the niche-NB loosening for a stronger "
+        "adversarial gradient. Tests whether the small latent makes "
+        "the higher-alpha regime tractable (on the s17 spine alpha>=2 "
+        "previously caused codebook collapse; the rvq-both spine "
+        "stabilised it — the tight version should be even more stable)."
+    ),
+    "patches": [
+        "+compact(encoder=[128,32], decoder=[128], gnn=32/1L)",
+        "+rvq(branch=both, levels=[30, 20, 10])",
+        "+decoder_covariate(embed_dim=32)",
+        "+adversarial_batch(alpha=2.0, wt=300.0)",
+        "+adj-w300",
+    ],
+    "build": lambda: _patch_dual_adj_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_scvi_compact(
+                            _BD(),
+                            encoder_hidden=128, latent_dim=32, decoder_hidden=128,
+                        ),
+                        branch="niche", codebook_sizes=(30, 20, 10),
+                    ),
+                    branch="cell", codebook_sizes=(30, 20, 10),
+                ),
+                embed_dim=32,
+            ),
+            alpha=2.0, wt_adv_batch=300.0,
+        ),
+        weight=300.0,
+    ),
+}
+
+
 VARIANTS["s21_v4_dualvq+wide+rvq-both+decoder-cov+adv+niche-neck+mmb0-1b_smb1-1b_1p"] = {
     "description": (
         "s21 sweep, variant 4: spine s17_v2 + niche-neck MLP. A new "
@@ -9372,6 +10556,73 @@ DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v22"] = [
     "s22_v8_dualvq+wide+rvq-both+decoder-cov+adv+bs256+lr1e-3+mmb0-1b_smb1-1b_1p",
 ]
 
+# Sweep 23 — drastic loss-weight grid on the s17_v2 spine. Goal:
+# improve cell_emb + neighborhood_emb iLISI while preserving (or
+# improving) niche / cell-type NMI. See the long block comment above
+# `s23_v1` in the VARIANTS section for the full design rationale.
+#
+# 16 variants in 4 hypothesis groups:
+#   A (v1-v4):   adjacency BCE weight sweep
+#   B (v5-v8):   stronger adversarial pressure
+#   C (v9-v12):  NB reconstruction balance
+#   D (v13-v16): combined sweet-spot candidates
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v23
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v23"] = [
+    # Group A: adjacency BCE weight sweep
+    "s23_v1_dualvq+wide+rvq-both+decoder-cov+adv+adj-w100+mmb0-1b_smb1-1b_1p",
+    "s23_v2_dualvq+wide+rvq-both+decoder-cov+adv+adj-w300+mmb0-1b_smb1-1b_1p",
+    "s23_v3_dualvq+wide+rvq-both+decoder-cov+adv+adj-w500+mmb0-1b_smb1-1b_1p",
+    "s23_v4_dualvq+wide+rvq-both+decoder-cov+adv+adj-w2000+mmb0-1b_smb1-1b_1p",
+    # Group B: stronger adversarial pressure
+    "s23_v5_dualvq+wide+rvq-both+decoder-cov+adv-alpha2-wt300+mmb0-1b_smb1-1b_1p",
+    "s23_v6_dualvq+wide+rvq-both+decoder-cov+adv-alpha3-wt300+mmb0-1b_smb1-1b_1p",
+    "s23_v7_dualvq+wide+rvq-both+decoder-cov+adv-alpha5+mmb0-1b_smb1-1b_1p",
+    "s23_v8_dualvq+wide+rvq-both+decoder-cov+adv-wt500+mmb0-1b_smb1-1b_1p",
+    # Group C: NB reconstruction balance
+    "s23_v9_dualvq+wide+rvq-both+decoder-cov+adv+nbr-w0.3+mmb0-1b_smb1-1b_1p",
+    "s23_v10_dualvq+wide+rvq-both+decoder-cov+adv+nbr-w0.5+mmb0-1b_smb1-1b_1p",
+    "s23_v11_dualvq+wide+rvq-both+decoder-cov+adv+nbr-w2.0+mmb0-1b_smb1-1b_1p",
+    "s23_v12_dualvq+wide+rvq-both+decoder-cov+adv+cell-w0.5+nbr-w0.5+mmb0-1b_smb1-1b_1p",
+    # Group D: combined sweet-spot candidates
+    "s23_v13_dualvq+wide+rvq-both+decoder-cov+adj-w300+adv-alpha2-wt300+mmb0-1b_smb1-1b_1p",
+    "s23_v14_dualvq+wide+rvq-both+decoder-cov+adv+adj-w300+nbr-w0.5+mmb0-1b_smb1-1b_1p",
+    "s23_v15_dualvq+wide+rvq-both+decoder-cov+adj-w200+adv-alpha3-wt300+mmb0-1b_smb1-1b_1p",
+    "s23_v16_dualvq+wide+rvq-both+decoder-cov+adj-w500+adv-alpha2-wt300+nbr-w0.7+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 24 — scVI-style tight bottleneck architecture. 12 variants in
+# 3 groups testing whether collapsing the latent / decoder geometry
+# (encoder MLP [128, 32], decoder [128], GNN h=32 / 1L, RVQ 3-level
+# (30, 20, 10), decoder-cov embed_dim=32) gives the encoder a stronger
+# incentive to discard batch-specific features → higher iLISI without
+# sacrificing NMI.
+#
+#   A (v1-v4):  architecture / codebook variations
+#   B (v5-v8):  batch integration on the tight architecture
+#   C (v9-v12): adv + the best s23-flavoured loss-weight levers
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v24
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v24"] = [
+    # Group A: architecture / codebook variations
+    "s24_v1_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+mmb0-1b_smb1-1b_1p",
+    "s24_v2_dualvq+compact-l16+rvq-both-30-20-10+decoder-cov-e16+mmb0-1b_smb1-1b_1p",
+    "s24_v3_dualvq+compact-l64+rvq-both-30-20-10+decoder-cov-e32+mmb0-1b_smb1-1b_1p",
+    "s24_v4_dualvq+compact-l32+rvq-both-50-30-20+decoder-cov-e32+mmb0-1b_smb1-1b_1p",
+    # Group B: batch integration on the tight architecture
+    "s24_v5_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+adv+mmb0-1b_smb1-1b_1p",
+    "s24_v6_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+adv-alpha2-wt300+mmb0-1b_smb1-1b_1p",
+    "s24_v7_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+mmd-w200+mmb0-1b_smb1-1b_1p",
+    "s24_v8_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+adv+mmd-w100+mmb0-1b_smb1-1b_1p",
+    # Group C: adv + the best s23-flavoured loss-weight levers
+    "s24_v9_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+adv+adj-w300+mmb0-1b_smb1-1b_1p",
+    "s24_v10_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+adv+nbr-w0.5+mmb0-1b_smb1-1b_1p",
+    "s24_v11_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+adv+adj-w300+nbr-w0.5+mmb0-1b_smb1-1b_1p",
+    "s24_v12_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+adv-alpha2-wt300+adj-w300+mmb0-1b_smb1-1b_1p",
+]
+
 
 def _ablation_summary(variant: str) -> dict:
     """A small, human-readable record of what this run is. Saved next to the
@@ -9561,7 +10812,7 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
 # Train (in-process so we control the wandb project AND the artifact layout)
 # ---------------------------------------------------------------------------
 
-def train(variant: str):
+def train(variant: str, train_precision: Optional[str] = None):
     """
     Train SQUINT.
 
@@ -9575,6 +10826,16 @@ def train(variant: str):
     Cloud logging to the "squint" wandb project still works via WandbLogger.
     The directory printed at the end is what you pass to --run-dir for
     inference; predict() expects the flat layout above (no `files/` subdir).
+
+    Parameters
+    ----------
+    train_precision
+        Lightning Trainer(precision=...) override. `None` (default)
+        means "use `cfg['trainer']['precision']`", which is
+        `"bf16-mixed"` in the canonical base config. Pass any
+        Lightning precision string (`"32-true"`, `"bf16-mixed"`,
+        `"16-mixed"`, …) to override per-run without editing the
+        base config. Bridges directly from the `--precision` CLI flag.
     """
     # Make the squint package importable in case the active venv hasn't been
     # pip-installed editable. We no longer import anything from
@@ -9608,6 +10869,18 @@ def train(variant: str):
         )
     cfg = VARIANTS[variant]["build"]()
     summary = _ablation_summary(variant)
+
+    # Apply CLI-level precision override (if any). Keeps the base
+    # config's bf16-mixed default in place when `train_precision is
+    # None`, but lets `--precision 32-true` / `--precision 16-mixed`
+    # win for a single run without editing make_train_config_*().
+    if train_precision is not None:
+        prev = cfg["trainer"].get("precision", "32-true")
+        cfg["trainer"]["precision"] = train_precision
+        print(
+            f"Trainer: precision override from CLI = {train_precision} "
+            f"(base config had {prev!r})"
+        )
 
     # ---- Resolve our own RUN_DIR ------------------------------------------
     # Each variant gets its own subdir under the dataset, so different
@@ -9968,10 +11241,16 @@ def train(variant: str):
     callbacks = callbacks or None   # PL wants None, not [], when empty
 
     # ---- Trainer ----------------------------------------------------------
+    # bf16-mixed by default (see base config `trainer.precision`).
+    # `.get` fallback to "32-true" keeps backward compat for any caller
+    # that builds a cfg without this key.
+    _train_precision = cfg["trainer"].get("precision", "32-true")
+    print(f"Trainer: precision = {_train_precision}")
     trainer = pl.Trainer(
         accelerator="auto",
         devices="auto",
         deterministic=True,
+        precision=_train_precision,
         logger=logger,
         callbacks=callbacks,
         strategy="ddp_find_unused_parameters_true",
@@ -11230,6 +12509,7 @@ def run_all_pipeline(
         skip_svg_plots: bool = False,
         skip_umap: bool = False,
         skip_metrics: bool = False,
+        train_precision: Optional[str] = None,
         predict_precision: Optional[str] = None,
         predict_strategy: Optional[str] = None,
         predict_compression: Optional[str] = None,
@@ -11255,7 +12535,7 @@ def run_all_pipeline(
     print("=" * 78)
     print(f"[1/6] Train  variant={variant!r}")
     print("=" * 78)
-    run_dir = train(variant)
+    run_dir = train(variant, train_precision=train_precision)
     if run_dir is None:
         # Older train() signatures didn't return; fall back to looking up
         # the most recent run dir for this variant. Resolve the variant's
@@ -11540,6 +12820,35 @@ def main():
              "the env var SQUINT_WITH_PEARSON=1.",
     )
 
+    # Train-time mixed-precision toggle. Default `None` means
+    # "honour the base config value" — which is currently
+    # `"bf16-mixed"` (see `make_train_config_poc().trainer.precision`
+    # for the rationale + safety notes). So invoking the CLI without
+    # this flag gives you bf16-mixed training; pass `--precision 32-true`
+    # to fall back to fp32 for a paranoid reproducibility comparison.
+    #
+    # Why a CLI flag (not just the cfg key):
+    #   - Lets you A/B bf16 vs fp32 on the same variant + same seed
+    #     by changing one CLI arg, without touching the base config.
+    #   - Lets the LSF submit scripts override per-job (e.g. one
+    #     job pinned to fp32 as a control while every other job runs
+    #     bf16) without re-rendering YAMLs.
+    #   - Applies uniformly across --train, --all, and --all-dataset.
+    p.add_argument(
+        "--precision", type=str, default=None,
+        help="Lightning Trainer(precision=...) override for the TRAIN "
+             "pass. Default: None = honour `cfg['trainer']['precision']` "
+             "from the base config (currently 'bf16-mixed' — see the "
+             "base-config trainer block for the bf16 rationale). "
+             "Common values: 'bf16-mixed' (default-on; Ampere/Hopper "
+             "20-40% wall-clock saving with no GradScaler needed), "
+             "'32-true' (legacy fp32, slowest but most reproducible), "
+             "'16-mixed' (fp16 + GradScaler — validate against the "
+             "adversarial alpha schedule before adopting). Affects the "
+             "TRAIN Trainer only — predict() has its own precision "
+             "wiring via `predict_precision` on run_all_pipeline().",
+    )
+
     # ---- Inference / analysis step toggles (forwarded to --all / --predict)
     # The end-to-end pipeline runs 6 steps: train, predict,
     # plot_code_indices_spatial, plot_svg_reconstruction,
@@ -11647,7 +12956,7 @@ def main():
     if args.build_blob:
         build_blob(dataset=args.build_blob_dataset)
     if args.train:
-        train(args.variant)
+        train(args.variant, train_precision=args.precision)
     if args.predict:
         run_dir = args.run_dir or args.wandb_run_dir
         if run_dir is None:
@@ -11677,6 +12986,7 @@ def main():
             skip_svg_plots=args.skip_svg_plots,
             skip_umap=args.skip_umap,
             skip_metrics=args.skip_metrics,
+            train_precision=args.precision,
         )
 
     # --all-dataset: loop --all over every variant in the dataset's sweep.
@@ -11691,6 +13001,7 @@ def main():
             batch_rename=args.batch_rename,
             cell_label_keys=args.cell_label_keys,
             niche_label_keys=args.niche_label_keys,
+            train_precision=args.precision,
             skip_predict=args.skip_predict,
             skip_code_index_plots=args.skip_code_index_plots,
             skip_svg_plots=args.skip_svg_plots,

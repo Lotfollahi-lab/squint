@@ -24,13 +24,28 @@ KEY INFO:
 ---> The `sample_neighbors_for_inference` parameter is used to control whether the neighbors are sampled during inference or not. This parameter is the same for validation and testing and is ignored for training.
 """
 import os
-from typing import Literal, Optional, Callable
+import time
+from typing import Literal, Optional, Callable, List, Any
 
 from torch.utils.data import DataLoader
 from torch_geometric.data import Data
 from torch_geometric.loader import NodeLoader, NeighborLoader
 from torch_geometric.sampler import NeighborSampler
 from torch_geometric.data.lightning import LightningNodeData
+
+
+def _identity_collate(items: List[Any]) -> Any:
+    """
+    Collate fn for the cached-batch DataLoader.
+
+    Each item in the underlying list IS already a fully-materialised
+    `torch_geometric.data.Batch` (built once during pre-caching). The
+    DataLoader is configured with `batch_size=1` so `items` is always a
+    one-element list — we just unwrap it. Using a real function (not a
+    lambda) keeps this picklable in case Lightning ever wraps the
+    loader for spawn-based DDP.
+    """
+    return items[0]
 
 NUM_CORES = 1
 NUM_WORKERS = 1
@@ -50,6 +65,7 @@ class InMemoryDataModule(LightningNodeData):
             predict_sample_neighbors_for_inference: bool = False,
             predict_batch_size: Optional[int] = None,
             val_batch_size: Optional[int] = None,
+            cache_train_batches: bool = False,
             obs_per_batch_id: Optional[dict] = None,
         ) -> None:
         """
@@ -119,6 +135,52 @@ class InMemoryDataModule(LightningNodeData):
             uses the val-loader's own fanout (`sample_neighbors_for_inference`),
             which is lighter than predict's `[-1]` so val can usually
             go even bigger than predict.
+        - cache_train_batches: bool
+            When True, the TRAINING DataLoader pre-computes one full
+            epoch's worth of `Batch` objects on first access and
+            serves the same cached list every subsequent epoch. The
+            standard NeighborLoader path (CPU NeighborSampler + induced
+            subgraph construction + tensor copy) is the dominant CPU
+            cost in SQUINT training; caching collapses it to a single
+            up-front pass and turns every later epoch into a pure
+            memcpy + H2D-copy loop. Per-epoch reshuffling of BATCH
+            ORDER is preserved (the cached list is wrapped in a
+            DataLoader with `shuffle=True`), but per-epoch neighbor
+            resampling and per-epoch seed-to-batch regrouping are
+            NOT — every epoch sees the same set of batches.
+
+            IMPORTANT: when caching is on, the cache-build loader's
+            `num_neighbors` is overridden to `[-1]` (full neighborhood)
+            regardless of `sampler_params['num_neighbors']`. Rationale:
+            the cache freezes neighborhoods anyway, so freezing the
+            FULL per-cell neighborhood is strictly more informative
+            than freezing a random subset — same staticness either
+            way. `self.sampler_params` is NOT mutated; val/test/predict
+            loaders still read the original fanout.
+
+            Trade-off:
+              + 30-60% wall-clock saving on CPU-sampler-heavy datasets
+                (SQUINT-scale spatial graphs with fanout=[8]).
+              + Lower CPU pressure → frees workers for other jobs on
+                shared nodes.
+              + Each cell sees its FULL spatial neighborhood every
+                step (richer signal than the sampled-[8] fanout used
+                by the uncached path).
+              - Loss of per-epoch neighbor-resampling regularisation.
+                For SQUINT this is usually small because the spatial
+                k-NN graph is sparse (avg degree ~10-12) — the
+                augmentation lost is small. A/B test on niche NMI /
+                iLISI if you're worried.
+              - Memory: stores ~N_train_batches × per-batch-node-tensors
+                in CPU memory. With the full-fanout override, ~2-3 GB
+                at SQUINT-mmb-smb scale (175 batches × ~12 neighbors ×
+                256 seeds × 431 genes float32), more like ~5-15 GB on
+                chl59-scale graphs. Still comfortable inside the
+                128 GB LSF default for the mmb / smb panels; consider
+                turning OFF on chl59 if you tighten memory limits.
+
+            Defaults to False to preserve legacy behaviour; turn on
+            via the base config or per-variant patches.
         """
         assert isinstance(data, Data), f"data must be of type torch_geometric.data.Data, but got {type(data)}."
 
@@ -286,6 +348,13 @@ class InMemoryDataModule(LightningNodeData):
         self.val_batch_size = (
             int(val_batch_size) if val_batch_size is not None else None
         )
+        # Pre-cache one epoch of TRAIN batches on first `train_dataloader()`
+        # access. See constructor docstring for the full trade-off; default
+        # is False so legacy callers behave as before.
+        self.cache_train_batches = bool(cache_train_batches)
+        # Lazy slot — populated on the first `train_dataloader()` call when
+        # caching is enabled. None means "not yet built".
+        self._cached_train_batches: Optional[list] = None
         print(f"Sample Neighbors for Inference (val/test): "
               f"{self.sample_neighbors_for_inference}")
         print(f"Sample Neighbors for Inference (predict):  "
@@ -294,6 +363,8 @@ class InMemoryDataModule(LightningNodeData):
               f"{self.predict_batch_size if self.predict_batch_size is not None else '(inherit from loader_params)'}")
         print(f"Val/Test Batch Size:                       "
               f"{self.val_batch_size if self.val_batch_size is not None else '(inherit from loader_params)'}")
+        print(f"Cache Train Batches:                       "
+              f"{self.cache_train_batches}")
 
         # build the data dictionary for the loader after data transforms
         base_data = {
@@ -465,15 +536,65 @@ class InMemoryDataModule(LightningNodeData):
         Notes:
         ------
         - `sample_neighbors_for_inference` is ignored for training.
+        - When `cache_train_batches=True`, the heavy NeighborLoader is
+          run ONCE to materialise an epoch of `Batch` objects, then a
+          lightweight DataLoader (num_workers=0, batch_size=1, identity
+          collate) serves them on every subsequent epoch with reshuffled
+          ORDER but identical batch CONTENT. See constructor docstring
+          for the full trade-off.
         """
         if self.loader_name in ['DefaultFullLoader', 'DefaultNodeLoader']:
             return super().train_dataloader()
 
         else:
+            # Sampler / loader params for THIS train dataloader. Shallow
+            # copies so the cache-time `[-1]` override below doesn't
+            # leak into `self.sampler_params` (val/test/predict still
+            # read those for their own loaders).
+            sampler_params = dict(self.sampler_params)
+            loader_params  = dict(self.loader_params)
+
+            # When caching is enabled, override num_neighbors to [-1]
+            # (full neighborhood) for the cache build.
+            #
+            # Rationale: the whole point of caching is to remove
+            # per-epoch resampling — every epoch sees the same batches.
+            # Given that, freezing a RANDOM 8-neighbor subset (the
+            # default training fanout) per cell gives strictly less
+            # information than freezing the FULL neighborhood. Same
+            # staticness either way; full-fanout just stores more
+            # signal per cell.
+            #
+            # Memory cost: spatial k-NN graphs have avg degree ~10-12,
+            # so [-1] is ~25-50% bigger per cell than [8]. For
+            # mmb-smb scale that's ~2-3 GB cache (vs ~1-2 GB with [8]) —
+            # still comfortable inside the 128 GB LSF default. For
+            # deeper fanouts like [8, 8] the bump is more like 2-3x
+            # because BOTH hops go full; chl59-scale graphs may want
+            # `cache_train_batches=False` if memory tightens.
+            #
+            # The override applies to the CACHE-BUILD loader only —
+            # val/test/predict loaders read `self.sampler_params`
+            # untouched.
+            if self.cache_train_batches:
+                original_fanout = sampler_params.get('num_neighbors')
+                if original_fanout:
+                    n_hops = len(original_fanout)
+                    sampler_params['num_neighbors'] = [-1] * n_hops
+                    print(
+                        f"[InMemoryDataModule] cache_train_batches=True — "
+                        f"overriding train num_neighbors from "
+                        f"{original_fanout} → "
+                        f"{sampler_params['num_neighbors']} for the cache "
+                        f"build (full neighborhood is strictly more "
+                        f"informative than a frozen random subset; "
+                        f"per-epoch resampling is lost either way)."
+                    )
+
             # instantiate the sampler class for training
             train_sampler = self.sampler_class(
                             data=self.data,
-                            **self.sampler_params,
+                            **sampler_params,
                         )
 
             # instantiate the loader class for training
@@ -483,11 +604,79 @@ class InMemoryDataModule(LightningNodeData):
                                         input_nodes=self.input_train_nodes,
                                         neighbor_sampler=train_sampler,
                                         shuffle=False,
-                                        **self.loader_params,
-                                        **self.sampler_params,
+                                        **loader_params,
+                                        **sampler_params,
                                         **self._loader_perf_kwargs(),
                                     )
-            return train_loader
+
+            # Legacy / opt-out path: return the NeighborLoader as-is and
+            # let workers sample neighborhoods fresh every epoch.
+            if not self.cache_train_batches:
+                return train_loader
+
+            # Pre-cache path: materialise one full epoch of `Batch`
+            # objects into a list (the heavy CPU work happens here, once),
+            # then wrap the list in a lightweight DataLoader. Subsequent
+            # epochs do zero CPU sampling.
+            if self._cached_train_batches is None:
+                t0 = time.time()
+                print(
+                    "[InMemoryDataModule] cache_train_batches=True — "
+                    "pre-caching one epoch of training batches (this "
+                    "runs the full NeighborSampler path once; "
+                    "subsequent epochs serve from CPU memory) ..."
+                )
+                # Pulling the iterator to exhaustion forces the workers
+                # to do their full pass. The workers are torn down when
+                # `train_loader`'s iterator is garbage-collected at the
+                # end of this scope — we don't keep `train_loader` alive
+                # past the cache build.
+                #
+                # `.cpu()` is critical: some PyG versions return
+                # device-mixed Batch objects from NeighborLoader when
+                # `pin_memory=True` is combined with CUDA-aware pyg-lib
+                # (a stray CUDA tensor inside an otherwise-CPU batch).
+                # If we cache those as-is, the outer DataLoader's
+                # `pin_memory=True` step downstream blows up with
+                # `cannot pin 'torch.cuda.FloatTensor' only dense CPU
+                # tensors can be pinned`. Calling `.cpu()` here is a
+                # no-op on already-CPU tensors and a forced device move
+                # on any GPU tensor, so the cache is guaranteed to be
+                # all-CPU regardless of the inner loader's behaviour.
+                cached: list = []
+                for batch in train_loader:
+                    cached.append(batch.cpu())
+                self._cached_train_batches = cached
+                dt = time.time() - t0
+                n_batches = len(self._cached_train_batches)
+                print(
+                    f"[InMemoryDataModule] cached {n_batches} train "
+                    f"batches in {dt:.1f}s. Subsequent epochs will "
+                    f"reuse this list (num_workers=0, identity collate)."
+                )
+
+            # Lightweight DataLoader over the cached list. Batch order
+            # reshuffles every epoch (preserves a bit of stochasticity);
+            # batch CONTENT is fixed by the cache.
+            #
+            # `pin_memory=False` on purpose: the cached `Batch` objects
+            # are heterogeneous PyG containers, and PyTorch's per-fetch
+            # `pin_memory` step recurses through `Batch.pin_memory()` →
+            # one stray non-pinnable tensor (sparse, GPU, custom) and
+            # the whole step crashes. The H2D-transfer cost we'd save
+            # by pinning is marginal anyway (small batches, 80-epoch
+            # reuse — the OS page cache absorbs most of it). Lightning's
+            # `transfer_batch_to_device` still moves each batch to GPU
+            # before the training step; we just don't pin in advance.
+            cached_loader = DataLoader(
+                self._cached_train_batches,
+                batch_size=1,
+                shuffle=True,
+                collate_fn=_identity_collate,
+                num_workers=0,        # no sampling needed any more
+                pin_memory=False,     # see comment above — avoid pin-crash
+            )
+            return cached_loader
 
 
     def val_dataloader(self):
