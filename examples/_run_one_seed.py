@@ -89,18 +89,43 @@ from run_squint import (  # noqa: E402
 )
 
 
-def _patch_seed(variant: str, seed: int):
-    """Replace `VARIANTS[variant]["build"]` with a seeded version.
-    Returns the original build so the caller can restore it.
+def _patch_seed(
+        variant: str,
+        seed: int,
+        batch_size: Optional[int] = None,
+        lr: Optional[float] = None,
+    ):
+    """Replace `VARIANTS[variant]["build"]` with a seeded version that
+    also applies optional `batch_size` / `lr` overrides. Returns the
+    original build so the caller can restore it.
 
-    `train()` calls `VARIANTS[variant]["build"]()` itself, so we
-    override the registry rather than passing the seed through any
-    other channel."""
+    Why monkey-patch the registry: `train()` calls
+    `VARIANTS[variant]["build"]()` itself with no kwargs. We can't pass
+    the seed (or any other override) through `train`'s signature
+    without breaking every other caller, so we replace the registry
+    entry for the lifetime of THIS seed's job and restore it in the
+    caller's `finally:` block.
+
+    The same trick is the cleanest way to layer `batch_size` / `lr`
+    overrides on top of the variant's build chain: the variant's own
+    patches (rvq sizes, adversarial config, decoder-cov, etc.) run
+    first, then we layer the runtime overrides on the resulting
+    config. That order matters — a variant's build could otherwise
+    legitimately reset `batch_size` (e.g. dataset-specific patches
+    like `_patch_dual_mmb20` force batch_size=64 for memory).
+    """
     original = VARIANTS[variant]["build"]
 
-    def _seeded(_orig=original, _seed=int(seed)):
+    def _seeded(_orig=original,
+                _seed=int(seed),
+                _bs=batch_size,
+                _lr=lr):
         cfg = _orig()
         cfg["experiment"]["seed"] = int(_seed)
+        if _bs is not None:
+            cfg["datamodule"]["loader_params"]["batch_size"] = int(_bs)
+        if _lr is not None:
+            cfg["model"]["optimizer_params"]["lr"] = float(_lr)
         return cfg
 
     VARIANTS[variant]["build"] = _seeded
@@ -141,6 +166,37 @@ def main() -> int:
     p.add_argument("--skip-svg-plots", action="store_true")
     p.add_argument("--skip-umap", action="store_true")
     p.add_argument("--skip-metrics", action="store_true")
+
+    # Optional run-time overrides for the variant's config. Both are
+    # layered on top of `VARIANTS[variant]["build"]()` inside
+    # `_patch_seed`, so the variant's own patches (rvq sizes,
+    # adversarial config, ...) run first and these overrides win.
+    #
+    # `--batch-size` overrides `loader_params["batch_size"]` (= 256 in
+    # the base config). `--lr` overrides
+    # `optimizer_params["lr"]` (= 5e-4 in the base config).
+    #
+    # Pair them sensibly: when you bump batch_size by 16x, scale lr
+    # too. Default lr was tuned at batch=256; for batch=4096:
+    #   - sqrt-scaling (recommended start): lr = 5e-4 * sqrt(16)
+    #                                          = 2e-3
+    #   - linear-scaling (more aggressive):   lr = 5e-4 * 16
+    #                                          = 8e-3 — usually
+    #                                          destabilises adversarial
+    #                                          training; use only with
+    #                                          a longer warmup.
+    p.add_argument(
+        "--batch-size", type=int, default=None,
+        help="Override `loader_params.batch_size` for this seed. "
+             "Pair with a rescaled --lr (sqrt-scaling: lr ≈ 5e-4 * "
+             "sqrt(batch/256)). Default: inherit from the variant.",
+    )
+    p.add_argument(
+        "--lr", type=float, default=None,
+        help="Override `optimizer_params.lr` for this seed. The base "
+             "config sets lr=5e-4 at batch=256; rescale with batch size "
+             "if you're changing both. Default: inherit from the variant.",
+    )
     args = p.parse_args()
 
     if args.variant not in VARIANTS:
@@ -166,14 +222,40 @@ def main() -> int:
     # `predicted_adata.h5ad`). The codes ARE the clusters — no
     # downstream Leiden / UMAP needed.
     #
+    # The AnnData WRITE step inside predict() is timed separately by
+    # `predict()` itself (sidecar `predict_write_seconds.txt`) and
+    # SUBTRACTED from this wall-clock total below — disk I/O is
+    # benchmark scaffolding, not method cost, and the baseline runners
+    # don't include it in their per-seed timers either.
+    #
     # Metric computation (compute_inference_metrics) and any optional
     # plot steps run in phase 2 below, OUTSIDE the timer, so the
     # reported runtime is apples-to-apples with the per-seed numbers
-    # produced by the baseline runners (after they're refactored to
-    # the same convention: time only "model + clustering", drop
-    # metric/plot cost). See `runtime_methodology.txt` written below.
+    # produced by the baseline runners. See `runtime_methodology.txt`
+    # written at the end of this script for the canonical methodology
+    # statement.
     t0 = time.time()
-    original_build = _patch_seed(args.variant, args.seed)
+    original_build = _patch_seed(
+        args.variant, args.seed,
+        batch_size=args.batch_size,
+        lr=args.lr,
+    )
+
+    # Print the RESOLVED batch_size + lr that train() will actually
+    # consume, with provenance tag (variant-default vs CLI override).
+    # This calls the patched build once for a peek — cheap (dict
+    # manipulation only, no model init or file I/O) and lets every
+    # LSF job log unambiguously show what config was used for this
+    # seed, without the reader having to know whether overrides were
+    # passed.
+    _peek_cfg = VARIANTS[args.variant]["build"]()
+    _resolved_bs = _peek_cfg["datamodule"]["loader_params"]["batch_size"]
+    _resolved_lr = _peek_cfg["model"]["optimizer_params"]["lr"]
+    _bs_src = "CLI override" if args.batch_size is not None else "variant default"
+    _lr_src = "CLI override" if args.lr is not None else "variant default"
+    print(f"[seed {args.seed}] resolved training config:")
+    print(f"  batch_size = {_resolved_bs}  ({_bs_src})")
+    print(f"  lr         = {_resolved_lr}  ({_lr_src})")
     try:
         try:
             run_dir = train(args.variant)
@@ -211,6 +293,33 @@ def main() -> int:
         # Phase-1 inference: run ONLY predict() (writes predicted_adata.h5ad
         # containing the code-index obs columns). Force-skip every other
         # step — plots and metrics belong in the untimed phase 2.
+        #
+        # The three `predict_*` overrides are the multi-seed-only
+        # predict-time optimisations (ablations / direct `--all` runs
+        # default to the legacy values inside predict()):
+        #
+        #   precision="bf16-mixed"
+        #     Enables Lightning autocast on the predict forward.
+        #     1.5-2x faster encoder / decoder MLPs on modern GPUs
+        #     (H100 / H200 / A100). bf16 keeps the fp32 exponent range
+        #     so we avoid the fp16 overflow risk, but the codebook
+        #     `argmin` over squared L2 distances can drift by a few
+        #     ULPs — a small number of borderline cells may pick a
+        #     different code vs fp32. Use `--predict-precision none`
+        #     (or wire an opt-out flag) if you need bit-exact
+        #     reproducibility against an fp32 baseline.
+        #   strategy="auto"
+        #     Drops the legacy `ddp_find_unused_parameters_true` for
+        #     predict, letting Lightning auto-pick
+        #     `SingleDeviceStrategy` on single-GPU LSF jobs (the
+        #     common case for multi-seed). ~5-15% predict speedup,
+        #     no output change.
+        #   compression="lzf"
+        #     ~3-5x faster AnnData writes than gzip on NFS — only
+        #     affects wall-clock UX since the write is already
+        #     excluded from `runtime_seconds`. File ends up ~1.5x
+        #     bigger on disk; readers (anndata.read_h5ad) handle lzf
+        #     transparently.
         try:
             run_inference_and_analysis(
                 run_dir=run_dir,
@@ -222,6 +331,9 @@ def main() -> int:
                 skip_svg_plots=True,               # untimed: phase 2
                 skip_umap=True,                    # untimed: phase 2
                 skip_metrics=True,                 # untimed: phase 2
+                predict_precision="bf16-mixed",    # multi-seed only
+                predict_strategy="auto",           # multi-seed only
+                predict_compression="lzf",         # multi-seed only
             )
         except Exception as e:  # noqa: BLE001
             tb = traceback.format_exc()
@@ -235,10 +347,38 @@ def main() -> int:
     finally:
         VARIANTS[args.variant]["build"] = original_build
 
-    seconds = time.time() - t0
+    phase1_wallclock = time.time() - t0
+
+    # Subtract the predicted_adata.h5ad WRITE time so `runtime_seconds`
+    # excludes disk I/O. `predict()` (in run_squint.py) stamps the
+    # write duration to `<run_dir>/predict_write_seconds.txt` after
+    # the `adata.write_h5ad` call returns. Excluding the write matches
+    # the baseline runners' convention (`_record_seed_runtime` in
+    # `run_pca_leiden.py` etc., which time only model + clustering and
+    # never include a downstream write or plot step). Best-effort: if
+    # the stamp is missing or unreadable we fall back to the raw
+    # wall-clock (same as pre-change behaviour) and warn so the user
+    # can spot it.
+    predict_write_seconds = 0.0
+    write_stamp_path = Path(run_dir) / "predict_write_seconds.txt"
+    if write_stamp_path.is_file():
+        try:
+            predict_write_seconds = float(write_stamp_path.read_text().strip())
+        except (ValueError, OSError) as e:  # noqa: BLE001
+            print(f"WARNING: could not parse {write_stamp_path} ({e}); "
+                  "AnnData write time will NOT be subtracted from "
+                  f"runtime_seconds for seed {args.seed}.")
+    else:
+        print(f"WARNING: {write_stamp_path} not found; AnnData write time "
+              f"will NOT be subtracted from runtime_seconds for seed "
+              f"{args.seed}. Was predict() interrupted before the write?")
+
+    seconds = phase1_wallclock - predict_write_seconds
     _write_stamp(seed_runs_dir, args.seed, "runtime_seconds", f"{seconds:.3f}")
     print(f"\n[seed {args.seed}] phase 1 (train + predict) done in "
-          f"{seconds:.1f}s -> {run_dir}")
+          f"{phase1_wallclock:.1f}s wall-clock; AnnData write "
+          f"{predict_write_seconds:.1f}s excluded → "
+          f"runtime_seconds = {seconds:.1f}s -> {run_dir}")
 
     # ---- Phase 2 (UNTIMED): metrics + any user-requested plots -----------
     # Decoupled from the runtime stamp on purpose: metrics produce the
@@ -289,18 +429,25 @@ def main() -> int:
     # documents.
     _write_stamp(
         seed_runs_dir, args.seed, "runtime_methodology",
-        "runtime_seconds covers train() + predict() ONLY. "
-        "Metric computation (NMI/ARI/iLISI/MMD/Pearson) and any plot "
-        "steps run in a second, untimed phase of _run_one_seed.py. "
-        "For apples-to-apples comparison with baseline runners, those "
-        "runners should also exclude metric/plot cost from the per-seed "
-        "timer (and add their shared embedding-compute cost back so "
-        "the per-seed number reflects 'time to obtain clusters from "
-        "scratch for this seed').",
+        "runtime_seconds covers train() + predict() forward / collation "
+        "ONLY. EXCLUDED: the predicted_adata.h5ad disk write (stamped "
+        "separately to predict_write_seconds.txt and subtracted from the "
+        "wall-clock total here), metric computation "
+        "(NMI/ARI/iLISI/MMD/Pearson), and any plot steps — all of those "
+        "run in a second, untimed phase of _run_one_seed.py. For "
+        "apples-to-apples comparison with baseline runners, those runners "
+        "also exclude metric/plot cost and disk I/O from the per-seed "
+        "timer (see `_record_seed_runtime` in "
+        "analysis/benchmarking/cell_type_identification/run_pca_leiden.py "
+        "for the shared convention), and add their shared embedding-compute "
+        "cost back so the per-seed number reflects 'time to obtain "
+        "clusters from scratch for this seed'.",
     )
     _write_stamp(seed_runs_dir, args.seed, "status", "OK")
     print(f"\n[seed {args.seed}] all done. runtime_seconds = {seconds:.1f}s "
-          f"(train + predict only); metrics + plots ran untimed.")
+          f"(train + predict compute only, AnnData write "
+          f"{predict_write_seconds:.1f}s excluded); metrics + plots ran "
+          "untimed.")
     return 0
 
 

@@ -39,16 +39,35 @@
 #   SEEDS    — Comma-separated seed list. Default: '0,1,2,3,4'.
 #
 # Optional CLI flags:
-#   --queue / -q QUEUE   LSF queue (default: gpu-lotfollahi).
+#   --queue / -q QUEUE   LSF queue (default: training-parallel).
 #                        Per-seed jobs AND the chained aggregator both
 #                        land on this queue (unless AGG_QUEUE env
 #                        override is set). Also overridable via the
 #                        LSF_QUEUE env var.
-#   --group / -g GROUP   LSF cost-code group (default: team361).
+#   --group / -g GROUP   LSF cost-code group (default: s10396).
 #                        Also overridable via LSF_GROUP env var.
+#   --batch-size / -b N  Override `loader_params.batch_size` for this
+#                        seed sweep. Default: inherit from the variant
+#                        (the base dual config sets 256). Pair with a
+#                        rescaled --lr — see below.
+#   --lr LR              Override `optimizer_params.lr` for this seed
+#                        sweep. Default: inherit from the variant
+#                        (the base dual config sets 5e-4 at batch=256).
+#                        When you bump --batch-size, scale --lr too:
+#                          - sqrt-scaling (recommended start):
+#                              lr ≈ 5e-4 * sqrt(batch / 256)
+#                              batch=1024 -> lr=1e-3
+#                              batch=4096 -> lr=2e-3
+#                          - linear-scaling (more aggressive):
+#                              lr =   5e-4 * (batch / 256)
+#                              batch=4096 -> lr=8e-3
+#                          Linear scaling usually destabilises the
+#                          adversarial loop at this batch size; sqrt
+#                          is the safer starting point.
 #   --help  / -h         Print this usage block and exit.
 #
-# Precedence for queue/group: CLI flag > env var > script default.
+# Precedence for queue/group/batch-size/lr: CLI flag > env (if any) >
+# variant's build.
 #
 # Optional environment overrides:
 #   VENV_PATH         /nfs/team361/sb75/.venvs/squint
@@ -57,7 +76,11 @@
 #   OUT_DIR           <auto: <ARTIFACTS>/<dataset_tag>/<variant>__multiseed/<TS>/>
 #   LSF_GROUP         team361             (also: --group / -g)
 #   LSF_QUEUE         gpu-lotfollahi      (also: --queue / -q)
-#   LSF_CORES         20  (16 DataLoader workers + 1 main + 3 headroom)
+#   LSF_CORES         24  (22 DataLoader workers + 1 main + 1 spare;
+#                          bumped from 20 / 16 workers after wandb
+#                          showed GPU util at 5-10% — see the
+#                          `num_workers` comment in run_squint.py's
+#                          base config for the rationale)
 #   LSF_MEM_MB        128000
 #   LSF_GPU           mode=exclusive_process:num=1:block=yes
 #   LSF_WALL          24:00
@@ -108,8 +131,8 @@ set -euo pipefail
 # --- Defaults ---------------------------------------------------------------
 # Match the (queue, group) pairing used by v9 / v10 / v11 wrappers.
 # Env vars still work for backward compatibility; CLI flags below win.
-DEFAULT_QUEUE="gpu-lotfollahi"
-DEFAULT_GROUP="team361"
+DEFAULT_QUEUE="training-parallel"
+DEFAULT_GROUP="s10396"
 
 QUEUE_ARG="${LSF_QUEUE:-$DEFAULT_QUEUE}"
 GROUP_ARG="${LSF_GROUP:-$DEFAULT_GROUP}"
@@ -118,6 +141,13 @@ GROUP_ARG="${LSF_GROUP:-$DEFAULT_GROUP}"
 # flag parsing) so the aggregator always lands on a queue the user can
 # actually submit to.
 AGG_QUEUE_OVERRIDE="${AGG_QUEUE:-}"
+
+# Runtime config overrides (forwarded to _run_one_seed.py).
+# Empty default = inherit from the variant's build (the
+# `loader_params.batch_size` / `optimizer_params.lr` set in
+# `_make_default_dual_config` / per-variant patches).
+BATCH_SIZE_ARG=""
+LR_ARG=""
 
 # --- Parse CLI flags --------------------------------------------------------
 # Accept --queue / -q and --group / -g anywhere in argv; everything else
@@ -152,6 +182,32 @@ while [[ $# -gt 0 ]]; do
             GROUP_ARG="${1#--group=}"
             shift
             ;;
+        --batch-size|-b)
+            shift
+            if [[ $# -eq 0 ]]; then
+                echo "ERROR: --batch-size / -b requires a value." >&2
+                exit 2
+            fi
+            BATCH_SIZE_ARG="$1"
+            shift
+            ;;
+        --batch-size=*)
+            BATCH_SIZE_ARG="${1#--batch-size=}"
+            shift
+            ;;
+        --lr)
+            shift
+            if [[ $# -eq 0 ]]; then
+                echo "ERROR: --lr requires a value." >&2
+                exit 2
+            fi
+            LR_ARG="$1"
+            shift
+            ;;
+        --lr=*)
+            LR_ARG="${1#--lr=}"
+            shift
+            ;;
         --help|-h)
             awk '/^[^#]/ {exit} {print}' "$0"
             exit 0
@@ -182,7 +238,7 @@ LOG_ROOT="${LOG_ROOT:-/nfs/team361/sb75/squint-reproducibility/artifacts/logs}"
 # Apply the resolved queue / group (flag > env > default).
 LSF_GROUP="$GROUP_ARG"
 LSF_QUEUE="$QUEUE_ARG"
-LSF_CORES="${LSF_CORES:-20}"
+LSF_CORES="${LSF_CORES:-24}"
 LSF_MEM_MB="${LSF_MEM_MB:-128000}"
 LSF_GPU="${LSF_GPU:-mode=exclusive_process:num=1:block=yes}"
 LSF_WALL="${LSF_WALL:-24:00}"
@@ -202,6 +258,8 @@ SUBMIT_AGGREGATOR="${SUBMIT_AGGREGATOR:-1}"
 echo "[multi-seed] LSF_QUEUE = $LSF_QUEUE"
 echo "[multi-seed] LSF_GROUP = $LSF_GROUP"
 echo "[multi-seed] AGG_QUEUE = $AGG_QUEUE"
+echo "[multi-seed] batch_size override = ${BATCH_SIZE_ARG:-<inherit from variant>}"
+echo "[multi-seed] lr         override = ${LR_ARG:-<inherit from variant>}"
 
 # Step skipping (forwarded to _run_one_seed.py via SEED_EXTRA_ARGS).
 SKIP_UMAP="${SKIP_UMAP:-1}"
@@ -217,6 +275,10 @@ SEED_EXTRA_ARGS=()
 [[ "$SKIP_CODE_INDEX_PLOTS" == "1" ]] && SEED_EXTRA_ARGS+=("--skip-code-index-plots")
 [[ "$SKIP_SVG_PLOTS"        == "1" ]] && SEED_EXTRA_ARGS+=("--skip-svg-plots")
 [[ "$SKIP_METRICS"          == "1" ]] && SEED_EXTRA_ARGS+=("--skip-metrics")
+# Runtime config overrides — forwarded to _run_one_seed.py which
+# layers them on top of the variant's build via `_patch_seed`.
+[[ -n "$BATCH_SIZE_ARG" ]] && SEED_EXTRA_ARGS+=("--batch-size" "$BATCH_SIZE_ARG")
+[[ -n "$LR_ARG"         ]] && SEED_EXTRA_ARGS+=("--lr"         "$LR_ARG")
 SEED_EXTRA_ARGS_STR="${SEED_EXTRA_ARGS[*]:-}"
 
 # Resolve dataset_tag for the variant (so we can place OUT_DIR + log dir

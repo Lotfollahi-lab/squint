@@ -7,7 +7,7 @@
 # cost-code group are accepted as flags so you can switch between
 # (queue, group) pairings without editing the script.
 #
-# Defaults: --queue gpu-lotfollahi --group team361 (the AI/GPU queue
+# Defaults: --queue training-parallel --group s10396 (the AI/GPU queue
 # with the team-project cost code).
 #
 # v9 design: SMALLER + FASTER architecture, 2 x 4 grid.
@@ -41,9 +41,9 @@
 #   bash examples/submit_mmb_smb_ablations_v9.sh [OPTIONS]
 #
 # Options:
-#   --queue / -q QUEUE   LSF queue (default: gpu-lotfollahi).
+#   --queue / -q QUEUE   LSF queue (default: training-parallel).
 #                        Also overridable via LSF_QUEUE env var.
-#   --group / -g GROUP   LSF cost-code group (default: team361).
+#   --group / -g GROUP   LSF cost-code group (default: s10396).
 #                        Also overridable via LSF_GROUP env var.
 #   --help  / -h         Print this usage block and exit.
 #
@@ -76,8 +76,8 @@
 set -euo pipefail
 
 # Defaults — same (queue, group) pair as the v10 / v11 wrappers.
-DEFAULT_QUEUE="gpu-lotfollahi"
-DEFAULT_GROUP="team361"
+DEFAULT_QUEUE="training-parallel"
+DEFAULT_GROUP="s10396"
 
 # Seed working values from env vars (env still works for the legacy
 # call-style), then let CLI flags override below.

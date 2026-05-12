@@ -6,7 +6,7 @@
 # jobs. Queue + cost-code group are accepted as flags so you can switch
 # between (queue, group) pairings without editing the script.
 #
-# Defaults: --queue gpu-lotfollahi --group team361 (the AI/GPU queue the
+# Defaults: --queue training-parallel --group s10396 (the AI/GPU queue the
 # user has access to with the team-project cost code).
 #
 # v10 = "is spatial supervision hurting cell-type NMI?" DIAGNOSTIC.
@@ -55,10 +55,10 @@
 #
 # Options:
 #   --queue / -q QUEUE   LSF queue to submit to.
-#                        Default: gpu-lotfollahi.
+#                        Default: training-parallel.
 #                        Also overridable via LSF_QUEUE env var.
 #   --group / -g GROUP   LSF cost-code group (`bsub -G`).
-#                        Default: team361.
+#                        Default: s10396.
 #                        Also overridable via LSF_GROUP env var.
 #   --help  / -h         Print this usage block and exit.
 #
@@ -99,8 +99,8 @@ set -euo pipefail
 # pairing. The cluster rejects sXXXX-group jobs on `gpu-basement` (it's
 # not an AI-acceleration queue), so we default to a (queue, group) pair
 # that's actually valid end-to-end rather than a queue alone.
-DEFAULT_QUEUE="gpu-lotfollahi"
-DEFAULT_GROUP="team361"
+DEFAULT_QUEUE="training-parallel"
+DEFAULT_GROUP="s10396"
 
 # Seed working values from env vars (env still works for the legacy
 # call-style), then let CLI flags override below.

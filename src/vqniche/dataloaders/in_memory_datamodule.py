@@ -48,6 +48,8 @@ class InMemoryDataModule(LightningNodeData):
             sampler_params: Optional[dict] = {},
             sample_neighbors_for_inference: bool = False,
             predict_sample_neighbors_for_inference: bool = False,
+            predict_batch_size: Optional[int] = None,
+            val_batch_size: Optional[int] = None,
             obs_per_batch_id: Optional[dict] = None,
         ) -> None:
         """
@@ -87,6 +89,36 @@ class InMemoryDataModule(LightningNodeData):
             single final predict pass should be heavy + deterministic.
             Setting `sample_neighbors_for_inference=True` alone (the
             common case) leaves predict on the safe default.
+        - predict_batch_size: Optional[int]
+            Per-batch size used by the PREDICT dataloader only. When
+            None (legacy default), predict inherits the training
+            `batch_size` from `loader_params`. The training batch size
+            is tuned for adversarial gradient dynamics — predict has
+            no such constraint and benefits from a much bigger batch
+            (fewer kernel launches, better GPU SM utilisation).
+            Combined with `predict_sample_neighbors_for_inference=False`
+            (the full-fanout default), bumping this to 4-8x the
+            training batch size typically cuts predict wall-clock 2-3x.
+            Memory ceiling: bigger predict batches carry more sampled
+            neighbours per batch ([-1] fanout × bigger seeds = bigger
+            total node count). 1024 is known-safe on a 256 GiB GPU
+            for the mmb-smb graph; bump to 2048+ on larger memory.
+        - val_batch_size: Optional[int]
+            Per-batch size used by the VAL and TEST dataloaders. When
+            None (legacy default), val/test inherit the training
+            `batch_size` from `loader_params`. Like predict, val and
+            test are no-grad passes so the small training batch is
+            unnecessary — bumping to 4-8x the training batch reduces
+            the val-pass wall-clock at every val epoch, which directly
+            lifts the GPU-utilisation floor (the GPU previously sat
+            idle for several seconds per val pass as small val batches
+            dribbled through). Combined with `check_val_every_n_epoch=2`
+            in the trainer config, this is one of the cheapest
+            throughput wins for SQUINT training. Safe to set
+            independently from `predict_batch_size`; val typically
+            uses the val-loader's own fanout (`sample_neighbors_for_inference`),
+            which is lighter than predict's `[-1]` so val can usually
+            go even bigger than predict.
         """
         assert isinstance(data, Data), f"data must be of type torch_geometric.data.Data, but got {type(data)}."
 
@@ -229,10 +261,39 @@ class InMemoryDataModule(LightningNodeData):
         # constructor docstring for the rationale.
         self.sample_neighbors_for_inference = sample_neighbors_for_inference
         self.predict_sample_neighbors_for_inference = predict_sample_neighbors_for_inference
+        # predict-only batch-size override (see constructor docstring).
+        # `None` means "inherit `loader_params['batch_size']`" — the
+        # legacy behaviour. Validated here so a string config typo
+        # ("1024" vs 1024) fails loudly rather than poisoning predict.
+        if predict_batch_size is not None and int(predict_batch_size) <= 0:
+            raise ValueError(
+                f"predict_batch_size must be positive when set; "
+                f"got {predict_batch_size!r}"
+            )
+        self.predict_batch_size = (
+            int(predict_batch_size) if predict_batch_size is not None else None
+        )
+        # val/test batch-size override (same legacy-safe shape as
+        # predict_batch_size). Sized independently from predict because
+        # val/test use a different fanout (`sample_neighbors_for_inference`,
+        # typically `[8]`) vs. predict (`[-1]`), and the val pass runs
+        # every N epochs, so per-pass cost is the bottleneck not memory.
+        if val_batch_size is not None and int(val_batch_size) <= 0:
+            raise ValueError(
+                f"val_batch_size must be positive when set; "
+                f"got {val_batch_size!r}"
+            )
+        self.val_batch_size = (
+            int(val_batch_size) if val_batch_size is not None else None
+        )
         print(f"Sample Neighbors for Inference (val/test): "
               f"{self.sample_neighbors_for_inference}")
         print(f"Sample Neighbors for Inference (predict):  "
               f"{self.predict_sample_neighbors_for_inference}")
+        print(f"Predict Batch Size:                        "
+              f"{self.predict_batch_size if self.predict_batch_size is not None else '(inherit from loader_params)'}")
+        print(f"Val/Test Batch Size:                       "
+              f"{self.val_batch_size if self.val_batch_size is not None else '(inherit from loader_params)'}")
 
         # build the data dictionary for the loader after data transforms
         base_data = {
@@ -365,9 +426,13 @@ class InMemoryDataModule(LightningNodeData):
             num_workers > 0; falls back to False otherwise.
           - pin_memory=True lets the data side overlap H2D copies with
             the GPU forward pass.
-          - prefetch_factor=4 lets each worker pre-build several batches
+          - prefetch_factor=8 lets each worker pre-build several batches
             ahead of the current one. PyG's NeighborSampler is
             CPU-bound, so this hides sampling latency behind GPU work.
+            Bumped from 4 -> 8 after wandb showed GPU utilisation
+            sitting at 5-10%; doubling the in-flight batches lets the
+            workers stay further ahead of the GPU consumer when
+            individual sampling calls have variable latency.
         Total expected speedup: 1.3-2x wall-clock on CPU-sampler-heavy
         datasets (mmb20).
 
@@ -382,7 +447,7 @@ class InMemoryDataModule(LightningNodeData):
         kw: dict = {"pin_memory": True}
         if int(self.num_workers) > 0:
             kw["persistent_workers"] = True
-            kw["prefetch_factor"] = 4
+            kw["prefetch_factor"] = 8
         # Drop any keys the caller already set in `loader_params` so
         # the eventual unpack at the loader call site can't see
         # duplicates. `getattr` with a default keeps this safe before
@@ -448,6 +513,13 @@ class InMemoryDataModule(LightningNodeData):
                 # update num_neighbors to -1 so that the neighbors are not sampled.
                 sampler_params['num_neighbors'] = [-1] * len(self.sampler_params['num_neighbors'])
 
+            # Same shallow-copy trick for loader_params: if
+            # val_batch_size is set, we override `batch_size` only for
+            # the val loader, leaving training + predict untouched.
+            loader_params = dict(self.loader_params)
+            if self.val_batch_size is not None:
+                loader_params["batch_size"] = self.val_batch_size
+
             # instantiate the sampler class for validation
             val_sampler = self.sampler_class(
                                 data=self.data,
@@ -461,7 +533,7 @@ class InMemoryDataModule(LightningNodeData):
                                 input_nodes=self.input_val_nodes,
                                 neighbor_sampler=val_sampler,
                                 shuffle=False,
-                                **self.loader_params,
+                                **loader_params,
                                 **sampler_params,
                                 **self._loader_perf_kwargs(),
                             )
@@ -477,6 +549,9 @@ class InMemoryDataModule(LightningNodeData):
         - If `sample_neighbors_for_inference` is set to True, the neighbors are sampled during inference.
         - If `sample_neighbors_for_inference` is set to False, the neighbors are not sampled during inference.
         - `test_dataloader` loops over nodes in the test set.
+        - `val_batch_size` (when set) ALSO applies to the test loader.
+          They share the same no-grad / lighter-fanout characteristics
+          so the same batch-size override usually makes sense for both.
         """
         if self.loader_name in ['DefaultFullLoader', 'DefaultNodeLoader']:
             return super().test_dataloader()
@@ -489,6 +564,14 @@ class InMemoryDataModule(LightningNodeData):
             if not self.sample_neighbors_for_inference:
                 # update num_neighbors to -1 so that the neighbors are not sampled.
                 sampler_params['num_neighbors'] = [-1] * len(self.sampler_params['num_neighbors'])
+
+            # Same shallow-copy trick for loader_params (see val_dataloader
+            # above). The `val_batch_size` knob applies to both val and
+            # test — they share the same usage pattern (no-grad pass
+            # over a held-out subset with lighter fanout than predict).
+            loader_params = dict(self.loader_params)
+            if self.val_batch_size is not None:
+                loader_params["batch_size"] = self.val_batch_size
 
             # instantiate the sampler class for testing
             test_sampler = self.sampler_class(
@@ -503,7 +586,7 @@ class InMemoryDataModule(LightningNodeData):
                                 input_nodes=self.input_test_nodes,
                                 neighbor_sampler=test_sampler,
                                 shuffle=False,
-                                **self.loader_params,
+                                **loader_params,
                                 **sampler_params,
                                 **self._loader_perf_kwargs(),
                             )
@@ -523,6 +606,13 @@ class InMemoryDataModule(LightningNodeData):
           neighbor) so the embeddings written to AnnData are
           deterministic and aggregate the full neighborhood. Set the
           flag to `True` if you want stochastic predict-time sampling.
+        - The PREDICT path can also use a separate `predict_batch_size`
+          (set on the datamodule). Default is "inherit
+          `loader_params['batch_size']`" — same as legacy. Bumping it
+          (e.g. 1024 with a 256-train-batch run) reduces the total
+          number of predict batches without changing model outputs;
+          training-time batch_size is tuned for gradient dynamics and
+          isn't relevant during a no-grad predict pass.
         - `predict_dataloader` loops over all the nodes in the graph.
         """
         # Shallow copy so the `[-1]` override below doesn't mutate
@@ -532,6 +622,13 @@ class InMemoryDataModule(LightningNodeData):
         # update num_neighbors to -1 so that the neighbors are not sampled.
         if not self.predict_sample_neighbors_for_inference:
             sampler_params['num_neighbors'] = [-1] * len(self.sampler_params['num_neighbors'])
+
+        # Same shallow-copy logic for loader_params: if predict_batch_size
+        # is set, we need to override `batch_size` for THIS loader only,
+        # without mutating self.loader_params (which val/test/train share).
+        loader_params = dict(self.loader_params)
+        if self.predict_batch_size is not None:
+            loader_params["batch_size"] = self.predict_batch_size
 
         # instantiate the sampler class to control the behavior of the loader
         infer_sampler = self.sampler_class(
@@ -547,7 +644,7 @@ class InMemoryDataModule(LightningNodeData):
                                     input_nodes=None,
                                     neighbor_sampler=infer_sampler,
                                     shuffle=False,
-                                    **self.loader_params,
+                                    **loader_params,
                                     **sampler_params,
                                     **self._loader_perf_kwargs(),
                                 )

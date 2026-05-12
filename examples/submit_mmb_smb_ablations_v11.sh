@@ -6,7 +6,7 @@
 # Queue + cost-code group are accepted as flags so you can switch
 # between (queue, group) pairings without editing the script.
 #
-# Defaults: --queue gpu-lotfollahi --group team361.
+# Defaults: --queue training-parallel --group s10396.
 #
 # v11 = SMOKE-TEST for the updated DataLoader config:
 #
@@ -40,10 +40,10 @@
 #
 # Options:
 #   --queue / -q QUEUE   LSF queue to submit to.
-#                        Default: gpu-lotfollahi.
+#                        Default: training-parallel.
 #                        Also overridable via LSF_QUEUE env var.
 #   --group / -g GROUP   LSF cost-code group (`bsub -G`).
-#                        Default: team361.
+#                        Default: s10396.
 #                        Also overridable via LSF_GROUP env var.
 #   --help  / -h         Print this usage block and exit.
 #
@@ -90,8 +90,8 @@ set -euo pipefail
 # Defaults — same (queue, group) pair as the v10 wrapper because that's
 # the combo that's valid end-to-end on this cluster (sXXXX groups are
 # rejected on non-AI queues).
-DEFAULT_QUEUE="gpu-lotfollahi"
-DEFAULT_GROUP="team361"
+DEFAULT_QUEUE="training-parallel"
+DEFAULT_GROUP="s10396"
 
 # Seed working values from env vars (env still works for the legacy
 # call-style), then let CLI flags override below.

@@ -543,30 +543,30 @@ def make_train_config_poc() -> dict:
         "datamodule": {
             "loader_name": "NeighborLoader",
             "loader_params": {
-                # batch_size pinned at 256.
-                # History: a v11 GPU-utilization push briefly bumped
-                # this to 1024 (with `max_epochs` 80 -> 200) to chase
-                # GPU duty cycle. The bigger-batch dynamics turned out
-                # to silently regress batch integration: with `lr`
-                # unchanged at 5e-4, the per-sample gradient
-                # contribution dropped 4x, the adversarial
-                # discriminator under-trained, and `neighborhood_emb`
-                # iLISI collapsed to numerical noise across seeds.
-                # Reverting to 256 (paired with `max_epochs=200`)
-                # restores the training dynamics the multi-seed
-                # benchmark numbers were originally tuned on. If you
-                # want to explore bigger batches again, scale `lr`
-                # linearly (5e-4 * (new_batch/256)) and validate
-                # end-to-end iLISI before publishing the comparison.
+                # batch_size pinned at 256. PAIRED with `max_epochs=80`
+                # — together these are the canonical config that
+                # produced the published-style niche NMI numbers
+                # (~0.66-0.70 on the +enc-deeper+adv-warmup10 family).
+                # See the long `max_epochs` history comment below for
+                # the full rationale on why both knobs were reverted
+                # in lockstep. Bigger batches require lr rescaling
+                # (5e-4 * sqrt(new/256) for sqrt, 5e-4 * (new/256)
+                # for linear) and post-hoc iLISI / niche-NMI
+                # validation — don't change just one knob.
                 "batch_size":         256,
-                # 16 workers leaves a few idle at batch=256 but is
-                # safe — `InMemoryDataModule._loader_perf_kwargs()`
-                # adds `pin_memory=True`, `persistent_workers=True`,
-                # and `prefetch_factor=4` automatically, so don't
-                # set those here (that triggers
-                # `TypeError: got multiple values for keyword
-                # argument` on the loader call).
-                "num_workers":        16,
+                # 22 DataLoader workers — bumped from 16 after wandb
+                # showed GPU utilisation pinned at 5-10% (DataLoader
+                # bottleneck, NOT GPU compute bottleneck — SQUINT's
+                # per-step model work is so cheap relative to PyG's
+                # CPU-side NeighborSampler that the GPU sits idle
+                # between batches). Pair with `LSF_CORES=24` in
+                # the submit scripts: 22 workers + 1 main proc +
+                # 1 spare = 24 cores. `_loader_perf_kwargs()` adds
+                # `pin_memory=True`, `persistent_workers=True`, and
+                # `prefetch_factor=8` automatically, so don't set
+                # those here (that triggers `TypeError: got multiple
+                # values for keyword argument` on the loader call).
+                "num_workers":        22,
             },
             "sampler_name": "NeighborSampler",
             "sampler_params": {"num_neighbors": [8]},  # 1 hop = num_layers
@@ -604,6 +604,47 @@ def make_train_config_poc() -> dict:
             "inference_params": {
                 "sample_neighbors_for_inference":         True,
                 "predict_sample_neighbors_for_inference": False,
+                # Predict-only batch-size override. Training batch is
+                # 256 (tuned for adversarial gradient dynamics);
+                # predict runs under torch.no_grad() so batch noise is
+                # irrelevant and the cost is dominated by kernel-launch
+                # overhead at small batch sizes.
+                #
+                # 16384 (= 64x training batch) further reduces the
+                # number of predict batches to ~6-7 on a 100k-cell
+                # graph, so per-step overhead becomes negligible.
+                # Bumped up from 4096 after seeing GPU utilization
+                # stay low during predict.
+                #
+                # Memory math on the mmb-smb graph with `[-1]` predict
+                # fanout (avg degree ~12 after symmetrization):
+                #   nodes_per_batch ≈ batch_size × (1 + avg_degree)
+                #                   ≈ 16384 × 13 ≈ ~213k nodes/batch
+                # Forward activations (no autograd, no optimizer state)
+                # at that node count on the dual model: ~3-6 GiB after
+                # the CUDA caching allocator overhead. Fits
+                # comfortably on any H100/H200 (80+ GiB) and trivially
+                # on the gpu_high_memory (384 GiB) node class.
+                #
+                # If you ever see OOM during predict (most likely on
+                # a denser dataset like chl59-8b_1p, or on mmb20 with
+                # 20+ sections), the safe fallback chain is
+                # 16384 → 8192 → 4096 → 2048 → 1024 → 512.
+                "predict_batch_size":                     16384,
+                # Val/test batch-size override. Val runs every
+                # `check_val_every_n_epoch` (see trainer config below
+                # — currently every 2 train epochs), and the per-val-
+                # pass overhead used to be visible as a periodic
+                # ~0% GPU-utilisation dip in wandb. Bumping val to
+                # 4096 (= 16× training) makes each val pass ~4-8×
+                # faster, shrinking those dips to near-invisible.
+                # Val fanout is lighter than predict's [-1] (val uses
+                # `sample_neighbors_for_inference=True` -> [8]), so
+                # val can comfortably go larger than predict without
+                # OOM. Same fallback logic as predict_batch_size if
+                # you ever see val-time OOM:
+                # 4096 → 2048 → 1024 → 512.
+                "val_batch_size":                         4096,
             },
         },
         "model": {
@@ -777,24 +818,54 @@ def make_train_config_poc() -> dict:
             # max_epochs is the universal training budget cap — every
             # individual / multi-seed / ablation run picks this value
             # up from the base config. At batch=256 / ~100k-cell
-            # dataset that's ~390 gradient steps/epoch, so 200 epochs
-            # ≈ 78k total gradient steps. Early stopping (below)
-            # cuts runs short when val_loss plateaus; the 200 cap is
-            # the safety ceiling for the adversarial variants whose
-            # val_loss can drift up after a long stable phase.
+            # dataset that's ~390 gradient steps/epoch, so 80 epochs
+            # ≈ 31k total gradient steps.
             #
-            # PAIRED WITH batch_size: the v11 1024/200 config silently
-            # regressed batch integration because `lr` wasn't rescaled
-            # with the 4x bigger batch — the per-sample gradient
-            # contribution dropped 4x and the adversarial discriminator
-            # under-trained, collapsing `neighborhood_emb` iLISI to
-            # numerical noise. Sticking with batch=256 keeps the
-            # per-sample dynamics on the curve this 200-epoch budget
-            # was originally tuned against. If you ever bump
-            # batch_size again, scale `lr` linearly (5e-4 *
-            # (new_batch/256)) and re-validate end-to-end iLISI
-            # before drawing cross-run conclusions.
-            "max_epochs": 200,
+            # HISTORY (don't repeat the cycle):
+            #
+            #   - Original (2026-04 / early 2026-05): max_epochs=80,
+            #     batch=256, lr=5e-4. The "good" Pareto: niche NMI
+            #     ~0.66-0.70 on the +enc-deeper+adv-warmup10 family.
+            #
+            #   - 2026-05-11 v11 push: bumped to (1024, 200) to chase
+            #     GPU duty cycle. lr was NOT rescaled; per-sample
+            #     gradient dropped 4x; adversarial discriminator
+            #     under-trained; `neighborhood_emb` iLISI collapsed to
+            #     numerical noise. Reverted.
+            #
+            #   - 2026-05-12 partial revert: (256, 200) — i.e. kept the
+            #     extended budget but restored the small-batch
+            #     dynamics. Result: niche NMI dropped ~0.03-0.05 across
+            #     EVERY variant in the v12-v16 ablations (0.69 -> 0.62
+            #     family). Cause: early-stopping monitor is `val_loss`,
+            #     which keeps inching down on the adversarial CE +
+            #     reconstruction terms even when the encoder is
+            #     over-correcting batch effects. With patience=20 +
+            #     min_delta=0.1, stopping never fires before epoch 200,
+            #     and the saved "best val_loss" checkpoint lands in
+            #     the over-corrected regime — niche structure
+            #     forgotten.
+            #
+            #   - Now (2026-05-12): reverted to max_epochs=80, the
+            #     working budget. Don't bump this in isolation again.
+            #     If you ever want to revisit "long-train better
+            #     Pareto", do it with a niche-quality-aware checkpoint
+            #     monitor (e.g. `val_pearson_gene_wise_1hop_nbr_log1p`
+            #     via SQUINT_WITH_PEARSON=1) AND verify post-hoc
+            #     niche NMI before publishing.
+            "max_epochs": 80,
+            # Run validation every 2 train epochs (Lightning default
+            # would be every epoch). Each val pass is a sub-pass over
+            # `val_dataloader` (cell-level 10% holdout from the train
+            # split) which causes GPU utilization to dip to ~0% while
+            # the train DataLoader workers idle and the val workers
+            # spin up. On a ~50s/epoch budget those dips cost ~20% of
+            # total throughput. Halving the val frequency recovers
+            # ~10% wall-clock with no model risk — early stopping
+            # (patience=20 val passes = 40 train epochs at this
+            # setting) and best-checkpoint selection still work
+            # exactly as before, just on a coarser val grid.
+            "check_val_every_n_epoch": 2,
             "enable_checkpointing": True,
             "ckpt_path": "best",
             # Early stopping: watch the val_loss (= sum of all weighted
@@ -803,21 +874,32 @@ def make_train_config_poc() -> dict:
             # generalisation rather than the optimisation objective on
             # the training set, which matters in particular for the
             # adversarial variants where train_loss can keep declining
-            # while val performance silently degrades. patience=20 epochs
-            # ≈ 8k gradient steps at batch_size=256 / ~100k cells —
-            # enough to distinguish a true plateau from a codebook
-            # reshuffle, and enough to ride through the adversarial
-            # alpha ramp-up that comes after `adv-warmup10` (otherwise
-            # patience=15 can fire during the 10-epoch warm-up + ~5
-            # post-warm-up epochs, before the adv-driven val_loss drift
-            # has had time to stabilise). min_delta=0.1: small absolute,
-            # but val_loss in this codebase ranges ~140-170 so 0.1 ≈
-            # 0.07% relative.
+            # while val performance silently degrades.
+            #
+            # patience=10 VAL PASSES — IMPORTANT: Lightning counts
+            # `patience` in val passes, not train epochs. With
+            # `check_val_every_n_epoch=2` (see trainer config above),
+            # one val pass = two train epochs, so patience=10 here
+            # means "stop if val_loss hasn't improved for 20 train
+            # epochs" — same effective horizon as the original
+            # patience=20 / val-every-epoch setup.
+            #
+            # 20 train epochs ≈ 8k gradient steps at
+            # batch_size=256 / ~100k cells — enough to distinguish
+            # a true plateau from a codebook reshuffle, and enough
+            # to ride through the adversarial alpha ramp-up that
+            # comes after `adv-warmup10` (otherwise patience can
+            # fire during the 10-epoch warm-up + ~5 post-warm-up
+            # epochs, before the adv-driven val_loss drift has had
+            # time to stabilise).
+            #
+            # min_delta=0.1: small absolute, but val_loss in this
+            # codebase ranges ~140-170 so 0.1 ≈ 0.07% relative.
             "early_stopping_params": {
                 "enabled":    True,
                 "monitor":    "val_loss",
                 "mode":       "min",
-                "patience":   20,
+                "patience":   10,    # 10 val passes × 2 train epochs/pass = 20 train epochs
                 "min_delta":  0.1,
             },
         },
@@ -1429,6 +1511,136 @@ def _patch_dual_no_spatial(cfg: dict) -> dict:
     return cfg
 
 
+def _patch_dual_batch_lr(
+        cfg: dict,
+        batch_size: Optional[int] = None,
+        lr: Optional[float] = None,
+    ) -> dict:
+    """
+    Override `loader_params.batch_size` and/or `optimizer_params.lr` in
+    the resolved config. Designed for ablation sweeps that BAKE a
+    specific (batch, lr) pair into a variant key — different from the
+    multiseed `--batch-size` / `--lr` CLI flags, which override at
+    submission time without changing the variant identity.
+
+    Either kwarg can be None to leave that knob untouched.
+
+    Recommended pairings (matches the docstring on `submit_multi_seed.sh`):
+
+      batch_size  | sqrt-scaled lr | linear-scaled lr
+      ------------+----------------+------------------
+       256 (def)  | 5e-4           | 5e-4
+       512        | ~7e-4          | 1e-3
+      1024        | 1e-3           | 2e-3
+      2048        | ~1.4e-3        | 4e-3
+      4096        | 2e-3           | 8e-3
+
+    Sqrt-scaling is the safer starting point — linear can saturate the
+    adversarial discriminator and collapse the encoder at 8x-16x batch.
+    """
+    if batch_size is not None:
+        cfg["datamodule"]["loader_params"]["batch_size"] = int(batch_size)
+    if lr is not None:
+        cfg["model"]["optimizer_params"]["lr"] = float(lr)
+    return cfg
+
+
+def _patch_dual_no_batch_int(cfg: dict) -> dict:
+    """
+    Drop EVERY batch-integration loss (adversarial CE + MMD). The
+    cell-side encoder + decoders + VQ codebooks still train normally;
+    no explicit batch-correction signal is applied. Useful for testing
+    whether SQUINT's per-batch decoder-covariate (`+decoder-cov`) is
+    enough to handle batch differences on its own, without an
+    encoder-side correction.
+
+    Removes both:
+      - `adversarial_cross_entropy_batch_loss` (the GRL adversarial CE)
+      - `mmd_batch_loss`                       (the kernel MMD term)
+    """
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    for ln in (
+        "adversarial_cross_entropy_batch_loss",
+        "mmd_batch_loss",
+    ):
+        if ln in losses:
+            losses.remove(ln)
+    # Also disable the adversarial classifier head + GRL alpha; keep
+    # them out of the optimizer + forward path so the no-adv config
+    # is truly "no batch integration" rather than "GRL with alpha=0".
+    cfg["model"]["adversarial_batch_dim_request"] = False
+    cfg["model"]["adversarial_alpha"] = 0.0
+    return cfg
+
+
+def _patch_dual_niche_neck(
+        cfg: dict,
+        hidden_channels: Optional[List[int]] = None,
+        dropout: float = 0.0,
+        norm: Optional[str] = None,
+    ) -> dict:
+    """
+    Insert a niche-side neck MLP between `z_mlp` and the GNN. The
+    cell-VQ still consumes `z_mlp` directly; only the GNN input is
+    routed through this extra MLP. See the `VQNiche_Dual_Encoder`
+    docstring for the schematic.
+
+    Why this might help:
+      - Currently the cell branch shares `z_mlp` with the niche-side
+        GNN input. Niche-side gradients (adjacency BCE, nbr-NB,
+        niche-commit) all flow back into `z_mlp`, which can pull the
+        cell quantiser away from cell-type-discriminative geometry.
+      - Inserting a learned linear transformation between `z_mlp` and
+        the GNN lets the niche-side gradients shape that new tensor
+        independently, leaving `z_mlp` (and therefore the cell-VQ
+        input) cleaner.
+
+    Default `hidden_channels=[256]` → a single 256-d projection layer
+    that preserves the wide-spine latent dim. Pass `[128]` etc. for a
+    smaller / different output dim (the GNN will be sized accordingly).
+    """
+    target = list(hidden_channels) if hidden_channels else [256]
+    cfg["model"]["encoder_params"]["niche_neck_params"] = {
+        "hidden_channels": target,
+        "dropout":          float(dropout),
+        "act":              "relu",
+        "norm":             norm,
+    }
+    return cfg
+
+
+def _patch_dual_no_nbr_recon(cfg: dict) -> dict:
+    """
+    Drop ONLY the neighborhood-gene-expression NB reconstruction loss
+    (`nb_attribute_reconstruction_loss_nbr_dual`). The niche encoder
+    still runs and is still committed to its codebook (niche-commit
+    kept), and the adjacency-BCE loss is still active — so the niche
+    branch retains spatial-structure supervision via the adjacency
+    decoder, but no longer tries to reconstruct neighborhood gene
+    expression.
+
+    Use this together with `_patch_dual_no_adj` to form a 2x2 grid
+    that isolates the contribution of each spatial loss term to
+    downstream cell-type / niche-type NMI:
+       adj=ON,  nbr=ON   -> baseline
+       adj=OFF, nbr=ON   -> `_patch_dual_no_adj`
+       adj=ON,  nbr=OFF  -> `_patch_dual_no_nbr_recon` (this)
+       adj=OFF, nbr=OFF  -> `_patch_dual_no_spatial`
+
+    Sibling of `_patch_dual_no_adj` and `_patch_dual_no_spatial`.
+    Apply LAST in the patch chain so the loss removal isn't undone
+    by a later patch that re-adds the loss name.
+    """
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    for ln in (
+        "nb_attribute_reconstruction_loss_nbr_dual",
+        "nb_attribute_reconstruction_loss_nbr",   # legacy single-codebook name
+    ):
+        if ln in losses:
+            losses.remove(ln)
+    return cfg
+
+
 def _patch_dual_rvq(cfg: dict,
                     branch: str = "both",
                     codebook_sizes=(30, 200)) -> dict:
@@ -1937,6 +2149,36 @@ def _patch_dual_encoder_shallow(
     return cfg
 
 
+def _patch_dual_commit_niche_weight(
+        cfg: dict,
+        wt_commit_niche: float = 2.0,
+    ) -> dict:
+    """
+    Increase (or decrease) the niche-branch commit-loss weight. Default 1.0
+    (set in `_make_default_dual_config`). Sibling of
+    `_patch_dual_commit_cell_weight`; both can be applied in sequence
+    via patch chaining (e.g. cell=3.0 + niche=0.5 to asymmetrically
+    sharpen the cell side while loosening the niche side).
+
+    The niche commit loss pulls `z_gnn[:batch_size]` (the niche-branch
+    pre-VQ representation) toward `z_q_niche` (post-VQ). Higher weight
+    → niche codes more concentrated → more distinct spatial regions
+    per code. Lower weight → niche codes smear → finer-grained niche
+    structure can survive in the residual.
+
+    Use cases:
+      - `wt_commit_niche > 1.0`: sharpen niche codes, often boosts
+        Niche NMI on the composite RVQ code; risk of over-coarsening
+        the spatial niches (multiple distinct regions collapse to one
+        code).
+      - `wt_commit_niche < 1.0`: looser niche commit, codes carry
+        less variance — useful when the niche encoder seems to be
+        overfitting batch-correlated spatial structure.
+    """
+    cfg["model"]["loss_params"]["loss_kwargs"]["wt_commit_niche"] = float(wt_commit_niche)
+    return cfg
+
+
 def _patch_dual_commit_cell_weight(
         cfg: dict,
         wt_commit_cell: float = 2.0,
@@ -1964,45 +2206,20 @@ def _patch_dual_commit_cell_weight(
     return cfg
 
 
-def _patch_dual_cross_entropy(
-        cfg: dict,
-        wt_cross_entropy: float = 10.0,
-    ) -> dict:
-    """
-    Turn ON the supervised cell-type cross-entropy loss on the
-    Linear predictor head (z_mlp[:batch_size] -> n_cell_types) with
-    weight `wt_cross_entropy`.
-
-    NOTE on methodological framing: this makes the variant
-    SEMI-SUPERVISED — it consumes ground-truth `cell_type` labels
-    at training time. The other SQUINT variants are unsupervised
-    (reconstruction + commit + adjacency + adversarial only). Reporting
-    a semi-supervised variant alongside the unsupervised ones is fair
-    iff clearly labeled in the methods — it gives an empirical upper
-    bound for "how much can cell-NMI improve if we directly optimise
-    for it?", which scaffolds the unsupervised story.
-
-    Mechanism: the Linear predictor is already built by `BaseModel`
-    (256 -> n_cell_types) but its output is unused unless
-    `cross_entropy_loss` is in `loss_names`. This patch flips it on
-    and sets the weight. The loss data dispatcher in
-    `BaseModel.criterion` already reads `logits` and `labels` from
-    loss_data, both of which `VQNiche_Dual._step` populates from
-    `predictor(z_mlp[:batch_size])` and `batch.y` respectively.
-
-    Weight calibration: typical NB attribute-reconstruction loss is
-    ~150 nats, CE on a 49-way classifier is bounded by log(49) ≈ 3.9.
-    A weight of 10 puts the CE gradient at ~10 × 3.9 / 150 ≈ 0.26x
-    the NB gradient — comparable to wt_adv_batch's effective scale —
-    so the predictor's signal is significant but doesn't dominate.
-    Lower (5) for more conservative; higher (50, 100) if cell-NMI
-    isn't the bottleneck.
-    """
-    losses = cfg["model"]["loss_params"]["loss_names"]
-    if "cross_entropy_loss" not in losses:
-        losses.append("cross_entropy_loss")
-    cfg["model"]["loss_params"]["loss_kwargs"]["wt_cross_entropy"] = float(wt_cross_entropy)
-    return cfg
+# NOTE: `_patch_dual_cross_entropy` was removed on purpose.
+#
+# That patch enabled a supervised cross-entropy loss on the cell-type
+# label, which would have turned SQUINT into a semi-supervised method
+# (consuming ground-truth `cell_type` at training time). We're keeping
+# SQUINT strictly unsupervised so it stays directly comparable to the
+# unsupervised / zero-shot baselines (scVI, NicheCompass, BANKSY,
+# Geneformer, scGPT, ...). The Linear predictor submodule itself is
+# still built by BaseModel (256 -> n_cell_types) but its output is
+# never folded into the loss, so it's harmless dead weight.
+#
+# If you ever need a supervised oracle / upper-bound number, do it as
+# a one-off external experiment outside the published variant set —
+# don't reintroduce a `+ce-w*` patch here.
 
 
 def _patch_dual_decoder_film(
@@ -3618,12 +3835,11 @@ VARIANTS: dict = {
     #     from the warmup phase or the post-warmup adversarial pressure?
     #   - Sharper cell VQ commit (commit-cell-w2) — discrete codes more
     #     concentrated, less smearing of cell-type clusters across codes.
-    #   - Semi-supervised cell-type CE (ce-w10) — empirical upper bound
-    #     for "what if we directly optimise cell-NMI?". Trains the
-    #     existing Linear predictor head; CLEARLY LABELED as
-    #     semi-supervised in methods.
     #   - Combo safety stack (enc-shallow + warmup10 + mmd-w50) — pulls
     #     the three best individual mechanisms together.
+    # (An earlier draft included a `+ce-w10` semi-supervised entry —
+    # removed when SQUINT was committed to the unsupervised-only design.
+    # See the comment block where `_patch_dual_cross_entropy` used to be.)
     # Group via `--all-dataset mmb0-1b_smb1-1b_1p-ablations-v6b`.
     # ========================================================================
     "dualvq+wide+rvq-both+decoder-cov+adv-w50+adv-warmup10+mmb0-1b_smb1-1b_1p": {
@@ -3717,42 +3933,12 @@ VARIANTS: dict = {
             wt_commit_cell=2.0,
         ),
     },
-    "dualvq+wide+rvq-both+decoder-cov+ce-w10+adv+adv-warmup10+mmb0-1b_smb1-1b_1p": {
-        "description": (
-            "v6b — auxiliary cross-entropy on the Linear predictor head "
-            "(z_mlp[:B] -> n_cell_types) with weight 10. Adds direct "
-            "supervised cell-type signal — the Linear predictor was "
-            "always built but its loss was never enabled. SEMI-"
-            "SUPERVISED: uses ground-truth cell_type at training time. "
-            "Empirical upper bound for cell-NMI; CLEARLY LABEL as "
-            "semi-supervised in paper methods (the rest of SQUINT, "
-            "scVI, NicheCompass, the foundation-model baselines, etc. "
-            "are unsupervised or zero-shot). Expected: cell-NMI 0.55-"
-            "0.65 (large bump); iLISI varies based on adv-warmup "
-            "interaction."
-        ),
-        "patches": [
-            "+wide", "+rvq(branch=both, levels=[30, 90])",
-            "+decoder_covariate",
-            "+cross_entropy_loss(weight=10.0)",
-            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
-        ],
-        "build": lambda: _patch_dual_cross_entropy(
-            _patch_dual_adversarial(
-                _patch_dual_decoder_covariate(
-                    _patch_dual_rvq(
-                        _patch_dual_rvq(
-                            _patch_dual_wide(_BD()),
-                            branch="niche", codebook_sizes=(30, 90),
-                        ),
-                        branch="cell", codebook_sizes=(30, 90),
-                    ),
-                ),
-                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
-            ),
-            wt_cross_entropy=10.0,
-        ),
-    },
+    # NOTE: the `+ce-w10` semi-supervised entry that used to live here
+    # (v6b "auxiliary cross-entropy on the Linear predictor head") was
+    # removed when we decided to keep SQUINT strictly unsupervised. See
+    # the comment block where `_patch_dual_cross_entropy` used to be
+    # defined for the rationale. No replacement in v6b — the remaining
+    # 7 v6b entries are all unsupervised.
     "dualvq+wide+rvq-both+decoder-cov+adv+enc-shallow+adv-warmup10+mmd-w50+mmb0-1b_smb1-1b_1p": {
         "description": (
             "v6b — combination safety stack: shallow encoder + 10-epoch "
@@ -6316,7 +6502,2110 @@ VARIANTS: dict = {
                         _patch_recon_both(_B())))),
             heads=10, codebook_size=5000),
     },
+
+    # ========================================================================
+    # mmb0-1b_smb1-1b_1p ablations v12-v15 — entire design space exploration.
+    # SPINE (held constant across all 32 entries):
+    #   dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10
+    # = the strongest published single-variant config so far on this dataset
+    #   (niche NMI ~0.69, cell NMI ~0.50). Each set varies one orthogonal
+    #   axis off this spine.
+    #
+    #   v12 — commit-loss weights (cell-side, niche-side, both)
+    #   v13 — codebook structure (single-level VQ, RVQ depth/sizes,
+    #         asymmetric cell vs niche)
+    #   v14 — loss-tuning (cross-entropy weight, MMD vs adversarial,
+    #         adversarial weight & warmup)
+    #   v15 — architecture (MLP/GNN width, latent dim, dropout,
+    #         attention, GNN depth)
+    #
+    # Submit each set via:
+    #   bash examples/submit_mmb_smb_ablations_v12.sh   # commit-losses
+    #   bash examples/submit_mmb_smb_ablations_v13.sh   # codebook-design
+    #   bash examples/submit_mmb_smb_ablations_v14.sh   # loss-tuning
+    #   bash examples/submit_mmb_smb_ablations_v15.sh   # architecture
+    # ========================================================================
+
+    # ---- v12: commit-loss weights -----------------------------------------
+    # Cell-side commit weight had a measurable impact on cell-code-vs-cell-
+    # type NMI (commit-cell-w2 → 0.503 vs spine 0.495). v12 scans both
+    # weights independently and tests asymmetric combinations to map the
+    # commit-loss landscape.
+    "dualvq+wide+rvq-both+decoder-cov+commit-cell-w0.5+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v12 commit-losses: cell commit weight 0.5 (looser cell "
+            "VQ assignment, more residual variance in z_mlp). Tests "
+            "whether SMALLER commit pressure on the cell side helps "
+            "niche-branch GNN aggregation (which consumes the same "
+            "z_mlp)."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+commit_cell(weight=0.5)",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_commit_cell_weight(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            wt_commit_cell=0.5,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+commit-cell-w3+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v12 commit-losses: cell commit weight 3 (vs default 1 / "
+            "previously-tried 2). Pushes z_mlp harder onto cell codes; "
+            "expected cell-NMI bump beyond the 0.503 we got at w=2."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+commit_cell(weight=3.0)",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_commit_cell_weight(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            wt_commit_cell=3.0,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+commit-cell-w5+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v12 commit-losses: cell commit weight 5 — aggressive. "
+            "Tests whether higher commit pushes z_mlp into a degenerate "
+            "code-collapse regime (only a few codes used)."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+commit_cell(weight=5.0)",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_commit_cell_weight(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            wt_commit_cell=5.0,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+commit-niche-w0.5+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v12 commit-losses: niche commit weight 0.5 (looser niche "
+            "VQ assignment). Lets the niche encoder maintain finer-"
+            "grained spatial variance pre-quantisation."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+commit_niche(weight=0.5)",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_commit_niche_weight(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            wt_commit_niche=0.5,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+commit-niche-w3+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v12 commit-losses: niche commit weight 3. Tightens niche "
+            "VQ → niche codes more distinct; expected niche NMI bump."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+commit_niche(weight=3.0)",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_commit_niche_weight(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            wt_commit_niche=3.0,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+commit-niche-w5+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v12 commit-losses: niche commit weight 5 — aggressive. "
+            "Same intent as commit-cell-w5: probe the niche-side "
+            "collapse boundary."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+commit_niche(weight=5.0)",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_commit_niche_weight(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            wt_commit_niche=5.0,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+commit-cell-w3+commit-niche-w0.5+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v12 commit-losses: asymmetric — cell sharp (3), niche "
+            "loose (0.5). Tests whether the two branches should be "
+            "differently regularised given their different downstream "
+            "tasks (cell-type clustering vs spatial-domain clustering)."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+commit_cell(weight=3.0)", "+commit_niche(weight=0.5)",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_commit_niche_weight(
+            _patch_dual_commit_cell_weight(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                    ),
+                ),
+                wt_commit_cell=3.0,
+            ),
+            wt_commit_niche=0.5,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+commit-cell-w0.5+commit-niche-w3+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v12 commit-losses: asymmetric — cell loose (0.5), niche "
+            "sharp (3). Mirror of the previous variant."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+commit_cell(weight=0.5)", "+commit_niche(weight=3.0)",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_commit_niche_weight(
+            _patch_dual_commit_cell_weight(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                    ),
+                ),
+                wt_commit_cell=0.5,
+            ),
+            wt_commit_niche=3.0,
+        ),
+    },
+
+    # ---- v13: codebook structure ------------------------------------------
+    # Test single-level (VQ) vs multi-level (RVQ) cell codebooks at
+    # various sizes, asymmetric cell-vs-niche configs, and composite VQ.
+    "dualvq+wide+vq-cell-30+rvq-niche-30-60-120+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v13 codebook: single-level VQ on cell, K=30 (≈ # cell "
+            "types). Tests the hypothesis 'cell codebook size should "
+            "match cell-type cardinality'."
+        ),
+        "patches": [
+            "+wide", "+vq(branch=cell, K=30)",
+            "+rvq(branch=niche, levels=[30, 60, 120])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_vq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 60, 120)),
+                        branch="cell", codebook_size=30,
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-cell-30-60+rvq-niche-30-60-120+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v13 codebook: 2-level cell RVQ with modest level-1 growth "
+            "(30, 60) — moderate refinement on top of the fixed "
+            "level-0 = 30 cell codebook. Niche stays at the standard "
+            "3-level (30, 60, 120)."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=cell, levels=[30, 60])",
+            "+rvq(branch=niche, levels=[30, 60, 120])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 60, 120)),
+                        branch="cell", codebook_sizes=(30, 60),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-cell-30-200+rvq-niche-30-60-120+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v13 codebook: 2-level cell RVQ with BIG level-1 (30, 200) "
+            "— ~6.7x growth on top of the fixed level-0. Tests whether "
+            "the cell side benefits from heavy residual refinement; "
+            "niche stays at 3-level (30, 60, 120)."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=cell, levels=[30, 200])",
+            "+rvq(branch=niche, levels=[30, 60, 120])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 60, 120)),
+                        branch="cell", codebook_sizes=(30, 200),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-cell-30-30+rvq-niche-30-60+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v13 codebook: 2-level cell RVQ with NO level-1 growth "
+            "(30, 30). The residual quantiser at level 1 has the same "
+            "capacity as level 0 — tests whether the cell side needs "
+            "any level-1 expansion at all."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=cell, levels=[30, 30])",
+            "+rvq(branch=niche, levels=[30, 60])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 60)),
+                        branch="cell", codebook_sizes=(30, 30),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-cell-30-90-270+rvq-niche-30-60-120+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v13 codebook: 3-level cell RVQ (30, 90, 270) — deepest "
+            "cell refinement we're testing; niche is also 3-level "
+            "(30, 60, 120). Symmetric depth, asymmetric per-level "
+            "growth rates (3x cell / 2x niche)."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=cell, levels=[30, 90, 270])",
+            "+rvq(branch=niche, levels=[30, 60, 120])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 60, 120)),
+                        branch="cell", codebook_sizes=(30, 90, 270),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-both-3level-30-30-30+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v13 codebook: symmetric 3-level RVQ with NO growth across "
+            "levels — all levels at 30. The residuals at levels 1 and "
+            "2 refine within a fixed-size codebook. Tests whether the "
+            "growth pattern matters or only the depth."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 30, 30)),
+                        branch="cell", codebook_sizes=(30, 30, 30),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+        ),
+    },
+    "dualvq+wide+cvq-cell-30-10+rvq-niche-30-60-120+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v13 codebook: composite VQ on cell (30 x 10 = 300 "
+            "effective codes via Cartesian product), RVQ on niche. "
+            "Tests CVQ's compositional code structure for the cell "
+            "branch."
+        ),
+        "patches": [
+            "+wide", "+cvq(branch=cell, levels=[30, 10])",
+            "+rvq(branch=niche, levels=[30, 60, 120])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_cvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 60, 120)),
+                        branch="cell", codebook_sizes=(30, 10),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-cell-30-90-270+rvq-niche-30-90+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v13 codebook: deeper cell RVQ (30, 90, 270) — niche stays "
+            "2-level (30, 90). Asymmetric depth favouring the cell side."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=cell, levels=[30, 90, 270])",
+            "+rvq(branch=niche, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 90)),
+                        branch="cell", codebook_sizes=(30, 90, 270),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+        ),
+    },
+
+    # ---- v14: loss-tuning (unsupervised) ---------------------------------
+    # ALL UNSUPERVISED. The earlier draft of v14 included a `+ce-w*`
+    # cross-entropy family for cell-type supervision; those were pulled
+    # when SQUINT was committed to the unsupervised-only design (see
+    # the comment block where `_patch_dual_cross_entropy` used to be
+    # defined). v14 now scans:
+    #   - Adjacency loss weight (3 weights spanning ~20x range)
+    #   - Adversarial schedule (shorter / longer warmup, higher weight)
+    #   - MMD layered on top of the adv+warmup spine (lighter weight)
+    #   - Pure MMD (no adv) as the simpler-batch-integration baseline
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+adj-w250+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v14 loss-tuning: adjacency-BCE weight 250 (vs default "
+            "1000). Lighter spatial structure pressure on the niche "
+            "branch — tests whether the default over-constrains "
+            "spatial geometry at the cost of cell-side flexibility."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper", "+adj_weight(250.0)",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            weight=250.0,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+adj-w500+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v14 loss-tuning: adjacency-BCE weight 500. Mid-point "
+            "between adj-w250 and the default 1000; completes the scan "
+            "alongside the existing adj-w3000 variant."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper", "+adj_weight(500.0)",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            weight=500.0,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+adj-w5000+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v14 loss-tuning: adjacency-BCE weight 5000 — heavier "
+            "than the existing adj-w3000 data point. Pushes the niche "
+            "encoder more aggressively toward spatial-cluster geometry."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper", "+adj_weight(5000.0)",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            weight=5000.0,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v14 loss-tuning: 5-epoch adversarial warmup (vs the spine's "
+            "10 and v14's other 20-epoch variant). Completes the warmup-"
+            "duration scan {5, 10, 20}."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=5)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 90)),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=5,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+mmd-w50+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v14 loss-tuning: light MMD-w50 layered on top of the adv "
+            "spine. MMD operates every step (vs adv which is gated by "
+            "warmup) — provides batch-integration safety during the "
+            "10-epoch adversarial warmup window."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper", "+mmd_batch(weight=50.0)",
+        ],
+        "build": lambda: _patch_dual_mmd_batch(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            wt_mmd_batch=50.0,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+mmd-w100+enc-deeper+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v14 loss-tuning: pure MMD-w100 batch integration on the "
+            "enc-deeper spine — no adversarial. Tests MMD-only as a "
+            "simpler alternative to the GRL adversary."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+mmd_batch(weight=100.0)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_mmd_batch(
+            _patch_dual_encoder_deeper(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 90)),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+            ),
+            wt_mmd_batch=100.0,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv-w500+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v14 loss-tuning: adversarial weight 500 (vs default 150). "
+            "Aggressive batch removal; expected better iLISI/MMD but "
+            "risk of crushing biological signal."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=500.0, warmup=10)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 90)),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=500.0, warmup_epochs=10,
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup20+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v14 loss-tuning: 20-epoch adversarial warmup (vs 10). "
+            "More time for encoder to commit codes before adversarial "
+            "pressure kicks in."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=20)",
+            "+enc-deeper",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(_BD(),
+                            branch="niche", codebook_sizes=(30, 90)),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=20,
+            ),
+        ),
+    },
+
+    # ---- v15: architecture -----------------------------------------------
+    # Encoder + GNN width, latent dim, dropout, GNN depth, attention.
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+gnn-h512+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v15 architecture: GNN hidden 256 → 512. Wider niche "
+            "branch — more spatial aggregation capacity."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper", "+gnn_hidden(512)",
+        ],
+        "build": lambda: _patch_dual_gnn_hidden(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            hidden=512,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+mlp-h512+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v15 architecture: MLP hidden 400 → 512 (default + 28%). "
+            "Wider cell encoder."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper", "+mlp_width(512)",
+        ],
+        "build": lambda: _patch_dual_mlp_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            hidden_channels=[512],
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+mlp-h128+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v15 architecture: MLP hidden 400 → 128. Narrow cell "
+            "encoder — tests whether the spine over-parameterises "
+            "the cell side."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper", "+mlp_width(128)",
+        ],
+        "build": lambda: _patch_dual_mlp_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            hidden_channels=[128],
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+dropout-p0.1+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v15 architecture: dropout p=0.1 in MLP / GNN. Light "
+            "regularisation."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper", "+dropout(p=0.1)",
+        ],
+        "build": lambda: _patch_dual_dropout(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            p=0.1,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+dropout-p0.3+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v15 architecture: dropout p=0.3. Stronger regularisation; "
+            "tests whether the spine overfits to training batches."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper", "+dropout(p=0.3)",
+        ],
+        "build": lambda: _patch_dual_dropout(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            p=0.3,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+small-latent-128+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v15 architecture: latent dim 256 → 128. Smaller "
+            "pre-codebook bottleneck."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper", "+small_latent(128)",
+        ],
+        "build": lambda: _patch_dual_small_latent(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+            latent_dim=128,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+gnn2+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v15 architecture: 2-layer GNN (vs default 1). Deeper "
+            "spatial aggregation; the sampler depth is bumped to "
+            "match (`num_neighbors=[8, 8]`)."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper", "+gnn2(num_layers=2, sampler=[8,8])",
+        ],
+        "build": lambda: _patch_dual_gnn2(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+gatv2+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v15 architecture: GATv2 attention in the niche GNN "
+            "(vs default GraphSAGE-style mean aggregation). Attention "
+            "lets the GNN weight neighbours by content rather than "
+            "uniformly."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper", "+gatv2",
+        ],
+        "build": lambda: _patch_dual_gatv2(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+                ),
+            ),
+        ),
+    },
+
+    # ---- v16: encoder/decoder dim grid (codebook 30-30-30 fixed) --------
+    # 4 hidden dims (<256) × 2 encoder depths = 8 variants.
+    # Codebook is fixed at (30, 30, 30) — symmetric 3-level RVQ with no
+    # growth across levels. The point of v16 is the dim sweep, NOT the
+    # codebook design (that's v13). `_patch_dual_small(hidden=N)` sets
+    # the encoder MLP + GNN + BOTH decoders to width N — so each
+    # variant is a uniform-width architecture, comparable apples-to-
+    # apples on parameter count.
+    #
+    # The shared spine here is `dualvq+small-h<N>` (no `+wide`), so
+    # the GNN runs at depth 1 with sampler `[8]` — same as the default
+    # base config. Adversarial + decoder-cov + adv-warmup10 match the
+    # rest of v12-v15.
+    "dualvq+small-h32+rvq-both-3level-30-30-30+decoder-cov+adv+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v16 dim grid: hidden=32 (encoder MLP + GNN + both "
+            "decoders), single-layer MLP. Smallest configuration; "
+            "tests whether the model can still learn 30-cluster "
+            "codebooks at extreme parameter compression."
+        ),
+        "patches": [
+            "+small(hidden=32)",
+            "+rvq(branch=both, levels=[30, 30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_small(_BD(), hidden=32),
+                        branch="niche", codebook_sizes=(30, 30, 30),
+                    ),
+                    branch="cell", codebook_sizes=(30, 30, 30),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+        ),
+    },
+    "dualvq+small-h64+rvq-both-3level-30-30-30+decoder-cov+adv+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v16 dim grid: hidden=64, single-layer MLP. ~2x params vs "
+            "h=32; the standard 'compact' point in the size sweep."
+        ),
+        "patches": [
+            "+small(hidden=64)",
+            "+rvq(branch=both, levels=[30, 30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_small(_BD(), hidden=64),
+                        branch="niche", codebook_sizes=(30, 30, 30),
+                    ),
+                    branch="cell", codebook_sizes=(30, 30, 30),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+        ),
+    },
+    "dualvq+small-h128+rvq-both-3level-30-30-30+decoder-cov+adv+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v16 dim grid: hidden=128, single-layer MLP. Matches the "
+            "non-wide default GNN width — moderate parameter count."
+        ),
+        "patches": [
+            "+small(hidden=128)",
+            "+rvq(branch=both, levels=[30, 30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_small(_BD(), hidden=128),
+                        branch="niche", codebook_sizes=(30, 30, 30),
+                    ),
+                    branch="cell", codebook_sizes=(30, 30, 30),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+        ),
+    },
+    "dualvq+small-h192+rvq-both-3level-30-30-30+decoder-cov+adv+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v16 dim grid: hidden=192, single-layer MLP. Largest sub-"
+            "256 point — close to (but below) the +wide spine's 256."
+        ),
+        "patches": [
+            "+small(hidden=192)",
+            "+rvq(branch=both, levels=[30, 30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_small(_BD(), hidden=192),
+                        branch="niche", codebook_sizes=(30, 30, 30),
+                    ),
+                    branch="cell", codebook_sizes=(30, 30, 30),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+        ),
+    },
+    "dualvq+small-h32+rvq-both-3level-30-30-30+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v16 dim grid: hidden=32 + 3-layer encoder MLP "
+            "([32, 32, 32]). Tests whether depth compensates for the "
+            "small width."
+        ),
+        "patches": [
+            "+small(hidden=32)",
+            "+rvq(branch=both, levels=[30, 30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper(mlp=[32, 32, 32])",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=32),
+                            branch="niche", codebook_sizes=(30, 30, 30),
+                        ),
+                        branch="cell", codebook_sizes=(30, 30, 30),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+            hidden_channels=[32, 32, 32],
+        ),
+    },
+    "dualvq+small-h64+rvq-both-3level-30-30-30+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v16 dim grid: hidden=64 + 3-layer encoder MLP "
+            "([64, 64, 64])."
+        ),
+        "patches": [
+            "+small(hidden=64)",
+            "+rvq(branch=both, levels=[30, 30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper(mlp=[64, 64, 64])",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=64),
+                            branch="niche", codebook_sizes=(30, 30, 30),
+                        ),
+                        branch="cell", codebook_sizes=(30, 30, 30),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+            hidden_channels=[64, 64, 64],
+        ),
+    },
+    "dualvq+small-h128+rvq-both-3level-30-30-30+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v16 dim grid: hidden=128 + 3-layer encoder MLP "
+            "([128, 128, 128])."
+        ),
+        "patches": [
+            "+small(hidden=128)",
+            "+rvq(branch=both, levels=[30, 30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper(mlp=[128, 128, 128])",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=128),
+                            branch="niche", codebook_sizes=(30, 30, 30),
+                        ),
+                        branch="cell", codebook_sizes=(30, 30, 30),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+            hidden_channels=[128, 128, 128],
+        ),
+    },
+    "dualvq+small-h192+rvq-both-3level-30-30-30+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "v16 dim grid: hidden=192 + 3-layer encoder MLP "
+            "([192, 192, 192]). Largest sub-256 point with depth."
+        ),
+        "patches": [
+            "+small(hidden=192)",
+            "+rvq(branch=both, levels=[30, 30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0, warmup=10)",
+            "+enc-deeper(mlp=[192, 192, 192])",
+        ],
+        "build": lambda: _patch_dual_encoder_deeper(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=192),
+                            branch="niche", codebook_sizes=(30, 30, 30),
+                        ),
+                        branch="cell", codebook_sizes=(30, 30, 30),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0, warmup_epochs=10,
+            ),
+            hidden_channels=[192, 192, 192],
+        ),
+    },
+
+    # ---- Sweep 18: small-arch + no-warmup + sampler-{4,8} grid -----------
+    # Goal: find the smallest working architecture before scaling up. All
+    # 8 variants share a strictly-unsupervised spine with NO adversarial
+    # warmup (`+adv` only, alpha=1.0 from epoch 0), `_patch_dual_small`
+    # for uniform-width encoder MLP + GNN + both decoders, and codebook
+    # level-0 fixed at 30.
+    #
+    # 2 × 2 × 2 = 8 variants:
+    #   hidden  ∈ {32, 64}
+    #   codebook ∈ {(30, 30) 2-level, (30, 30, 30) 3-level}
+    #   sampler  ∈ {[4], [8]}
+    #
+    # If small variants do well, the next sweep can scale up; if not, the
+    # sweep tells us SQUINT needs more capacity than 64-d to learn
+    # cell-type + niche structure under unsupervised losses.
+    #
+    # NOTE: variants are registered with their full "s18_v<N>_<base>"
+    # names — there's no separate flat-name entry for these, since they
+    # are genuinely new (not aliases of existing variants).
+    "s18_v1_dualvq+small-h32+rvq-both-30-30+decoder-cov+adv+sampler4+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s18 sweep, variant 1: hidden=32, 2-level RVQ (30, 30), "
+            "sampler=[4], adv-from-epoch-0 (no warmup). Smallest of "
+            "the grid."
+        ),
+        "patches": [
+            "+small(hidden=32)",
+            "+rvq(branch=both, levels=[30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+sampler([4])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=32),
+                            branch="niche", codebook_sizes=(30, 30),
+                        ),
+                        branch="cell", codebook_sizes=(30, 30),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            num_neighbors=[4],
+        ),
+    },
+    "s18_v2_dualvq+small-h64+rvq-both-30-30+decoder-cov+adv+sampler4+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s18 sweep, variant 2: hidden=64, 2-level RVQ (30, 30), "
+            "sampler=[4]. 2x width vs s18_v1."
+        ),
+        "patches": [
+            "+small(hidden=64)",
+            "+rvq(branch=both, levels=[30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+sampler([4])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=64),
+                            branch="niche", codebook_sizes=(30, 30),
+                        ),
+                        branch="cell", codebook_sizes=(30, 30),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            num_neighbors=[4],
+        ),
+    },
+    "s18_v3_dualvq+small-h32+rvq-both-3level-30-30-30+decoder-cov+adv+sampler4+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s18 sweep, variant 3: hidden=32, 3-level RVQ (30, 30, 30), "
+            "sampler=[4]. Tests whether deeper codebook helps the "
+            "smallest architecture."
+        ),
+        "patches": [
+            "+small(hidden=32)",
+            "+rvq(branch=both, levels=[30, 30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+sampler([4])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=32),
+                            branch="niche", codebook_sizes=(30, 30, 30),
+                        ),
+                        branch="cell", codebook_sizes=(30, 30, 30),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            num_neighbors=[4],
+        ),
+    },
+    "s18_v4_dualvq+small-h64+rvq-both-3level-30-30-30+decoder-cov+adv+sampler4+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s18 sweep, variant 4: hidden=64, 3-level RVQ (30, 30, 30), "
+            "sampler=[4]. Slightly larger arch + deeper codebook on "
+            "narrow sampler."
+        ),
+        "patches": [
+            "+small(hidden=64)",
+            "+rvq(branch=both, levels=[30, 30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+sampler([4])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=64),
+                            branch="niche", codebook_sizes=(30, 30, 30),
+                        ),
+                        branch="cell", codebook_sizes=(30, 30, 30),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            num_neighbors=[4],
+        ),
+    },
+    "s18_v5_dualvq+small-h32+rvq-both-30-30+decoder-cov+adv+sampler8+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s18 sweep, variant 5: hidden=32, 2-level RVQ (30, 30), "
+            "sampler=[8] (default fanout). Pair to s18_v1 — isolates "
+            "the sampler effect."
+        ),
+        "patches": [
+            "+small(hidden=32)",
+            "+rvq(branch=both, levels=[30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+sampler([8])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=32),
+                            branch="niche", codebook_sizes=(30, 30),
+                        ),
+                        branch="cell", codebook_sizes=(30, 30),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            num_neighbors=[8],
+        ),
+    },
+    "s18_v6_dualvq+small-h64+rvq-both-30-30+decoder-cov+adv+sampler8+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s18 sweep, variant 6: hidden=64, 2-level RVQ (30, 30), "
+            "sampler=[8]. Pair to s18_v2."
+        ),
+        "patches": [
+            "+small(hidden=64)",
+            "+rvq(branch=both, levels=[30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+sampler([8])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=64),
+                            branch="niche", codebook_sizes=(30, 30),
+                        ),
+                        branch="cell", codebook_sizes=(30, 30),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            num_neighbors=[8],
+        ),
+    },
+    "s18_v7_dualvq+small-h32+rvq-both-3level-30-30-30+decoder-cov+adv+sampler8+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s18 sweep, variant 7: hidden=32, 3-level RVQ (30, 30, 30), "
+            "sampler=[8]. Pair to s18_v3."
+        ),
+        "patches": [
+            "+small(hidden=32)",
+            "+rvq(branch=both, levels=[30, 30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+sampler([8])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=32),
+                            branch="niche", codebook_sizes=(30, 30, 30),
+                        ),
+                        branch="cell", codebook_sizes=(30, 30, 30),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            num_neighbors=[8],
+        ),
+    },
+    "s18_v8_dualvq+small-h64+rvq-both-3level-30-30-30+decoder-cov+adv+sampler8+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s18 sweep, variant 8: hidden=64, 3-level RVQ (30, 30, 30), "
+            "sampler=[8]. Largest of the s18 grid; pair to s18_v4."
+        ),
+        "patches": [
+            "+small(hidden=64)",
+            "+rvq(branch=both, levels=[30, 30, 30])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+sampler([8])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_small(_BD(), hidden=64),
+                            branch="niche", codebook_sizes=(30, 30, 30),
+                        ),
+                        branch="cell", codebook_sizes=(30, 30, 30),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            num_neighbors=[8],
+        ),
+    },
+
+    # ---- Sweep 19: spatial-loss ablation -------------------------------
+    # Question being tested: do the SPATIAL supervision losses (adjacency
+    # BCE + neighborhood-NB gene-expression reconstruction) help the
+    # CELL branch learn cell-type-discriminative codes? The cell branch
+    # shares `z_mlp` with the niche GNN (the GNN consumes z_mlp from
+    # sampled-neighbor cells), so spatial losses on the niche side
+    # backprop into z_mlp via the shared trunk — they MAY help or hurt
+    # cell-NMI depending on whether spatial structure correlates with
+    # cell-type identity.
+    #
+    # 2x2 grid (4 variants):
+    #               adj-BCE ON          adj-BCE OFF
+    #   nbr-NB ON   s19_v1 baseline     s19_v2 +no-adj
+    #   nbr-NB OFF  s19_v3 +no-nbr      s19_v4 +no-spatial
+    #
+    # Shared spine: `dualvq+wide+rvq-both+decoder-cov+adv` — the
+    # historic top-niche-NMI variant (0.695 niche NMI in the s17 sweep).
+    # Picking a strong spine means the deltas read cleanly as
+    # "what the spatial losses contribute on top of an otherwise
+    # working model" rather than getting tangled up with under-trained
+    # other components.
+    "s19_v1_dualvq+wide+rvq-both+decoder-cov+adv+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s19 sweep, variant 1: baseline (adj-BCE ON, nbr-NB ON). "
+            "Spine = +wide+rvq-both+decoder-cov+adv with both spatial "
+            "supervision losses active. Reference for the other three "
+            "v2..v4 ablations."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+        ],
+        "build": lambda: _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+    },
+    "s19_v2_dualvq+wide+rvq-both+decoder-cov+adv+no-adj+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s19 sweep, variant 2: drop adjacency-BCE only (nbr-NB "
+            "ON). Tests whether the adjacency-decoder spatial-structure "
+            "supervision is load-bearing for cell-NMI. The niche "
+            "encoder still gets neighborhood-NB reconstruction "
+            "gradients."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+no-adj",
+        ],
+        "build": lambda: _patch_dual_no_adj(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
+    "s19_v3_dualvq+wide+rvq-both+decoder-cov+adv+no-nbr+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s19 sweep, variant 3: drop neighborhood-NB only (adj-BCE "
+            "ON). Tests whether the niche-branch gene-expression "
+            "reconstruction target is load-bearing for cell-NMI. The "
+            "niche encoder still gets adjacency-BCE spatial structure "
+            "supervision + niche commit loss; it just isn't asked to "
+            "predict neighborhood gene expression."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+no-nbr",
+        ],
+        "build": lambda: _patch_dual_no_nbr_recon(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
+    "s19_v4_dualvq+wide+rvq-both+decoder-cov+adv+no-spatial+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s19 sweep, variant 4: drop ALL spatial losses — "
+            "no adj-BCE, no nbr-NB, no niche-commit. Niche-branch "
+            "modules still run forward but receive zero gradient "
+            "signal (effectively idle). Tests the cell-NMI ceiling "
+            "for a purely cell-branch VQ-VAE with adversarial batch "
+            "integration — matches the scVI/Harmony loss shape. If "
+            "this variant has the BEST cell-NMI, spatial losses are "
+            "hurting the cell branch on this dataset."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+no-spatial",
+        ],
+        "build": lambda: _patch_dual_no_spatial(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            _patch_dual_wide(_BD()),
+                            branch="niche", codebook_sizes=(30, 90),
+                        ),
+                        branch="cell", codebook_sizes=(30, 90),
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+        ),
+    },
 }
+
+
+# ---------------------------------------------------------------------------
+# Variant-name prefix convention (sweep 17 onward)
+# ---------------------------------------------------------------------------
+# Going forward, every NEW ablation-set variant is registered under a
+# name of the form `s<sweep>_v<variant>_<base>`:
+#
+#   - `s<sweep>` = the sweep's number, matching the trailing digit(s)
+#                  of `DATASET_VARIANTS["mmb...-ablations-vNN"]`.
+#                  E.g. `s17_` for the v17 sweep below, `s18_` for
+#                  the next one.
+#   - `v<variant>` = the variant's INDEX WITHIN the sweep (1-based,
+#                    typically 1..8 for an 8-variant sweep). Order
+#                    is whatever the sweep author chooses (historic
+#                    score, complexity, etc.).
+#
+# Example:
+#   s17_v3_dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p
+#   = the 3rd variant in the 17th sweep.
+#
+# Benefits:
+#   1. Findability per sweep:
+#        ls <artifacts>/<dataset> | grep '^s17_'
+#      lists every artefact dir from sweep 17. The `v<N>` segment
+#      preserves within-sweep ordering.
+#   2. Re-runnable history — when a top variant is re-used across
+#      sweeps (e.g. the sweep 17 below verifying the
+#      `max_epochs=80` revert), the prefixed alias keeps its
+#      artefacts separate from historical runs of the same model.
+#   3. No cross-sweep collisions — `s17_v1_<base>` and
+#      `s18_v1_<base>` (even with the same `<base>`) are distinct
+#      VARIANTS keys, so re-using a model across sweeps is safe.
+#
+# Aliases are registered via `_register_alias(new_name, orig_name)`:
+# the new key points at the SAME build lambda as the original, so
+# the model + config + dataset_tag are byte-identical to the
+# original. Only the artefact directory name differs.
+#
+# Sweeps registered BEFORE sweep 17 (v1..v16, v6b, v11, etc.) keep
+# their flat names — renaming them would break every artefact path
+# + log file currently on disk.
+
+
+def _register_alias(new_name: str, orig_name: str) -> None:
+    """Register `new_name` as a fresh VARIANTS key sharing the same
+    build lambda + description as `orig_name`.
+
+    The new entry is a Python-level alias only — it produces a separate
+    artifact directory (`<artifacts>/<dataset>/<new_name>/<TS>/`)
+    because `train()` derives the dir name from the variant key.
+
+    No-op if `new_name` already exists (so re-running this module
+    doesn't double-register). Raises if `orig_name` doesn't exist —
+    typos should fail loudly rather than silently registering nothing.
+    """
+    if orig_name not in VARIANTS:
+        raise KeyError(
+            f"_register_alias: original variant {orig_name!r} not in "
+            f"VARIANTS. Check the spelling against existing keys."
+        )
+    if new_name in VARIANTS:
+        return  # idempotent
+    orig = VARIANTS[orig_name]
+    VARIANTS[new_name] = {
+        "description": (
+            f"Alias of {orig_name!r}. " +
+            orig.get("description", "")
+        ),
+        "patches": list(orig.get("patches", [])),
+        "build":   orig["build"],   # same callable; same config every time
+    }
+
+
+# ---- Sweep 17: top-8 niche-NMI variants (max_epochs=80 fix verification) ----
+# All 8 are the historic top performers on niche NMI from
+# `summary_long.csv` (pre-2026-05-12 timestamps), aliased under
+# `s17_v<N>_<orig>` names where N=1..8 is the variant's index within
+# the v17 sweep (sorted by historic best score, descending).
+#
+# Find this sweep's artefacts with:
+#   ls <artifacts>/<dataset> | grep '^s17_'
+#
+# These re-runs verify that reverting `max_epochs` 200 -> 80 actually
+# restores the historic 0.66-0.70 niche NMI numbers — if the
+# s17_v<N>_* results match the historic numbers, the regression is
+# fixed and the rest of v12-v16 can be re-submitted with confidence.
+_register_alias(
+    "s17_v1_dualvq+wide+rvq-both+decoder-cov+mmd-w100+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+mmd-w100+mmb0-1b_smb1-1b_1p",
+)
+_register_alias(
+    "s17_v2_dualvq+wide+rvq-both+decoder-cov+adv",
+    "dualvq+wide+rvq-both+decoder-cov+adv",
+)
+_register_alias(
+    "s17_v3_dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
+)
+_register_alias(
+    "s17_v4_dualvq+wide+rvq-both+decoder-cov+adv+nbr-hops-3+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+nbr-hops-3+mmb0-1b_smb1-1b_1p",
+)
+_register_alias(
+    "s17_v5_dualvq+wide+rvq-both+decoder-cov+adv+adj-w3000+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+adj-w3000+mmb0-1b_smb1-1b_1p",
+)
+_register_alias(
+    "s17_v6_dualvq+wide+rvq-both+decoder-cov+adv-w50+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv-w50+adv-warmup10+mmb0-1b_smb1-1b_1p",
+)
+_register_alias(
+    "s17_v7_dualvq+wide+rvq-both-3level+decoder-cov+mmd-w50+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both-3level+decoder-cov+mmd-w50+mmb0-1b_smb1-1b_1p",
+)
+_register_alias(
+    "s17_v8_dualvq+wide+rvq-both-3level-20-40-80+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both-3level-20-40-80+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
+)
+
+
+# ---- Sweep 20: 1-knob-at-a-time ablation from s17_v2 baseline -------
+# Diagnosing the s18 regression. s17_v2 (`+wide+rvq-both+decoder-cov
+# +adv`, niche NMI 0.695) → s18 variants (niche NMI 0.57-0.61) changed
+# THREE knobs simultaneously:
+#   - architecture:  +wide (h=256)            → +small-h32/64
+#   - codebook:      (30, 90) 2-level         → (30, 30) or (30, 30, 30)
+#   - sampler:       [8] (default)            → [4] in half of s18
+#
+# s20 holds two knobs at the s17 reference value and varies the third,
+# so the per-knob delta is directly readable from the niche NMI of each
+# variant. The fourth variant (s20_v1) re-runs the exact s17 baseline
+# as a within-sweep sanity check (same hardware, same code as v2/v3/v4).
+#
+# Interpretation:
+#   - If v1 ≈ 0.69 and v2/v3/v4 split evenly below: all 3 knobs matter.
+#   - If only one of v2/v3/v4 drops: that's THE culprit; the other two
+#     knobs are safe to change in future sweeps.
+#   - If v1 itself drops well below 0.69: something else regressed
+#     between now and the s17 runs (data, env, ...) — investigate
+#     before reading the v2/v3/v4 deltas.
+#
+# s20_v1 is an alias of the existing baseline; v2/v3/v4 are new builds
+# that don't have prior entries in VARIANTS.
+_register_alias(
+    "s20_v1_dualvq+wide+rvq-both+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv",
+)
+
+VARIANTS["s20_v2_dualvq+wide+rvq-both-3level-30-30-30+decoder-cov+adv+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s20 sweep, variant 2: spine s17_v2 with CODEBOOK swapped from "
+        "(30, 90) 2-level monotone-growing to (30, 30, 30) 3-level "
+        "no-growth (the codebook shape s18 used). All other knobs "
+        "(+wide h=256, default sampler [8], no warmup) match the s17 "
+        "reference. Isolates the codebook contribution to the s18 "
+        "regression."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 30, 30])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+    ],
+    "build": lambda: _patch_dual_adversarial(
+        _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+                _patch_dual_rvq(
+                    _patch_dual_wide(_BD()),
+                    branch="niche", codebook_sizes=(30, 30, 30),
+                ),
+                branch="cell", codebook_sizes=(30, 30, 30),
+            ),
+        ),
+        alpha=1.0, wt_adv_batch=150.0,
+    ),
+}
+
+VARIANTS["s20_v3_dualvq+small-h64+rvq-both+decoder-cov+adv+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s20 sweep, variant 3: spine s17_v2 with ARCHITECTURE swapped "
+        "from +wide (h=256) to +small-h64 (h=64 for encoder MLP + GNN "
+        "+ both decoders). Codebook stays at (30, 90) 2-level, sampler "
+        "stays default [8], no warmup. Isolates the encoder-size "
+        "contribution to the s18 regression."
+    ),
+    "patches": [
+        "+small(hidden=64)",
+        "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+    ],
+    "build": lambda: _patch_dual_adversarial(
+        _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+                _patch_dual_rvq(
+                    _patch_dual_small(_BD(), hidden=64),
+                    branch="niche", codebook_sizes=(30, 90),
+                ),
+                branch="cell", codebook_sizes=(30, 90),
+            ),
+        ),
+        alpha=1.0, wt_adv_batch=150.0,
+    ),
+}
+
+VARIANTS["s20_v4_dualvq+wide+rvq-both+decoder-cov+adv+sampler4+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s20 sweep, variant 4: spine s17_v2 with SAMPLER swapped from "
+        "default [8] to [4] (half the per-cell neighbors aggregated by "
+        "the niche GNN). +wide h=256, codebook (30, 90) 2-level, no "
+        "warmup all kept at the s17 reference value. Isolates the "
+        "sampler-fanout contribution to the s18 regression."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+sampler([4])",
+    ],
+    "build": lambda: _patch_dual_sampler_neighbors(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        num_neighbors=[4],
+    ),
+}
+
+# ---- Sweep 21: batch-integration loss & niche-neck ablation -----------
+# Three orthogonal modifications off the s17_v2 spine
+# (`+wide+rvq-both+decoder-cov+adv`, niche NMI 0.695):
+#
+#   v1: baseline (re-runs s17_v2 for within-sweep comparison)
+#   v2: drop all batch-integration losses (no adv, no MMD)
+#   v3: replace adv with MMD batch integration (w=100)
+#   v4: keep adv, but add a niche-neck MLP that decouples the GNN
+#       input from z_mlp (cell-VQ still sees z_mlp directly)
+#
+# v2 + v3 test "does SQUINT need the adversarial loss?" — v2 is the
+# pure-encoder ceiling (`+decoder-cov` covariate is the only
+# batch-correction signal), v3 swaps the GRL adversary for a kernel-
+# based MMD pressure (deterministic per-step, no min-max game).
+#
+# v4 tests "is the cell-VQ being pulled by niche-side gradients
+# through the shared z_mlp?" — the new niche-neck MLP inserts a
+# learned transformation between z_mlp and the GNN, leaving z_mlp
+# untouched for the cell-VQ. If v4 lifts cell-NMI without hurting
+# niche-NMI, the shared trunk WAS the bottleneck.
+# (See `_patch_dual_niche_neck` for the full mechanism.)
+VARIANTS["s21_v2_dualvq+wide+rvq-both+decoder-cov+no-batch-int+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s21 sweep, variant 2: drop ALL batch-integration losses (no "
+        "adversarial CE, no MMD). The decoder-covariate (+decoder-cov) "
+        "is the only batch-correction signal — tests whether SQUINT's "
+        "NicheCompass-style covariate concat is enough on its own, or "
+        "whether an active encoder-side batch-removal pressure is "
+        "load-bearing."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+no-batch-int  (drops adv + MMD; adversarial head disabled)",
+    ],
+    "build": lambda: _patch_dual_no_batch_int(
+        _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+                _patch_dual_rvq(
+                    _patch_dual_wide(_BD()),
+                    branch="niche", codebook_sizes=(30, 90),
+                ),
+                branch="cell", codebook_sizes=(30, 90),
+            ),
+        ),
+    ),
+}
+
+# ---- Sweep 22: batch-size × learning-rate grid -----------------------
+# Goal: find the right (batch, lr) pair for scaling up SQUINT
+# training. The spine is the historic top-niche-NMI variant
+# (`+wide+rvq-both+decoder-cov+adv`, niche NMI 0.695 at batch=256 /
+# lr=5e-4 / max_epochs=80 — see sweep 17).
+#
+# Grid (8 variants):
+#   v1: batch=256,  lr=5e-4    (baseline — duplicates s17_v2 config)
+#   v2: batch=1024, lr=1e-3    (sqrt-scaled to 4x batch)
+#   v3: batch=2048, lr=1.4e-3  (sqrt-scaled to 8x batch)
+#   v4: batch=4096, lr=2e-3    (sqrt-scaled to 16x batch)
+#   v5: batch=1024, lr=2e-3    (linear-scaled to 4x batch)
+#   v6: batch=2048, lr=4e-3    (linear-scaled to 8x batch)
+#   v7: batch=4096, lr=8e-3    (linear-scaled to 16x batch)
+#   v8: batch=256,  lr=1e-3    (lr-only doubling — control: does lr
+#                               alone help even without bigger batch?)
+#
+# Reading the grid:
+#   - v1 → v2 → v3 → v4 traces sqrt-scaling at growing batch.
+#   - v5/v6/v7 are the linear-scaling counterparts. Compare against
+#     v2/v3/v4 to see which scaling rule is safer for SQUINT's
+#     adversarial dynamics on this dataset.
+#   - v8 isolates "is lr the bottleneck?": same batch as baseline,
+#     2x lr.
+#
+# Submit via:
+#   bash examples/submit_mmb_smb_ablations_v22.sh
+VARIANTS["s22_v2_dualvq+wide+rvq-both+decoder-cov+adv+bs1024+lr1e-3+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s22 sweep, variant 2: s17_v2 spine at batch=1024, lr=1e-3 "
+        "(sqrt-scaling 4x batch / 2x lr from baseline). Tests whether "
+        "the 4x throughput gain comes with no quality loss."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+bs1024+lr1e-3",
+    ],
+    "build": lambda: _patch_dual_batch_lr(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        batch_size=1024, lr=1e-3,
+    ),
+}
+
+VARIANTS["s22_v3_dualvq+wide+rvq-both+decoder-cov+adv+bs2048+lr1.4e-3+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s22 sweep, variant 3: s17_v2 spine at batch=2048, lr=1.4e-3 "
+        "(sqrt-scaling 8x batch / sqrt(8)x lr from baseline)."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+bs2048+lr1.4e-3",
+    ],
+    "build": lambda: _patch_dual_batch_lr(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        batch_size=2048, lr=1.4e-3,
+    ),
+}
+
+VARIANTS["s22_v4_dualvq+wide+rvq-both+decoder-cov+adv+bs4096+lr2e-3+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s22 sweep, variant 4: s17_v2 spine at batch=4096, lr=2e-3 "
+        "(sqrt-scaling 16x batch / 4x lr from baseline). Largest "
+        "sqrt-scaled point in the grid."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+bs4096+lr2e-3",
+    ],
+    "build": lambda: _patch_dual_batch_lr(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        batch_size=4096, lr=2e-3,
+    ),
+}
+
+VARIANTS["s22_v5_dualvq+wide+rvq-both+decoder-cov+adv+bs1024+lr2e-3+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s22 sweep, variant 5: s17_v2 spine at batch=1024, lr=2e-3 "
+        "(linear-scaling 4x batch / 4x lr from baseline). Pair with v2 "
+        "to see whether linear or sqrt scaling is the right rule for "
+        "SQUINT's adversarial dynamics at 4x batch."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+bs1024+lr2e-3",
+    ],
+    "build": lambda: _patch_dual_batch_lr(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        batch_size=1024, lr=2e-3,
+    ),
+}
+
+VARIANTS["s22_v6_dualvq+wide+rvq-both+decoder-cov+adv+bs2048+lr4e-3+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s22 sweep, variant 6: s17_v2 spine at batch=2048, lr=4e-3 "
+        "(linear-scaling 8x batch / 8x lr). Pair with v3."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+bs2048+lr4e-3",
+    ],
+    "build": lambda: _patch_dual_batch_lr(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        batch_size=2048, lr=4e-3,
+    ),
+}
+
+VARIANTS["s22_v7_dualvq+wide+rvq-both+decoder-cov+adv+bs4096+lr8e-3+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s22 sweep, variant 7: s17_v2 spine at batch=4096, lr=8e-3 "
+        "(linear-scaling 16x batch / 16x lr — most aggressive). Pair "
+        "with v4. Common failure mode: adversarial CE saturates and "
+        "the encoder collapses; early stopping fires."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+bs4096+lr8e-3",
+    ],
+    "build": lambda: _patch_dual_batch_lr(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        batch_size=4096, lr=8e-3,
+    ),
+}
+
+VARIANTS["s22_v8_dualvq+wide+rvq-both+decoder-cov+adv+bs256+lr1e-3+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s22 sweep, variant 8: s17_v2 spine at batch=256, lr=1e-3 "
+        "(default batch + 2x lr). Control: does the LR alone help at "
+        "the default batch, or is the batch increase needed?"
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+bs256+lr1e-3",
+    ],
+    "build": lambda: _patch_dual_batch_lr(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        batch_size=256, lr=1e-3,
+    ),
+}
+
+# s22_v1 is an alias of the s17_v2 baseline — re-runs the (batch=256,
+# lr=5e-4) reference on the same hardware + code as v2..v8 so the
+# (batch, lr) deltas are read cleanly within the sweep.
+_register_alias(
+    "s22_v1_dualvq+wide+rvq-both+decoder-cov+adv+bs256+lr5e-4+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv",
+)
+
+
+VARIANTS["s21_v4_dualvq+wide+rvq-both+decoder-cov+adv+niche-neck+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s21 sweep, variant 4: spine s17_v2 + niche-neck MLP. A new "
+        "256-d projection layer is inserted between z_mlp and the GNN: "
+        "the cell-VQ still consumes z_mlp directly, but the GNN sees "
+        "niche_neck(z_mlp). Niche-side gradients (adj-BCE, nbr-NB, "
+        "niche-commit) flow back into this NEW tensor, not into z_mlp "
+        "— so the cell quantiser is structurally protected from being "
+        "pulled by the niche objective. If cell-NMI lifts without "
+        "niche-NMI dropping, the shared z_mlp was a real bottleneck."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 90])",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+niche_neck(hidden_channels=[256])",
+    ],
+    "build": lambda: _patch_dual_niche_neck(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                    _patch_dual_rvq(
+                        _patch_dual_wide(_BD()),
+                        branch="niche", codebook_sizes=(30, 90),
+                    ),
+                    branch="cell", codebook_sizes=(30, 90),
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        hidden_channels=[256],
+    ),
+}
+
+# s21_v1 + s21_v3 are aliases of existing variants (s17_v2 spine + the
+# already-registered +mmd-w100 variant). Re-running them under the
+# s21_ prefix gives within-sweep sanity-check artefacts on the same
+# hardware + code as v2 + v4, without duplicating the build chains.
+_register_alias(
+    "s21_v1_dualvq+wide+rvq-both+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv",
+)
+_register_alias(
+    "s21_v3_dualvq+wide+rvq-both+decoder-cov+mmd-w100+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+mmd-w100+mmb0-1b_smb1-1b_1p",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -6754,26 +9043,25 @@ DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v6"] = [
 
 # v6b — second wave targeting cell-token NMI on cell_type. The 3 MMD
 # variants from v6 errored on a kwarg name mismatch (now fixed); we
-# re-run them here. The other 5 v6 variants underperformed; we replace
+# re-run them here. The other v6 variants underperformed; we replace
 # them with new mechanisms ablating different parts of the
 # warmup-NMI / integration trade-off:
 #   - Post-warmup adv-weight scan (adv-w50, adv-w300 with warmup10)
 #   - Sharper cell VQ commit (commit-cell-w2 + warmup10)
-#   - Semi-supervised cell-type CE (ce-w10 + warmup10) — empirical
-#     upper bound; CLEARLY LABEL as semi-supervised in paper
 #   - Combo safety stack (enc-shallow + warmup10 + mmd-w50)
-# Submit all 8 via:
+# (A `+ce-w10` semi-supervised entry was here originally but was
+# removed when SQUINT was committed to the unsupervised-only design.)
+# Submit all 7 via:
 #   bash examples/submit_mmb_smb_ablations_v6b.sh
 DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v6b"] = [
     # Re-runs of the 3 MMD variants (now that mmd_target arg-name is fixed).
     "dualvq+wide+rvq-both+decoder-cov+adv+adv-warmup10+mmd-w50+mmb0-1b_smb1-1b_1p",
     "dualvq+wide+rvq-both+decoder-cov+adv+adv-warmup10+mmd-w200+mmb0-1b_smb1-1b_1p",
     "dualvq+wide+rvq-both+decoder-cov+mmd-w100+mmb0-1b_smb1-1b_1p",
-    # 5 NEW mechanisms.
+    # 4 NEW mechanisms.
     "dualvq+wide+rvq-both+decoder-cov+adv-w50+adv-warmup10+mmb0-1b_smb1-1b_1p",
     "dualvq+wide+rvq-both+decoder-cov+adv-w300+adv-warmup10+mmb0-1b_smb1-1b_1p",
     "dualvq+wide+rvq-both+decoder-cov+commit-cell-w2+adv+adv-warmup10+mmb0-1b_smb1-1b_1p",
-    "dualvq+wide+rvq-both+decoder-cov+ce-w10+adv+adv-warmup10+mmb0-1b_smb1-1b_1p",
     "dualvq+wide+rvq-both+decoder-cov+adv+enc-shallow+adv-warmup10+mmd-w50+mmb0-1b_smb1-1b_1p",
 ]
 
@@ -6881,6 +9169,207 @@ DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v10"] = [
 # patches, different anatomical zones) without touching the submitter.
 DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-region-holdout"] = [
     "dualvq+rvq-both+decoder-cov+adv+region-holdout+mmb0-1b_smb1-1b_1p",
+]
+
+# v12 — commit-loss exploration. 8 variants varying `wt_commit_cell`,
+# `wt_commit_niche`, and asymmetric combinations off the shared spine
+# `dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10`. Maps
+# the commit-loss landscape that the v6b `commit-cell-w2` data point
+# only hinted at (0.503 cell NMI vs 0.495 spine).
+# Submit via:
+#   bash examples/submit_mmb_smb_ablations_v12.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v12"] = [
+    "dualvq+wide+rvq-both+decoder-cov+commit-cell-w0.5+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+commit-cell-w3+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+commit-cell-w5+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+commit-niche-w0.5+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+commit-niche-w3+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+commit-niche-w5+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+commit-cell-w3+commit-niche-w0.5+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+commit-cell-w0.5+commit-niche-w3+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+]
+
+# v13 — codebook structure. 8 variants varying RVQ depth (2-level vs
+# 3-level), level-1+ sizes (no-growth, modest, big), asymmetric cell-
+# vs-niche depths, single-level VQ on cell, and composite VQ on cell.
+# IMPORTANT: level-0 codebook size is FIXED at 30 across every entry
+# (both branches) — this set deliberately does NOT ablate level-0.
+# Same spine as v12.
+# Submit via:
+#   bash examples/submit_mmb_smb_ablations_v13.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v13"] = [
+    "dualvq+wide+vq-cell-30+rvq-niche-30-60-120+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-cell-30-60+rvq-niche-30-60-120+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-cell-30-200+rvq-niche-30-60-120+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-cell-30-30+rvq-niche-30-60+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-cell-30-90-270+rvq-niche-30-60-120+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both-3level-30-30-30+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+cvq-cell-30-10+rvq-niche-30-60-120+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-cell-30-90-270+rvq-niche-30-90+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+]
+
+# v14 — loss-weight tuning (UNSUPERVISED). 8 variants sweeping
+# adjacency-BCE weight (3 weights), adversarial warmup duration
+# {5, 20} and weight {500}, plus MMD layered on adv vs pure MMD.
+# Same spine as v12. No cell-type-label-consuming entries — see the
+# comment block where `_patch_dual_cross_entropy` was removed for
+# the rationale.
+# Submit via:
+#   bash examples/submit_mmb_smb_ablations_v14.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v14"] = [
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+adj-w250+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+adj-w500+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+adj-w5000+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup5+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+mmd-w50+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+mmd-w100+enc-deeper+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv-w500+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup20+mmb0-1b_smb1-1b_1p",
+]
+
+# v15 — architecture exploration. 8 variants varying GNN/MLP width,
+# latent dim, dropout, GNN depth, and attention type. Same spine as v12.
+# Submit via:
+#   bash examples/submit_mmb_smb_ablations_v15.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v15"] = [
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+gnn-h512+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+mlp-h512+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+mlp-h128+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+dropout-p0.1+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+dropout-p0.3+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+small-latent-128+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+gnn2+mmb0-1b_smb1-1b_1p",
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10+gatv2+mmb0-1b_smb1-1b_1p",
+]
+
+# v16 — encoder/decoder dim grid with codebook fixed at (30, 30, 30).
+# 4 hidden dims (<256) × 2 encoder depths (1-layer / 3-layer) = 8
+# variants. Tests whether the (+wide=256) dim of v12-v15 is necessary
+# for the symmetric-3-level-30 codebook to learn meaningful clusters
+# at both cell-type and niche scales, or whether the model fits in a
+# more compact architecture.
+# Submit via:
+#   bash examples/submit_mmb_smb_ablations_v16.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v16"] = [
+    # 1-layer MLP encoder (the `_patch_dual_small` default depth)
+    "dualvq+small-h32+rvq-both-3level-30-30-30+decoder-cov+adv+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+small-h64+rvq-both-3level-30-30-30+decoder-cov+adv+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+small-h128+rvq-both-3level-30-30-30+decoder-cov+adv+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+small-h192+rvq-both-3level-30-30-30+decoder-cov+adv+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    # 3-layer MLP encoder (`+enc-deeper` with the matching width)
+    "dualvq+small-h32+rvq-both-3level-30-30-30+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+small-h64+rvq-both-3level-30-30-30+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+small-h128+rvq-both-3level-30-30-30+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "dualvq+small-h192+rvq-both-3level-30-30-30+decoder-cov+adv+enc-deeper+adv-warmup10+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 17 — top-8 niche-NMI variants re-run as `s17_v<N>_*` aliases
+# (sweep 17, variant index 1..8 sorted by historic best niche NMI
+# descending) on the reverted (max_epochs=80) base config. Verifies
+# that the regression diagnosed on 2026-05-12 is fixed: each
+# s17_v<N>_* should land within ~0.01 niche NMI of its historic
+# pre-05-12 score (0.66 - 0.70 range). All entries point at the
+# SAME build lambdas as the original variants — only the artefact
+# directory name changes
+# (`<artifacts>/<dataset>/s17_v<N>_<orig>/<TS>/`), so the test is a
+# direct apples-to-apples re-run.
+#
+# Submit via:
+#   bash examples/submit_mmb_smb_ablations_v17.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v17"] = [
+    "s17_v1_dualvq+wide+rvq-both+decoder-cov+mmd-w100+mmb0-1b_smb1-1b_1p",
+    "s17_v2_dualvq+wide+rvq-both+decoder-cov+adv",
+    "s17_v3_dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
+    "s17_v4_dualvq+wide+rvq-both+decoder-cov+adv+nbr-hops-3+mmb0-1b_smb1-1b_1p",
+    "s17_v5_dualvq+wide+rvq-both+decoder-cov+adv+adj-w3000+mmb0-1b_smb1-1b_1p",
+    "s17_v6_dualvq+wide+rvq-both+decoder-cov+adv-w50+adv-warmup10+mmb0-1b_smb1-1b_1p",
+    "s17_v7_dualvq+wide+rvq-both-3level+decoder-cov+mmd-w50+mmb0-1b_smb1-1b_1p",
+    "s17_v8_dualvq+wide+rvq-both-3level-20-40-80+decoder-cov+adv+enc-deeper+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 18 — small-arch / no-warmup / sampler {4,8} grid. 2 × 2 × 2 = 8
+# variants exploring whether SQUINT can learn cell-type + niche
+# structure at <256-d width without adversarial warmup. All variants
+# share: `_patch_dual_small(hidden=N)`, `adv` from epoch 0 (no
+# warmup), `decoder_covariate`, codebook level-0 = 30, sampler
+# variable [4] vs [8].
+#
+# Submit via:
+#   bash examples/submit_mmb_smb_ablations_v18.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v18"] = [
+    "s18_v1_dualvq+small-h32+rvq-both-30-30+decoder-cov+adv+sampler4+mmb0-1b_smb1-1b_1p",
+    "s18_v2_dualvq+small-h64+rvq-both-30-30+decoder-cov+adv+sampler4+mmb0-1b_smb1-1b_1p",
+    "s18_v3_dualvq+small-h32+rvq-both-3level-30-30-30+decoder-cov+adv+sampler4+mmb0-1b_smb1-1b_1p",
+    "s18_v4_dualvq+small-h64+rvq-both-3level-30-30-30+decoder-cov+adv+sampler4+mmb0-1b_smb1-1b_1p",
+    "s18_v5_dualvq+small-h32+rvq-both-30-30+decoder-cov+adv+sampler8+mmb0-1b_smb1-1b_1p",
+    "s18_v6_dualvq+small-h64+rvq-both-30-30+decoder-cov+adv+sampler8+mmb0-1b_smb1-1b_1p",
+    "s18_v7_dualvq+small-h32+rvq-both-3level-30-30-30+decoder-cov+adv+sampler8+mmb0-1b_smb1-1b_1p",
+    "s18_v8_dualvq+small-h64+rvq-both-3level-30-30-30+decoder-cov+adv+sampler8+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 19 — spatial-loss ablation: 2x2 grid over {adj-BCE on/off} x
+# {nbr-NB on/off} = 4 variants on the historic top-niche-NMI spine
+# (`+wide+rvq-both+decoder-cov+adv`). Tests whether either spatial
+# loss is load-bearing for cell-NMI on this dataset.
+#
+# Submit via:
+#   bash examples/submit_mmb_smb_ablations_v19.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v19"] = [
+    "s19_v1_dualvq+wide+rvq-both+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+    "s19_v2_dualvq+wide+rvq-both+decoder-cov+adv+no-adj+mmb0-1b_smb1-1b_1p",
+    "s19_v3_dualvq+wide+rvq-both+decoder-cov+adv+no-nbr+mmb0-1b_smb1-1b_1p",
+    "s19_v4_dualvq+wide+rvq-both+decoder-cov+adv+no-spatial+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 20 — 1-knob-at-a-time isolation of the s18 niche-NMI regression.
+# Anchor is s17_v2 (`+wide+rvq-both+decoder-cov+adv`, niche NMI 0.695).
+# Each of v2/v3/v4 changes EXACTLY ONE knob to the s18 value, so the
+# resulting niche-NMI delta is directly attributable to that knob.
+# v1 re-runs the baseline as a within-sweep sanity check.
+#
+# Submit via:
+#   bash examples/submit_mmb_smb_ablations_v20.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v20"] = [
+    "s20_v1_dualvq+wide+rvq-both+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+    "s20_v2_dualvq+wide+rvq-both-3level-30-30-30+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+    "s20_v3_dualvq+small-h64+rvq-both+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+    "s20_v4_dualvq+wide+rvq-both+decoder-cov+adv+sampler4+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 21 — batch-integration loss & niche-neck ablation on the
+# s17_v2 spine. 4 variants:
+#   v1: spine baseline (re-run of s17_v2)
+#   v2: no batch-integration loss (drop adv, no MMD — only +decoder-cov)
+#   v3: MMD-w100 batch integration INSTEAD of adv
+#   v4: spine + niche-neck MLP (decouples GNN input from z_mlp)
+#
+# Submit via:
+#   bash examples/submit_mmb_smb_ablations_v21.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v21"] = [
+    "s21_v1_dualvq+wide+rvq-both+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+    "s21_v2_dualvq+wide+rvq-both+decoder-cov+no-batch-int+mmb0-1b_smb1-1b_1p",
+    "s21_v3_dualvq+wide+rvq-both+decoder-cov+mmd-w100+mmb0-1b_smb1-1b_1p",
+    "s21_v4_dualvq+wide+rvq-both+decoder-cov+adv+niche-neck+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 22 — batch_size × learning_rate grid on the s17_v2 spine.
+# 4 batch sizes (256, 1024, 2048, 4096) × 2 LR-scaling rules (sqrt,
+# linear) + 1 LR-only control = 8 variants. v1 is an alias of the
+# s17_v2 baseline (re-runs at batch=256, lr=5e-4) for within-sweep
+# reference. Tests whether SQUINT can train at bigger batch sizes
+# without quality regression, and which LR scaling rule is safer.
+#
+# Submit via:
+#   bash examples/submit_mmb_smb_ablations_v22.sh
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v22"] = [
+    "s22_v1_dualvq+wide+rvq-both+decoder-cov+adv+bs256+lr5e-4+mmb0-1b_smb1-1b_1p",
+    "s22_v2_dualvq+wide+rvq-both+decoder-cov+adv+bs1024+lr1e-3+mmb0-1b_smb1-1b_1p",
+    "s22_v3_dualvq+wide+rvq-both+decoder-cov+adv+bs2048+lr1.4e-3+mmb0-1b_smb1-1b_1p",
+    "s22_v4_dualvq+wide+rvq-both+decoder-cov+adv+bs4096+lr2e-3+mmb0-1b_smb1-1b_1p",
+    "s22_v5_dualvq+wide+rvq-both+decoder-cov+adv+bs1024+lr2e-3+mmb0-1b_smb1-1b_1p",
+    "s22_v6_dualvq+wide+rvq-both+decoder-cov+adv+bs2048+lr4e-3+mmb0-1b_smb1-1b_1p",
+    "s22_v7_dualvq+wide+rvq-both+decoder-cov+adv+bs4096+lr8e-3+mmb0-1b_smb1-1b_1p",
+    "s22_v8_dualvq+wide+rvq-both+decoder-cov+adv+bs256+lr1e-3+mmb0-1b_smb1-1b_1p",
 ]
 
 
@@ -7487,6 +9976,14 @@ def train(variant: str):
         callbacks=callbacks,
         strategy="ddp_find_unused_parameters_true",
         max_epochs=cfg["trainer"]["max_epochs"],
+        # Run val every N train epochs (N=2 by default — see base
+        # config). Halves val-pass overhead at the cost of running
+        # early stopping on a coarser val grid. `getattr`-style
+        # fallback to 1 keeps backward compat for any cfg that
+        # doesn't carry the key.
+        check_val_every_n_epoch=int(
+            cfg["trainer"].get("check_val_every_n_epoch", 1)
+        ),
         enable_checkpointing=enable_checkpointing,
         num_sanity_val_steps=0,
         enable_progress_bar=False,
@@ -7601,6 +10098,7 @@ def _build_clean_adata_from_inference(
     import anndata as ad
     import numpy as np
     import pandas as pd
+    import torch as _torch  # local alias so we can dtype-check below
 
     def to_np(x):
         # Avoid an unnecessary GPU->CPU copy when the tensor is already
@@ -7608,8 +10106,22 @@ def _build_clean_adata_from_inference(
         # tensors to CPU; an extra .cpu() call is a no-op semantically
         # but allocates a fresh tensor under the hood (multi-GB on
         # mmb20 across several layers + obsm slots).
+        #
+        # bf16 guard: NumPy has no bfloat16 dtype, so `t.numpy()` on a
+        # bf16 tensor raises `TypeError: Got unsupported ScalarType
+        # BFloat16`. This happens when the multi-seed pipeline runs
+        # predict with `Trainer(precision="bf16-mixed")` and some
+        # output tensor stays in bf16 after autocast (e.g. the VQ
+        # codebook lookup result, which has no autocast cast-back
+        # rule). Upcast to fp32 before conversion — no-op for tensors
+        # already in fp32 / int / bool, only triggers on the autocast
+        # leftovers. fp16 has the same issue formally, but numpy DOES
+        # support float16 so it's fine; we only need to guard bf16.
         if hasattr(x, "cpu"):
-            return x.numpy() if not x.is_cuda else x.cpu().numpy()
+            t = x if not x.is_cuda else x.cpu()
+            if t.dtype is _torch.bfloat16:
+                t = t.float()
+            return t.numpy()
         return np.asarray(x)
 
     # ---- sanity checks on inputs ----
@@ -7877,6 +10389,9 @@ def predict(
     silver_dir: str | None = None,
     model_ckpt_fname: str | None = None,
     output_dir: str | None = None,
+    precision: Optional[str] = None,
+    strategy: Optional[str] = None,
+    compression: Optional[str] = None,
 ):
     """
     Run inference on a folder of .h5ad files using a trained SQUINT
@@ -7904,6 +10419,39 @@ def predict(
         — predictions land alongside checkpoints / config /
         ablation_summary.yaml so everything for one training run lives in
         one folder.
+    precision
+        Lightning `Trainer(precision=...)` override for the predict pass.
+        `None` (default) → fp32, identical to training. Set to
+        `"bf16-mixed"` (recommended on H100/H200/A100) or `"16-mixed"`
+        to enable autocast — typically 1.5-2x faster on the encoder /
+        decoder MLPs. CAVEAT: the VQ codebook lookup uses `argmin` over
+        squared L2 distances; in mixed precision the distance compute
+        can drift by a few ULPs, which on borderline cells can change
+        which code wins. The output AnnData written to disk will then
+        differ by a small number of `cell_code_index` /
+        `neighborhood_code_index` flips vs fp32 — usually invisible in
+        NMI / ARI / iLISI summaries but worth A/B-testing on a single
+        seed before adopting for a publication run. Use `precision=None`
+        if you need bit-exact reproducibility against the training run.
+    strategy
+        Lightning `Trainer(strategy=...)` override for the predict pass.
+        `None` (default) → `"ddp_find_unused_parameters_true"`, the
+        legacy training-time strategy. On single-GPU LSF jobs (the
+        common case) this is wasteful — DDP wrapping + the
+        find-unused-params traversal adds overhead with no benefit.
+        Pass `"auto"` to let Lightning pick `SingleDeviceStrategy`
+        when only one GPU is visible (typically ~5-15% predict speedup).
+    compression
+        AnnData write compression for `predicted_adata.h5ad`.
+        `None` (default) → `"gzip"` at level 4 (3-10x smaller, ~30-60 s
+        on a 100k-cell mmb-smb file). `"lzf"` is 3-5x faster to write
+        but ~1.5x bigger on disk — useful when the write is on the
+        critical path of a downstream pipeline waiting on the file.
+        Now that the write is excluded from `runtime_seconds`, this
+        only affects wall-clock UX, not the recorded runtime.
+        Use `"gzip"` for paper / archival outputs; `"lzf"` for
+        benchmark sweeps where a downstream metric runner is blocked
+        on the write.
     """
     # --- Imports done lazily so the script's CLI / config helpers don't
     #     pull torch on every invocation. ---
@@ -8093,17 +10641,39 @@ def predict(
     model = Model.load_from_checkpoint(config["model"]["model_ckpt_fname"])
     model.eval()
 
-    trainer = pl.Trainer(
+    # Resolve optimization overrides. Each kwarg defaults to the legacy
+    # training-parity value when not set; the multi-seed runner
+    # (`_run_one_seed.py`) opts INTO the faster settings explicitly so
+    # ablation runs (which go through `run_squint.py --all` and never
+    # pass these kwargs) stay on the conservative path.
+    _trainer_precision = precision  # e.g. None / "bf16-mixed" / "16-mixed"
+    _trainer_strategy  = (
+        strategy if strategy is not None else "ddp_find_unused_parameters_true"
+    )
+    _write_compression = compression if compression is not None else "gzip"
+    if _trainer_precision is not None:
+        print(f"Predict: precision override = {_trainer_precision} (autocast enabled)")
+    if strategy is not None:
+        print(f"Predict: strategy override  = {_trainer_strategy}")
+    print(f"Predict: AnnData compression = {_write_compression}")
+
+    trainer_kwargs = dict(
         accelerator="auto",
         devices="auto",
         deterministic=True,
         logger=False,
-        strategy="ddp_find_unused_parameters_true",
+        strategy=_trainer_strategy,
         enable_checkpointing=False,
         num_sanity_val_steps=0,
         enable_progress_bar=False,
         enable_model_summary=False,
     )
+    if _trainer_precision is not None:
+        # Lightning accepts the precision kwarg only when explicitly set —
+        # passing `None` triggers the "missing positional" code path on
+        # some versions, so gate the addition.
+        trainer_kwargs["precision"] = _trainer_precision
+    trainer = pl.Trainer(**trainer_kwargs)
 
     print("Predicting model...")
     predict_data_cache = trainer.predict(model=model, datamodule=datamodule)
@@ -8367,7 +10937,38 @@ def predict(
     # NFS (network transfer dominates). compression_opts=4 is a sane
     # default (level 4: balanced compression / write speed). h5py
     # accepts integers 0-9; raise for higher ratio at write-time cost.
-    adata.write_h5ad(out_path, compression="gzip", compression_opts=4)
+    #
+    # The write step is wrapped in a wall-clock timer and the duration
+    # is stamped to `predict_write_seconds.txt` next to the AnnData.
+    # `_run_one_seed.py` reads that stamp and SUBTRACTS it from the
+    # Phase-1 `train + predict` total so the recorded `runtime_seconds`
+    # excludes disk I/O — matching the "scaffolding excluded" runtime
+    # methodology used by the baseline runners (which never include an
+    # AnnData write in their timer). Best-effort write: if the stamp
+    # can't be created (read-only filesystem, etc.), the runtime
+    # number just doesn't get the subtraction — same as before this
+    # change.
+    import time as _time
+    _t_write_start = _time.time()
+    # Honour the caller's compression choice; only `gzip` supports a
+    # numeric level via `compression_opts`. h5py treats `lzf` as a
+    # plain filter (no opts) and rejects the extra kwarg if passed.
+    _write_kwargs: dict = {"compression": _write_compression}
+    if _write_compression == "gzip":
+        _write_kwargs["compression_opts"] = 4
+    adata.write_h5ad(out_path, **_write_kwargs)
+    _write_seconds = _time.time() - _t_write_start
+    try:
+        (output_dir / "predict_write_seconds.txt").write_text(
+            f"{_write_seconds:.3f}\n"
+        )
+    except OSError as _exc:
+        # Sidecar is best-effort. Log + continue.
+        print(f"NOTE: could not write predict_write_seconds.txt ({_exc}); "
+              "the AnnData was still written but the runtime aggregator "
+              "won't be able to subtract the write cost from this seed.")
+    print(f"  predicted_adata.h5ad write took {_write_seconds:.1f}s "
+          "(excluded from runtime_seconds)")
 
     print()
     print("=" * 78)
@@ -8399,6 +11000,9 @@ def run_inference_and_analysis(
         skip_svg_plots: bool = False,
         skip_umap: bool = False,
         skip_metrics: bool = False,
+        predict_precision: Optional[str] = None,
+        predict_strategy: Optional[str] = None,
+        predict_compression: Optional[str] = None,
     ) -> Path:
     """
     Steps 2-6 of the end-to-end pipeline (everything AFTER `train()`):
@@ -8452,6 +11056,9 @@ def run_inference_and_analysis(
             silver_dir=silver_dir,
             model_ckpt_fname=model_ckpt_fname,
             output_dir=output_dir,
+            precision=predict_precision,
+            strategy=predict_strategy,
+            compression=predict_compression,
         )
         if not predicted_adata_path.exists():
             raise FileNotFoundError(
@@ -8618,6 +11225,14 @@ def run_all_pipeline(
         batch_rename: Optional[str] = None,
         cell_label_keys: Optional[str] = None,
         niche_label_keys: Optional[str] = None,
+        skip_predict: bool = False,
+        skip_code_index_plots: bool = False,
+        skip_svg_plots: bool = False,
+        skip_umap: bool = False,
+        skip_metrics: bool = False,
+        predict_precision: Optional[str] = None,
+        predict_strategy: Optional[str] = None,
+        predict_compression: Optional[str] = None,
     ) -> None:
     """
     End-to-end pipeline:
@@ -8628,6 +11243,11 @@ def run_all_pipeline(
     To re-run only steps 2-6 against an already-trained checkpoint, use
     `examples/run_inference.py --variant <V> --timestamp <TS>` (it calls
     `run_inference_and_analysis` directly).
+
+    The five `skip_*` flags are forwarded to `run_inference_and_analysis`
+    — use them (or `--metrics-only` on the CLI, which sets the three plot
+    skips) to suppress the expensive analysis steps in ablation /
+    benchmark runs where only the metrics CSVs are needed.
     """
     # ------------------------------------------------------------------
     # 1. Train
@@ -8663,6 +11283,14 @@ def run_all_pipeline(
         batch_rename=batch_rename,
         cell_label_keys=cell_label_keys,
         niche_label_keys=niche_label_keys,
+        skip_predict=skip_predict,
+        skip_code_index_plots=skip_code_index_plots,
+        skip_svg_plots=skip_svg_plots,
+        skip_umap=skip_umap,
+        skip_metrics=skip_metrics,
+        predict_precision=predict_precision,
+        predict_strategy=predict_strategy,
+        predict_compression=predict_compression,
     )
 
 
@@ -8911,7 +11539,59 @@ def main():
              "pipeline regardless of this flag. Equivalent to setting "
              "the env var SQUINT_WITH_PEARSON=1.",
     )
+
+    # ---- Inference / analysis step toggles (forwarded to --all / --predict)
+    # The end-to-end pipeline runs 6 steps: train, predict,
+    # plot_code_indices_spatial, plot_svg_reconstruction,
+    # plot_latent_umap, compute_inference_metrics. Each step is
+    # independently skippable. For ablation / benchmark sweeps where
+    # only the metric CSVs are needed, pass `--metrics-only` to drop
+    # the three plot stages while keeping predict + metrics.
+    p.add_argument(
+        "--skip-predict", action="store_true",
+        help="Skip the predict() step. Downstream steps will load the "
+             "existing `predicted_adata.h5ad` from the run dir — fails "
+             "if that file is missing.",
+    )
+    p.add_argument(
+        "--skip-code-index-plots", action="store_true",
+        help="Skip `plot_code_indices_spatial.py` (step 3/6).",
+    )
+    p.add_argument(
+        "--skip-svg-plots", action="store_true",
+        help="Skip `plot_svg_reconstruction.py` (step 4/6).",
+    )
+    p.add_argument(
+        "--skip-umap", action="store_true",
+        help="Skip `plot_latent_umap.py` (step 5/6). The UMAP step is "
+             "typically the most expensive analysis stage (rapids GPU "
+             "UMAP / scanpy CPU fallback both 5-15 min on 100k cells).",
+    )
+    p.add_argument(
+        "--skip-metrics", action="store_true",
+        help="Skip `compute_inference_metrics.py` (step 6/6). Rarely "
+             "useful — the metrics CSVs are the whole point of the "
+             "benchmark pipeline.",
+    )
+    p.add_argument(
+        "--metrics-only", action="store_true",
+        help="Shortcut: enable --skip-code-index-plots, --skip-svg-plots, "
+             "and --skip-umap. Keeps predict() + metrics, drops the "
+             "three plot stages. This is the recommended setting for "
+             "ablation sweeps where only the benchmark CSVs matter "
+             "(the ablation submission scripts pass this by default).",
+    )
     args = p.parse_args()
+
+    # `--metrics-only` is a convenience alias — promote it into the
+    # three explicit plot-skip flags BEFORE the args.all / args.predict
+    # branches consume them. Per-flag overrides still work
+    # (e.g. `--metrics-only --skip-metrics` would also skip metrics,
+    # though that's a weird combo to want).
+    if args.metrics_only:
+        args.skip_code_index_plots = True
+        args.skip_svg_plots = True
+        args.skip_umap = True
 
     # Propagate the CLI flag to the env-var that `_resolve_metrics_list()`
     # checks at config-build time. Setting the env var here (before any
@@ -8992,6 +11672,11 @@ def main():
             batch_rename=args.batch_rename,
             cell_label_keys=args.cell_label_keys,
             niche_label_keys=args.niche_label_keys,
+            skip_predict=args.skip_predict,
+            skip_code_index_plots=args.skip_code_index_plots,
+            skip_svg_plots=args.skip_svg_plots,
+            skip_umap=args.skip_umap,
+            skip_metrics=args.skip_metrics,
         )
 
     # --all-dataset: loop --all over every variant in the dataset's sweep.
@@ -9006,6 +11691,11 @@ def main():
             batch_rename=args.batch_rename,
             cell_label_keys=args.cell_label_keys,
             niche_label_keys=args.niche_label_keys,
+            skip_predict=args.skip_predict,
+            skip_code_index_plots=args.skip_code_index_plots,
+            skip_svg_plots=args.skip_svg_plots,
+            skip_umap=args.skip_umap,
+            skip_metrics=args.skip_metrics,
         )
 
 

@@ -21,6 +21,14 @@
 #                  Default: /nfs/team361/sb75/.venvs/squint
 #   SQUINT_REPO  — optional. Path to the squint repo root.
 #                  Default: /nfs/team361/sb75/squint
+#
+# Env-var toggles (set in the calling shell or in the bsub command):
+#   SQUINT_WITH_PLOTS=1   re-enable the code-index spatial / SVG-recon /
+#                          latent-UMAP plot stages (skipped by default for
+#                          ablation throughput). The metrics step always
+#                          runs regardless.
+#   SQUINT_WITH_PEARSON=1  run the Pearson metrics list every val epoch
+#                          during training (forwarded to run_squint.py).
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -110,6 +118,24 @@ echo "  host         : $(hostname)"
 echo "  CUDA devices : ${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "  cwd          : $(pwd)"
 
-python "$SQUINT_REPO/examples/run_squint.py" --all --variant "$VARIANT"
+# Ablation sweeps consume the per-variant metric CSVs, not the
+# spatial / SVG / UMAP plots. Skip those by default — UMAP alone
+# typically takes 5-15 min per run and the plot rendering adds
+# another 1-3 min, which compounds across a 24-variant sweep.
+# Opt back in for individual debugging runs:
+#   SQUINT_WITH_PLOTS=1 bash examples/_run_one_variant.sh <V>
+# (or invoke `run_squint.py --all --variant <V>` directly without
+# --metrics-only).
+EXTRA_ARGS=()
+if [[ "${SQUINT_WITH_PLOTS:-0}" == "1" ]]; then
+    echo "  plots        : ENABLED (SQUINT_WITH_PLOTS=1)"
+else
+    echo "  plots        : skipped (--metrics-only); set SQUINT_WITH_PLOTS=1 to enable"
+    EXTRA_ARGS+=( --metrics-only )
+fi
+
+python "$SQUINT_REPO/examples/run_squint.py" \
+    --all --variant "$VARIANT" \
+    "${EXTRA_ARGS[@]}"
 
 echo "[$(date '+%F %T')] finished variant: $VARIANT"

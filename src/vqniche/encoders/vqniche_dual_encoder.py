@@ -64,6 +64,7 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             conditioning_params: dict = {},
             vq_cell_params: dict = {},
             vq_niche_params: dict = {},
+            niche_neck_params: Optional[dict] = None,
         ):
         """
         Parameters
@@ -97,7 +98,41 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             self.mlp_module = MLP_Module(in_channels=in_channels, **mlp_params)
             cell_in_channels = self.mlp_module.out_channels
 
-        # ---- GNN (consumes continuous z_mlp) --------------------------------
+        # ---- Optional NICHE NECK MLP (between z_mlp and the GNN) ------------
+        # When `niche_neck_params` is provided, an additional MLP is
+        # inserted on the niche-side path BETWEEN z_mlp and the GNN:
+        #
+        #   z_mlp  ──────► VQ_cell  (unchanged — cell-VQ still sees z_mlp)
+        #     │
+        #     ▼
+        #   niche_neck
+        #     │
+        #     ▼
+        #   GNN ──► VQ_niche
+        #
+        # This decouples the niche-side input from `z_mlp`: the GNN can
+        # learn a different "view" of z_mlp without disturbing the cell
+        # quantiser's commitment. Useful for testing whether the cell VQ
+        # was being pulled away from cell-type-discriminative geometry
+        # by gradients flowing back from the niche branch through the
+        # shared `z_mlp`.
+        #
+        # Default `None` -> niche_neck is identity (legacy behaviour:
+        # GNN consumes z_mlp directly). The output dim of `niche_neck`
+        # becomes the GNN's input dim — usually we keep it equal to
+        # `cell_in_channels` so the GNN module config doesn't need to
+        # change.
+        if niche_neck_params is not None:
+            self.niche_neck = MLP_Module(
+                in_channels=cell_in_channels,
+                **niche_neck_params,
+            )
+            gnn_in_channels = self.niche_neck.out_channels
+        else:
+            self.niche_neck = None
+            gnn_in_channels = cell_in_channels
+
+        # ---- GNN (consumes continuous z_mlp OR niche_neck(z_mlp)) -----------
         if not gnn_params or gnn_params.get('num_layers', 0) == 0:
             raise ValueError(
                 "VQNiche_Dual_Encoder requires at least one GNN layer; the "
@@ -105,7 +140,7 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
                 f"gnn_params={gnn_params}."
             )
         self.gnn_module = init_gnn_module(
-            in_channels=cell_in_channels,
+            in_channels=gnn_in_channels,
             gnn_name=gnn_name,
             gnn_params=gnn_params,
         )
@@ -180,10 +215,19 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
                 x=z_mlp, conditions=batch_encoder_conditions,
             )
 
-        # GNN consumes the conditioned (continuous) z_mlp.
-        z_gnn = self.gnn_module(z_mlp, batch_edge_index)
+        # GNN consumes the conditioned (continuous) z_mlp, optionally
+        # routed through a niche-side neck MLP first (see __init__).
+        # When `self.niche_neck is None` (default), this is identical
+        # to the legacy behaviour `z_gnn = self.gnn_module(z_mlp, ...)`.
+        gnn_input = (
+            self.niche_neck(z_mlp) if self.niche_neck is not None else z_mlp
+        )
+        z_gnn = self.gnn_module(gnn_input, batch_edge_index)
 
-        # Two independent quantizations.
+        # Two independent quantizations. NOTE: cell-VQ takes `z_mlp`
+        # directly (NOT the niche_neck output) — the whole point of
+        # niche_neck is to decouple the niche path from the cell-VQ
+        # input.
         z_q_cell,  idx_cell,  _ = self.vq_cell(z_mlp)
         z_q_niche, idx_niche, _ = self.vq_niche(z_gnn)
 
