@@ -610,23 +610,21 @@ def make_train_config_poc() -> dict:
                 # irrelevant and the cost is dominated by kernel-launch
                 # overhead at small batch sizes.
                 #
-                # DEFAULT: 1024  (REVERTED 2026-05-12).
+                # A/B TEST 2026-05-12: bumped 1024 → 8192 (8×) alongside
+                # `precision: "bf16-mixed"` re-activation, on the
+                # now-known-good config (cache_train_batches=False).
+                # Tests whether the predict-batch bump + bf16 bundle
+                # introduces any regression, now that cache is ruled
+                # out as the culprit. If THIS run regresses, the next
+                # bisect is within the bundle (one of: bf16 train,
+                # bf16 predict, predict_bs).
                 #
-                # Was previously 16384 (=64× training batch). Reverted
-                # in the same investigation as the precision flip
-                # above — a multi-seed sweep showed metric drops vs
-                # historic, and 16384 at full `[-1]` fanout means
-                # ~213k nodes per predict batch in bf16 autocast,
-                # which is a plausible second source of numerical
-                # drift on the codebook argmin. 1024 is the
-                # known-good value from before the optimisation pass
-                # (and matches what historic baselines were predicted
-                # under).
-                #
-                # Re-bump in increments (1024 → 2048 → 4096 → 8192 →
-                # 16384) once the bf16-vs-32 question is settled. The
-                # safe fallback chain still applies on OOM.
-                "predict_batch_size":                     1024,
+                # Memory math on the mmb-smb graph with `[-1]` predict
+                # fanout (avg degree ~12):
+                #   nodes_per_batch ≈ 8192 × 13 ≈ ~106k nodes/batch
+                # Safe on H100/H200 (80+ GiB) and gpu_high_memory
+                # (384 GiB). Fallback on OOM: 8192 → 4096 → 2048 → 1024.
+                "predict_batch_size":                     8192,
                 # Val/test batch-size override. Val runs every
                 # `check_val_every_n_epoch` (see trainer config below
                 # — currently every 2 train epochs), and the per-val-
@@ -682,6 +680,17 @@ def make_train_config_poc() -> dict:
                 # dict the initialiser unpacks into `InMemoryDataModule`'s
                 # kwargs. It's a TRAIN-side flag (val/test/predict are
                 # unaffected) — don't read meaning into the name.
+                # CONFIRMED CULPRIT 2026-05-12: `cache_train_batches=True`
+                # caused the multi-seed regression. The single-flip A/B
+                # showed metrics dropping severely when only this knob
+                # was changed (everything else was historic-compatible).
+                # The cache-build internal [-1] fanout override (see
+                # `in_memory_datamodule.py` `train_dataloader`) is the
+                # most likely mechanism: freezing the full per-cell
+                # neighborhood removes the per-epoch [8]-sample
+                # regularisation the niche GNN depends on. Keeping the
+                # default OFF; the plumbing stays available behind the
+                # flag for future investigation.
                 "cache_train_batches":                    False,
             },
         },
@@ -892,30 +901,29 @@ def make_train_config_poc() -> dict:
             #     via SQUINT_WITH_PEARSON=1) AND verify post-hoc
             #     niche NMI before publishing.
             "max_epochs": 80,
-            # Training precision. DEFAULT: "32-true" (REVERTED 2026-05-12).
+            # Training precision.
             #
-            # Originally set to "bf16-mixed" for ~20-40% wall-clock
-            # saving on Ampere/Hopper. Reverted to "32-true" after a
-            # multi-seed sweep showed severe metric drops vs historic
-            # numbers despite training losses looking normal — leading
-            # hypothesis: bf16-mantissa precision shifts the codebook
-            # entries enough to flip ~5-10% of cell→code assignments,
-            # which crashes NMI/ARI even when reconstruction NB loss
-            # looks unchanged. VQ models amplify small parameter
-            # drifts into discrete output flips, so even "0.1 nat
-            # loss diff" can mean visible cluster reshuffling.
+            # A/B TEST 2026-05-12: reactivated bf16-mixed after the
+            # earlier multi-seed regression turned out to be caused
+            # by `cache_train_batches=True` (now off). Bundle being
+            # tested: bf16 train + bf16 predict + predict_bs=8192.
+            # If metrics match historic, bf16 is innocent and we keep
+            # the ~20-40% wall-clock saving on Ampere/Hopper. If they
+            # regress, bisect within the bundle.
             #
-            # Opt back into bf16 per-run via `--precision bf16-mixed`
-            # on the CLI (run_squint.py main flag); the multi-seed
-            # runner (_run_one_seed.py) currently doesn't forward
-            # that flag — flip the value here for a global multi-
-            # seed bf16 test if you want.
+            # Lightning's "bf16-mixed" wraps each train/val/test step
+            # in `torch.autocast(device_type='cuda', dtype=bfloat16)`
+            # while keeping model params + optimizer state in fp32.
+            # No GradScaler needed (bf16 has fp32 exponent range).
+            # VQ codebook params stay fp32; the cosine-distance matmul
+            # runs in bf16 with fp32 accumulator — argmin should be
+            # stable.
             #
-            # If you re-adopt bf16 as default, A/B test against a
-            # fp32 control on at least one seed of the canonical
-            # baseline (s17_v2) and confirm NMI/iLISI match within
-            # 0.01 before pushing cluster-wide.
-            "precision": "32-true",
+            # Override per-run with `--precision 32-true` on the
+            # run_squint.py CLI (multi-seed runner doesn't forward
+            # the flag yet — flip the value here for a global
+            # multi-seed fp32 test).
+            "precision": "bf16-mixed",
             # Run validation every 2 train epochs (Lightning default
             # would be every epoch). Each val pass is a sub-pass over
             # `val_dataloader` (cell-level 10% holdout from the train

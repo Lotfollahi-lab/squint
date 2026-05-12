@@ -298,28 +298,28 @@ def main() -> int:
         # predict-time optimisations (ablations / direct `--all` runs
         # default to the legacy values inside predict()):
         #
-        #   precision=None  (REVERTED 2026-05-12 from "bf16-mixed")
-        #     Was previously "bf16-mixed" — Lightning autocast on the
-        #     predict forward, ~1.5-2× faster MLPs. Reverted because a
-        #     multi-seed sweep showed severe metric drops despite
-        #     normal training losses; bf16 codebook argmin drift is
-        #     the leading suspect (the discrete output amplifies
-        #     small precision differences into ~5-10% cell→code
-        #     reassignments → NMI/ARI craters). None = fp32, identical
-        #     to the historic baseline runs. Re-adopt bf16 here once
-        #     the A/B vs fp32 confirms NMI/iLISI parity.
+        #   precision="bf16-mixed"  (REACTIVATED 2026-05-12)
+        #     Lightning autocast on the predict forward, ~1.5-2×
+        #     faster MLPs. Previously reverted to None during a
+        #     multi-seed regression investigation — turned out the
+        #     culprit was `cache_train_batches=True`, NOT bf16. Now
+        #     re-activated alongside the base config's bf16 train +
+        #     bigger predict_batch_size, on the now-known-good
+        #     `cache_train_batches=False` config. If THIS run
+        #     regresses, bisect within the bundle (predict bf16,
+        #     train bf16, predict_bs).
         #   strategy="auto"
         #     Drops the legacy `ddp_find_unused_parameters_true` for
         #     predict, letting Lightning auto-pick
         #     `SingleDeviceStrategy` on single-GPU LSF jobs (the
         #     common case for multi-seed). ~5-15% predict speedup,
-        #     no output change. Kept on — no precision dependency.
+        #     no output change.
         #   compression="lzf"
         #     ~3-5x faster AnnData writes than gzip on NFS — only
         #     affects wall-clock UX since the write is already
         #     excluded from `runtime_seconds`. File ends up ~1.5x
         #     bigger on disk; readers (anndata.read_h5ad) handle lzf
-        #     transparently. Kept on — no precision dependency.
+        #     transparently.
         try:
             run_inference_and_analysis(
                 run_dir=run_dir,
@@ -331,7 +331,7 @@ def main() -> int:
                 skip_svg_plots=True,               # untimed: phase 2
                 skip_umap=True,                    # untimed: phase 2
                 skip_metrics=True,                 # untimed: phase 2
-                predict_precision=None,            # fp32 (was "bf16-mixed")
+                predict_precision="bf16-mixed",    # multi-seed only
                 predict_strategy="auto",           # multi-seed only
                 predict_compression="lzf",         # multi-seed only
             )
