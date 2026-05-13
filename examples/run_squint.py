@@ -22765,6 +22765,1395 @@ VARIANTS: dict = {
             wt_contrastive_cell=200.0, k_pos=5, temperature=0.1,
         ),
     },
+    # -----------------------------------------------------------------------
+    # s50 sweep — 16 ablations: shared-trunk encoder size sweep on s49_v7 spine
+    # -----------------------------------------------------------------------
+    # Spine = s49_v7 (s48_v2 + codebook-diversity on cell-VQ wt=100) -- the
+    # variant whose integration metrics held up while cell-NMI lifted. The
+    # ONLY axis varied is the encoder MLP shape (no Y-shape, no decoupling).
+    #
+    # NB: the cell-VQ codebook embedding dim = last encoder layer dim, so
+    # variants ending in 256 isolate the trunk-shape effect; variants ending
+    # in other dims also vary the codebook embedding space.
+    #
+    # Variant index order: 1-layer (v1-v4), 2-layer (v5-v9),
+    # 3-layer (v10-v13), 4-layer + tweaks (v14-v16).
+    #
+    # Submit via:
+    #   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v50
+    "s50_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-64+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 1: shared-trunk encoder shape [64]. Built on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100) -- a higher-diversity variant from s49. The ONLY change from s49_v7 is the encoder MLP shape. \n\nArchitecture (single shared MLP, NO Y-shape, NO decoupling): x[431] -> MLP[64] -> z_mlp[64] split to VQ_cell (RVQ [30, 90], dim=64) + GNN -> VQ_niche. Encoder MLP params ~28k (vs s49_v7's ~436k, 15.8x smaller). \n\nNote: the cell-VQ codebook embedding dim equals the last encoder layer dim (64 here vs 256 in s49_v7). Variants ending in 256 isolate the trunk-shape effect; variants ending in other dims also shrink/grow the codebook embedding space. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[64])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[64],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 2: shared-trunk encoder shape [128]. Built on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100) -- a higher-diversity variant from s49. The ONLY change from s49_v7 is the encoder MLP shape. \n\nArchitecture (single shared MLP, NO Y-shape, NO decoupling): x[431] -> MLP[128] -> z_mlp[128] split to VQ_cell (RVQ [30, 90], dim=128) + GNN -> VQ_niche. Encoder MLP params ~55k (vs s49_v7's ~436k, 7.9x smaller). \n\nNote: the cell-VQ codebook embedding dim equals the last encoder layer dim (128 here vs 256 in s49_v7). Variants ending in 256 isolate the trunk-shape effect; variants ending in other dims also shrink/grow the codebook embedding space. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[128])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[128],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 3: shared-trunk encoder shape [256]. Built on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100) -- a higher-diversity variant from s49. The ONLY change from s49_v7 is the encoder MLP shape. \n\nArchitecture (single shared MLP, NO Y-shape, NO decoupling): x[431] -> MLP[256] -> z_mlp[256] split to VQ_cell (RVQ [30, 90], dim=256) + GNN -> VQ_niche. Encoder MLP params ~111k (vs s49_v7's ~436k, 3.9x smaller). \n\nNote: the cell-VQ codebook embedding dim equals the last encoder layer dim (256 here vs 256 in s49_v7). Variants ending in 256 isolate the trunk-shape effect; variants ending in other dims also shrink/grow the codebook embedding space. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[256],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-512+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 4: shared-trunk encoder shape [512]. Built on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100) -- a higher-diversity variant from s49. The ONLY change from s49_v7 is the encoder MLP shape. \n\nArchitecture (single shared MLP, NO Y-shape, NO decoupling): x[431] -> MLP[512] -> z_mlp[512] split to VQ_cell (RVQ [30, 90], dim=512) + GNN -> VQ_niche. Encoder MLP params ~221k (vs s49_v7's ~436k, 2.0x smaller). \n\nNote: the cell-VQ codebook embedding dim equals the last encoder layer dim (512 here vs 256 in s49_v7). Variants ending in 256 isolate the trunk-shape effect; variants ending in other dims also shrink/grow the codebook embedding space. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[512])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[512],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v5_dualvq+rvq-both+decoder-cov+no-batch-int+enc-64-64+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 5: shared-trunk encoder shape [64, 64]. Built on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100) -- a higher-diversity variant from s49. The ONLY change from s49_v7 is the encoder MLP shape. \n\nArchitecture (single shared MLP, NO Y-shape, NO decoupling): x[431] -> MLP[64, 64] -> z_mlp[64] split to VQ_cell (RVQ [30, 90], dim=64) + GNN -> VQ_niche. Encoder MLP params ~32k (vs s49_v7's ~436k, 13.7x smaller). \n\nNote: the cell-VQ codebook embedding dim equals the last encoder layer dim (64 here vs 256 in s49_v7). Variants ending in 256 isolate the trunk-shape effect; variants ending in other dims also shrink/grow the codebook embedding space. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[64, 64])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[64, 64],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v6_dualvq+rvq-both+decoder-cov+no-batch-int+enc-128-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 6: shared-trunk encoder shape [128, 128]. Built on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100) -- a higher-diversity variant from s49. The ONLY change from s49_v7 is the encoder MLP shape. \n\nArchitecture (single shared MLP, NO Y-shape, NO decoupling): x[431] -> MLP[128, 128] -> z_mlp[128] split to VQ_cell (RVQ [30, 90], dim=128) + GNN -> VQ_niche. Encoder MLP params ~72k (vs s49_v7's ~436k, 6.1x smaller). \n\nNote: the cell-VQ codebook embedding dim equals the last encoder layer dim (128 here vs 256 in s49_v7). Variants ending in 256 isolate the trunk-shape effect; variants ending in other dims also shrink/grow the codebook embedding space. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[128, 128])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[128, 128],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v7_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 7: shared-trunk encoder shape [256, 128]. Built on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100) -- a higher-diversity variant from s49. The ONLY change from s49_v7 is the encoder MLP shape. \n\nArchitecture (single shared MLP, NO Y-shape, NO decoupling): x[431] -> MLP[256, 128] -> z_mlp[128] split to VQ_cell (RVQ [30, 90], dim=128) + GNN -> VQ_niche. Encoder MLP params ~143k (vs s49_v7's ~436k, 3.0x smaller). \n\nNote: the cell-VQ codebook embedding dim equals the last encoder layer dim (128 here vs 256 in s49_v7). Variants ending in 256 isolate the trunk-shape effect; variants ending in other dims also shrink/grow the codebook embedding space. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256, 128])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[256, 128],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-256+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 8: shared-trunk encoder shape [256, 256]. Built on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100) -- a higher-diversity variant from s49. The ONLY change from s49_v7 is the encoder MLP shape. \n\nArchitecture (single shared MLP, NO Y-shape, NO decoupling): x[431] -> MLP[256, 256] -> z_mlp[256] split to VQ_cell (RVQ [30, 90], dim=256) + GNN -> VQ_niche. Encoder MLP params ~176k (vs s49_v7's ~436k, 2.5x smaller). \n\nNote: the cell-VQ codebook embedding dim equals the last encoder layer dim (256 here vs 256 in s49_v7). Variants ending in 256 isolate the trunk-shape effect; variants ending in other dims also shrink/grow the codebook embedding space. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[256, 256],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v9_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-256+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 9: shared-trunk encoder shape [400, 256]. Built on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100) -- a higher-diversity variant from s49. The ONLY change from s49_v7 is the encoder MLP shape. \n\nArchitecture (single shared MLP, NO Y-shape, NO decoupling): x[431] -> MLP[400, 256] -> z_mlp[256] split to VQ_cell (RVQ [30, 90], dim=256) + GNN -> VQ_niche. Encoder MLP params ~275k (vs s49_v7's ~436k, 1.6x smaller). \n\nNote: the cell-VQ codebook embedding dim equals the last encoder layer dim (256 here vs 256 in s49_v7). Variants ending in 256 isolate the trunk-shape effect; variants ending in other dims also shrink/grow the codebook embedding space. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[400, 256],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v10_dualvq+rvq-both+decoder-cov+no-batch-int+enc-128-128-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 10: shared-trunk encoder shape [128, 128, 128]. Built on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100) -- a higher-diversity variant from s49. The ONLY change from s49_v7 is the encoder MLP shape. \n\nArchitecture (single shared MLP, NO Y-shape, NO decoupling): x[431] -> MLP[128, 128, 128] -> z_mlp[128] split to VQ_cell (RVQ [30, 90], dim=128) + GNN -> VQ_niche. Encoder MLP params ~88k (vs s49_v7's ~436k, 4.9x smaller). \n\nNote: the cell-VQ codebook embedding dim equals the last encoder layer dim (128 here vs 256 in s49_v7). Variants ending in 256 isolate the trunk-shape effect; variants ending in other dims also shrink/grow the codebook embedding space. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[128, 128, 128])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[128, 128, 128],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v11_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-128-64+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 11: shared-trunk encoder shape [256, 128, 64]. Built on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100) -- a higher-diversity variant from s49. The ONLY change from s49_v7 is the encoder MLP shape. \n\nArchitecture (single shared MLP, NO Y-shape, NO decoupling): x[431] -> MLP[256, 128, 64] -> z_mlp[64] split to VQ_cell (RVQ [30, 90], dim=64) + GNN -> VQ_niche. Encoder MLP params ~152k (vs s49_v7's ~436k, 2.9x smaller). \n\nNote: the cell-VQ codebook embedding dim equals the last encoder layer dim (64 here vs 256 in s49_v7). Variants ending in 256 isolate the trunk-shape effect; variants ending in other dims also shrink/grow the codebook embedding space. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256, 128, 64])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[256, 128, 64],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v12_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-256-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 12: shared-trunk encoder shape [256, 256, 128]. Built on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100) -- a higher-diversity variant from s49. The ONLY change from s49_v7 is the encoder MLP shape. \n\nArchitecture (single shared MLP, NO Y-shape, NO decoupling): x[431] -> MLP[256, 256, 128] -> z_mlp[128] split to VQ_cell (RVQ [30, 90], dim=128) + GNN -> VQ_niche. Encoder MLP params ~209k (vs s49_v7's ~436k, 2.1x smaller). \n\nNote: the cell-VQ codebook embedding dim equals the last encoder layer dim (128 here vs 256 in s49_v7). Variants ending in 256 isolate the trunk-shape effect; variants ending in other dims also shrink/grow the codebook embedding space. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256, 256, 128])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[256, 256, 128],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v13_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-256-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 13: shared-trunk encoder shape [400, 256, 128]. Built on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100) -- a higher-diversity variant from s49. The ONLY change from s49_v7 is the encoder MLP shape. \n\nArchitecture (single shared MLP, NO Y-shape, NO decoupling): x[431] -> MLP[400, 256, 128] -> z_mlp[128] split to VQ_cell (RVQ [30, 90], dim=128) + GNN -> VQ_niche. Encoder MLP params ~308k (vs s49_v7's ~436k, 1.4x smaller). \n\nNote: the cell-VQ codebook embedding dim equals the last encoder layer dim (128 here vs 256 in s49_v7). Variants ending in 256 isolate the trunk-shape effect; variants ending in other dims also shrink/grow the codebook embedding space. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 256, 128])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[400, 256, 128],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v14_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-256-256-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 14: shared-trunk encoder shape [256, 256, 256, 128]. Built on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100) -- a higher-diversity variant from s49. The ONLY change from s49_v7 is the encoder MLP shape. \n\nArchitecture (single shared MLP, NO Y-shape, NO decoupling): x[431] -> MLP[256, 256, 256, 128] -> z_mlp[128] split to VQ_cell (RVQ [30, 90], dim=128) + GNN -> VQ_niche. Encoder MLP params ~275k (vs s49_v7's ~436k, 1.6x smaller). \n\nNote: the cell-VQ codebook embedding dim equals the last encoder layer dim (128 here vs 256 in s49_v7). Variants ending in 256 isolate the trunk-shape effect; variants ending in other dims also shrink/grow the codebook embedding space. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256, 256, 256, 128])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[256, 256, 256, 128],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v15_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-256-128-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 15: shared-trunk encoder shape [400, 256, 128, 128]. Built on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100) -- a higher-diversity variant from s49. The ONLY change from s49_v7 is the encoder MLP shape. \n\nArchitecture (single shared MLP, NO Y-shape, NO decoupling): x[431] -> MLP[400, 256, 128, 128] -> z_mlp[128] split to VQ_cell (RVQ [30, 90], dim=128) + GNN -> VQ_niche. Encoder MLP params ~325k (vs s49_v7's ~436k, 1.3x smaller). \n\nNote: the cell-VQ codebook embedding dim equals the last encoder layer dim (128 here vs 256 in s49_v7). Variants ending in 256 isolate the trunk-shape effect; variants ending in other dims also shrink/grow the codebook embedding space. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 256, 128, 128])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[400, 256, 128, 128],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v16_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-400-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 16: shared-trunk encoder shape [400, 400, 128]. Built on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100) -- a higher-diversity variant from s49. The ONLY change from s49_v7 is the encoder MLP shape. \n\nArchitecture (single shared MLP, NO Y-shape, NO decoupling): x[431] -> MLP[400, 400, 128] -> z_mlp[128] split to VQ_cell (RVQ [30, 90], dim=128) + GNN -> VQ_niche. Encoder MLP params ~385k (vs s49_v7's ~436k, 1.1x smaller). \n\nNote: the cell-VQ codebook embedding dim equals the last encoder layer dim (128 here vs 256 in s49_v7). Variants ending in 256 isolate the trunk-shape effect; variants ending in other dims also shrink/grow the codebook embedding space. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 128])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[400, 400, 128],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    # -----------------------------------------------------------------------
+    # s50 sweep — 8 DECOUPLED-encoder variants (v17-v24) appended to v1-v16
+    # -----------------------------------------------------------------------
+    # Same spine as v1-v16, with +decoupled-encoders added. Curated subset
+    # of shapes since decoupled-enc 2x's the encoder MLP param count.
+    "s50_v17_dualvq+rvq-both+decoder-cov+no-batch-int+decoupled-enc-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 17: DECOUPLED encoders, shape [128] per branch. Cell trunk + niche trunk are two INDEPENDENT MLP modules with the same shape but disjoint weights — spatial gradients (nbr-NB, niche-commit, adjacency-BCE) flow only through the niche MLP, never reaching the cell MLP. \n\nBuilt on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100), so all loss weights and other hyperparameters match the single-trunk s50 variants 1-16 — the ONLY difference is the +decoupled-enc structural change + this variant's specific shape. \n\nArchitecture: 2 x MLP[128], codebook dim = 128 (last MLP layer dim). Encoder MLP params ~55k per trunk x 2 = ~111k total (vs s49_v7's single-trunk 436k baseline). \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[128])",
+            "+decoupled-encoders(niche trunk = independent deep copy)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[128],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v18_dualvq+rvq-both+decoder-cov+no-batch-int+decoupled-enc-256+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 18: DECOUPLED encoders, shape [256] per branch. Cell trunk + niche trunk are two INDEPENDENT MLP modules with the same shape but disjoint weights — spatial gradients (nbr-NB, niche-commit, adjacency-BCE) flow only through the niche MLP, never reaching the cell MLP. \n\nBuilt on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100), so all loss weights and other hyperparameters match the single-trunk s50 variants 1-16 — the ONLY difference is the +decoupled-enc structural change + this variant's specific shape. \n\nArchitecture: 2 x MLP[256], codebook dim = 256 (last MLP layer dim). Encoder MLP params ~111k per trunk x 2 = ~221k total (vs s49_v7's single-trunk 436k baseline). \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256])",
+            "+decoupled-encoders(niche trunk = independent deep copy)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[256],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v19_dualvq+rvq-both+decoder-cov+no-batch-int+decoupled-enc-128-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 19: DECOUPLED encoders, shape [128, 128] per branch. Cell trunk + niche trunk are two INDEPENDENT MLP modules with the same shape but disjoint weights — spatial gradients (nbr-NB, niche-commit, adjacency-BCE) flow only through the niche MLP, never reaching the cell MLP. \n\nBuilt on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100), so all loss weights and other hyperparameters match the single-trunk s50 variants 1-16 — the ONLY difference is the +decoupled-enc structural change + this variant's specific shape. \n\nArchitecture: 2 x MLP[128, 128], codebook dim = 128 (last MLP layer dim). Encoder MLP params ~72k per trunk x 2 = ~144k total (vs s49_v7's single-trunk 436k baseline). \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[128, 128])",
+            "+decoupled-encoders(niche trunk = independent deep copy)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[128, 128],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v20_dualvq+rvq-both+decoder-cov+no-batch-int+decoupled-enc-256-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 20: DECOUPLED encoders, shape [256, 128] per branch. Cell trunk + niche trunk are two INDEPENDENT MLP modules with the same shape but disjoint weights — spatial gradients (nbr-NB, niche-commit, adjacency-BCE) flow only through the niche MLP, never reaching the cell MLP. \n\nBuilt on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100), so all loss weights and other hyperparameters match the single-trunk s50 variants 1-16 — the ONLY difference is the +decoupled-enc structural change + this variant's specific shape. \n\nArchitecture: 2 x MLP[256, 128], codebook dim = 128 (last MLP layer dim). Encoder MLP params ~143k per trunk x 2 = ~287k total (vs s49_v7's single-trunk 436k baseline). \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256, 128])",
+            "+decoupled-encoders(niche trunk = independent deep copy)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[256, 128],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v21_dualvq+rvq-both+decoder-cov+no-batch-int+decoupled-enc-256-256+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 21: DECOUPLED encoders, shape [256, 256] per branch. Cell trunk + niche trunk are two INDEPENDENT MLP modules with the same shape but disjoint weights — spatial gradients (nbr-NB, niche-commit, adjacency-BCE) flow only through the niche MLP, never reaching the cell MLP. \n\nBuilt on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100), so all loss weights and other hyperparameters match the single-trunk s50 variants 1-16 — the ONLY difference is the +decoupled-enc structural change + this variant's specific shape. \n\nArchitecture: 2 x MLP[256, 256], codebook dim = 256 (last MLP layer dim). Encoder MLP params ~176k per trunk x 2 = ~353k total (vs s49_v7's single-trunk 436k baseline). \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256, 256])",
+            "+decoupled-encoders(niche trunk = independent deep copy)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[256, 256],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v22_dualvq+rvq-both+decoder-cov+no-batch-int+decoupled-enc-128-128-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 22: DECOUPLED encoders, shape [128, 128, 128] per branch. Cell trunk + niche trunk are two INDEPENDENT MLP modules with the same shape but disjoint weights — spatial gradients (nbr-NB, niche-commit, adjacency-BCE) flow only through the niche MLP, never reaching the cell MLP. \n\nBuilt on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100), so all loss weights and other hyperparameters match the single-trunk s50 variants 1-16 — the ONLY difference is the +decoupled-enc structural change + this variant's specific shape. \n\nArchitecture: 2 x MLP[128, 128, 128], codebook dim = 128 (last MLP layer dim). Encoder MLP params ~88k per trunk x 2 = ~177k total (vs s49_v7's single-trunk 436k baseline). \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[128, 128, 128])",
+            "+decoupled-encoders(niche trunk = independent deep copy)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[128, 128, 128],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v23_dualvq+rvq-both+decoder-cov+no-batch-int+decoupled-enc-256-256-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 23: DECOUPLED encoders, shape [256, 256, 128] per branch. Cell trunk + niche trunk are two INDEPENDENT MLP modules with the same shape but disjoint weights — spatial gradients (nbr-NB, niche-commit, adjacency-BCE) flow only through the niche MLP, never reaching the cell MLP. \n\nBuilt on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100), so all loss weights and other hyperparameters match the single-trunk s50 variants 1-16 — the ONLY difference is the +decoupled-enc structural change + this variant's specific shape. \n\nArchitecture: 2 x MLP[256, 256, 128], codebook dim = 128 (last MLP layer dim). Encoder MLP params ~209k per trunk x 2 = ~419k total (vs s49_v7's single-trunk 436k baseline). \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256, 256, 128])",
+            "+decoupled-encoders(niche trunk = independent deep copy)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[256, 256, 128],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s50_v24_dualvq+rvq-both+decoder-cov+no-batch-int+decoupled-enc-400-256-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s50 sweep, variant 24: DECOUPLED encoders, shape [400, 256, 128] per branch. Cell trunk + niche trunk are two INDEPENDENT MLP modules with the same shape but disjoint weights — spatial gradients (nbr-NB, niche-commit, adjacency-BCE) flow only through the niche MLP, never reaching the cell MLP. \n\nBuilt on the s49_v7 spine (s48_v2 + codebook-diversity on cell-VQ at wt=100, T=100), so all loss weights and other hyperparameters match the single-trunk s50 variants 1-16 — the ONLY difference is the +decoupled-enc structural change + this variant's specific shape. \n\nArchitecture: 2 x MLP[400, 256, 128], codebook dim = 128 (last MLP layer dim). Encoder MLP params ~308k per trunk x 2 = ~617k total (vs s49_v7's single-trunk 436k baseline). \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 256, 128])",
+            "+decoupled-encoders(niche trunk = independent deep copy)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[400, 256, 128],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
 }
 
 
@@ -26498,6 +27887,40 @@ DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v49"] = [
     "s49_v22_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+shared-specific-enc+contrastWB-w1000-k5+mmb0-1b_smb1-1b_1p",
     "s49_v23_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
     "s49_v24_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+rvq-cell-30-200+contrastWB-w200-k5+mmb0-1b_smb1-1b_1p",
+]
+
+
+# -----------------------------------------------------------------------
+# s50 sweep — single-trunk encoder size sweep on s49_v7 spine.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v50
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v50"] = [
+    "s50_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-64+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-512+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v5_dualvq+rvq-both+decoder-cov+no-batch-int+enc-64-64+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v6_dualvq+rvq-both+decoder-cov+no-batch-int+enc-128-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v7_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-256+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v9_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-256+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v10_dualvq+rvq-both+decoder-cov+no-batch-int+enc-128-128-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v11_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-128-64+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v12_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-256-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v13_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-256-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v14_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-256-256-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v15_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-256-128-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v16_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-400-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    # ----- 8 decoupled-encoder variants -----
+    "s50_v17_dualvq+rvq-both+decoder-cov+no-batch-int+decoupled-enc-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v18_dualvq+rvq-both+decoder-cov+no-batch-int+decoupled-enc-256+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v19_dualvq+rvq-both+decoder-cov+no-batch-int+decoupled-enc-128-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v20_dualvq+rvq-both+decoder-cov+no-batch-int+decoupled-enc-256-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v21_dualvq+rvq-both+decoder-cov+no-batch-int+decoupled-enc-256-256+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v22_dualvq+rvq-both+decoder-cov+no-batch-int+decoupled-enc-128-128-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v23_dualvq+rvq-both+decoder-cov+no-batch-int+decoupled-enc-256-256-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s50_v24_dualvq+rvq-both+decoder-cov+no-batch-int+decoupled-enc-400-256-128+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
 ]
 
 
