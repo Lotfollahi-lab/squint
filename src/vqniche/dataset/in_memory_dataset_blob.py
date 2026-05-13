@@ -37,6 +37,7 @@ import concurrent.futures
 from typing import Optional, Callable, List, Tuple
 
 import numpy as np
+import pandas as pd
 import scanpy as sc
 import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
@@ -273,7 +274,20 @@ class InMemoryDatasetBlob(InMemoryDataset):
                         "for this batch."
                     )
                     continue
-                self.label_categories[label_name].update(adata_batch.obs[label_key].unique())
+                # Drop NaN / None / pd.NA from the unique-values list before
+                # adding to the category set. Real-world AnnDatas often have
+                # unlabeled cells (NaN in obs[label_key]); they shouldn't
+                # become a category (and the mixed-type set would also fail
+                # the `sorted()` below with
+                # `'<' not supported between instances of 'float' and 'str'`).
+                # Cells with NaN/None labels still load — `pandas_to_torch_one_hot`
+                # encodes them as an all-zero row (no category matches),
+                # which downstream code treats as "unlabeled".
+                _vals = adata_batch.obs[label_key].unique()
+                # pandas' `.dropna()` on an Index also strips pd.NA; cast to
+                # Series first since np.ndarray doesn't have .dropna().
+                _vals = pd.Series(_vals).dropna().tolist()
+                self.label_categories[label_name].update(_vals)
 
         print("All batches have the same gene panel.")
 
@@ -506,9 +520,16 @@ class InMemoryDatasetBlob(InMemoryDataset):
         # ----------------- Add Metadata -----------------
         batch_dict['xy_coordinates'] = Tensor(adata_batch.obsm['spatial'])
         batch_dict['cell_id'] = adata_batch.obs['cell_id'].to_list()
-        batch_dict['dataset_id'] = adata_batch.uns['dataset_id']
-        batch_dict['tissue'] = adata_batch.uns['tissue']
-        batch_dict['species'] = adata_batch.uns['species']
+        # `dataset_id` / `tissue` / `species` are pure metadata —
+        # round-tripped through training so they end up on the
+        # `predicted_adata.uns` at inference time for traceability, but
+        # NO downstream computation reads them. Default to safe values
+        # when missing so new datasets (e.g. spatch_1p) can build their
+        # blob without a curator pre-stamping every metadata key first.
+        # If you DO stamp them on the silver AnnDatas, those values win.
+        batch_dict['dataset_id'] = adata_batch.uns.get('dataset_id', self.name)
+        batch_dict['tissue']     = adata_batch.uns.get('tissue',     'unknown')
+        batch_dict['species']    = adata_batch.uns.get('species',    'unknown')
 
         # Per-cell row index INTO this AnnData's `.obs` DataFrame. Combined
         # with `adata_batch_ids` it forms a unique per-cell key that

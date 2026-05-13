@@ -386,6 +386,79 @@ def make_dataset_blob_config_mmb20() -> dict:
     }
 
 
+def make_dataset_blob_config_spatch() -> dict:
+    """
+    Dataset-blob build config for the `spatch_1p` dataset
+    (`/nfs/team361/sb75/DATASETS/silver/spatch_1p`, N AnnDatas named
+    `dataset_id_<N>.h5ad`).
+
+    Smoke-test scope: this config is intended for a 1-epoch pipeline
+    sanity check. It uses cell-type label `obs['annotation']` and niche
+    label `obs['spatial_cluster']` — the supervisory keys the user
+    specified for this dataset.
+
+    Expectations on the silver AnnDatas:
+      - `adata.uns['batch']`           — integer / 'batchN' string for
+        each section (required by `InMemoryDatasetBlob._derive_adata_batch_id`).
+        `dataset_id_<N>.h5ad` should stamp `uns['batch']` so the file's
+        intended id surfaces — e.g. `dataset_id_2.h5ad` -> `uns['batch']='batch2'`
+        (or just the int `2`). See `examples/stamp_spatch_uns_batch.py`.
+      - `adata.obs['annotation']`      — cell-type label column.
+      - `adata.obs['spatial_cluster']` — niche / spatial-cluster label.
+      - `adata.obsm['spatial']`        — XY coordinates for the spatial
+        k-NN graph build.
+      - `adata.obs['batch']`           — per-cell batch (used by the
+        batch-key path in the blob's graph build + by
+        `build_batch_one_hot_from_obs`). If absent, the loader falls
+        back to parsing `cell_id`; either is fine for the smoke test.
+
+    Differences from `make_dataset_blob_config`:
+      - dataset name -> spatch_1p
+      - data_directory_path -> /nfs/team361/sb75/DATASETS
+      - label_names         -> ["cell_types=annotation",
+                                "niche_types=spatial_cluster"]
+      - n_neighs_list       -> [8] (single k for smoke; expand later
+        if knn-ablations are added on spatch_1p).
+    """
+    return {
+        "experiment": {
+            "name": "in_memory_dataset_blob",
+            "description": (
+                "spatch_1p dataset (silver/spatch_1p/dataset_id_*.h5ad). "
+                "Cell-type label = obs['annotation']; niche label = "
+                "obs['spatial_cluster']."
+            ),
+        },
+        "dataset": {
+            "name": "spatch_1p",
+            "feature_names": ["cell_gene_counts"],
+            "label_names": [
+                "cell_types=annotation",
+                "niche_types=spatial_cluster",
+            ],
+            "graph_kwargs": {
+                "coord_type":         "generic",
+                "spatial_key":        "spatial",
+                "n_neighs_list":      [8],
+                "radius_list":        None,
+                "include_self_loop":  True,
+                "batch_key":          "batch",   # falls back to cell_id parse if absent
+                "k": {
+                    "lm_eigvecs": 128,
+                },
+            },
+            "data_directory_path": "/nfs/team361/sb75/DATASETS",
+            "pre_transform": None,
+            "pre_filter":    None,
+            "overwrite":     True,
+        },
+        "software_paths": {
+            "deepwalk": "",
+            "gosh":     "",
+        },
+    }
+
+
 def make_dataset_blob_config() -> dict:
     """
     Mirrors  config/create_in_memory_dataset_blob/mmb0-4b_1p.yaml  but for
@@ -409,7 +482,15 @@ def make_dataset_blob_config() -> dict:
             "graph_kwargs": {
                 "coord_type": "generic",
                 "spatial_key": "spatial",     # adata.obsm['spatial']
-                "n_neighs_list": [8],         # SQUINT default 8-NN graph
+                # Build the spatial k-NN graph at MULTIPLE k values so
+                # variants can select between them at training time via
+                # `cfg.dataset.graph_params.n_neighs`. The default
+                # training config picks k=8 (the historic SQUINT
+                # default); +knn12 / +knn6 variants select k=12 / k=6
+                # from the same pre-built blob. Rebuilding the blob is
+                # required ONCE to populate the extra graphs:
+                #   python examples/run_squint.py --build-blob
+                "n_neighs_list": [6, 8, 12, 16],  # SQUINT default 8-NN + knn ablations
                 "radius_list": None,
                 "include_self_loop": True,
                 "k": {
@@ -554,18 +635,17 @@ def make_train_config_poc() -> dict:
                 # for linear) and post-hoc iLISI / niche-NMI
                 # validation — don't change just one knob.
                 "batch_size":         256,
-                # 22 DataLoader workers — bumped from 16 after wandb
-                # showed GPU utilisation pinned at 5-10% (DataLoader
-                # bottleneck, NOT GPU compute bottleneck — SQUINT's
-                # per-step model work is so cheap relative to PyG's
-                # CPU-side NeighborSampler that the GPU sits idle
-                # between batches). Pair with `LSF_CORES=24` in
-                # the submit scripts: 22 workers + 1 main proc +
-                # 1 spare = 24 cores. `_loader_perf_kwargs()` adds
-                # `pin_memory=True`, `persistent_workers=True`, and
-                # `prefetch_factor=8` automatically, so don't set
-                # those here (that triggers `TypeError: got multiple
-                # values for keyword argument` on the loader call).
+                # 22 DataLoader workers. Kept high (the dataloader-
+                # throughput knobs aren't part of the speedups
+                # rolled back 2026-05-12 — the regression is on the
+                # model / precision / optimizer side, not the data
+                # side). Pair with `LSF_CORES=24` in the submit
+                # scripts: 22 workers + 1 main proc + 1 spare = 24
+                # cores. `_loader_perf_kwargs()` adds `pin_memory=True`,
+                # `persistent_workers=True`, and `prefetch_factor=8`
+                # automatically, so don't set those here (that
+                # triggers `TypeError: got multiple values for
+                # keyword argument` on the loader call).
                 "num_workers":        22,
             },
             "sampler_name": "NeighborSampler",
@@ -610,21 +690,30 @@ def make_train_config_poc() -> dict:
                 # irrelevant and the cost is dominated by kernel-launch
                 # overhead at small batch sizes.
                 #
-                # A/B TEST 2026-05-12: bumped 1024 → 8192 (8×) alongside
-                # `precision: "bf16-mixed"` re-activation, on the
-                # now-known-good config (cache_train_batches=False).
-                # Tests whether the predict-batch bump + bf16 bundle
-                # introduces any regression, now that cache is ruled
-                # out as the culprit. If THIS run regresses, the next
-                # bisect is within the bundle (one of: bf16 train,
-                # bf16 predict, predict_bs).
+                # DEFAULT: 65536 (= 64×1024, bumped 8× from 8192 on
+                # 2026-05-12). Predict-time math is unaffected by
+                # batch grouping (codebook argmin is per-cell,
+                # deterministic regardless of batch composition), so
+                # bigger is purely a throughput win for the no-grad
+                # forward pass.
                 #
                 # Memory math on the mmb-smb graph with `[-1]` predict
                 # fanout (avg degree ~12):
-                #   nodes_per_batch ≈ 8192 × 13 ≈ ~106k nodes/batch
-                # Safe on H100/H200 (80+ GiB) and gpu_high_memory
-                # (384 GiB). Fallback on OOM: 8192 → 4096 → 2048 → 1024.
-                "predict_batch_size":                     8192,
+                #   nodes_per_batch ≈ 65536 × 13 ≈ ~852k nodes/batch
+                #   input X tensor   ≈ 852k × 431 genes × 4 B ≈ ~1.4 GiB
+                #   + model activations (no autograd, no opt state):
+                #     ~5-10 GiB on the s17_v2 spine, less on s25's
+                #     128-dim tight spine.
+                # Total peak GPU mem ~10-15 GiB on the wide spine,
+                # ~5-8 GiB on the tight s25 spine — comfortable on
+                # any H100/H200 (80+ GiB) and trivial on the
+                # gpu_high_memory (384 GiB) class.
+                #
+                # Fallback chain on OOM (most likely on denser
+                # datasets like chl59-8b_1p, or mmb20 with 20+
+                # sections):
+                #   65536 → 32768 → 16384 → 8192 → 4096 → 2048 → 1024.
+                "predict_batch_size":                     65536,
                 # Val/test batch-size override. Val runs every
                 # `check_val_every_n_epoch` (see trainer config below
                 # — currently every 2 train epochs), and the per-val-
@@ -808,6 +897,27 @@ def make_train_config_poc() -> dict:
                 "lr": 0.0005,
                 "weight_decay": 0.001,
                 "mask_lr_scale": 1.0,
+                # `fused=True` coalesces parameter updates into a single
+                # CUDA kernel instead of per-tensor launches. 5-15%
+                # wall-clock saving on the optimizer step for SQUINT's
+                # many-small-tensor regime.
+                #
+                # DEFAULT: False (REVERTED 2026-05-12, third pass).
+                #
+                # Turned off as the new bisection suspect after the
+                # conservative-baseline rollback didn't restore
+                # metrics. In theory fused Adam is mathematically
+                # identical to the unfused path (same Adam update,
+                # just better-batched kernels), but: torch's fused
+                # Adam has had bf16-master-weight + dynamic-graph
+                # edge cases in the past, and some PyTorch versions
+                # silently skip the codebook EMA params (which have
+                # `requires_grad=False` but still need to flow
+                # through `optimizer.step` for the rest of the model
+                # to update correctly). If toggling this off
+                # restores metrics, we'll know fused is the culprit
+                # and look at it post-deadline.
+                "fused": False,
             },
             "loss_params": {
                 "loss_names": [
@@ -903,27 +1013,71 @@ def make_train_config_poc() -> dict:
             "max_epochs": 80,
             # Training precision.
             #
-            # A/B TEST 2026-05-12: reactivated bf16-mixed after the
-            # earlier multi-seed regression turned out to be caused
-            # by `cache_train_batches=True` (now off). Bundle being
-            # tested: bf16 train + bf16 predict + predict_bs=8192.
-            # If metrics match historic, bf16 is innocent and we keep
-            # the ~20-40% wall-clock saving on Ampere/Hopper. If they
-            # regress, bisect within the bundle.
+            # DEFAULT: "32-true" (full rollback to pre-session
+            # baseline 2026-05-12). All efficiency knobs are off
+            # EXCEPT `deterministic=False / benchmark=True` (kept
+            # below). Opt back in per-run with `--precision bf16-mixed`
+            # once the conservative config confirms metrics back at
+            # historic.
+            "precision": "32-true",
+            # Determinism vs benchmark mode.
             #
-            # Lightning's "bf16-mixed" wraps each train/val/test step
-            # in `torch.autocast(device_type='cuda', dtype=bfloat16)`
-            # while keeping model params + optimizer state in fp32.
-            # No GradScaler needed (bf16 has fp32 exponent range).
-            # VQ codebook params stay fp32; the cosine-distance matmul
-            # runs in bf16 with fp32 accumulator — argmin should be
-            # stable.
+            # `deterministic: True` (DEFAULT, REVERTED 2026-05-12).
+            # Was briefly False (with `benchmark=True`) for a 5-10%
+            # wall-clock saving via cuDNN autotune; reverted after
+            # the autotune-driven kernel variation turned out to
+            # destabilise adversarial training on multiple variants
+            # (CE jumped + early stopping fired). Adversarial min-max
+            # is genuinely sensitive to per-step numerical
+            # differences — cuDNN benchmark mode picks different
+            # kernels per shape across runs, and the accumulated
+            # noise breaks the encoder/discriminator co-evolution.
             #
-            # Override per-run with `--precision 32-true` on the
-            # run_squint.py CLI (multi-seed runner doesn't forward
-            # the flag yet — flip the value here for a global
-            # multi-seed fp32 test).
-            "precision": "bf16-mixed",
+            # Implies `benchmark=False` in the Trainer (Lightning
+            # forces this when deterministic=True). Override per-run
+            # via the `--deterministic`/`--no-deterministic` flags
+            # if you want to A/B test benchmark mode on a non-
+            # adversarial variant.
+            "deterministic": True,
+            # Lightning Trainer strategy.
+            #
+            # DEFAULT: "ddp_find_unused_parameters_true" (historic value,
+            # REVERTED 2026-05-12). Was briefly "auto" — empirically
+            # that turned out to destabilise adversarial training
+            # across multiple variants (CE jumped + early stopping
+            # fired). My earlier claim that "strategy=auto only
+            # changes the Lightning wrapper class, not the math"
+            # turned out to be wrong for SQUINT's adversarial dynamics
+            # — Lightning's `find_unused_parameters_true` path
+            # interacts with the GRL branch's gradient handling in a
+            # way that single-device strategy doesn't, and the
+            # difference is enough to flip the adversarial min-max
+            # game on this workload. Sticking with the historic
+            # default. Override per-run via `--strategy <STR>` for
+            # experimentation only.
+            "strategy": "ddp_find_unused_parameters_true",
+            # torch.compile the model after init.
+            #
+            # DEFAULT: False (REVERTED 2026-05-12 after empirical test).
+            #
+            # The compile path is fully implemented and crash-free
+            # (the VQ `gumbel_sample` incompatibility is handled by
+            # `_install_compile_safe_one_hot()` — see definition near
+            # `train()`). HOWEVER, on a multi-seed test run, compile
+            # made wall-clock SLOWER, not faster. Most likely cause:
+            # the compile / autotune cost per first-time shape isn't
+            # amortised across enough iterations because:
+            #   - The dataset has only ~340 batches/epoch at bs=256;
+            #     `dynamic=True` still recompiles a few times for
+            #     extreme-end shapes during the first epoch.
+            #   - SQUINT's per-step compute is so small that even a
+            #     few extra ms of dynamo overhead per step wipes out
+            #     the kernel-fusion savings.
+            # Opt back in via `--compile` once we have a way to keep
+            # compile cheap (e.g. AOT compile + cached recompiles
+            # across seeds), or for runs with a much higher per-step
+            # cost (bigger batch, deeper model).
+            "compile_model": False,
             # Run validation every 2 train epochs (Lightning default
             # would be every epoch). Each val pass is a sub-pass over
             # `val_dataloader` (cell-level 10% holdout from the train
@@ -1818,6 +1972,36 @@ def _patch_dual_attr_recon_nbr_weight(cfg: dict, weight: float) -> dict:
     return cfg
 
 
+def _patch_dual_max_epochs(cfg: dict, max_epochs: int = 200) -> dict:
+    """
+    Override the training-budget cap (`trainer.max_epochs`).
+
+    The base config uses `max_epochs=80` (see the long history comment
+    inside `make_train_config_dualvq` near the `max_epochs` field for
+    why — short version: the 2026-05-11 jump to 200 + patience=20 +
+    val_loss monitor regressed niche NMI by ~0.03-0.05 across the
+    board because the val_loss optimum drifted past the niche-NMI
+    optimum).
+
+    Use cases for bumping this:
+      - Variants whose codebook hasn't visibly converged at epoch 80
+        (rare but real for high-cardinality 3-level RVQ / large CVQ
+        trees).
+      - "Long-train better-Pareto?" probes — pair with
+        `SQUINT_WITH_PEARSON=1` so the niche-quality-aware
+        `val_pearson_gene_wise_1hop_nbr_log1p` monitor is available
+        and verify post-hoc niche NMI before drawing conclusions.
+
+    Note: this only RAISES the cap; the run can still early-stop earlier
+    (patience=10 val passes ≈ 20 train epochs at the default
+    check_val_every_n_epoch=2). To disable early stopping entirely,
+    additionally set
+    `cfg["trainer"]["early_stopping_params"]["enabled"] = False`.
+    """
+    cfg["trainer"]["max_epochs"] = int(max_epochs)
+    return cfg
+
+
 def _patch_dual_wide(
         cfg: dict,
         cell_codebook_size:  int = 50,
@@ -1988,6 +2172,53 @@ def _patch_dual_gnn2(
     return cfg
 
 
+def _patch_dual_decoder_width(
+        cfg: dict,
+        hidden_channels,
+        branch: str = "both",
+    ) -> dict:
+    """
+    Override the attribute-decoder MLP `hidden_channels` for the cell
+    and/or niche branches independently.
+
+    Defaults in the dual base: both decoders use `[400, 400]` (2
+    hidden layers, gelu, layer_norm). Shrinking the decoder
+    constrains the reconstruction pathway: less capacity for the
+    decoder to absorb per-cell / per-batch gene patterns → more
+    pressure on the latent / codebook to encode the reconstruction
+    signal directly. Hypothesis: tighter decoder forces the encoder
+    to produce more discriminative latents → potentially better
+    NMI/iLISI at the cost of NB Pearson on hard genes.
+
+    Parameters
+    ----------
+    hidden_channels
+        Decoder hidden widths as a list of ints. Examples:
+          - `[256, 256]` : 2 hidden layers, narrower than default
+          - `[128, 128]` : 2 hidden layers, much narrower
+          - `[64, 64]`   : 2 hidden layers, extreme bottleneck
+          - `[400]`      : 1 hidden layer, baseline width (depth-only
+                           reduction)
+          - `[128]`      : 1 hidden layer, narrow
+          - `[64]`       : 1 hidden layer, extreme bottleneck
+        Last entry feeds the NB rate head (softmax × read_depth);
+        the head itself is appended internally and isn't included
+        in this list.
+    branch
+        "both" (default) | "cell" | "niche". Apply to cell decoder,
+        niche decoder, or both independently. Asymmetric variants
+        (e.g. tight niche decoder + baseline cell decoder) test
+        whether the decoder pressure helps one branch more than
+        the other.
+    """
+    target = list(hidden_channels)
+    if branch in ("cell", "both"):
+        cfg["model"]["attribute_decoder_cell_params"]["mlp_params"]["hidden_channels"] = target
+    if branch in ("niche", "both"):
+        cfg["model"]["attribute_decoder_niche_params"]["mlp_params"]["hidden_channels"] = target
+    return cfg
+
+
 def _patch_dual_small_latent(cfg: dict, latent_dim: int = 128) -> dict:
     """
     Shrink the latent / codebook-embedding dimension. Both `cell_dim`
@@ -2107,6 +2338,34 @@ def _patch_dual_sampler_neighbors(
     """
     target = list(num_neighbors) if num_neighbors else [16]
     cfg["datamodule"]["sampler_params"]["num_neighbors"] = target
+    return cfg
+
+
+def _patch_dual_graph_knn(cfg: dict, n_neighs: int = 8) -> dict:
+    """
+    Select which pre-built spatial k-NN graph to use at training time.
+
+    Sets `cfg["dataset"]["graph_params"]["n_neighs"]` — the loader
+    then picks the corresponding `edge_index_*` from the dataset
+    blob. This is a SELECTION at runtime, not a graph build: the
+    target k MUST exist in the blob's `n_neighs_list` (set in
+    `make_dataset_blob_config()`).
+
+    To use k values not in the existing blob:
+      1. Add the desired k(s) to `make_dataset_blob_config()`'s
+         `graph_kwargs.n_neighs_list` (e.g. `[6, 8, 12]`).
+      2. Rebuild the blob:  `python examples/run_squint.py --build-blob`
+      3. Use this patch to select the new k at training time.
+
+    Parameters
+    ----------
+    n_neighs : int
+        Target spatial k-NN k value. Must be present in the blob's
+        n_neighs_list. Smaller k → sparser graph → less spatial
+        signal per cell + faster sampling. Larger k → richer
+        spatial context but heavier per-step memory.
+    """
+    cfg["dataset"]["graph_params"]["n_neighs"] = int(n_neighs)
     return cfg
 
 
@@ -2307,6 +2566,75 @@ def _patch_dual_mmd_batch(
     # from `z_mlp[:batch_size]` and `adata_batch_ids[:batch_size]`
     # unconditionally; the dispatcher only consumes them when
     # `mmd_batch_loss` is in `loss_names`.
+    return cfg
+
+
+def _patch_dual_mmd_prior(
+        cfg: dict,
+        wt_mmd_prior: float = 50.0,
+        n_sub: int = 512,
+        prior_std: float = 1.0,
+    ) -> dict:
+    """
+    Add a non-adversarial, NON-PARAMETRIC MMD-to-prior loss.
+
+    Pulls the empirical distribution of `z_mlp[:batch_size]` (the
+    cell-token input pre-VQ) toward samples from the isotropic
+    Gaussian prior `N(0, prior_std² * I)`. This is the parameterless
+    analogue of NicheCompass's `KL(q(z|x) || N(0, I))` divergence —
+    achieves the same prior-matching pressure without needing to
+    make the encoder probabilistic (output mu, sigma) and without
+    requiring KL annealing.
+
+    Mechanism:
+      - The prior is batch-agnostic by construction.
+      - Pulling the embedding toward the prior forces per-batch z
+        distributions to converge to the same prior → integrated.
+      - Combined with `+decoder-cov` (which absorbs per-batch
+        differences on the decoder side), this mirrors NicheCompass's
+        integration without the adversarial min-max game OR the
+        parametric VAE complexity.
+
+    Compared to siblings:
+      - `_patch_dual_adversarial`: min-max GRL game. Unstable
+        dynamics, but strong gradient when working.
+      - `_patch_dual_mmd_batch`: matches per-batch distributions to
+        EACH OTHER (pairwise). Requires batch labels.
+      - `_patch_dual_mmd_prior` (this): matches the empirical
+        distribution to a FIXED prior. No batch labels. Single MMD
+        per call.
+
+    All three can coexist — they consume overlapping data but
+    compute different distances.
+
+    Use cases:
+      1. Replace `+adv` entirely → pure prior-matching integration.
+      2. Combine with `+adv` → stacked: GRL game + prior pull.
+      3. Combine with `+mmd-w*` (batch MMD) → "match to each other
+         AND to a prior".
+
+    Parameters
+    ----------
+    wt_mmd_prior
+        Loss weight on the MMD^2 vs prior. Default 50 (similar
+        magnitude to `_patch_dual_mmd_batch`'s default).
+    n_sub
+        Sub-sample size for the pairwise kernel. Default 512.
+    prior_std
+        Std of the isotropic Gaussian prior. Default 1.0 (= N(0, I)).
+        Bump up if the encoder's natural scale is large and the
+        prior pull fights reconstruction too hard.
+    """
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    if "mmd_prior_loss" not in losses:
+        losses.append("mmd_prior_loss")
+    cfg["model"]["loss_params"]["loss_kwargs"]["wt_mmd_prior"] = float(wt_mmd_prior)
+    cfg["model"]["loss_params"]["loss_kwargs"]["mmd_n_sub"] = int(n_sub)
+    cfg["model"]["loss_params"]["loss_kwargs"]["mmd_prior_std"] = float(prior_std)
+    # The model's `_step` populates `mmd_target` from
+    # `z_mlp[:batch_size]` unconditionally; this loss consumes the
+    # same tensor as `mmd_batch_loss` but ignores `mmd_target_labels`
+    # (no batch labels needed for prior-matching).
     return cfg
 
 
@@ -2758,6 +3086,101 @@ def _patch_dual_mmb20(
     return cfg
 
 
+def _patch_dual_spatch(
+        cfg: dict,
+        train_batch_idx: Optional[List[int]] = None,
+        test_batch_idx=None,
+        batch_size: int = 16,
+        edge_sampling_ratio: float = 1.0,
+    ) -> dict:
+    """
+    Swap the dataset to /nfs/team361/sb75/DATASETS/silver/spatch_1p
+    (N AnnDatas named `dataset_id_<N>.h5ad`) for the spatch_1p smoke
+    test. Configures whole-section holdout via `SpatialBatchSplit`.
+
+    Defaults match the user-described smoke-test setup:
+      train: `dataset_id_2.h5ad`  (adata_batch_id = 2)
+      test : every OTHER section in the spatch_1p silver dir (sentinel
+             value `"rest"` resolved at runtime in `train()` once
+             the blob is loaded — see the train_batches resolution
+             block).
+
+    Parameters
+    ----------
+    train_batch_idx
+        `adata_batch_id` values used for gradient updates. Default
+        `[2]` — picks `dataset_id_2.h5ad` as the sole training
+        section.
+    test_batch_idx
+        Either an explicit list of ids OR the sentinel string
+        `"rest"` (default). `"rest"` is resolved at runtime to
+        "every blob section not in train/val" (mirrors the
+        existing train-side auto-default).
+    batch_size, edge_sampling_ratio
+        Memory tuning. The smoke test uses a small batch_size
+        (16) and conservative edge sampling so the run fits on
+        a small GPU and finishes quickly. Bump for full training.
+
+    Labels (set in `make_dataset_blob_config_spatch`):
+      cell-type label  -> obs['annotation']
+      niche / spatial  -> obs['spatial_cluster']
+    """
+    if train_batch_idx is None:
+        train_batch_idx = [2]
+    train_batch_idx = list(train_batch_idx)
+
+    # Accept either an explicit list OR the sentinel string "rest".
+    # The sentinel survives yaml round-trips and is resolved at
+    # runtime inside `train()` (see the train_batches resolution
+    # block) into "all blob ids not in train+val".
+    if test_batch_idx is None:
+        test_batch_idx = "rest"
+    if isinstance(test_batch_idx, str):
+        if test_batch_idx != "rest":
+            raise ValueError(
+                f"test_batch_idx string must be 'rest'; got "
+                f"{test_batch_idx!r}. Use a list for explicit ids."
+            )
+    else:
+        test_batch_idx = list(test_batch_idx)
+
+    cfg["dataset"]["dataset_name"]   = "spatch_1p"
+    cfg["dataset"]["dataset_tag"]    = "spatch_1p"
+    cfg["dataset"]["root_data_dir"]  = "/nfs/team361/sb75/DATASETS"
+    # `adata_batch_idx` (positions) is resolved at runtime in
+    # `train()` from `train_batches` (ids) via the blob's
+    # id-to-position mapping.
+    cfg["dataset"]["adata_batch_idx"] = []
+
+    cfg["dataset"]["train_transform_params"] = {
+        "region":         None,
+        "train_batches":  list(train_batch_idx),
+        "val_batches":    [],   # no whole-section val; cell-level split provides val
+        "test_batches":   test_batch_idx,   # explicit list OR "rest" sentinel
+        "xy_key":         "xy_coordinates",
+        "train_val_cell_split":
+            cfg["dataset"]["train_transform_params"].get("train_val_cell_split", 0.10),
+        "cell_split_seed":
+            cfg["dataset"]["train_transform_params"].get("cell_split_seed", 0),
+    }
+
+    # spatch_1p AnnDatas are expected to carry obs['batch']; falls back to
+    # cell_id parse if absent (same defensive path as chl59).
+    cfg["dataset"]["graph_params"]["batch_key"] = "batch"
+
+    # Memory tuning. Defaults are conservative for a smoke test.
+    cfg["datamodule"]["loader_params"]["batch_size"] = int(batch_size)
+    cfg["model"]["loss_params"]["loss_kwargs"]["edge_sampling_ratio"] = float(
+        edge_sampling_ratio
+    )
+
+    # Validation runs on the cell-level 10% split inside the single
+    # training section; the held-out test sections are evaluated by
+    # `predict()` post-hoc.
+    cfg["trainer"]["monitor"] = "val_loss"
+    return cfg
+
+
 def _patch_dual_mmb20_holdout(cfg: dict) -> dict:
     """
     Convenience holdout for the mmb20 cross-platform retrieval experiment.
@@ -2951,6 +3374,46 @@ VARIANTS: dict = {
                 alpha=1.0, wt_adv_batch=150.0,
             ),
             test_batch_idx=[2, 3],
+            batch_size=16,
+        ),
+    },
+    "smoke-test+spatch_1p": {
+        "description": (
+            "1-epoch end-to-end pipeline test on the spatch_1p dataset "
+            "(/nfs/team361/sb75/DATASETS/silver/spatch_1p). Train = "
+            "dataset_id_2.h5ad (adata_batch_id = 2); test = ALL other "
+            "sections (resolved at runtime via the `test_batches='rest'` "
+            "sentinel — predict() then runs inference on every "
+            "non-training section). Cell-type label = obs['annotation'], "
+            "niche label = obs['spatial_cluster']. Dual-VQ + decoder "
+            "covariate + adversarial GRL — same batch-correction recipe "
+            "as the other smoke tests. Capped at 1 epoch, early stopping "
+            "disabled, narrow GNN (num_layers=1, sampler=[8], "
+            "nbr_hops=1), batch_size=16.\n\n"
+            "PREREQUISITE: build the spatch_1p blob ONCE before running "
+            "this variant:\n"
+            "    python examples/run_squint.py --build-blob "
+            "--build-blob-dataset spatch_1p\n"
+            "(each spatch_1p silver `dataset_id_<N>.h5ad` must carry "
+            "`adata.uns['batch']` — int / 'batchN' string — so the "
+            "blob loader can derive section ids. Use "
+            "`examples/stamp_spatch_uns_batch.py` to stamp the files.)"
+        ),
+        "patches": [
+            "+quick(max_epochs=1, batch_size=16, narrow GNN)",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+spatch_1p(train_ids=[2], test='rest')",
+        ],
+        "build": lambda: _patch_dual_spatch(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_quick(_BD(), max_epochs=1, batch_size=16)
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            train_batch_idx=[2],
+            test_batch_idx="rest",
             batch_size=16,
         ),
     },
@@ -3306,6 +3769,1870 @@ VARIANTS: dict = {
             ),
         ),
     },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Sibling of `+enc-deeper` with the cell + niche decoders "
+            "shrunk from [400, 400] (2 hidden of 400) → [256] (1 hidden "
+            "of 256). Tests whether decoder pressure on the latent "
+            "improves NMI / iLISI on the known-good +enc-deeper spine "
+            "without sacrificing NB reconstruction. All other knobs "
+            "(1-layer SAGE GNN, RVQ (30, 90), decoder-cov embed=16, "
+            "adv α=1 wt=150) match the parent variant — only the "
+            "decoder geometry changes."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[256]  (both cell and niche, 1 hidden layer)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[256],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w128+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Tighter-decoder sibling of `+enc-deeper+dec-w256`: cell "
+            "+ niche decoders shrunk from [256] (1 hidden of 256) → "
+            "[128] (1 hidden of 128). Encoder stays at [400, 400, "
+            "256] (`+enc-deeper`), latent dim stays 256, GNN stays "
+            "1-layer SAGE h=256. Tests whether further decoder "
+            "shrinking (half the hidden width) puts useful extra "
+            "pressure on the 256-dim latent + codebook without "
+            "compromising NB reconstruction."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[128]  (both cell and niche, 1 hidden of 128)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[128],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w64+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Even-tighter decoder sibling of `+enc-deeper+dec-w256`: "
+            "cell + niche decoders shrunk from [256] → [64] (1 hidden "
+            "of 64, 4× narrower). Encoder stays at [400, 400, 256] "
+            "(`+enc-deeper`), latent dim stays 256, GNN stays "
+            "1-layer SAGE h=256. Extreme decoder bottleneck — tests "
+            "the limit of decoder-pressure-on-latent. NB Pearson "
+            "likely takes a hit; the question is whether the codebook "
+            "compensates enough to keep NMI strong."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[64]  (both cell and niche, 1 hidden of 64)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[64],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Most-extreme decoder shrink in the +enc-deeper family: "
+            "cell + niche decoders [32] (1 hidden of 32, 12.5× "
+            "narrower than the default [400, 400], 2× narrower than "
+            "the +dec-w64 sibling). Encoder stays at [400, 400, 256] "
+            "(+enc-deeper), latent stays 256, GNN stays 1-layer "
+            "SAGE h=256, adversarial keeps α=1 wt=150. Pushes the "
+            "decoder-pressure-on-latent hypothesis past the +dec-w64 "
+            "limit. Expected NB Pearson floor — useful for finding "
+            "where reconstruction quality drops off a cliff."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]  (both cell and niche, 1 hidden of 32)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+sampler4+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Sibling of `+enc-deeper+dec-w32` with the NeighborSampler "
+            "fanout cut from default [8] → [4] (1-hop, 4 neighbours "
+            "per cell instead of 8). 1-hop is preserved (matches the "
+            "1-layer SAGE GNN); only the per-hop fanout halves. "
+            "Sampled neighbourhood per cell drops from 1 + 8 = 9 "
+            "nodes to 1 + 4 = 5 nodes (~44% reduction).\n\n"
+            "Tests two things:\n"
+            "  - Throughput: thinner neighbourhood → smaller batches "
+            "→ faster per-step.\n"
+            "  - Niche-GNN robustness: does the niche embedding "
+            "tolerate a thinner 1-hop neighbourhood, or do we lose "
+            "spatial signal?\n\n"
+            "The historic +wide+sampler4 variant (s20_v4) collapsed "
+            "nbr_NMI to 0.11 — but that was the +wide spine where "
+            "the GNN had 2 layers and sampler [4] left the second "
+            "hop with empty neighbourhoods. THIS variant uses 1-layer "
+            "GNN, so sampler [4] is fully consistent (no empty hops). "
+            "Should be safe."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+sampler([4])  (1-hop, 4 nbrs)",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                ),
+                hidden_channels=[32],
+            ),
+            num_neighbors=[4],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+sampler12+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Sibling of `+enc-deeper+dec-w32` with the "
+            "NeighborSampler fanout bumped from default [8] → [12] "
+            "(1-hop, 12 nbrs requested per cell). 1-hop preserved "
+            "(matches the 1-layer SAGE GNN); only the per-hop "
+            "fanout changes.\n\n"
+            "Note: this is the SAMPLER fanout (training-time "
+            "neighbor selection), NOT the spatial graph k. The "
+            "underlying k-NN graph is still k=8 (the historic "
+            "default), so PyG's NeighborSampler will sample up to 8 "
+            "available neighbors per cell — the [12] request "
+            "effectively caps at the graph's actual k. For a true "
+            "12-neighbor receptive field, pair with `+knn12` (which "
+            "selects the k=12 graph from the rebuilt blob)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+sampler([12])  (1-hop, 12 nbrs requested — capped at "
+            "graph's actual k=8 unless paired with +knn12)",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                ),
+                hidden_channels=[32],
+            ),
+            num_neighbors=[12],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+knn12+sampler12+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Sibling of `+enc-deeper+dec-w32` with the SPATIAL "
+            "k-NN graph k bumped from 8 → 12 AND the sampler fanout "
+            "bumped to match: `[12]`. Each cell has 12 spatial "
+            "neighbours in the graph and the GNN samples ALL of "
+            "them per cell at training time — clean 'thicker "
+            "spatial neighborhood' ablation vs the parent's k=8 + "
+            "[8]-sampler.\n\n"
+            "Hypothesis: a denser spatial graph captures larger-"
+            "scale spatial structure → richer niche context → "
+            "potentially better nbr_NMI. Cost: ~50% more edges + "
+            "larger sampled neighbourhood per step → bigger memory "
+            "footprint. Combined with the tight dec-w32 decoder, "
+            "the codebook should learn richer spatial relationships.\n\n"
+            "REQUIRES BLOB REBUILD: `n_neighs_list = [6, 8, 12]` is "
+            "now configured in `make_dataset_blob_config()`, but the "
+            "existing blob on disk only has k=8. Rebuild with:\n"
+            "    python examples/run_squint.py --build-blob\n"
+            "(one-off, takes ~10-20 min depending on dataset size). "
+            "After rebuild, the blob will contain k=6, 8, and 12 "
+            "graphs."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=12)  (REQUIRES blob rebuild)",
+            "+sampler([12])           (matches graph k)",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            alpha=1.0, wt_adv_batch=150.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=12,
+            ),
+            num_neighbors=[12],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w64+knn12+sampler12+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Looser-decoder sibling of `+enc-deeper+dec-w32+knn12+"
+            "sampler12`: same denser-spatial-neighborhood setup "
+            "(k=12 graph + matching `[12]` sampler) but with the "
+            "decoder relaxed from [32] → [64]. Tests whether the "
+            "weak integration of the dec-w32 sibling was caused by "
+            "the extreme decoder bottleneck over-constraining the "
+            "latent — at dec-w64 the decoder has 2× more capacity, "
+            "so the encoder may have more room to learn batch-"
+            "invariant features.\n\n"
+            "All other knobs match the parent `+enc-deeper+dec-w32+"
+            "knn12+sampler12`: encoder [400, 400, 256], 1-layer SAGE "
+            "GNN h=256 (using k=12 graph), RVQ (30, 90), decoder-cov "
+            "embed=16, adv α=1 wt=150. Niche-GNN sees ALL 12 graph "
+            "neighbors per cell.\n\n"
+            "REQUIRES BLOB REBUILD (same as +knn12+sampler12 "
+            "sibling) — `python examples/run_squint.py --build-blob` "
+            "to populate the k=12 graph in the blob."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[64]",
+            "+graph_knn(n_neighs=12)  (REQUIRES blob rebuild)",
+            "+sampler([12])           (matches graph k)",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            alpha=1.0, wt_adv_batch=150.0,
+                        ),
+                    ),
+                    hidden_channels=[64],
+                ),
+                n_neighs=12,
+            ),
+            num_neighbors=[12],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+knn12+sampler8+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Asymmetric variant: SPATIAL k-NN graph k=12 (each cell "
+            "has 12 spatial neighbours in the graph) BUT sampler "
+            "fanout `[8]` (the GNN only samples 8 of the 12 per cell "
+            "per step). Unlike `+knn12+sampler12` (which uses ALL 12 "
+            "neighbours deterministically per step), this version "
+            "introduces stochastic neighbour subsampling: each epoch "
+            "the GNN sees a different random 8-of-12 per cell. Acts "
+            "as a per-epoch data-augmentation on the niche side.\n\n"
+            "Hypothesis: the denser k=12 graph carries richer "
+            "spatial signal than k=8, but the stochastic 8-of-12 "
+            "sampling preserves the original SQUINT training "
+            "dynamic (8-neighbour fanout) rather than forcing the "
+            "GNN to aggregate the full neighborhood every step. "
+            "The augmentation may help niche-side generalisation "
+            "and integration.\n\n"
+            "Compared to siblings:\n"
+            "  - `+knn8+sampler8` (parent, no patches): static, all "
+            "    8 of 8 neighbours per step.\n"
+            "  - `+knn12+sampler12`: static, all 12 of 12 per step "
+            "    (denser deterministic).\n"
+            "  - `+knn12+sampler8` (THIS): denser graph + stochastic "
+            "    8-of-12 sampling.\n\n"
+            "REQUIRES BLOB REBUILD (same as other +knn12 siblings) — "
+            "`python examples/run_squint.py --build-blob` to "
+            "populate the k=12 graph in the blob."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=12)  (REQUIRES blob rebuild)",
+            "+sampler([8])            (stochastic 8-of-12 per epoch)",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            alpha=1.0, wt_adv_batch=150.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=12,
+            ),
+            num_neighbors=[8],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+knn16+sampler16+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Densest paired-neighbourhood variant in the +enc-deeper"
+            "+dec-w32 family: SPATIAL k-NN graph k=16 + sampler "
+            "fanout `[16]` (each cell has 16 spatial neighbours in "
+            "the graph and the GNN samples ALL of them per step). "
+            "2× denser than the parent's k=8.\n\n"
+            "Tests whether even larger spatial context (vs k=12 "
+            "sibling) further lifts niche metrics — diminishing-"
+            "returns probe. Cost: 2× more edges than parent, ~33% "
+            "more than +knn12+sampler12 → bigger per-step memory.\n\n"
+            "REQUIRES BLOB REBUILD: `n_neighs_list = [6, 8, 12, 16]` "
+            "is now in `make_dataset_blob_config()` but the existing "
+            "blob on disk doesn't yet have the k=16 graph. Rebuild "
+            "with:\n"
+            "    python examples/run_squint.py --build-blob\n"
+            "After rebuild, k=6/8/12/16 are all available."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)  (REQUIRES blob rebuild)",
+            "+sampler([16])           (matches graph k)",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            alpha=1.0, wt_adv_batch=150.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=16,
+            ),
+            num_neighbors=[16],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+knn16+sampler8+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Asymmetric variant: SPATIAL k-NN graph k=16 (densest) "
+            "BUT sampler fanout `[8]` (the GNN samples only 8 of 16 "
+            "per cell per step). Each epoch the GNN sees a random "
+            "8-of-16 per cell — stochastic neighbour subsampling at "
+            "the highest available graph density.\n\n"
+            "Compared to the +knn12+sampler8 sibling: the underlying "
+            "graph has MORE choices (16 vs 12), so the random 8 "
+            "selected per epoch covers a wider spatial radius on "
+            "average. Tests whether maximising graph density + "
+            "keeping the historic sampler fanout `[8]` gives the "
+            "best of both: richer spatial signal + per-epoch "
+            "augmentation.\n\n"
+            "REQUIRES BLOB REBUILD (same as +knn16+sampler16 "
+            "sibling)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)  (REQUIRES blob rebuild)",
+            "+sampler([8])            (stochastic 8-of-16 per epoch)",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            alpha=1.0, wt_adv_batch=150.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=16,
+            ),
+            num_neighbors=[8],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-256-256-128+gnn-h128+dec-w32+knn16+sampler8+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Smaller-latent sibling of `+enc-deeper+dec-w32+knn16+"
+            "sampler8`: encoder MLP shrinks from [400, 400, 256] -> "
+            "[256, 256, 128] AND niche-branch GNN hidden shrinks "
+            "from 256 -> 128 (lock-step with encoder output, so cell "
+            "+ niche latents stay SYMMETRIC at 128). Tightens the "
+            "codebook embedding dim from 256 -> 128 while keeping "
+            "the deep-encoder trunk depth (3 hidden layers) and "
+            "the densest-spatial-graph asymmetric sampler "
+            "(k=16 graph + sampler [8] = stochastic 8-of-16 per "
+            "epoch).\n\n"
+            "Hypothesis: at the densest spatial graph, a tighter "
+            "latent forces the codebook to discard batch-specific "
+            "signal AND average over the richer 16-neighbourhood "
+            "more aggressively — potentially a Pareto winner if "
+            "the +enc-deeper sibling is over-parametrised relative "
+            "to the (30, 90) codebook capacity.\n\n"
+            "REQUIRES BLOB REBUILD (same as the parent +knn16+"
+            "sampler8 sibling) — the k=16 graph must be present "
+            "in the blob."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[256, 256, 128])",
+            "+gnn-h=128",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)  (REQUIRES blob rebuild)",
+            "+sampler([8])            (stochastic 8-of-16 per epoch)",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_gnn_hidden(
+                        _patch_dual_encoder_deeper(
+                            _patch_dual_adversarial(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                alpha=1.0, wt_adv_batch=150.0,
+                            ),
+                            hidden_channels=[256, 256, 128],
+                        ),
+                        hidden=128,
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=16,
+            ),
+            num_neighbors=[8],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-128-128-64+gnn-h128+dec-w32+knn16+sampler8+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "ASYMMETRIC encoder/GNN sibling of `+enc-deeper+dec-w32+"
+            "knn16+sampler8`: encoder MLP [128, 128, 64] (tight "
+            "cell-branch latent = 64) BUT GNN hidden = 128 (wider "
+            "niche-branch latent). z_mlp and z_gnn end up at "
+            "DIFFERENT dimensions — the cell-branch codebook lives "
+            "in a 64-dim space, the niche-branch codebook in a 128-"
+            "dim space.\n\n"
+            "Hypothesis: cell-type signal is lower-rank than spatial-"
+            "context signal, so the cell branch tolerates / benefits "
+            "from a tighter bottleneck while the niche branch "
+            "(consuming the k=16 spatial graph + stochastic 8-of-16 "
+            "sampler) gets a bit more representational room.\n\n"
+            "Compared to the +enc-256-256-128+gnn-h128 sibling: same "
+            "GNN width, but the encoder trunk is 2x narrower AND the "
+            "cell-branch latent halves to 64. Tests both axes "
+            "together — useful if either alone (s31's symmetric "
+            "shrinks) wasn't enough.\n\n"
+            "REQUIRES BLOB REBUILD (same as the parent +knn16+"
+            "sampler8 sibling)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[128, 128, 64])  (cell latent = 64)",
+            "+gnn-h=128                       (niche latent = 128; ASYMMETRIC)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)  (REQUIRES blob rebuild)",
+            "+sampler([8])            (stochastic 8-of-16 per epoch)",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_gnn_hidden(
+                        _patch_dual_encoder_deeper(
+                            _patch_dual_adversarial(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                alpha=1.0, wt_adv_batch=150.0,
+                            ),
+                            hidden_channels=[128, 128, 64],
+                        ),
+                        hidden=128,
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=16,
+            ),
+            num_neighbors=[8],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+knn16+sampler16+200ep+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Long-train sibling of `+enc-deeper+dec-w32+knn16+sampler16`: "
+            "every architectural knob identical (RVQ (30, 90), "
+            "decoder-cov, adv α=1 wt=150, encoder [400, 400, 256], "
+            "1-layer SAGE GNN h=256, decoders [32], k=16 graph + "
+            "sampler [16]) — only the training-budget cap changes "
+            "from `max_epochs=80` -> `max_epochs=200`.\n\n"
+            "Hypothesis: the densest-spatial-graph variant may need "
+            "more steps for the niche-branch codebook to settle on "
+            "the larger 16-NN neighbourhood. Early stopping is "
+            "still ENABLED (patience=10 val passes ≈ 20 train "
+            "epochs on val_loss), so the run can finish before "
+            "epoch 200 if val_loss plateaus.\n\n"
+            "CAVEAT (see `make_train_config_dualvq` max_epochs "
+            "comment): in the 2026-05-12 sweep, bumping max_epochs "
+            "80 -> 200 with the val_loss monitor regressed niche "
+            "NMI by ~0.03-0.05 across the board — the val_loss "
+            "optimum drifted past the niche-NMI optimum. If this "
+            "variant under-performs the 80-epoch sibling on niche "
+            "NMI, suspect the same dynamic. Pair with "
+            "`SQUINT_WITH_PEARSON=1` to also log "
+            "`val_pearson_gene_wise_1hop_nbr_log1p` and pick the "
+            "best-niche-Pearson ckpt for post-hoc analysis.\n\n"
+            "REQUIRES BLOB REBUILD (same as the 80-epoch sibling) — "
+            "the k=16 graph must be present in the blob."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)  (REQUIRES blob rebuild)",
+            "+sampler([16])           (matches graph k)",
+            "+max_epochs=200          (default 80; early stop still ON)",
+        ],
+        "build": lambda: _patch_dual_max_epochs(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_encoder_deeper(
+                            _patch_dual_adversarial(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                alpha=1.0, wt_adv_batch=150.0,
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[16],
+            ),
+            max_epochs=200,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+knn16+sampler8+200ep+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Long-train sibling of `+enc-deeper+dec-w32+knn16+sampler8`: "
+            "every architectural knob identical (RVQ (30, 90), "
+            "decoder-cov, adv α=1 wt=150, encoder [400, 400, 256], "
+            "1-layer SAGE GNN h=256, decoders [32], k=16 graph + "
+            "sampler [8] — stochastic 8-of-16 per epoch) — only the "
+            "training-budget cap changes from `max_epochs=80` -> "
+            "`max_epochs=200`.\n\n"
+            "Hypothesis: the asymmetric (k=16 graph, sampler [8]) "
+            "setup gives per-epoch stochastic augmentation; longer "
+            "training lets the niche codebook integrate over more "
+            "of those 16-neighbour subsets, potentially improving "
+            "spatial-context robustness. Early stopping is still "
+            "ENABLED (patience=10 val passes on val_loss).\n\n"
+            "CAVEAT (see `make_train_config_dualvq` max_epochs "
+            "comment): the 2026-05-12 max_epochs=200 sweep "
+            "regressed niche NMI vs the 80-epoch siblings — pair "
+            "with `SQUINT_WITH_PEARSON=1` to also log the "
+            "niche-Pearson val-monitor and check whether the "
+            "best-val_loss ckpt is the best-niche-Pearson ckpt.\n\n"
+            "REQUIRES BLOB REBUILD (same as the 80-epoch sibling)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)  (REQUIRES blob rebuild)",
+            "+sampler([8])            (stochastic 8-of-16 per epoch)",
+            "+max_epochs=200          (default 80; early stop still ON)",
+        ],
+        "build": lambda: _patch_dual_max_epochs(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_encoder_deeper(
+                            _patch_dual_adversarial(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                alpha=1.0, wt_adv_batch=150.0,
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[8],
+            ),
+            max_epochs=200,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+knn6+sampler6+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Sibling of `+enc-deeper+dec-w32` with the SPATIAL "
+            "k-NN graph k REDUCED from 8 → 6 AND the sampler fanout "
+            "set to match: `[6]`. Each cell has 6 spatial neighbours "
+            "in the graph and the GNN samples ALL of them per cell. "
+            "Clean 'thinner spatial neighborhood' ablation vs the "
+            "parent's k=8 + [8]-sampler.\n\n"
+            "Tests whether the niche embedding can still extract "
+            "good spatial structure from a thinner k=6 graph.\n\n"
+            "REQUIRES BLOB REBUILD (same as +knn12+sampler12 "
+            "sibling) — the current blob only has k=8. After "
+            "rebuild, k=6 / k=8 / k=12 are all available."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=6)   (REQUIRES blob rebuild)",
+            "+sampler([6])            (matches graph k)",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            alpha=1.0, wt_adv_batch=150.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=6,
+            ),
+            num_neighbors=[6],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w16+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Most-extreme decoder shrink yet on the +enc-deeper family: "
+            "cell + niche decoders [16] (1 hidden of 16, 25× narrower "
+            "than the default [400, 400], 2× narrower than the "
+            "+dec-w32 sibling). Encoder stays at [400, 400, 256] "
+            "(+enc-deeper), latent stays 256, GNN stays 1-layer SAGE "
+            "h=256, adv α=1 wt=150.\n\n"
+            "Decoder shape: 256 (z_q_cell) + 16 (covariate) = 272 → "
+            "16 → 431. The first layer compresses ~17×, the second "
+            "expands ~27× to gene space. Tests the absolute floor of "
+            "decoder bottleneck on this spine — if this still works, "
+            "the codebook (RVQ 30×90 = 2,700 entries) really IS the "
+            "representation, and the decoder is little more than a "
+            "code→rates lookup table."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[16]  (both cell and niche, 1 hidden of 16)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[16],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-400-400-128+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Lower-latent sibling of `+enc-deeper+dec-w32`: encoder "
+            "kept wide ([400, 400, 128]) but latent dim halved from "
+            "256 → 128. GNN hidden matches at 128 (symmetric "
+            "latents). Decoder stays at [32]. Tests whether the "
+            "codebook embedding dim alone affects clustering / "
+            "integration, with encoder hidden widths unchanged.\n\n"
+            "Codebook embedding dim: 128 (was 256). The codebook "
+            "still has 30 × 90 = 2,700 composite codes, just at "
+            "half the embedding dim — same discrete capacity, "
+            "tighter geometry."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 128])",
+            "+gnn-hidden(128)",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_gnn_hidden(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[400, 400, 128],
+                ),
+                hidden=128,
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-200-200-128+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Moderate joint reduction: encoder hidden widths halved "
+            "to [200, 200, 128] AND latent dim halved to 128. GNN "
+            "hidden=128 (symmetric latents). Decoder [32]. Tests "
+            "the combined effect of narrower encoder + smaller "
+            "codebook embedding dim. Parameter-efficient sibling of "
+            "`+enc-deeper+dec-w32` — encoder hidden widths shrink "
+            "from 400 → 200 (~2× narrower) plus latent from 256 → "
+            "128 (~2× smaller codebook geometry)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[200, 200, 128])",
+            "+gnn-hidden(128)",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_gnn_hidden(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[200, 200, 128],
+                ),
+                hidden=128,
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-200-200-64+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Aggressive joint reduction: encoder hidden widths "
+            "halved to [200, 200, 64] AND latent dim quartered to "
+            "64. GNN hidden=64 (symmetric latents). Decoder [32]. "
+            "Most compact spine variant — encoder ~2× narrower, "
+            "codebook embedding dim ~4× smaller than the dec-w32 "
+            "parent. Tests how far the codebook geometry can shrink "
+            "before clustering quality breaks."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[200, 200, 64])",
+            "+gnn-hidden(64)",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_gnn_hidden(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[200, 200, 64],
+                ),
+                hidden=64,
+            ),
+            hidden_channels=[32],
+        ),
+    },
+
+    # ---- Asymmetric variants: low encoder dim + WIDER 2-LAYER GNN -----
+    # Hypothesis: the parent `+enc-200-200-64+dec-w32` lifted cell-side
+    # metrics + integration via the tight cell-VQ codebook (64-dim),
+    # but the niche codebook suffered because z_gnn is also 64-dim
+    # (limited spatial expressivity at 1-hop). Keep the small encoder
+    # latent (cell-side benefit) but give the niche-side GNN MORE
+    # capacity: bigger hidden width AND 2 layers (+wide).
+    #
+    # With these patches the two branches are ASYMMETRIC:
+    #   - z_mlp (cell-branch input to VQ_cell) = encoder output dim
+    #     (64 or 128, varies per variant)
+    #   - z_gnn (niche-branch input to VQ_niche) = GNN hidden_channels
+    #     (256 default or 384, varies per variant)
+    # The GNN's first SAGEConv layer accepts the small z_mlp and
+    # projects to its hidden_channels; the second SAGEConv aggregates
+    # over the sampled 2-hop neighbourhood at the bigger width.
+
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-200-200-64+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Same encoder + decoder as `+enc-200-200-64+dec-w32` but "
+            "with +wide added: 2-layer SAGE GNN h=256, sampler "
+            "[8, 8], 2-hop nbr aggregation. Asymmetric latents — "
+            "z_mlp=64 (cell branch, small), z_gnn=256 (niche branch, "
+            "big). Tests whether the niche-side richer GNN context "
+            "recovers the niche-codebook quality lost in the parent "
+            "while preserving the cell-side integration gain."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[200, 200, 64])  (z_mlp = 64)",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(
+                                _patch_dual_wide(_BD()),
+                                branch="niche", codebook_sizes=(30, 90),
+                            ),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+                hidden_channels=[200, 200, 64],
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-200-200-64+gnn-h384+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Same as the +wide variant above but with the GNN hidden "
+            "width bumped from 256 → 384. Encoder stays at [200, "
+            "200, 64], so z_mlp=64 (tight cell branch) and z_gnn=384 "
+            "(wider niche branch). Most asymmetric variant in this "
+            "family — niche-side codebook geometry becomes 384-dim "
+            "while cell-side stays at 64-dim. Tests whether more "
+            "niche-side capacity translates to better niche metrics "
+            "without breaking the cell-side wins."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[200, 200, 64])  (z_mlp = 64)",
+            "+gnn-hidden(384)  (z_gnn = 384)",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_gnn_hidden(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(
+                                    _patch_dual_wide(_BD()),
+                                    branch="niche", codebook_sizes=(30, 90),
+                                ),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[200, 200, 64],
+                ),
+                hidden=384,
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-200-200-128+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Encoder one-step-up from [200, 200, 64] → [200, 200, "
+            "128] (z_mlp = 128). +wide spine: 2-layer SAGE GNN "
+            "h=256, sampler [8, 8], 2-hop nbr aggregation. "
+            "Asymmetric latents — z_mlp=128, z_gnn=256. Modest "
+            "step-up in cell-branch latent capacity vs the 64-dim "
+            "variant, keeps niche side at the wide default."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[200, 200, 128])  (z_mlp = 128)",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(
+                                _patch_dual_wide(_BD()),
+                                branch="niche", codebook_sizes=(30, 90),
+                            ),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+                hidden_channels=[200, 200, 128],
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-200-200-128+gnn-h384+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Same as the +enc-200-200-128 +wide variant above but "
+            "with GNN hidden bumped to 384. z_mlp=128 (cell branch), "
+            "z_gnn=384 (niche branch). Combines moderate cell-side "
+            "expansion with maximum niche-side capacity in this "
+            "family."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[200, 200, 128])  (z_mlp = 128)",
+            "+gnn-hidden(384)  (z_gnn = 384)",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_gnn_hidden(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(
+                                    _patch_dual_wide(_BD()),
+                                    branch="niche", codebook_sizes=(30, 90),
+                                ),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[200, 200, 128],
+                ),
+                hidden=384,
+            ),
+            hidden_channels=[32],
+        ),
+    },
+
+    "dualvq+rvq-both+decoder-cov+mmd-prior-w50+enc-deeper+dec-w64+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Same architecture as `+enc-deeper+dec-w64` (encoder MLP "
+            "[400, 400, 256], 1L SAGE GNN h=256, decoders [64], "
+            "RVQ (30, 90), decoder-cov embed=16) but with the "
+            "adversarial head REPLACED by `+mmd-prior(w=50, "
+            "prior_std=1.0)`. Tests the NicheCompass-style prior-"
+            "matching integration mechanism on the most decoder-"
+            "constrained spine — the extreme bottleneck combined "
+            "with non-adversarial integration."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+mmd-prior(w=50, prior_std=1.0)  (NO +adv)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[64]  (both cell and niche, 1 hidden of 64)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_mmd_prior(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    wt_mmd_prior=50.0, prior_std=1.0,
+                ),
+            ),
+            hidden_channels=[64],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-shallow+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Symmetric tight variant — both encoder MLP AND decoders "
+            "are 1 hidden layer of 256. Encoder shrunk from default "
+            "[400, 256] (2 hidden) → [256] (1 hidden, output 256), "
+            "decoders shrunk from [400, 400] (2 hidden of 400) → "
+            "[256] (1 hidden of 256). Latent dim preserved at 256 "
+            "across both branches. All other knobs (1-layer SAGE GNN, "
+            "RVQ (30, 90), decoder-cov embed=16, adv α=1 wt=150) "
+            "match the +enc-deeper+dec-w256 sibling — only the "
+            "encoder depth changes (3 → 1 hidden layer)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-shallow(mlp=[256])",
+            "+dec-w=[256]  (both cell and niche, 1 hidden layer)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_shallow(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+                hidden_channels=[256],
+            ),
+            hidden_channels=[256],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-shallow+niche-neck-256-256+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Cell-branch-only-shallow architecture with a SEPARATE "
+            "deeper niche path. The cell branch sees a SHORT encoder "
+            "MLP `[256]` (1 hidden of 256) → z_mlp → VQ_cell. The "
+            "niche branch reuses z_mlp but routes it through an "
+            "EXTRA `[256, 256]` niche-neck MLP (2 hidden of 256) "
+            "before the GNN, so niche-side gradients (adjacency BCE, "
+            "nbr-NB, niche-commit) shape THAT new tensor instead of "
+            "pulling z_mlp away from cell-type-discriminative "
+            "geometry.\n\n"
+            "Schematic:\n"
+            "  Input(431) → MLP[256] → z_mlp ─→ VQ_cell → cell decoder\n"
+            "                              └─→ MLP[256, 256] → GNN\n"
+            "                                                  → z_gnn → VQ_niche → niche decoder\n\n"
+            "All latent dims stay at 256 (z_mlp = niche_neck_out = "
+            "z_gnn = 256), so the codebooks operate on matched-dim "
+            "embeddings. Other knobs (RVQ (30, 90), 1-layer SAGE "
+            "GNN, decoder-cov embed=16, adv α=1 wt=150, decoder "
+            "[256]) match the +enc-shallow+dec-w256 sibling — the "
+            "ONLY change is the addition of the 2-hidden niche-neck."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-shallow(mlp=[256])  (cell-branch encoder)",
+            "+niche-neck(mlp=[256, 256])  (niche-only extra MLP before GNN)",
+            "+dec-w=[256]  (both cell and niche, 1 hidden layer)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_niche_neck(
+                _patch_dual_encoder_shallow(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[256],
+                ),
+                hidden_channels=[256, 256],
+            ),
+            hidden_channels=[256],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-shallow+niche-neck-256-256+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Tight-decoder sibling of `+enc-shallow+niche-neck-256-256"
+            "+dec-w256`: same niche-neck decoupling architecture "
+            "(encoder MLP [256], niche-neck MLP [256, 256], 1L SAGE "
+            "GNN h=256, RVQ (30, 90), decoder-cov embed=16, adv α=1 "
+            "wt=150) but with the cell + niche decoders shrunk from "
+            "[256] → [32] (1 hidden of 32, 8× narrower).\n\n"
+            "Combines two structural pressures that empirically each "
+            "worked: (a) niche-neck decoupling — protects the cell "
+            "quantiser from niche-side gradients — and (b) extreme "
+            "decoder bottleneck — forces the codebook to carry the "
+            "reconstruction signal. The +dec-w32 size already worked "
+            "on the +enc-deeper spine; this tests whether it also "
+            "works on the decoupled niche-neck spine that gave good "
+            "cell-NMI."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-shallow(mlp=[256])  (cell-branch encoder)",
+            "+niche-neck(mlp=[256, 256])  (niche-only extra MLP before GNN)",
+            "+dec-w=[32]  (both cell and niche, 1 hidden of 32)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_niche_neck(
+                _patch_dual_encoder_shallow(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[256],
+                ),
+                hidden_channels=[256, 256],
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-256-256+niche-neck-256+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Inverse-asymmetry of the parent `+enc-shallow+niche-neck"
+            "-256-256+dec-w256`: the original variant had a SHALLOW "
+            "cell-encoder [256] + DEEP niche-neck [256, 256], which "
+            "gave good cell-NMI but weak integration. This variant "
+            "FLIPS the depth allocation — DEEP cell-encoder [256, 256] "
+            "+ SHALLOW niche-neck [256]. Tests whether more cell-side "
+            "encoder capacity (before z_mlp reaches VQ_cell AND the "
+            "niche-neck branch) gives the encoder more room to learn "
+            "batch-invariant features for both branches.\n\n"
+            "Schematic:\n"
+            "  Input(431) → MLP[256, 256] → z_mlp ─→ VQ_cell → cell decoder\n"
+            "                                    └─→ MLP[256] → GNN\n"
+            "                                                  → z_gnn → VQ_niche → niche decoder\n\n"
+            "Latent dims symmetric at 256 (z_mlp = niche_neck_out = "
+            "z_gnn = 256). RVQ (30, 90), decoder [256], decoder-cov "
+            "embed=16, adv α=1 wt=150 all unchanged."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[256, 256])  (cell-branch encoder)",
+            "+niche-neck(mlp=[256])  (shallow neck — 1 hidden of 256)",
+            "+dec-w=[256]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_niche_neck(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[256, 256],
+                ),
+                hidden_channels=[256],
+            ),
+            hidden_channels=[256],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-256-256+niche-neck-256-256+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Symmetric-depth decoupled variant — encoder MLP and "
+            "niche-neck MLP have MATCHED depth (both 2 hidden layers "
+            "of 256). The cell branch sees `MLP[256, 256]` → z_mlp → "
+            "VQ_cell. The niche branch routes z_mlp through a SECOND "
+            "`MLP[256, 256]` (niche-neck) before the GNN, so the "
+            "niche path effectively has 4 MLP layers (encoder + neck) "
+            "between input and GNN.\n\n"
+            "Schematic:\n"
+            "  Input(431) → MLP[256, 256] → z_mlp ─→ VQ_cell → cell decoder\n"
+            "                                    └─→ MLP[256, 256] → GNN\n"
+            "                                                       → z_gnn → VQ_niche → niche decoder\n\n"
+            "All latents stay at 256 (z_mlp = niche_neck_out = z_gnn "
+            "= 256). Compare to the `+enc-shallow+niche-neck-256-256` "
+            "sibling: that one had a single-layer encoder MLP; this "
+            "one has a 2-layer encoder. Tests whether MORE cell-side "
+            "encoder capacity (when paired with the niche-neck "
+            "decoupling) lifts cell-branch metrics."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[256, 256])  (cell-branch encoder)",
+            "+niche-neck(mlp=[256, 256])  (niche-only extra MLP before GNN)",
+            "+dec-w=[256]  (both cell and niche, 1 hidden layer)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_niche_neck(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[256, 256],
+                ),
+                hidden_channels=[256, 256],
+            ),
+            hidden_channels=[256],
+        ),
+    },
+
+    # ---- Sweep 27: encoder-shape ablations on the +enc-deeper+dec-w256 spine
+    # All 4 variants share the same parent spine as
+    # `dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w256+mmb0-1b_smb1-1b_1p`:
+    #   - 1-layer SAGE GNN, h=256
+    #   - RVQ (30, 90) on both branches
+    #   - decoder-cov embed=16
+    #   - adversarial α=1, wt=150 (no warmup)
+    #   - cell + niche decoders [256] (1 hidden of 256)
+    # Only the ENCODER MLP shape changes.
+    #
+    # IMPORTANT: the GNN's hidden_channels stays at 256, so when the
+    # encoder output (= last entry of mlp_params.hidden_channels)
+    # differs from 256, the two branches have ASYMMETRIC latent dims:
+    #   - z_mlp (cell-branch input to VQ_cell) = encoder output dim
+    #   - z_gnn (niche-branch input to VQ_niche) = 256 (unchanged)
+    # The cell-branch codebook embedding dim follows z_mlp; the
+    # niche-branch codebook embedding dim follows z_gnn = 256. This
+    # is the minimal-change interpretation of "change the encoder
+    # only" — if you want symmetric latents, layer a
+    # `_patch_dual_gnn_hidden(<latent>)` patch on top.
+    #
+    # Variants:
+    #   v1: encoder [512]                        (1 hidden of 512; latent=512)
+    #   v2: encoder [128, 128, 128]              (3 hidden of 128; latent=128)
+    #   v3: encoder [256, 256, 256, 256]         (4 hidden of 256; latent=256 — symmetric)
+    #   v4: encoder [512, 256, 128]              (funnel; latent=128)
+    #
+    # Submit via:
+    #   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v27
+
+    "s27_v1_dualvq+rvq-both+decoder-cov+adv+enc-512+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s27 sweep, variant 1: parent spine + encoder MLP [512] "
+            "(1 hidden layer of 512, output dim 512). WIDE single "
+            "hidden layer — latent dim becomes 512, asymmetric vs "
+            "the niche branch's z_gnn=256. Tests whether a wide "
+            "shallow encoder captures more pre-VQ signal than the "
+            "deeper [400, 400, 256] parent."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-shallow(mlp=[512])  (latent dim = 512)",
+            "+dec-w=[256]  (both cell and niche, 1 hidden layer)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_shallow(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+                hidden_channels=[512],
+            ),
+            hidden_channels=[256],
+        ),
+    },
+    "s27_v2_dualvq+rvq-both+decoder-cov+adv+enc-128-128-128+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s27 sweep, variant 2: parent spine + encoder MLP "
+            "[128, 128, 128] (3 hidden layers of 128, output dim "
+            "128). DEEP and NARROW — latent dim becomes 128, "
+            "asymmetric vs z_gnn=256. Tests whether a tight "
+            "multi-layer encoder gives a more compact + abstract "
+            "cell-branch latent than the wider parent."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[128, 128, 128])  (latent dim = 128)",
+            "+dec-w=[256]  (both cell and niche, 1 hidden layer)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+                hidden_channels=[128, 128, 128],
+            ),
+            hidden_channels=[256],
+        ),
+    },
+    "s27_v3_dualvq+rvq-both+decoder-cov+adv+enc-256-256-256-256+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s27 sweep, variant 3: parent spine + encoder MLP "
+            "[256, 256, 256, 256] (4 hidden layers of 256, output "
+            "dim 256). MAX DEPTH at matched latent — latent stays "
+            "at 256 (symmetric vs z_gnn). Tests whether more "
+            "encoder depth alone improves the pre-VQ representation "
+            "without changing the latent geometry."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[256, 256, 256, 256])  (latent dim = 256)",
+            "+dec-w=[256]  (both cell and niche, 1 hidden layer)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+                hidden_channels=[256, 256, 256, 256],
+            ),
+            hidden_channels=[256],
+        ),
+    },
+    "s27_v4_dualvq+rvq-both+decoder-cov+adv+enc-512-256-128+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s27 sweep, variant 4: parent spine + encoder MLP "
+            "[512, 256, 128] (3 hidden layers, FUNNEL shape — wide "
+            "→ narrow). Latent dim ends at 128 (the funnel "
+            "bottom). Asymmetric vs z_gnn=256. Tests whether a "
+            "gradually-funneling encoder captures cell features at "
+            "multiple scales before bottlenecking, vs the uniform-"
+            "width parent."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[512, 256, 128])  (latent dim = 128, funnel)",
+            "+dec-w=[256]  (both cell and niche, 1 hidden layer)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+                hidden_channels=[512, 256, 128],
+            ),
+            hidden_channels=[256],
+        ),
+    },
+
+    # ---- Sweep 28: s27 encoder shapes with 2-LAYER GNN ----------------
+    # Mirror of s27 with the GNN bumped from 1 layer to 2 layers via
+    # `+wide`. Same 4 encoder shapes as s27 (v1..v4 mappings preserved),
+    # same decoder [256], same RVQ (30, 90), decoder-cov, adv. Only the
+    # GNN depth changes:
+    #   - GNN num_layers: 1 → 2 (from +wide)
+    #   - Sampler fanout: [8] → [8, 8] (from +wide, matches 2L GNN)
+    #   - Nbr-aggregation hops: 1 → 2 (from +wide)
+    #
+    # `+wide`'s codebook bump (50) is overwritten by the subsequent
+    # +rvq patches, so codebook stays at RVQ (30, 90).
+    #
+    # The same encoder-output-dim asymmetry note applies as in s27:
+    # where encoder output ≠ 256, z_mlp (cell branch) and z_gnn (niche
+    # branch, still =256) have different dims.
+    #
+    # Cross-reference s27_vN ↔ s28_vN for the "does 2-hop niche
+    # aggregation help this encoder shape?" A/B at each shape.
+    #
+    # Submit via:
+    #   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v28
+
+    "s28_v1_dualvq+wide+rvq-both+decoder-cov+adv+enc-512+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s28 sweep, variant 1: same encoder shape as s27_v1 "
+            "([512], 1 hidden of 512, latent=512), decoder [256], "
+            "but with 2-LAYER GNN via +wide (sampler [8, 8], 2-hop "
+            "nbr aggregation). Tests whether the 2-hop niche-side "
+            "aggregation lifts metrics on the wide-shallow encoder."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-shallow(mlp=[512])  (latent dim = 512)",
+            "+dec-w=[256]  (both cell and niche, 1 hidden layer)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_shallow(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(
+                                _patch_dual_wide(_BD()),
+                                branch="niche", codebook_sizes=(30, 90),
+                            ),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+                hidden_channels=[512],
+            ),
+            hidden_channels=[256],
+        ),
+    },
+    "s28_v2_dualvq+wide+rvq-both+decoder-cov+adv+enc-128-128-128+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s28 sweep, variant 2: same encoder shape as s27_v2 "
+            "([128, 128, 128], 3 hidden of 128, latent=128), decoder "
+            "[256], but with 2-LAYER GNN via +wide. Tests whether "
+            "the deeper narrow encoder benefits from richer spatial "
+            "context on the niche side."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[128, 128, 128])  (latent dim = 128)",
+            "+dec-w=[256]  (both cell and niche, 1 hidden layer)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(
+                                _patch_dual_wide(_BD()),
+                                branch="niche", codebook_sizes=(30, 90),
+                            ),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+                hidden_channels=[128, 128, 128],
+            ),
+            hidden_channels=[256],
+        ),
+    },
+    "s28_v3_dualvq+wide+rvq-both+decoder-cov+adv+enc-256-256-256-256+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s28 sweep, variant 3: same encoder shape as s27_v3 "
+            "([256, 256, 256, 256], 4 hidden of 256, latent=256), "
+            "decoder [256], but with 2-LAYER GNN via +wide. "
+            "Symmetric latents (z_mlp=z_gnn=256) plus 2-hop niche "
+            "aggregation — strongest depth + symmetry candidate."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[256, 256, 256, 256])  (latent dim = 256)",
+            "+dec-w=[256]  (both cell and niche, 1 hidden layer)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(
+                                _patch_dual_wide(_BD()),
+                                branch="niche", codebook_sizes=(30, 90),
+                            ),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+                hidden_channels=[256, 256, 256, 256],
+            ),
+            hidden_channels=[256],
+        ),
+    },
+    "s28_v4_dualvq+wide+rvq-both+decoder-cov+adv+enc-512-256-128+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s28 sweep, variant 4: same encoder shape as s27_v4 "
+            "([512, 256, 128], funnel, latent=128), decoder [256], "
+            "but with 2-LAYER GNN via +wide. Tests whether the "
+            "funneling encoder pairs well with deeper spatial "
+            "aggregation."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[512, 256, 128])  (latent dim = 128, funnel)",
+            "+dec-w=[256]  (both cell and niche, 1 hidden layer)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(
+                                _patch_dual_wide(_BD()),
+                                branch="niche", codebook_sizes=(30, 90),
+                            ),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+                hidden_channels=[512, 256, 128],
+            ),
+            hidden_channels=[256],
+        ),
+    },
+
+    # ---- Sweep 29: batch-integration mechanism comparison ----------
+    # Tests the new MMD-to-prior loss against the existing adversarial
+    # + MMD-batch mechanisms. All 6 variants share the
+    # `+enc-deeper+dec-w256` spine (the user's "works reasonably well"
+    # reference). Only the BATCH-INTEGRATION term varies.
+    #
+    # Spine (all variants):
+    #   - Encoder MLP [400, 400, 256] (+enc-deeper)
+    #   - GNN: SAGE h=256, 1 layer (dual-base default)
+    #   - VQ cell + niche: RVQ (30, 90)
+    #   - Decoders [256] (+dec-w256)
+    #   - Decoder cov embed=16
+    #
+    # Integration variants:
+    #   v1: +adv only                            (reference; = parent)
+    #   v2: +mmd-prior(w=50)                     (NEW: prior-matching only)
+    #   v3: +mmd-prior(w=200)                    (NEW: stronger prior pull)
+    #   v4: +mmd-batch(w=200)                    (existing: per-batch MMD only)
+    #   v5: +adv + +mmd-prior(w=50)              (stacked: GRL + prior)
+    #   v6: +mmd-prior(w=50) + +mmd-batch(w=100) (stacked: prior + batch-MMD)
+    #
+    # Reading the grid:
+    #   - v2 vs v1: does prior-matching alone replace adv?
+    #   - v3 vs v2: does more prior weight help?
+    #   - v4 vs v2: prior-matching vs batch-MMD as adv replacement
+    #   - v5 vs v1: does stacking prior with adv lift things?
+    #   - v6 vs v2/v4: do the two MMD axes complement each other?
+    #
+    # Submit via:
+    #   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v29
+
+    "s29_v1_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s29 sweep, variant 1 (REFERENCE): the +enc-deeper+dec-w256 "
+            "spine with canonical +adv (α=1, wt=150). Direct alias of "
+            "the parent variant; included here so the s29 sweep is "
+            "self-contained for the integration-mechanism A/B."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[256]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[256],
+        ),
+    },
+    "s29_v2_dualvq+rvq-both+decoder-cov+mmd-prior-w50+enc-deeper+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s29 sweep, variant 2: parent spine WITHOUT +adv, with "
+            "+mmd-prior(w=50, prior_std=1.0). Pure NicheCompass-style "
+            "prior-matching integration — pulls z_mlp toward N(0, I) "
+            "via MMD. No min-max game, no batch labels needed."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+mmd-prior(w=50, prior_std=1.0)  (NO +adv)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[256]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_mmd_prior(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    wt_mmd_prior=50.0, prior_std=1.0,
+                ),
+            ),
+            hidden_channels=[256],
+        ),
+    },
+    "s29_v3_dualvq+rvq-both+decoder-cov+mmd-prior-w200+enc-deeper+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s29 sweep, variant 3: same as v2 but with stronger "
+            "+mmd-prior(w=200, prior_std=1.0). Tests the prior-pull "
+            "weight axis — 4× the v2 weight."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+mmd-prior(w=200, prior_std=1.0)  (NO +adv)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[256]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_mmd_prior(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    wt_mmd_prior=200.0, prior_std=1.0,
+                ),
+            ),
+            hidden_channels=[256],
+        ),
+    },
+    "s29_v4_dualvq+rvq-both+decoder-cov+mmd-batch-w200+enc-deeper+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s29 sweep, variant 4: parent spine WITHOUT +adv, with "
+            "+mmd-batch(w=200) — the existing per-batch MMD loss. "
+            "Direct comparison to v2/v3 (prior-matching) at matched "
+            "weight magnitude. Tests: does matching batches to each "
+            "other work better than matching them to a prior?"
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+mmd-batch(w=200)  (NO +adv)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[256]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_mmd_batch(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90)),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    wt_mmd_batch=200.0,
+                ),
+            ),
+            hidden_channels=[256],
+        ),
+    },
+    "s29_v5_dualvq+rvq-both+decoder-cov+adv+mmd-prior-w50+enc-deeper+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s29 sweep, variant 5: parent spine + canonical +adv + "
+            "+mmd-prior(w=50). STACKED: GRL adversarial pressure on "
+            "top of prior-matching. Tests whether the two mechanisms "
+            "are complementary."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+mmd-prior(w=50, prior_std=1.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[256]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_mmd_prior(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    wt_mmd_prior=50.0, prior_std=1.0,
+                ),
+            ),
+            hidden_channels=[256],
+        ),
+    },
+    "s29_v6_dualvq+rvq-both+decoder-cov+mmd-prior-w50+mmd-batch-w100+enc-deeper+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s29 sweep, variant 6: parent spine WITHOUT +adv, with "
+            "+mmd-prior(w=50) + +mmd-batch(w=100). STACKED: two MMD "
+            "axes — match batches to each other AND to a prior. "
+            "Tests whether the two distance-matching pressures are "
+            "complementary, with no adversarial."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+mmd-prior(w=50, prior_std=1.0)",
+            "+mmd-batch(w=100)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[256]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_mmd_batch(
+                    _patch_dual_mmd_prior(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        wt_mmd_prior=50.0, prior_std=1.0,
+                    ),
+                    wt_mmd_batch=100.0,
+                ),
+            ),
+            hidden_channels=[256],
+        ),
+    },
+
     "dualvq+rvq-both+decoder-cov+adv+gnn-h384+mmb0-1b_smb1-1b_1p": {
         "description": (
             "Spine ablation — GNN hidden 256 -> 384. Wider niche-branch "
@@ -3616,6 +5943,135 @@ VARIANTS: dict = {
             ),
         ),
     },
+    "dualvq+wide+rvq-both+decoder-cov+mmd-prior-w50+enc-deeper+dec-w64+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Combination of: `+wide` spine (2-layer SAGE GNN h=256, "
+            "sampler [8, 8], 2-hop nbr aggregation) + `+enc-deeper` "
+            "encoder ([400, 400, 256], 3 hidden layers) + extreme "
+            "decoder bottleneck `+dec-w64` ([64], 1 hidden of 64) + "
+            "the new NicheCompass-style `+mmd-prior(w=50, "
+            "prior_std=1.0)` integration mechanism (REPLACES "
+            "adversarial). RVQ (30, 90) on both branches, decoder-cov "
+            "embed=16.\n\n"
+            "Stacks four pressures simultaneously: (1) richer "
+            "spatial context via 2-hop GNN, (2) deeper encoder for "
+            "pre-VQ features, (3) tight decoder forcing the latent "
+            "to encode reconstruction signal, (4) prior-matching "
+            "MMD pulling z_mlp toward N(0, I) for batch invariance. "
+            "Aggressive multi-axis architecture — high-risk, "
+            "high-potential-reward candidate if all four pressures "
+            "compose well."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+mmd-prior(w=50, prior_std=1.0)  (NO +adv)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[64]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_mmd_prior(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(
+                                _patch_dual_wide(_BD()),
+                                branch="niche", codebook_sizes=(30, 90),
+                            ),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    wt_mmd_prior=50.0, prior_std=1.0,
+                ),
+            ),
+            hidden_channels=[64],
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+dec-w64+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Adversarial sibling of `+wide+mmd-prior-w50+enc-deeper+"
+            "dec-w64`: same architecture (+wide 2L SAGE GNN h=256, "
+            "+enc-deeper MLP [400, 400, 256], decoders [64], RVQ "
+            "(30, 90), decoder-cov embed=16) but uses canonical "
+            "adversarial `+adv` (α=1, wt=150) instead of the new "
+            "MMD-to-prior loss. Direct A/B for the integration-"
+            "mechanism question on the multi-axis aggressive spine."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[64]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(
+                                _patch_dual_wide(_BD()),
+                                branch="niche", codebook_sizes=(30, 90),
+                            ),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[64],
+        ),
+    },
+    # Throughput-test variant: same as `+enc-deeper` above but with
+    # the NeighborSampler fanout cut from [8, 8] → [4, 4]. 2-hop is
+    # preserved (matching the +wide GNN's 2 layers); each hop just
+    # samples 4 instead of 8. Sampled neighbourhood per cell drops
+    # from 1 + 8 + 8×8 = 73 nodes to 1 + 4 + 4×4 = 21 nodes (~70%
+    # reduction). Big expected wall-clock win on both data prep AND
+    # the niche-GNN forward pass; the question is whether nbr_NMI /
+    # iLISI hold.
+    #
+    # Why [4, 4] specifically (not [4] like s20_v4 / s18):
+    #   - +wide sets GNN num_layers=2, so the second layer aggregates
+    #     over hop-2 neighbours sampled by the second entry of the
+    #     fanout list. A [4]-fanout would leave hop-2 with zero
+    #     sampled neighbours — the GNN's second layer aggregates
+    #     over an empty set → niche embedding collapses (s20_v4
+    #     showed exactly this: nbr_NMI 0.68 → 0.11).
+    #   - [4, 4] preserves the 2-hop structure, just thinner.
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+sampler4-4+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Throughput-test sibling of the +enc-deeper variant above: "
+            "identical build chain, plus `+sampler([4, 4])` to cut the "
+            "NeighborSampler fanout from [8, 8] → [4, 4]. Tests whether "
+            "the niche GNN tolerates a thinner 2-hop neighborhood "
+            "(~70% fewer sampled nodes per batch) without losing "
+            "nbr_NMI / iLISI. If metrics hold, this is a cheap "
+            "wall-clock win we can roll out to other variants."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+sampler([4, 4])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(
+                                _patch_dual_wide(_BD()),
+                                branch="niche", codebook_sizes=(30, 90),
+                            ),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            num_neighbors=[4, 4],
+        ),
+    },
     "dualvq+wide+rvq-both+decoder-cov+adv+adj-w3000+mmb0-1b_smb1-1b_1p": {
         "description": (
             "v3 spine + much stronger adjacency BCE (3000 vs default "
@@ -3643,6 +6099,98 @@ VARIANTS: dict = {
                 alpha=1.0, wt_adv_batch=150.0,
             ),
             weight=3000.0,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+adj-w3000+enc-shallow+dec-w256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Symmetric tight variant on the `+wide+adj-w3000` spine. "
+            "Encoder MLP shrunk from default [400, 256] (2 hidden) → "
+            "[256] (1 hidden of 256, output 256). Cell + niche decoders "
+            "shrunk from [400, 400] (2 hidden of 400) → [256] (1 hidden "
+            "of 256). Latent dim preserved at 256 across both branches. "
+            "All other knobs (+wide → 2-layer SAGE GNN h=256, sampler "
+            "[8, 8], 2-hop nbr aggregation; RVQ (30, 90); decoder-cov "
+            "embed=16; adv α=1 wt=150; adj weight 3000) match the "
+            "parent +wide+adj-w3000 variant — only the MLP geometries "
+            "change."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+adj(weight=3000)",
+            "+enc-shallow(mlp=[256])",
+            "+dec-w=[256]  (both cell and niche, 1 hidden layer)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_shallow(
+                _patch_dual_adj_weight(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(
+                                    _patch_dual_wide(_BD()),
+                                    branch="niche", codebook_sizes=(30, 90),
+                                ),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    weight=3000.0,
+                ),
+                hidden_channels=[256],
+            ),
+            hidden_channels=[256],
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+adj-w3000+enc-shallow+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Tight-decoder sibling of `+wide+adj-w3000+enc-shallow"
+            "+dec-w256`: same +wide spine (2-layer SAGE GNN h=256, "
+            "sampler [8, 8], 2-hop nbr aggregation) + enc-shallow "
+            "[256] + adj-w3000 + RVQ (30, 90) + decoder-cov embed=16 "
+            "+ adv α=1 wt=150, but the cell + niche decoders shrunk "
+            "from [256] → [32] (1 hidden of 32, 8× narrower).\n\n"
+            "Parent variant had very good cluster-quality metrics "
+            "(NMI / ARI) but weak batch integration (iLISI). "
+            "Hypothesis: the smaller decoder forces the codebook to "
+            "carry the reconstruction signal, which may pressure the "
+            "encoder to drop batch-specific features (since the "
+            "decoder no longer has slack capacity to absorb them via "
+            "the decoder covariate). If integration lifts without "
+            "sacrificing the NMI/ARI win, this is a Pareto-improved "
+            "sibling.\n\n"
+            "Decoder shape: 256 (z_q) + 16 (covariate) = 272 → 32 → "
+            "431. Heavy compression (~8.5×) at the input, large "
+            "expansion (~13.5×) at the output."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+adj(weight=3000)",
+            "+enc-shallow(mlp=[256])",
+            "+dec-w=[32]  (both cell and niche, 1 hidden of 32)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_shallow(
+                _patch_dual_adj_weight(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(
+                                    _patch_dual_wide(_BD()),
+                                    branch="niche", codebook_sizes=(30, 90),
+                                ),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    weight=3000.0,
+                ),
+                hidden_channels=[256],
+            ),
+            hidden_channels=[32],
         ),
     },
     "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adj-w3000+mmb0-1b_smb1-1b_1p": {
@@ -3674,6 +6222,101 @@ VARIANTS: dict = {
                 ),
             ),
             weight=3000.0,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Same as `+wide+adv+enc-deeper+dec-w32+sampler4` but with "
+            "the DEFAULT [8, 8] sampler (no fanout reduction). Spine: "
+            "+wide (2-layer SAGE GNN h=256, sampler [8, 8], 2-hop "
+            "nbr aggregation) + +enc-deeper ([400, 400, 256]) + "
+            "RVQ (30, 90) + decoder-cov embed=16 + adv α=1 wt=150 + "
+            "extreme decoder bottleneck `+dec-w=[32]`.\n\n"
+            "Clean A/B pair with the `+sampler4` sibling — same "
+            "architecture, only the per-hop fanout differs ([8, 8] "
+            "here vs [4, 4] there). Isolates the sampler-fanout "
+            "effect from everything else.\n\n"
+            "Also compare to:\n"
+            "  - `+enc-deeper+dec-w32` (1-layer GNN): isolates the "
+            "+wide (2-hop GNN) contribution at the extreme decoder "
+            "bottleneck.\n"
+            "  - `+wide+adv+enc-deeper` (default decoder [400, 400]): "
+            "isolates the decoder shrink on the +wide+enc-deeper "
+            "spine."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(
+                                _patch_dual_wide(_BD()),
+                                branch="niche", codebook_sizes=(30, 90),
+                            ),
+                            branch="cell", codebook_sizes=(30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+sampler4+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Combines `+wide` (2-layer SAGE GNN h=256) + `+enc-deeper` "
+            "([400, 400, 256] encoder) + `+dec-w=[32]` (extreme decoder "
+            "bottleneck) + reduced sampler. RVQ (30, 90), decoder-cov "
+            "embed=16, adv α=1 wt=150 unchanged.\n\n"
+            "Sampler: `[4, 4]` (2-hop, 4 nbrs each hop) — matches the "
+            "2-layer GNN from +wide. NOT `[4]` (1-hop only) which "
+            "would leave the GNN's second layer aggregating over "
+            "empty neighbourhoods — that's the failure mode that "
+            "caused the historic s20_v4 (+wide+sampler4) nbr_NMI "
+            "collapse to 0.11. The `+sampler4` tag here is shorthand "
+            "for `[4, 4]` on the +wide spine.\n\n"
+            "Tests three orthogonal compressions stacked:\n"
+            "  - Extreme decoder bottleneck `[32]` (forces codebook "
+            "to carry recon signal)\n"
+            "  - 2-hop GNN context (+wide spine: spatial signal at 2 "
+            "hops)\n"
+            "  - Thinner sampling [4, 4] (less spatial signal per "
+            "step, but consistent with GNN depth)\n"
+            "Sampled neighbourhood per cell drops from 1 + 8 + 8×8 = "
+            "73 nodes to 1 + 4 + 4×4 = 21 nodes (~70% reduction)."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+sampler([4, 4])  (2-hop, 4 nbrs each — matches 2L GNN)",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(
+                                    _patch_dual_wide(_BD()),
+                                    branch="niche", codebook_sizes=(30, 90),
+                                ),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                ),
+                hidden_channels=[32],
+            ),
+            num_neighbors=[4, 4],
         ),
     },
     "dualvq+wide+rvq-both+decoder-cov+adv-warmup10+mmb0-1b_smb1-1b_1p": {
@@ -5498,6 +8141,46 @@ VARIANTS: dict = {
             ),
         ),
     },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+region-holdout+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Region-holdout port of the current best mmb-smb variant "
+            "`+enc-deeper+dec-w32`. Spine: 1-layer SAGE GNN h=256 + "
+            "RVQ (30, 90) + decoder-cov embed=16 + adv α=1 wt=150 + "
+            "deeper encoder MLP [400, 400, 256] + extreme decoder "
+            "bottleneck [32]. Adds the same 25%x25% spatial holdout "
+            "patches (batch15 upper-left + batch82 lower-right) used "
+            "by the existing region-holdout reference. Held-out cells "
+            "are tagged `data_split=\"test\"` so post-inference "
+            "Pearson is computed exclusively on cells the model never "
+            "saw during training."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+region_holdout(test_regions={15: 25%x25% upper-left, "
+            "82: 25%x25% lower-right})",
+        ],
+        "build": lambda: _patch_holdout_regions(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                ),
+                hidden_channels=[32],
+            ),
+        ),
+    },
     # ---- Reconstruction-mode ablations (all other components fixed) --------
     "recon-cell": {
         "description": (
@@ -6189,6 +8872,116 @@ VARIANTS: dict = {
                 ),
             ),
             test_batch_idx=[2, 3],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+chl59-8b_1p": {
+        "description": (
+            "chl59-8b_1p port of the current best mmb-smb variant "
+            "`+enc-deeper+dec-w32`. Adds the extreme decoder "
+            "bottleneck [32] on top of the existing "
+            "`+enc-deeper+chl59-8b_1p` sibling. Spine: 1-layer SAGE "
+            "GNN h=256 + RVQ (30, 90) + decoder-cov embed=16 + adv "
+            "α=1 wt=150 + deeper encoder MLP [400, 400, 256] + "
+            "decoders [32]. Train: chl59 adata_batch_id 0+1+4+5+6+7. "
+            "Test: 2+3 (held-out replicate + new donor)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+chl59-8b_1p(test_ids=[2,3])",
+        ],
+        "build": lambda: _patch_dual_chl59_lung5(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                ),
+                hidden_channels=[32],
+            ),
+            test_batch_idx=[2, 3],
+        ),
+    },
+    # ========================================================================
+    # spatch_1p variants (dataset: spatch_1p)
+    # ========================================================================
+    # Train on dataset_id_2.h5ad (adata_batch_id = 2); every OTHER section
+    # in /nfs/team361/sb75/DATASETS/silver/spatch_1p/ is held out for
+    # post-hoc evaluation via predict + compute_inference_metrics
+    # (resolved by the `test_batches='rest'` sentinel at runtime).
+    # Labels: cell-type = obs['annotation'], niche = obs['spatial_cluster'].
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+spatch_1p": {
+        "description": (
+            "spatch_1p port of the current best mmb-smb variant "
+            "`+enc-deeper+dec-w32`. Architecture is identical to the "
+            "mmb-smb baseline — RVQ (30, 90) on both branches + "
+            "decoder-cov embed=16 + adv α=1 wt=150 + encoder MLP "
+            "[400, 400, 256] + 1-layer SAGE GNN h=256 + decoders "
+            "[32]. Train: spatch_1p adata_batch_id=2 only "
+            "(dataset_id_2.h5ad). Test: every other section in the "
+            "spatch_1p silver dir (resolved at runtime via the "
+            "`test_batches='rest'` sentinel — predict() runs "
+            "inference on all non-training sections post-hoc).\n\n"
+            "Memory: batch_size=128 by default (vs the mmb-smb 256 "
+            "default; the smaller batch is conservative for a new "
+            "dataset whose section sizes haven't been profiled). "
+            "Bump via the LSF_MEM_MB env-var + a custom variant if "
+            "the GPU has headroom.\n\n"
+            "PREREQUISITES:\n"
+            "  1. Stamp metadata on every silver "
+            "`dataset_id_<N>.h5ad` (three one-off scripts):\n"
+            "       python examples/stamp_spatch_uns_batch.py   "
+            "# uns['batch'] (REQUIRED)\n"
+            "       python examples/stamp_spatch_cell_id.py     "
+            "# obs['cell_id'] (REQUIRED)\n"
+            "       python examples/stamp_spatch_metadata.py    "
+            "# uns['dataset_id'/'tissue'/'species'] (optional;\n"
+            "                                                   "
+            "#  safe defaults supplied by the loader otherwise)\n"
+            "  2. Build the spatch_1p blob:\n"
+            "       python examples/run_squint.py --build-blob "
+            "--build-blob-dataset spatch_1p\n"
+            "  3. (Sanity-check) run the 1-epoch smoke test first:\n"
+            "       python examples/run_squint.py --all "
+            "--variant smoke-test+spatch_1p"
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+spatch_1p(train_ids=[2], test='rest')",
+        ],
+        "build": lambda: _patch_dual_spatch(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                ),
+                hidden_channels=[32],
+            ),
+            train_batch_idx=[2],
+            test_batch_idx="rest",
+            batch_size=128,
         ),
     },
     # ========================================================================
@@ -8225,6 +11018,1644 @@ VARIANTS: dict = {
             ),
         ),
     },
+
+    # ========================================================================
+    # Sweeps s30 — s35: six 8-variant ablation grids on the
+    # `+enc-deeper+dec-w32` baseline.
+    # ========================================================================
+    # All six sweeps share the SAME spine:
+    #   `dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p`
+    # i.e. RVQ (30, 90) on both branches, decoder-cov, adversarial
+    # (α=1, wt=150), encoder MLP [400, 400, 256], 1-layer SAGE GNN h=256,
+    # decoders [32] (both branches), spatial k-NN k=8, sampler [8].
+    #
+    # Sweep design:
+    #   s30 — 3-level RVQ codebook with L0=30, varying L1, L2.
+    #   s31 — reduced codebook + encoder dim (down to [128], [64]).
+    #   s32 — knn=12 and knn=16 × 4 batch-integration approaches.
+    #   s33 — loss-weight tweaks (stronger cell NB, weaker/stronger adj).
+    #   s34 — combinations of s30..s33 winners (Pareto candidates).
+    #   s35 — replace RVQ with CVQ (2- and 3-level ConditionalVQ).
+    #
+    # Submit each via:
+    #   bash examples/submit_dataset_sweep.sh \
+    #       mmb0-1b_smb1-1b_1p-ablations-v{30,31,32,33,34,35}
+    # ========================================================================
+
+    # ------------------------------------------------------------------------
+    # s30 — 3-level RVQ codebook (L0=30, varying L1, L2)
+    # ------------------------------------------------------------------------
+    # Baseline RVQ is 2-level (30, 90) → 2,700 composite codes. These
+    # variants add a third codebook level: 3-level RVQ gives composite
+    # cardinality = L0 × L1 × L2. The hypothesis is that a third level
+    # of residual quantisation provides finer-grained partitioning of
+    # the latent — useful for distinguishing rare cell types / niches
+    # that share the top-level macro cluster. L0=30 stays fixed (matches
+    # the baseline's macro level) so the macro structure is held
+    # constant; only L1 and L2 vary across the 8 variants.
+    "s30_v1_dualvq+rvq-both-30-30-30+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s30 sweep, variant 1: 3-level RVQ (30, 30, 30) — "
+            "27,000 composite codes. Smallest 3-level tree on the "
+            "+enc-deeper+dec-w32 spine. Balanced level sizes: each "
+            "residual gets the same quantisation budget. Tests whether "
+            "more levels (with smaller per-level budgets) beat the "
+            "2-level (30, 90) parent."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 30, 30])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 30, 30)),
+                            branch="cell", codebook_sizes=(30, 30, 30),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s30_v2_dualvq+rvq-both-30-30-60+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s30 sweep, variant 2: 3-level RVQ (30, 30, 60) — "
+            "54,000 composite codes. Mild expansion at the leaf "
+            "level; mid level stays compact at 30."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 30, 60])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 30, 60)),
+                            branch="cell", codebook_sizes=(30, 30, 60),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s30_v3_dualvq+rvq-both-30-30-90+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s30 sweep, variant 3: 3-level RVQ (30, 30, 90) — "
+            "81,000 composite codes. Direct extension of the parent "
+            "2-level (30, 90) by adding a middle level of 30. "
+            "If this beats the parent, the extra residual STAGE is "
+            "what matters (not just leaf cardinality)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 30, 90)),
+                            branch="cell", codebook_sizes=(30, 30, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s30_v4_dualvq+rvq-both-30-60-30+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s30 sweep, variant 4: 3-level RVQ (30, 60, 30) — "
+            "54,000 composite codes, middle-heavy. Tests whether "
+            "putting capacity in the mid level (where coarse niche / "
+            "cell-type structure lives) helps more than at the leaf."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 60, 30])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 60, 30)),
+                            branch="cell", codebook_sizes=(30, 60, 30),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s30_v5_dualvq+rvq-both-30-60-60+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s30 sweep, variant 5: 3-level RVQ (30, 60, 60) — "
+            "108,000 composite codes. Balanced 2nd + 3rd levels."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 60, 60])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 60, 60)),
+                            branch="cell", codebook_sizes=(30, 60, 60),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s30_v6_dualvq+rvq-both-30-60-90+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s30 sweep, variant 6: 3-level RVQ (30, 60, 90) — "
+            "162,000 composite codes. Increasing-cardinality tree: "
+            "each level adds finer detail on top of the previous."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 60, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 60, 90)),
+                            branch="cell", codebook_sizes=(30, 60, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s30_v7_dualvq+rvq-both-30-60-120+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s30 sweep, variant 7: 3-level RVQ (30, 60, 120) — "
+            "216,000 composite codes. Same shape as the historic "
+            "s25 variants' codebook but on the +enc-deeper+dec-w32 "
+            "spine (not the +gatv2+enc128+dec128 one)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 60, 120])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 60, 120)),
+                            branch="cell", codebook_sizes=(30, 60, 120),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s30_v8_dualvq+rvq-both-30-90-90+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s30 sweep, variant 8: 3-level RVQ (30, 90, 90) — "
+            "243,000 composite codes, largest in s30. Direct "
+            "comparison to v3 (30, 30, 90): same leaf budget, "
+            "but a fatter middle level."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 90, 90)),
+                            branch="cell", codebook_sizes=(30, 90, 90),
+                        ),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+
+    # ------------------------------------------------------------------------
+    # s31 — reduced codebook + encoder dim (down to [128], [64])
+    # ------------------------------------------------------------------------
+    # Baseline encoder is [400, 400, 256] with latent dim 256. These
+    # variants progressively shrink the latent dimension (and therefore
+    # codebook embedding dim + GNN hidden width). Hypothesis: a tighter
+    # bottleneck forces the encoder to discard batch-specific features
+    # and concentrate on biologically discriminative ones (NicheCompass-
+    # style integration without an adversarial head), at the cost of
+    # raw reconstruction fidelity. The GNN hidden is bumped in lock-
+    # step with the latent so the niche-branch latent stays SYMMETRIC
+    # with the cell-branch latent (z_mlp dim = z_gnn dim).
+    "s31_v1_dualvq+rvq-both+decoder-cov+adv+enc-400-400-128+gnn-h128+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s31 sweep, variant 1: encoder MLP [400, 400, 128], "
+            "GNN h=128. Halves the latent dim from 256 → 128 while "
+            "keeping the encoder trunk wide. Cleanest 'shrink the "
+            "codebook embedding dim only' test."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 128])",
+            "+gnn-h=128",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_gnn_hidden(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[400, 400, 128],
+                ),
+                hidden=128,
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s31_v2_dualvq+rvq-both+decoder-cov+adv+enc-400-400-64+gnn-h64+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s31 sweep, variant 2: encoder MLP [400, 400, 64], "
+            "GNN h=64. Quarters the latent dim from 256 → 64. "
+            "Same wide trunk as v1, even tighter bottleneck."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 64])",
+            "+gnn-h=64",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_gnn_hidden(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[400, 400, 64],
+                ),
+                hidden=64,
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s31_v3_dualvq+rvq-both+decoder-cov+adv+enc-200-200-128+gnn-h128+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s31 sweep, variant 3: encoder MLP [200, 200, 128], "
+            "GNN h=128. Halves both trunk width and latent dim. "
+            "Tests whether a uniformly smaller encoder is enough."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[200, 200, 128])",
+            "+gnn-h=128",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_gnn_hidden(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[200, 200, 128],
+                ),
+                hidden=128,
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s31_v4_dualvq+rvq-both+decoder-cov+adv+enc-200-200-64+gnn-h64+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s31 sweep, variant 4: encoder MLP [200, 200, 64], "
+            "GNN h=64. Half the trunk width and quartered latent. "
+            "More aggressive than v3."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[200, 200, 64])",
+            "+gnn-h=64",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_gnn_hidden(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[200, 200, 64],
+                ),
+                hidden=64,
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s31_v5_dualvq+rvq-both+decoder-cov+adv+enc-128-128-128+gnn-h128+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s31 sweep, variant 5: encoder MLP [128, 128, 128] "
+            "(uniform 128), GNN h=128. Compact + uniform — every "
+            "layer in the encoder + GNN works in the same 128-dim "
+            "space."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[128, 128, 128])",
+            "+gnn-h=128",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_gnn_hidden(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[128, 128, 128],
+                ),
+                hidden=128,
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s31_v6_dualvq+rvq-both+decoder-cov+adv+enc-128-128-64+gnn-h64+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s31 sweep, variant 6: encoder MLP [128, 128, 64], "
+            "GNN h=64. Compact trunk with a 64-dim funnel."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[128, 128, 64])",
+            "+gnn-h=64",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_gnn_hidden(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[128, 128, 64],
+                ),
+                hidden=64,
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s31_v7_dualvq+rvq-both+decoder-cov+adv+enc-shallow128+gnn-h128+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s31 sweep, variant 7: SHALLOW encoder MLP [128] "
+            "(1 hidden layer of 128, output dim 128), GNN h=128. "
+            "Direct 'down to [128]' as requested — drops the "
+            "encoder-deeper trunk entirely."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-shallow(mlp=[128])",
+            "+gnn-h=128",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_gnn_hidden(
+                _patch_dual_encoder_shallow(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[128],
+                ),
+                hidden=128,
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s31_v8_dualvq+rvq-both+decoder-cov+adv+enc-shallow64+gnn-h64+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s31 sweep, variant 8: SHALLOW encoder MLP [64] "
+            "(1 hidden layer of 64), GNN h=64. Extreme 'down to "
+            "[64]' as requested — tightest bottleneck in this sweep."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-shallow(mlp=[64])",
+            "+gnn-h=64",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_gnn_hidden(
+                _patch_dual_encoder_shallow(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[64],
+                ),
+                hidden=64,
+            ),
+            hidden_channels=[32],
+        ),
+    },
+
+    # ------------------------------------------------------------------------
+    # s32 — spatial k-NN graph k × batch-integration loss
+    # ------------------------------------------------------------------------
+    # 2 × 4 grid: k ∈ {12, 16} (selected from the rebuilt blob's
+    # `n_neighs_list = [6, 8, 12, 16]`) × batch-integration ∈ {default
+    # adv α=1 wt=150, stronger adv α=2 wt=300, mmd-batch wt=200,
+    # mmd-prior wt=50}. Each variant uses sampler == k (the GNN sees
+    # ALL spatial neighbours per cell). Hypothesis: a denser spatial
+    # graph gives the niche branch richer context, which may either
+    # help integration (more cells from each batch in each
+    # neighbourhood → smoother batch averaging) or hurt it (more
+    # cross-batch edges → harder to separate niches).
+    "s32_v1_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+knn12+sampler12+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s32 sweep, variant 1: k=12 spatial graph + sampler [12] "
+            "+ default adv (α=1, wt=150). Alias of the existing "
+            "`+enc-deeper+dec-w32+knn12+sampler12` variant — re-run "
+            "as the within-sweep adv-baseline."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=12)",
+            "+sampler([12])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            alpha=1.0, wt_adv_batch=150.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=12,
+            ),
+            num_neighbors=[12],
+        ),
+    },
+    "s32_v2_dualvq+rvq-both+decoder-cov+adv-alpha2-wt300+enc-deeper+dec-w32+knn12+sampler12+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s32 sweep, variant 2: k=12 spatial graph + sampler [12] "
+            "+ STRONGER adv (α=2, wt=300). Tests whether the denser "
+            "graph tolerates more aggressive batch-integration "
+            "pressure (the α=2 / wt=300 setting historically helped "
+            "iLISI on the +wide spine, but pushed too hard on the "
+            "+enc-deeper spine — k=12's richer neighbourhood may "
+            "let the GNN absorb the extra pressure better)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=2.0, wt=300.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=12)",
+            "+sampler([12])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            alpha=2.0, wt_adv_batch=300.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=12,
+            ),
+            num_neighbors=[12],
+        ),
+    },
+    "s32_v3_dualvq+rvq-both+decoder-cov+mmd-batch-w200+enc-deeper+dec-w32+knn12+sampler12+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s32 sweep, variant 3: k=12 spatial graph + sampler [12] "
+            "+ MMD-BATCH (wt=200) INSTEAD of adv. Pairwise per-batch "
+            "MMD as the integration mechanism — no adversarial CE. "
+            "Tests whether non-adversarial integration works with "
+            "the denser graph."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+mmd_batch(wt=200)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=12)",
+            "+sampler([12])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_mmd_batch(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            wt_mmd_batch=200.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=12,
+            ),
+            num_neighbors=[12],
+        ),
+    },
+    "s32_v4_dualvq+rvq-both+decoder-cov+mmd-prior-w50+enc-deeper+dec-w32+knn12+sampler12+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s32 sweep, variant 4: k=12 spatial graph + sampler [12] "
+            "+ MMD-PRIOR (wt=50) INSTEAD of adv. NicheCompass-style "
+            "prior-matching (non-parametric KL analog) as the "
+            "integration mechanism. Tests whether prior-matching "
+            "works on the denser graph."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+mmd_prior(wt=50)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=12)",
+            "+sampler([12])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_mmd_prior(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            wt_mmd_prior=50.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=12,
+            ),
+            num_neighbors=[12],
+        ),
+    },
+    "s32_v5_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+knn16+sampler16+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s32 sweep, variant 5: k=16 spatial graph + sampler [16] "
+            "+ default adv. Alias of the existing "
+            "`+enc-deeper+dec-w32+knn16+sampler16` variant — re-run "
+            "as the within-sweep k=16-baseline."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            alpha=1.0, wt_adv_batch=150.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=16,
+            ),
+            num_neighbors=[16],
+        ),
+    },
+    "s32_v6_dualvq+rvq-both+decoder-cov+adv-alpha2-wt300+enc-deeper+dec-w32+knn16+sampler16+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s32 sweep, variant 6: k=16 spatial graph + sampler [16] "
+            "+ STRONGER adv (α=2, wt=300). Sibling of v2 on the "
+            "k=16 graph."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=2.0, wt=300.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            alpha=2.0, wt_adv_batch=300.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=16,
+            ),
+            num_neighbors=[16],
+        ),
+    },
+    "s32_v7_dualvq+rvq-both+decoder-cov+mmd-batch-w200+enc-deeper+dec-w32+knn16+sampler16+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s32 sweep, variant 7: k=16 spatial graph + sampler [16] "
+            "+ MMD-BATCH (wt=200) INSTEAD of adv. Sibling of v3 "
+            "on the k=16 graph."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+mmd_batch(wt=200)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_mmd_batch(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            wt_mmd_batch=200.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=16,
+            ),
+            num_neighbors=[16],
+        ),
+    },
+    "s32_v8_dualvq+rvq-both+decoder-cov+mmd-prior-w50+enc-deeper+dec-w32+knn16+sampler16+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s32 sweep, variant 8: k=16 spatial graph + sampler [16] "
+            "+ MMD-PRIOR (wt=50) INSTEAD of adv. Sibling of v4 on "
+            "the k=16 graph."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+mmd_prior(wt=50)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_mmd_prior(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            wt_mmd_prior=50.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=16,
+            ),
+            num_neighbors=[16],
+        ),
+    },
+
+    # ------------------------------------------------------------------------
+    # s33 — loss-weight tweaks (stronger cell NB, weaker/stronger adj)
+    # ------------------------------------------------------------------------
+    # The cell-branch NB reconstruction weight `wt_attr_reconstr`
+    # defaults to 1.0; raising it tightens the cell embedding to per-
+    # batch gene means → can improve cell-type NMI (sharper cell
+    # signal) at the cost of cell_iLISI. The adjacency BCE weight
+    # `wt_adj_reconstr` defaults to 1000; tweaking it scales the niche-
+    # branch spatial-structure pressure. The combo (v8) stacks the
+    # individually-promising values from both axes.
+    "s33_v1_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+cell-w1.5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s33 sweep, variant 1: STRONGER cell-NB recon "
+            "(wt_attr_reconstr = 1.5, default 1.0). Mildly tighter "
+            "cell embedding → potentially sharper cell-type NMI."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+wt_attr_reconstr=1.5",
+        ],
+        "build": lambda: _patch_dual_attr_recon_weight(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                ),
+                hidden_channels=[32],
+            ),
+            weight=1.5,
+        ),
+    },
+    "s33_v2_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+cell-w2.0+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s33 sweep, variant 2: STRONGER cell-NB recon "
+            "(wt_attr_reconstr = 2.0). 2× the default — clearer "
+            "test of the 'tighten cell to gain cell-NMI' hypothesis."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+wt_attr_reconstr=2.0",
+        ],
+        "build": lambda: _patch_dual_attr_recon_weight(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                ),
+                hidden_channels=[32],
+            ),
+            weight=2.0,
+        ),
+    },
+    "s33_v3_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+cell-w3.0+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s33 sweep, variant 3: STRONGER cell-NB recon "
+            "(wt_attr_reconstr = 3.0). Aggressive — expect lower "
+            "cell_iLISI but sharper cell-type NMI."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+wt_attr_reconstr=3.0",
+        ],
+        "build": lambda: _patch_dual_attr_recon_weight(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                ),
+                hidden_channels=[32],
+            ),
+            weight=3.0,
+        ),
+    },
+    "s33_v4_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+adj-w300+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s33 sweep, variant 4: WEAKER adjacency BCE "
+            "(wt_adj_reconstr = 300, default 1000). Loosens the "
+            "niche-side spatial pressure → niche embedding is "
+            "freer to drift away from rigid cosine-similarity "
+            "spatial structure. Tests whether the default is too "
+            "strong for this dataset."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+wt_adj_reconstr=300",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                ),
+                hidden_channels=[32],
+            ),
+            weight=300.0,
+        ),
+    },
+    "s33_v5_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+adj-w500+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s33 sweep, variant 5: WEAKER adjacency BCE "
+            "(wt_adj_reconstr = 500). Half the default — gentler "
+            "tweak vs v4."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+wt_adj_reconstr=500",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                ),
+                hidden_channels=[32],
+            ),
+            weight=500.0,
+        ),
+    },
+    "s33_v6_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+adj-w2000+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s33 sweep, variant 6: STRONGER adjacency BCE "
+            "(wt_adj_reconstr = 2000). 2× default — pushes the "
+            "niche embedding harder onto the spatial graph "
+            "structure."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+wt_adj_reconstr=2000",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                ),
+                hidden_channels=[32],
+            ),
+            weight=2000.0,
+        ),
+    },
+    "s33_v7_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+adj-w3000+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s33 sweep, variant 7: STRONGER adjacency BCE "
+            "(wt_adj_reconstr = 3000). 3× default — aggressive."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+wt_adj_reconstr=3000",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                ),
+                hidden_channels=[32],
+            ),
+            weight=3000.0,
+        ),
+    },
+    "s33_v8_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+cell-w2.0+adj-w2000+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s33 sweep, variant 8: BOTH stronger cell-NB "
+            "(wt_attr_reconstr = 2.0) AND stronger adjacency "
+            "(wt_adj_reconstr = 2000). Combination of v2 + v6. "
+            "Sharper cell + tighter spatial — tests whether the "
+            "two axes are additive."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+wt_attr_reconstr=2.0",
+            "+wt_adj_reconstr=2000",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_attr_recon_weight(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            alpha=1.0, wt_adv_batch=150.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+                weight=2.0,
+            ),
+            weight=2000.0,
+        ),
+    },
+
+    # ------------------------------------------------------------------------
+    # s34 — combinations of s30..s33 (Pareto candidates)
+    # ------------------------------------------------------------------------
+    # 8 stacked variants combining the most-promising knobs from the
+    # earlier sweeps. Use these as candidate winners — they pre-stack
+    # multiple ablation results so the best combination shows up in
+    # the same run as the single-knob variants.
+    "s34_v1_dualvq+rvq-both-30-60-90+decoder-cov+adv+enc-deeper+dec-w32+knn12+sampler12+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s34 sweep, variant 1: s30_v6 (3-level RVQ (30, 60, 90)) "
+            "stacked on s32_v1 (k=12 graph + sampler [12]). Tests "
+            "whether deeper codebook + denser graph compound."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 60, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=12)", "+sampler([12])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 60, 90)),
+                                    branch="cell", codebook_sizes=(30, 60, 90),
+                                ),
+                            ),
+                            alpha=1.0, wt_adv_batch=150.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=12,
+            ),
+            num_neighbors=[12],
+        ),
+    },
+    "s34_v2_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+cell-w2.0+knn12+sampler12+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s34 sweep, variant 2: s33_v2 (cell-NB w=2.0) stacked "
+            "on s32_v1 (k=12 + sampler [12]). Sharper cell + denser "
+            "spatial graph."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+wt_attr_reconstr=2.0",
+            "+graph_knn(n_neighs=12)", "+sampler([12])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_attr_recon_weight(
+                    _patch_dual_decoder_width(
+                        _patch_dual_encoder_deeper(
+                            _patch_dual_adversarial(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                alpha=1.0, wt_adv_batch=150.0,
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    weight=2.0,
+                ),
+                n_neighs=12,
+            ),
+            num_neighbors=[12],
+        ),
+    },
+    "s34_v3_dualvq+rvq-both-30-60-90+decoder-cov+adv-alpha2-wt300+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s34 sweep, variant 3: s30_v6 (3-level RVQ (30, 60, 90)) "
+            "+ stronger adv (α=2, wt=300). Bigger codebook + harder "
+            "integration pressure."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 60, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=2.0, wt=300.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_rvq(
+                            _patch_dual_rvq(_BD(),
+                                branch="niche", codebook_sizes=(30, 60, 90)),
+                            branch="cell", codebook_sizes=(30, 60, 90),
+                        ),
+                    ),
+                    alpha=2.0, wt_adv_batch=300.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s34_v4_dualvq+rvq-both+decoder-cov+adv+enc-200-200-128+gnn-h128+dec-w32+knn12+sampler12+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s34 sweep, variant 4: s31_v3 (encoder [200, 200, 128] "
+            "+ gnn-h128) stacked on s32_v1 (k=12 + sampler [12]). "
+            "Smaller latent + denser spatial graph."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[200, 200, 128])",
+            "+gnn-h=128",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=12)", "+sampler([12])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_gnn_hidden(
+                        _patch_dual_encoder_deeper(
+                            _patch_dual_adversarial(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                alpha=1.0, wt_adv_batch=150.0,
+                            ),
+                            hidden_channels=[200, 200, 128],
+                        ),
+                        hidden=128,
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=12,
+            ),
+            num_neighbors=[12],
+        ),
+    },
+    "s34_v5_dualvq+rvq-both-30-60-90+decoder-cov+adv+enc-deeper+dec-w32+cell-w2.0+adj-w500+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s34 sweep, variant 5: s30_v6 (3-level RVQ (30, 60, 90)) "
+            "+ s33_v2 (cell-NB w=2.0) + s33_v5 (adj w=500). Pareto "
+            "stack: deeper codebook + sharper cell + looser "
+            "spatial."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 60, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+wt_attr_reconstr=2.0", "+wt_adj_reconstr=500",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_attr_recon_weight(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 60, 90)),
+                                    branch="cell", codebook_sizes=(30, 60, 90),
+                                ),
+                            ),
+                            alpha=1.0, wt_adv_batch=150.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+                weight=2.0,
+            ),
+            weight=500.0,
+        ),
+    },
+    "s34_v6_dualvq+rvq-both-30-30-30+decoder-cov+adv+enc-128-128-128+gnn-h128+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s34 sweep, variant 6: s30_v1 (3-level RVQ (30, 30, 30)) "
+            "+ s31_v5 (encoder [128, 128, 128] + gnn-h128). "
+            "Compact spine: small uniform-128 trunk + small "
+            "uniform-30 codebook tree."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 30, 30])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[128, 128, 128])",
+            "+gnn-h=128",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_gnn_hidden(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 30, 30)),
+                                branch="cell", codebook_sizes=(30, 30, 30),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[128, 128, 128],
+                ),
+                hidden=128,
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s34_v7_dualvq+rvq-both+decoder-cov+adv-alpha2-wt300+enc-200-200-128+gnn-h128+dec-w32+adj-w300+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s34 sweep, variant 7: s31_v3 (enc [200, 200, 128] + "
+            "gnn-h128) + s32_v2-style stronger adv (α=2, wt=300) "
+            "+ s33_v4 (adj w=300). Smaller latent + harder "
+            "integration + much-looser spatial pressure."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=2.0, wt=300.0)",
+            "+enc-deeper(mlp=[200, 200, 128])",
+            "+gnn-h=128",
+            "+dec-w=[32]",
+            "+wt_adj_reconstr=300",
+        ],
+        "build": lambda: _patch_dual_adj_weight(
+            _patch_dual_decoder_width(
+                _patch_dual_gnn_hidden(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            alpha=2.0, wt_adv_batch=300.0,
+                        ),
+                        hidden_channels=[200, 200, 128],
+                    ),
+                    hidden=128,
+                ),
+                hidden_channels=[32],
+            ),
+            weight=300.0,
+        ),
+    },
+    "s34_v8_dualvq+rvq-both+decoder-cov+adv+enc-128-128-128+gnn-h128+dec-w32+knn12+sampler12+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s34 sweep, variant 8: s31_v5 (encoder [128, 128, 128] "
+            "+ gnn-h128) stacked on s32_v1 (k=12 + sampler [12]). "
+            "Compact uniform-128 trunk + denser spatial graph."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[128, 128, 128])",
+            "+gnn-h=128",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=12)", "+sampler([12])",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_gnn_hidden(
+                        _patch_dual_encoder_deeper(
+                            _patch_dual_adversarial(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                alpha=1.0, wt_adv_batch=150.0,
+                            ),
+                            hidden_channels=[128, 128, 128],
+                        ),
+                        hidden=128,
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=12,
+            ),
+            num_neighbors=[12],
+        ),
+    },
+
+    # ------------------------------------------------------------------------
+    # s35 — replace RVQ with CVQ (ConditionalVQ, tree-structured)
+    # ------------------------------------------------------------------------
+    # ConditionalVQ uses a hard tree: each level-1 macro bucket has its
+    # own level-2 (and optionally level-3) sub-codebook, so children are
+    # macro-specialised rather than shared as in RVQ. Composite codes
+    # are K1 (× K2 (× K3)). Tests whether macro-specialised children
+    # outperform RVQ's residual+shared scheme at the same nominal
+    # cardinality.
+    "s35_v1_dualvq+cvq-both-30-30+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s35 sweep, variant 1: CVQ (30, 30) — 2-level, "
+            "900 composite codes. Direct CVQ analog of an RVQ "
+            "(30, 30)."
+        ),
+        "patches": [
+            "+cvq(branch=both, K1=30, K2=30)",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_cvq(_BD(),
+                            branch="both", k1=30, k2=30),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s35_v2_dualvq+cvq-both-30-60+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s35 sweep, variant 2: CVQ (30, 60) — 2-level, "
+            "1,800 composite codes."
+        ),
+        "patches": [
+            "+cvq(branch=both, K1=30, K2=60)",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_cvq(_BD(),
+                            branch="both", k1=30, k2=60),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s35_v3_dualvq+cvq-both-30-90+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s35 sweep, variant 3: CVQ (30, 90) — 2-level, "
+            "2,700 composite codes. DIRECT comparison to the "
+            "parent RVQ (30, 90): same nominal cardinality, "
+            "but CVQ uses macro-specialised children while RVQ "
+            "shares them across macros."
+        ),
+        "patches": [
+            "+cvq(branch=both, K1=30, K2=90)",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_cvq(_BD(),
+                            branch="both", k1=30, k2=90),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s35_v4_dualvq+cvq-both-30-30-30+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s35 sweep, variant 4: CVQ (30, 30, 30) — 3-level, "
+            "27,000 composite codes. Direct CVQ analog of s30_v1's "
+            "RVQ (30, 30, 30)."
+        ),
+        "patches": [
+            "+cvq(branch=both, K1=30, K2=30, K3=30)",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_cvq(_BD(),
+                            branch="both", k1=30, k2=30, k3=30),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s35_v5_dualvq+cvq-both-30-30-60+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s35 sweep, variant 5: CVQ (30, 30, 60) — 3-level, "
+            "54,000 composite codes. CVQ analog of s30_v2."
+        ),
+        "patches": [
+            "+cvq(branch=both, K1=30, K2=30, K3=60)",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_cvq(_BD(),
+                            branch="both", k1=30, k2=30, k3=60),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s35_v6_dualvq+cvq-both-30-60-60+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s35 sweep, variant 6: CVQ (30, 60, 60) — 3-level, "
+            "108,000 composite codes. CVQ analog of s30_v5."
+        ),
+        "patches": [
+            "+cvq(branch=both, K1=30, K2=60, K3=60)",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_cvq(_BD(),
+                            branch="both", k1=30, k2=60, k3=60),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s35_v7_dualvq+cvq-both-30-60-90+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s35 sweep, variant 7: CVQ (30, 60, 90) — 3-level, "
+            "162,000 composite codes. CVQ analog of s30_v6 "
+            "(the s34_v1 codebook shape)."
+        ),
+        "patches": [
+            "+cvq(branch=both, K1=30, K2=60, K3=90)",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_cvq(_BD(),
+                            branch="both", k1=30, k2=60, k3=90),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
+    "s35_v8_dualvq+cvq-both-30-90-90+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s35 sweep, variant 8: CVQ (30, 90, 90) — 3-level, "
+            "243,000 composite codes. CVQ analog of s30_v8."
+        ),
+        "patches": [
+            "+cvq(branch=both, K1=30, K2=90, K3=90)",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+                _patch_dual_adversarial(
+                    _patch_dual_decoder_covariate(
+                        _patch_dual_cvq(_BD(),
+                            branch="both", k1=30, k2=90, k3=90),
+                    ),
+                    alpha=1.0, wt_adv_batch=150.0,
+                ),
+            ),
+            hidden_channels=[32],
+        ),
+    },
 }
 
 
@@ -9752,6 +14183,794 @@ VARIANTS["s24_v12_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+adv-alpha
 }
 
 
+# ---- Sweep 25: tight architecture (enc/dec=[128], GATv2, RVQ-3L) ----
+# Hypothesis: the historic `+wide+rvq-both-3level+decoder-cov+adv
+# +enc-shallow` variant gave GOOD niche / cell NMI but WEAK batch
+# integration. Tighten the architecture further (symmetric 128-dim
+# latents on both branches) and swap SAGE → GATv2; vary the
+# integration approach to find a config that lifts iLISI without
+# sacrificing the NMI win.
+#
+# Architecture (all 8 variants share this spine):
+#   - Encoder MLP:    [128]  (1 hidden of 128) via _patch_dual_encoder_shallow
+#   - GNN:            GATv2, hidden=128, **1 layer** (via +wide with
+#                      gnn_layers=1 override, +gatv2 for type,
+#                      +gnn-hidden(128) for width)
+#   - Codebook:       RVQ 3-level (30, 60, 120) on both branches
+#                      = 216k composite codes per branch
+#   - Decoder:        [128]  (1 hidden of 128) on BOTH cell and niche
+#                      via _patch_dual_decoder_width
+#   - Decoder cov:    learned embedding, embed_dim=16
+#   - Sampler:        [8] (from +wide override, matches 1-layer GNN)
+#   - Nbr-agg hops:   1 (from +wide override)
+#
+# Both branches end up with SYMMETRIC 128-dim latents (z_mlp=128,
+# z_gnn=128). Compared to the historic "+enc-shallow" variant (which
+# had encoder=[256], decoder=[400,400], GNN=SAGE h=256), this is
+# strictly tighter on every dim AND swaps the message-passing op to
+# GATv2.
+#
+# 8 variants vary ONLY the batch-integration approach. The spine is
+# tightened to maximise the latent's batch-invariance pressure, then
+# we sweep integration knobs to find where iLISI lifts without
+# breaking the NMI win.
+#
+#   v1: +adv (canonical, α=1.0, wt=150)    — baseline integration
+#   v2: +adv-alpha2-wt300 (≈4× encoder grad) — stronger adv
+#   v3: +mmd-w200 (MMD only, no adv)        — non-adversarial path
+#   v4: +adv + +mmd-w100 (combined)          — stacked pressure
+#   v5: +adv + +adj-w300 (relaxed adj BCE)   — loosen niche-side anchor
+#   v6: +adv + +nbr-w0.5 (relaxed niche NB)  — loosen reconstruction anchor
+#   v7: +adv + +adj-w300 + +nbr-w0.5         — multi-axis relax
+#   v8: +adv-alpha2-wt300 + +adj-w300        — strong adv + relaxed adj
+#
+# Reading the grid:
+#   - v1 establishes the new spine's baseline. Compare to historic
+#     "+enc-shallow" to see whether the GATv2 + tighter dims alone
+#     already help integration.
+#   - v2 / v3 / v7 / v8 test pure integration pressure increases.
+#   - v5 / v6 isolate niche-side anchor loosening (the s23 levers).
+#   - v4 / v7 stack multiple knobs for a Pareto candidate.
+#
+# What to watch:
+#   - nbr_NMI / cell_NMI: shouldn't fall much below the historic
+#     "+enc-shallow" levels — if they do, the new spine is too tight.
+#   - nbr_iLISI / cell_iLISI: the headline metric this sweep is
+#     trying to lift. Historic enc-shallow was weak here.
+#   - Pearson NB recon: secondary; the tight latent + tight decoder
+#     may hurt fine-grained gene reconstruction.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v25
+
+# Shared spine for every s25 variant. The build chain runs:
+#   _BD() → +wide → rvq(niche, [30,60,120]) → rvq(cell, [30,60,120])
+#         → +gatv2 → gnn_hidden(128) → enc_shallow([128])
+#         → decoder_width([128]) → decoder_covariate (default embed=16)
+# Then each variant wraps THIS with its integration-knob patches.
+
+VARIANTS["s25_v1_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s25 sweep, variant 1: tight architecture (enc=[128], "
+        "dec=[128], GATv2 GNN h=128 2L, RVQ 3-level (30,60,120)) + "
+        "canonical adversarial (alpha=1, wt=150). Establishes the "
+        "baseline on the new spine — directly compare to the historic "
+        "'+enc-shallow' variant to see whether GATv2 + tighter dims "
+        "alone help integration."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 60, 120])",
+        "+gatv2", "+gnn_hidden(128)",
+        "+enc-shallow(mlp=[128])", "+dec-w=[128]",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+    ],
+    "build": lambda: _patch_dual_adversarial(
+        _patch_dual_decoder_covariate(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_shallow(
+                    _patch_dual_gnn_hidden(
+                        _patch_dual_gatv2(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(
+                                    _patch_dual_wide(_BD(), gnn_layers=1, sampler_neighbors=[8], nbr_hops=1),
+                                    branch="niche", codebook_sizes=(30, 60, 120),
+                                ),
+                                branch="cell", codebook_sizes=(30, 60, 120),
+                            ),
+                        ),
+                        hidden=128,
+                    ),
+                    hidden_channels=[128],
+                ),
+                hidden_channels=[128],
+            ),
+        ),
+        alpha=1.0, wt_adv_batch=150.0,
+    ),
+}
+
+VARIANTS["s25_v2_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-alpha2-wt300+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s25 sweep, variant 2: same tight spine as v1, but with "
+        "stronger adversarial (alpha=2, wt=300; ≈4× effective "
+        "encoder gradient). Tests whether the tighter latent makes "
+        "the higher-alpha regime tractable (alpha>=2 previously "
+        "caused codebook collapse on smaller setups; the rvq-3level "
+        "spine should stabilise it)."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 60, 120])",
+        "+gatv2", "+gnn_hidden(128)",
+        "+enc-shallow(mlp=[128])", "+dec-w=[128]",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=2.0, wt=300.0)",
+    ],
+    "build": lambda: _patch_dual_adversarial(
+        _patch_dual_decoder_covariate(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_shallow(
+                    _patch_dual_gnn_hidden(
+                        _patch_dual_gatv2(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(
+                                    _patch_dual_wide(_BD(), gnn_layers=1, sampler_neighbors=[8], nbr_hops=1),
+                                    branch="niche", codebook_sizes=(30, 60, 120),
+                                ),
+                                branch="cell", codebook_sizes=(30, 60, 120),
+                            ),
+                        ),
+                        hidden=128,
+                    ),
+                    hidden_channels=[128],
+                ),
+                hidden_channels=[128],
+            ),
+        ),
+        alpha=2.0, wt_adv_batch=300.0,
+    ),
+}
+
+VARIANTS["s25_v3_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+mmd-w200+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s25 sweep, variant 3: same tight spine as v1, but with "
+        "MMD-only batch integration (wt_mmd_batch=200, no "
+        "adversarial head). Tests whether the smaller latent lets "
+        "MMD's distribution-matching pressure actually reach the "
+        "encoder (deterministic per-step signal, no min-max "
+        "instability)."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 60, 120])",
+        "+gatv2", "+gnn_hidden(128)",
+        "+enc-shallow(mlp=[128])", "+dec-w=[128]",
+        "+decoder_covariate",
+        "+mmd-w200",
+    ],
+    "build": lambda: _patch_dual_mmd_batch(
+        _patch_dual_decoder_covariate(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_shallow(
+                    _patch_dual_gnn_hidden(
+                        _patch_dual_gatv2(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(
+                                    _patch_dual_wide(_BD(), gnn_layers=1, sampler_neighbors=[8], nbr_hops=1),
+                                    branch="niche", codebook_sizes=(30, 60, 120),
+                                ),
+                                branch="cell", codebook_sizes=(30, 60, 120),
+                            ),
+                        ),
+                        hidden=128,
+                    ),
+                    hidden_channels=[128],
+                ),
+                hidden_channels=[128],
+            ),
+        ),
+        wt_mmd_batch=200.0,
+    ),
+}
+
+VARIANTS["s25_v4_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv+mmd-w100+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s25 sweep, variant 4: same tight spine as v1, with adv + MMD-w100 "
+        "STACKED. Tests whether combining the two distinct integration "
+        "pressures (min-max GRL + deterministic distribution match) "
+        "gives a stronger combined effect than either alone."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 60, 120])",
+        "+gatv2", "+gnn_hidden(128)",
+        "+enc-shallow(mlp=[128])", "+dec-w=[128]",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+mmd-w100",
+    ],
+    "build": lambda: _patch_dual_mmd_batch(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_shallow(
+                        _patch_dual_gnn_hidden(
+                            _patch_dual_gatv2(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(
+                                        _patch_dual_wide(_BD(), gnn_layers=1, sampler_neighbors=[8], nbr_hops=1),
+                                        branch="niche", codebook_sizes=(30, 60, 120),
+                                    ),
+                                    branch="cell", codebook_sizes=(30, 60, 120),
+                                ),
+                            ),
+                            hidden=128,
+                        ),
+                        hidden_channels=[128],
+                    ),
+                    hidden_channels=[128],
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        wt_mmd_batch=100.0,
+    ),
+}
+
+VARIANTS["s25_v5_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv+adj-w300+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s25 sweep, variant 5: same tight spine as v1 + canonical adv + "
+        "adj-w300 (cosine adjacency BCE weight reduced from default "
+        "1000 → 300). Loosens the niche-side spatial anchor — frees "
+        "the niche embedding for integration without disabling the "
+        "adjacency loss entirely."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 60, 120])",
+        "+gatv2", "+gnn_hidden(128)",
+        "+enc-shallow(mlp=[128])", "+dec-w=[128]",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+adj-w300",
+    ],
+    "build": lambda: _patch_dual_adj_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_shallow(
+                        _patch_dual_gnn_hidden(
+                            _patch_dual_gatv2(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(
+                                        _patch_dual_wide(_BD(), gnn_layers=1, sampler_neighbors=[8], nbr_hops=1),
+                                        branch="niche", codebook_sizes=(30, 60, 120),
+                                    ),
+                                    branch="cell", codebook_sizes=(30, 60, 120),
+                                ),
+                            ),
+                            hidden=128,
+                        ),
+                        hidden_channels=[128],
+                    ),
+                    hidden_channels=[128],
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        weight=300.0,
+    ),
+}
+
+VARIANTS["s25_v6_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv+nbr-w0.5+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s25 sweep, variant 6: same tight spine as v1 + canonical adv + "
+        "nbr-w0.5 (niche NB attribute-reconstruction weight reduced "
+        "from default 1.0 → 0.5). Loosens the per-cell gene-mean "
+        "anchor on the niche embedding — complementary to v5's "
+        "adjacency reduction."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 60, 120])",
+        "+gatv2", "+gnn_hidden(128)",
+        "+enc-shallow(mlp=[128])", "+dec-w=[128]",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+nbr-w0.5",
+    ],
+    "build": lambda: _patch_dual_attr_recon_nbr_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_shallow(
+                        _patch_dual_gnn_hidden(
+                            _patch_dual_gatv2(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(
+                                        _patch_dual_wide(_BD(), gnn_layers=1, sampler_neighbors=[8], nbr_hops=1),
+                                        branch="niche", codebook_sizes=(30, 60, 120),
+                                    ),
+                                    branch="cell", codebook_sizes=(30, 60, 120),
+                                ),
+                            ),
+                            hidden=128,
+                        ),
+                        hidden_channels=[128],
+                    ),
+                    hidden_channels=[128],
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=150.0,
+        ),
+        weight=0.5,
+    ),
+}
+
+VARIANTS["s25_v7_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv+adj-w300+nbr-w0.5+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s25 sweep, variant 7: same tight spine as v1 + canonical adv + "
+        "BOTH niche-side relaxations from v5 + v6 (adj-w300 + nbr-w0.5). "
+        "Multi-axis loosening — the strongest niche-side relaxation in "
+        "this sweep, pairs naturally with the default-strength adv."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 60, 120])",
+        "+gatv2", "+gnn_hidden(128)",
+        "+enc-shallow(mlp=[128])", "+dec-w=[128]",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=150.0)",
+        "+adj-w300", "+nbr-w0.5",
+    ],
+    "build": lambda: _patch_dual_attr_recon_nbr_weight(
+        _patch_dual_adj_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_decoder_width(
+                        _patch_dual_encoder_shallow(
+                            _patch_dual_gnn_hidden(
+                                _patch_dual_gatv2(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _patch_dual_wide(_BD(), gnn_layers=1, sampler_neighbors=[8], nbr_hops=1),
+                                            branch="niche", codebook_sizes=(30, 60, 120),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 60, 120),
+                                    ),
+                                ),
+                                hidden=128,
+                            ),
+                            hidden_channels=[128],
+                        ),
+                        hidden_channels=[128],
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=150.0,
+            ),
+            weight=300.0,
+        ),
+        weight=0.5,
+    ),
+}
+
+VARIANTS["s25_v8_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-alpha2-wt300+adj-w300+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s25 sweep, variant 8: same tight spine as v1 + stronger adv "
+        "(alpha=2, wt=300) + adj-w300. Combines the strongest "
+        "integration pressure (v2-style adv) with niche-side anchor "
+        "relaxation (v5-style adj). If the high-alpha regime doesn't "
+        "collapse on this tight spine, v8 is the aggressive Pareto "
+        "candidate."
+    ),
+    "patches": [
+        "+wide", "+rvq(branch=both, levels=[30, 60, 120])",
+        "+gatv2", "+gnn_hidden(128)",
+        "+enc-shallow(mlp=[128])", "+dec-w=[128]",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=2.0, wt=300.0)",
+        "+adj-w300",
+    ],
+    "build": lambda: _patch_dual_adj_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_shallow(
+                        _patch_dual_gnn_hidden(
+                            _patch_dual_gatv2(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(
+                                        _patch_dual_wide(_BD(), gnn_layers=1, sampler_neighbors=[8], nbr_hops=1),
+                                        branch="niche", codebook_sizes=(30, 60, 120),
+                                    ),
+                                    branch="cell", codebook_sizes=(30, 60, 120),
+                                ),
+                            ),
+                            hidden=128,
+                        ),
+                        hidden_channels=[128],
+                    ),
+                    hidden_channels=[128],
+                ),
+            ),
+            alpha=2.0, wt_adv_batch=300.0,
+        ),
+        weight=300.0,
+    ),
+}
+
+
+# ---- Sweep 26: s25 with WEAK adversarial (wt=15, warmup=5) ----------
+# Mirror of the s25 sweep with two changes baked into every variant
+# that uses adversarial:
+#   - `wt_adv_batch`: 150 → 15 (10× smaller). Same magnitude regime as
+#     the discriminator's natural CE scale (log(2) ≈ 0.69 nats); pulls
+#     the encoder back from the aggressive 150-weighted gradient that
+#     dominated reconstruction.
+#   - `warmup_epochs`: 0 → 5. The GRL alpha is zero for the first 5
+#     epochs so cell + niche codes settle on biology before any
+#     batch-invariance pressure kicks in. The discriminator still
+#     trains during warmup; only the encoder is shielded.
+#
+# For variants that were "stronger adv" in s25 (v2 with α=2/wt=300,
+# v8 with α=2/wt=300), we scale proportionally → α=2, wt=30 here
+# (still 10× smaller than the s25 counterpart). v3 (MMD-only, no
+# adversarial head at all) is unchanged from s26's perspective.
+#
+# Hypothesis: s25's adversarial weight may have been too aggressive on
+# the tight architecture — pulling the encoder too hard toward batch
+# invariance and starving the reconstruction signal. Gentler adv +
+# warmup should let the model establish a good NB-reconstruction
+# regime first, then apply mild batch-invariance pressure on top.
+#
+# Same shared spine as s25:
+#   GATv2 GNN h=128, 1 layer + enc MLP [128] + dec [128] + RVQ 3L
+#   (30, 60, 120) + decoder-cov + sampler [8] + nbr-agg hops 1.
+#
+# 8 variants, mirroring s25's integration-knob structure:
+#   v1: +adv(α=1, wt=15, warmup=5)              ← baseline weak adv
+#   v2: +adv(α=2, wt=30, warmup=5)               ← still-weak stronger adv
+#   v3: +mmd-w200                                ← unchanged from s25_v3
+#   v4: +adv(weak) + +mmd-w100                   ← stacked weak adv + mmd
+#   v5: +adv(weak) + +adj-w300                   ← weak adv + relaxed adj
+#   v6: +adv(weak) + +nbr-w0.5                   ← weak adv + relaxed niche NB
+#   v7: +adv(weak) + +adj-w300 + +nbr-w0.5       ← multi-axis with weak adv
+#   v8: +adv(α=2, wt=30, warmup=5) + +adj-w300   ← stronger-weak adv + relaxed adj
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v26
+
+VARIANTS["s26_v1_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-wt15-warmup5+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s26 sweep, variant 1: same tight spine as s25_v1, but with "
+        "WEAK adversarial (α=1, wt=15, warmup=5). 10× smaller "
+        "wt_adv_batch + 5-epoch GRL warmup. Establishes the new "
+        "weak-adv baseline — compare to s25_v1 to see whether "
+        "gentler adv preserves NMI better."
+    ),
+    "patches": [
+        "+wide(gnn_layers=1)", "+rvq(branch=both, levels=[30, 60, 120])",
+        "+gatv2", "+gnn_hidden(128)",
+        "+enc-shallow(mlp=[128])", "+dec-w=[128]",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=15.0, warmup=5)",
+    ],
+    "build": lambda: _patch_dual_adversarial(
+        _patch_dual_decoder_covariate(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_shallow(
+                    _patch_dual_gnn_hidden(
+                        _patch_dual_gatv2(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(
+                                    _patch_dual_wide(_BD(), gnn_layers=1, sampler_neighbors=[8], nbr_hops=1),
+                                    branch="niche", codebook_sizes=(30, 60, 120),
+                                ),
+                                branch="cell", codebook_sizes=(30, 60, 120),
+                            ),
+                        ),
+                        hidden=128,
+                    ),
+                    hidden_channels=[128],
+                ),
+                hidden_channels=[128],
+            ),
+        ),
+        alpha=1.0, wt_adv_batch=15.0, warmup_epochs=5,
+    ),
+}
+
+VARIANTS["s26_v2_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-alpha2-wt30-warmup5+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s26 sweep, variant 2: same tight spine + α=2, wt=30, "
+        "warmup=5. Mirror of s25_v2 but with adversarial weight 10× "
+        "smaller. Tests whether the higher-alpha regime is more "
+        "tractable when the loss-weight magnitude is gentler."
+    ),
+    "patches": [
+        "+wide(gnn_layers=1)", "+rvq(branch=both, levels=[30, 60, 120])",
+        "+gatv2", "+gnn_hidden(128)",
+        "+enc-shallow(mlp=[128])", "+dec-w=[128]",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=2.0, wt=30.0, warmup=5)",
+    ],
+    "build": lambda: _patch_dual_adversarial(
+        _patch_dual_decoder_covariate(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_shallow(
+                    _patch_dual_gnn_hidden(
+                        _patch_dual_gatv2(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(
+                                    _patch_dual_wide(_BD(), gnn_layers=1, sampler_neighbors=[8], nbr_hops=1),
+                                    branch="niche", codebook_sizes=(30, 60, 120),
+                                ),
+                                branch="cell", codebook_sizes=(30, 60, 120),
+                            ),
+                        ),
+                        hidden=128,
+                    ),
+                    hidden_channels=[128],
+                ),
+                hidden_channels=[128],
+            ),
+        ),
+        alpha=2.0, wt_adv_batch=30.0, warmup_epochs=5,
+    ),
+}
+
+VARIANTS["s26_v3_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+mmd-w200+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s26 sweep, variant 3: same tight spine + MMD-only (w=200, no "
+        "adversarial head). Identical to s25_v3 since the weak-adv "
+        "rescaling doesn't apply to the MMD-only path. Included for "
+        "sweep completeness — direct cross-reference for the "
+        "non-adversarial path on this spine."
+    ),
+    "patches": [
+        "+wide(gnn_layers=1)", "+rvq(branch=both, levels=[30, 60, 120])",
+        "+gatv2", "+gnn_hidden(128)",
+        "+enc-shallow(mlp=[128])", "+dec-w=[128]",
+        "+decoder_covariate",
+        "+mmd-w200",
+    ],
+    "build": lambda: _patch_dual_mmd_batch(
+        _patch_dual_decoder_covariate(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_shallow(
+                    _patch_dual_gnn_hidden(
+                        _patch_dual_gatv2(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(
+                                    _patch_dual_wide(_BD(), gnn_layers=1, sampler_neighbors=[8], nbr_hops=1),
+                                    branch="niche", codebook_sizes=(30, 60, 120),
+                                ),
+                                branch="cell", codebook_sizes=(30, 60, 120),
+                            ),
+                        ),
+                        hidden=128,
+                    ),
+                    hidden_channels=[128],
+                ),
+                hidden_channels=[128],
+            ),
+        ),
+        wt_mmd_batch=200.0,
+    ),
+}
+
+VARIANTS["s26_v4_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-wt15-warmup5+mmd-w100+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s26 sweep, variant 4: same tight spine + weak adv (α=1, "
+        "wt=15, warmup=5) + MMD-w100. Stacks the two distinct "
+        "integration pressures at gentler magnitudes than s25_v4."
+    ),
+    "patches": [
+        "+wide(gnn_layers=1)", "+rvq(branch=both, levels=[30, 60, 120])",
+        "+gatv2", "+gnn_hidden(128)",
+        "+enc-shallow(mlp=[128])", "+dec-w=[128]",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=15.0, warmup=5)",
+        "+mmd-w100",
+    ],
+    "build": lambda: _patch_dual_mmd_batch(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_shallow(
+                        _patch_dual_gnn_hidden(
+                            _patch_dual_gatv2(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(
+                                        _patch_dual_wide(_BD(), gnn_layers=1, sampler_neighbors=[8], nbr_hops=1),
+                                        branch="niche", codebook_sizes=(30, 60, 120),
+                                    ),
+                                    branch="cell", codebook_sizes=(30, 60, 120),
+                                ),
+                            ),
+                            hidden=128,
+                        ),
+                        hidden_channels=[128],
+                    ),
+                    hidden_channels=[128],
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=15.0, warmup_epochs=5,
+        ),
+        wt_mmd_batch=100.0,
+    ),
+}
+
+VARIANTS["s26_v5_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-wt15-warmup5+adj-w300+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s26 sweep, variant 5: same tight spine + weak adv (α=1, "
+        "wt=15, warmup=5) + adj-w300. Mirror of s25_v5 with gentler "
+        "adv — frees the niche side via adj relaxation while keeping "
+        "encoder pressure mild."
+    ),
+    "patches": [
+        "+wide(gnn_layers=1)", "+rvq(branch=both, levels=[30, 60, 120])",
+        "+gatv2", "+gnn_hidden(128)",
+        "+enc-shallow(mlp=[128])", "+dec-w=[128]",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=15.0, warmup=5)",
+        "+adj-w300",
+    ],
+    "build": lambda: _patch_dual_adj_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_shallow(
+                        _patch_dual_gnn_hidden(
+                            _patch_dual_gatv2(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(
+                                        _patch_dual_wide(_BD(), gnn_layers=1, sampler_neighbors=[8], nbr_hops=1),
+                                        branch="niche", codebook_sizes=(30, 60, 120),
+                                    ),
+                                    branch="cell", codebook_sizes=(30, 60, 120),
+                                ),
+                            ),
+                            hidden=128,
+                        ),
+                        hidden_channels=[128],
+                    ),
+                    hidden_channels=[128],
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=15.0, warmup_epochs=5,
+        ),
+        weight=300.0,
+    ),
+}
+
+VARIANTS["s26_v6_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-wt15-warmup5+nbr-w0.5+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s26 sweep, variant 6: same tight spine + weak adv + "
+        "nbr-w0.5. Mirror of s25_v6 with gentler adv."
+    ),
+    "patches": [
+        "+wide(gnn_layers=1)", "+rvq(branch=both, levels=[30, 60, 120])",
+        "+gatv2", "+gnn_hidden(128)",
+        "+enc-shallow(mlp=[128])", "+dec-w=[128]",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=15.0, warmup=5)",
+        "+nbr-w0.5",
+    ],
+    "build": lambda: _patch_dual_attr_recon_nbr_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_shallow(
+                        _patch_dual_gnn_hidden(
+                            _patch_dual_gatv2(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(
+                                        _patch_dual_wide(_BD(), gnn_layers=1, sampler_neighbors=[8], nbr_hops=1),
+                                        branch="niche", codebook_sizes=(30, 60, 120),
+                                    ),
+                                    branch="cell", codebook_sizes=(30, 60, 120),
+                                ),
+                            ),
+                            hidden=128,
+                        ),
+                        hidden_channels=[128],
+                    ),
+                    hidden_channels=[128],
+                ),
+            ),
+            alpha=1.0, wt_adv_batch=15.0, warmup_epochs=5,
+        ),
+        weight=0.5,
+    ),
+}
+
+VARIANTS["s26_v7_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-wt15-warmup5+adj-w300+nbr-w0.5+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s26 sweep, variant 7: same tight spine + weak adv + "
+        "BOTH adj-w300 and nbr-w0.5. Mirror of s25_v7 with gentler "
+        "adv — multi-axis relaxation paired with mild encoder "
+        "pressure."
+    ),
+    "patches": [
+        "+wide(gnn_layers=1)", "+rvq(branch=both, levels=[30, 60, 120])",
+        "+gatv2", "+gnn_hidden(128)",
+        "+enc-shallow(mlp=[128])", "+dec-w=[128]",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=1.0, wt=15.0, warmup=5)",
+        "+adj-w300", "+nbr-w0.5",
+    ],
+    "build": lambda: _patch_dual_attr_recon_nbr_weight(
+        _patch_dual_adj_weight(
+            _patch_dual_adversarial(
+                _patch_dual_decoder_covariate(
+                    _patch_dual_decoder_width(
+                        _patch_dual_encoder_shallow(
+                            _patch_dual_gnn_hidden(
+                                _patch_dual_gatv2(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _patch_dual_wide(_BD(), gnn_layers=1, sampler_neighbors=[8], nbr_hops=1),
+                                            branch="niche", codebook_sizes=(30, 60, 120),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 60, 120),
+                                    ),
+                                ),
+                                hidden=128,
+                            ),
+                            hidden_channels=[128],
+                        ),
+                        hidden_channels=[128],
+                    ),
+                ),
+                alpha=1.0, wt_adv_batch=15.0, warmup_epochs=5,
+            ),
+            weight=300.0,
+        ),
+        weight=0.5,
+    ),
+}
+
+VARIANTS["s26_v8_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-alpha2-wt30-warmup5+adj-w300+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s26 sweep, variant 8: same tight spine + α=2, wt=30, "
+        "warmup=5 + adj-w300. Mirror of s25_v8 with adversarial "
+        "weight 10× smaller — combines stronger-but-still-gentle adv "
+        "with adj relaxation. Aggressive Pareto candidate among the "
+        "weak-adv variants."
+    ),
+    "patches": [
+        "+wide(gnn_layers=1)", "+rvq(branch=both, levels=[30, 60, 120])",
+        "+gatv2", "+gnn_hidden(128)",
+        "+enc-shallow(mlp=[128])", "+dec-w=[128]",
+        "+decoder_covariate",
+        "+adversarial_batch(alpha=2.0, wt=30.0, warmup=5)",
+        "+adj-w300",
+    ],
+    "build": lambda: _patch_dual_adj_weight(
+        _patch_dual_adversarial(
+            _patch_dual_decoder_covariate(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_shallow(
+                        _patch_dual_gnn_hidden(
+                            _patch_dual_gatv2(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(
+                                        _patch_dual_wide(_BD(), gnn_layers=1, sampler_neighbors=[8], nbr_hops=1),
+                                        branch="niche", codebook_sizes=(30, 60, 120),
+                                    ),
+                                    branch="cell", codebook_sizes=(30, 60, 120),
+                                ),
+                            ),
+                            hidden=128,
+                        ),
+                        hidden_channels=[128],
+                    ),
+                    hidden_channels=[128],
+                ),
+            ),
+            alpha=2.0, wt_adv_batch=30.0, warmup_epochs=5,
+        ),
+        weight=300.0,
+    ),
+}
+
+
 VARIANTS["s21_v4_dualvq+wide+rvq-both+decoder-cov+adv+niche-neck+mmb0-1b_smb1-1b_1p"] = {
     "description": (
         "s21 sweep, variant 4: spine s17_v2 + niche-neck MLP. A new "
@@ -10361,6 +15580,7 @@ DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v10"] = [
 # patches, different anatomical zones) without touching the submitter.
 DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-region-holdout"] = [
     "dualvq+rvq-both+decoder-cov+adv+region-holdout+mmb0-1b_smb1-1b_1p",
+    "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+region-holdout+mmb0-1b_smb1-1b_1p",
 ]
 
 # v12 — commit-loss exploration. 8 variants varying `wt_commit_cell`,
@@ -10631,6 +15851,213 @@ DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v24"] = [
     "s24_v12_dualvq+compact-l32+rvq-both-30-20-10+decoder-cov-e32+adv-alpha2-wt300+adj-w300+mmb0-1b_smb1-1b_1p",
 ]
 
+# Sweep 25 — tight-architecture integration sweep. 8 variants on a
+# shared spine: GATv2 GNN h=128 2L + encoder MLP [128] + decoder [128]
+# + RVQ 3-level (30, 60, 120) + decoder-cov. Symmetric 128-dim
+# latents on both branches. Variants vary the batch-integration
+# approach to lift iLISI without sacrificing NMI on the new tight
+# spine.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v25
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v25"] = [
+    "s25_v1_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv+mmb0-1b_smb1-1b_1p",
+    "s25_v2_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-alpha2-wt300+mmb0-1b_smb1-1b_1p",
+    "s25_v3_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+mmd-w200+mmb0-1b_smb1-1b_1p",
+    "s25_v4_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv+mmd-w100+mmb0-1b_smb1-1b_1p",
+    "s25_v5_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv+adj-w300+mmb0-1b_smb1-1b_1p",
+    "s25_v6_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv+nbr-w0.5+mmb0-1b_smb1-1b_1p",
+    "s25_v7_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv+adj-w300+nbr-w0.5+mmb0-1b_smb1-1b_1p",
+    "s25_v8_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-alpha2-wt300+adj-w300+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 26 — s25 spine with WEAK adversarial (wt_adv_batch 10×
+# smaller + 5-epoch GRL warmup). Same 8-variant integration grid as
+# s25, but every adv-using variant runs with wt=15 (vs 150) /
+# wt=30 (vs 300) + warmup_epochs=5.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v26
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v26"] = [
+    "s26_v1_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-wt15-warmup5+mmb0-1b_smb1-1b_1p",
+    "s26_v2_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-alpha2-wt30-warmup5+mmb0-1b_smb1-1b_1p",
+    "s26_v3_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+mmd-w200+mmb0-1b_smb1-1b_1p",
+    "s26_v4_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-wt15-warmup5+mmd-w100+mmb0-1b_smb1-1b_1p",
+    "s26_v5_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-wt15-warmup5+adj-w300+mmb0-1b_smb1-1b_1p",
+    "s26_v6_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-wt15-warmup5+nbr-w0.5+mmb0-1b_smb1-1b_1p",
+    "s26_v7_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-wt15-warmup5+adj-w300+nbr-w0.5+mmb0-1b_smb1-1b_1p",
+    "s26_v8_dualvq+gatv2+enc128+dec128+rvq3l-30-60-120+decoder-cov+adv-alpha2-wt30-warmup5+adj-w300+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 27 — encoder-shape ablations on the +enc-deeper+dec-w256
+# spine (= `dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w256`).
+# All 4 variants share decoder=[256], 1L SAGE GNN h=256, RVQ (30,90),
+# decoder-cov embed=16, adv α=1 wt=150. Only the encoder MLP varies.
+# Note: where the encoder output dim differs from 256, the
+# cell-branch latent (z_mlp) and niche-branch latent (z_gnn=256)
+# become asymmetric — see VARIANTS dict entries for details.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v27
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v27"] = [
+    "s27_v1_dualvq+rvq-both+decoder-cov+adv+enc-512+dec-w256+mmb0-1b_smb1-1b_1p",
+    "s27_v2_dualvq+rvq-both+decoder-cov+adv+enc-128-128-128+dec-w256+mmb0-1b_smb1-1b_1p",
+    "s27_v3_dualvq+rvq-both+decoder-cov+adv+enc-256-256-256-256+dec-w256+mmb0-1b_smb1-1b_1p",
+    "s27_v4_dualvq+rvq-both+decoder-cov+adv+enc-512-256-128+dec-w256+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 28 — same encoder shapes as s27, but with 2-LAYER GNN via
+# +wide (sampler [8, 8], 2-hop nbr aggregation). Cross-reference
+# s27_vN ↔ s28_vN to read the "does 2-hop niche aggregation help
+# this encoder shape?" A/B at each shape.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v28
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v28"] = [
+    "s28_v1_dualvq+wide+rvq-both+decoder-cov+adv+enc-512+dec-w256+mmb0-1b_smb1-1b_1p",
+    "s28_v2_dualvq+wide+rvq-both+decoder-cov+adv+enc-128-128-128+dec-w256+mmb0-1b_smb1-1b_1p",
+    "s28_v3_dualvq+wide+rvq-both+decoder-cov+adv+enc-256-256-256-256+dec-w256+mmb0-1b_smb1-1b_1p",
+    "s28_v4_dualvq+wide+rvq-both+decoder-cov+adv+enc-512-256-128+dec-w256+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 29 — batch-integration mechanism comparison on the
+# `+enc-deeper+dec-w256` spine. 6 variants comparing the new
+# `_patch_dual_mmd_prior` (NicheCompass-style MMD-to-prior) against
+# `_patch_dual_adversarial` and `_patch_dual_mmd_batch` alone and in
+# combination. Tests whether non-adversarial prior-matching can
+# replace or complement the adversarial integration.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v29
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v29"] = [
+    "s29_v1_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w256+mmb0-1b_smb1-1b_1p",
+    "s29_v2_dualvq+rvq-both+decoder-cov+mmd-prior-w50+enc-deeper+dec-w256+mmb0-1b_smb1-1b_1p",
+    "s29_v3_dualvq+rvq-both+decoder-cov+mmd-prior-w200+enc-deeper+dec-w256+mmb0-1b_smb1-1b_1p",
+    "s29_v4_dualvq+rvq-both+decoder-cov+mmd-batch-w200+enc-deeper+dec-w256+mmb0-1b_smb1-1b_1p",
+    "s29_v5_dualvq+rvq-both+decoder-cov+adv+mmd-prior-w50+enc-deeper+dec-w256+mmb0-1b_smb1-1b_1p",
+    "s29_v6_dualvq+rvq-both+decoder-cov+mmd-prior-w50+mmd-batch-w100+enc-deeper+dec-w256+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 30 — 3-level RVQ codebook variants on the
+# `+enc-deeper+dec-w32` baseline. L0 stays fixed at 30 (matches the
+# parent's macro level); 8 distinct (L1, L2) shapes vary across the
+# sweep, ranging from 27k composite codes (30, 30, 30) to 243k
+# (30, 90, 90). Hypothesis: an extra residual quantisation level
+# gives the codebook finer-grained partitioning of the latent —
+# useful for rare cell types / niches.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v30
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v30"] = [
+    "s30_v1_dualvq+rvq-both-30-30-30+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s30_v2_dualvq+rvq-both-30-30-60+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s30_v3_dualvq+rvq-both-30-30-90+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s30_v4_dualvq+rvq-both-30-60-30+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s30_v5_dualvq+rvq-both-30-60-60+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s30_v6_dualvq+rvq-both-30-60-90+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s30_v7_dualvq+rvq-both-30-60-120+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s30_v8_dualvq+rvq-both-30-90-90+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 31 — reduced codebook + encoder dim on the
+# `+enc-deeper+dec-w32` baseline. Progressively shrinks the latent
+# dim from 256 down to [128] and [64]. GNN hidden width is bumped
+# in lock-step with the encoder output so the cell + niche latents
+# stay symmetric.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v31
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v31"] = [
+    "s31_v1_dualvq+rvq-both+decoder-cov+adv+enc-400-400-128+gnn-h128+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s31_v2_dualvq+rvq-both+decoder-cov+adv+enc-400-400-64+gnn-h64+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s31_v3_dualvq+rvq-both+decoder-cov+adv+enc-200-200-128+gnn-h128+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s31_v4_dualvq+rvq-both+decoder-cov+adv+enc-200-200-64+gnn-h64+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s31_v5_dualvq+rvq-both+decoder-cov+adv+enc-128-128-128+gnn-h128+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s31_v6_dualvq+rvq-both+decoder-cov+adv+enc-128-128-64+gnn-h64+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s31_v7_dualvq+rvq-both+decoder-cov+adv+enc-shallow128+gnn-h128+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s31_v8_dualvq+rvq-both+decoder-cov+adv+enc-shallow64+gnn-h64+dec-w32+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 32 — k-NN graph k × batch-integration loss on the
+# `+enc-deeper+dec-w32` baseline. 2 (k ∈ {12, 16}) × 4 (default
+# adv, stronger adv α=2 wt=300, mmd-batch w=200, mmd-prior w=50)
+# = 8 variants. Each row uses sampler == k (the GNN sees ALL
+# spatial neighbours per cell).
+#
+# REQUIRES BLOB REBUILD if the on-disk blob doesn't already have
+# k=12 + k=16 graphs:
+#   python examples/run_squint.py --build-blob
+# (the current `make_dataset_blob_config()` ships
+# `n_neighs_list = [6, 8, 12, 16]`).
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v32
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v32"] = [
+    "s32_v1_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+knn12+sampler12+mmb0-1b_smb1-1b_1p",
+    "s32_v2_dualvq+rvq-both+decoder-cov+adv-alpha2-wt300+enc-deeper+dec-w32+knn12+sampler12+mmb0-1b_smb1-1b_1p",
+    "s32_v3_dualvq+rvq-both+decoder-cov+mmd-batch-w200+enc-deeper+dec-w32+knn12+sampler12+mmb0-1b_smb1-1b_1p",
+    "s32_v4_dualvq+rvq-both+decoder-cov+mmd-prior-w50+enc-deeper+dec-w32+knn12+sampler12+mmb0-1b_smb1-1b_1p",
+    "s32_v5_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+knn16+sampler16+mmb0-1b_smb1-1b_1p",
+    "s32_v6_dualvq+rvq-both+decoder-cov+adv-alpha2-wt300+enc-deeper+dec-w32+knn16+sampler16+mmb0-1b_smb1-1b_1p",
+    "s32_v7_dualvq+rvq-both+decoder-cov+mmd-batch-w200+enc-deeper+dec-w32+knn16+sampler16+mmb0-1b_smb1-1b_1p",
+    "s32_v8_dualvq+rvq-both+decoder-cov+mmd-prior-w50+enc-deeper+dec-w32+knn16+sampler16+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 33 — loss-weight ablations on the `+enc-deeper+dec-w32`
+# baseline. Two axes:
+#   v1-v3: STRONGER cell-NB recon (wt_attr_reconstr = 1.5, 2.0, 3.0)
+#   v4-v7: adjacency BCE sweep (wt_adj_reconstr = 300, 500, 2000, 3000)
+#   v8:    combination of v2 (cell w=2.0) + v6 (adj w=2000)
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v33
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v33"] = [
+    "s33_v1_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+cell-w1.5+mmb0-1b_smb1-1b_1p",
+    "s33_v2_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+cell-w2.0+mmb0-1b_smb1-1b_1p",
+    "s33_v3_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+cell-w3.0+mmb0-1b_smb1-1b_1p",
+    "s33_v4_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+adj-w300+mmb0-1b_smb1-1b_1p",
+    "s33_v5_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+adj-w500+mmb0-1b_smb1-1b_1p",
+    "s33_v6_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+adj-w2000+mmb0-1b_smb1-1b_1p",
+    "s33_v7_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+adj-w3000+mmb0-1b_smb1-1b_1p",
+    "s33_v8_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+cell-w2.0+adj-w2000+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 34 — Pareto-stack combinations of the s30..s33 knobs on the
+# `+enc-deeper+dec-w32` baseline. Each variant stacks 2-3 of the
+# individually-promising knobs.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v34
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v34"] = [
+    "s34_v1_dualvq+rvq-both-30-60-90+decoder-cov+adv+enc-deeper+dec-w32+knn12+sampler12+mmb0-1b_smb1-1b_1p",
+    "s34_v2_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+cell-w2.0+knn12+sampler12+mmb0-1b_smb1-1b_1p",
+    "s34_v3_dualvq+rvq-both-30-60-90+decoder-cov+adv-alpha2-wt300+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s34_v4_dualvq+rvq-both+decoder-cov+adv+enc-200-200-128+gnn-h128+dec-w32+knn12+sampler12+mmb0-1b_smb1-1b_1p",
+    "s34_v5_dualvq+rvq-both-30-60-90+decoder-cov+adv+enc-deeper+dec-w32+cell-w2.0+adj-w500+mmb0-1b_smb1-1b_1p",
+    "s34_v6_dualvq+rvq-both-30-30-30+decoder-cov+adv+enc-128-128-128+gnn-h128+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s34_v7_dualvq+rvq-both+decoder-cov+adv-alpha2-wt300+enc-200-200-128+gnn-h128+dec-w32+adj-w300+mmb0-1b_smb1-1b_1p",
+    "s34_v8_dualvq+rvq-both+decoder-cov+adv+enc-128-128-128+gnn-h128+dec-w32+knn12+sampler12+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 35 — replace RVQ with CVQ (ConditionalVQ, tree-structured)
+# on the `+enc-deeper+dec-w32` baseline. v1-v3 are 2-level CVQ
+# (K1, K2); v4-v8 are 3-level CVQ (K1, K2, K3). The shapes mirror
+# s30's RVQ shapes so each CVQ variant has a direct RVQ analog
+# in s30 (and via s34_v1 / s30_v6 / s30_v8 etc.).
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v35
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v35"] = [
+    "s35_v1_dualvq+cvq-both-30-30+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s35_v2_dualvq+cvq-both-30-60+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s35_v3_dualvq+cvq-both-30-90+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s35_v4_dualvq+cvq-both-30-30-30+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s35_v5_dualvq+cvq-both-30-30-60+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s35_v6_dualvq+cvq-both-30-60-60+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s35_v7_dualvq+cvq-both-30-60-90+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+    "s35_v8_dualvq+cvq-both-30-90-90+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+]
+
 
 def _ablation_summary(variant: str) -> dict:
     """A small, human-readable record of what this run is. Saved next to the
@@ -10777,10 +16204,14 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
     elif dataset == "mmb0-1b_smb1-1b_1p":
         cfg = make_dataset_blob_config()
         cfg_path = CONFIG_OUT_DIR / "build_blob_mmb0-1b_smb1-1b_1p.yaml"
+    elif dataset == "spatch_1p":
+        cfg = make_dataset_blob_config_spatch()
+        cfg_path = CONFIG_OUT_DIR / "build_blob_spatch_1p.yaml"
     else:
         raise ValueError(
             f"Unknown --build-blob-dataset {dataset!r}. Choices: "
-            f"'mmb0-1b_smb1-1b_1p', 'chl59-8b_1p', 'mmb0-1b_smb1-20b_1p'."
+            f"'mmb0-1b_smb1-1b_1p', 'chl59-8b_1p', "
+            f"'mmb0-1b_smb1-20b_1p', 'spatch_1p'."
         )
     with open(cfg_path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
@@ -10817,10 +16248,95 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
 
 
 # ---------------------------------------------------------------------------
+# torch.compile compatibility shim
+# ---------------------------------------------------------------------------
+
+def _install_compile_safe_one_hot() -> None:
+    """
+    Replace `torch.nn.functional.one_hot` with a scatter-based equivalent
+    so torch.compile(dynamic=True) can trace through the VQ codebook
+    lookup.
+
+    Why this is needed
+    ------------------
+    Native `F.one_hot` calls `.numel()` internally on the input. Under
+    dynamo's FakeTensor mode with dynamic shapes (mandatory for SQUINT —
+    NeighborLoader yields variable-shape batches), `.numel()` can't be
+    resolved on symbolically-shaped inputs and compile fails with:
+
+        TorchRuntimeError: Failed running call_function one_hot(...):
+        Cannot call numel() on tensor with symbolic sizes/strides
+
+    The crash site is `vector_quantize_pytorch.gumbel_sample` (called
+    every step inside the VQ codebook lookup), so compile crashes on
+    first forward.
+
+    The fix
+    -------
+    Build the one-hot tensor manually with `scatter`, which dynamo
+    handles fine with symbolic shapes. Logically identical output to
+    the native `F.one_hot` for the `(tensor, int num_classes)` form
+    that the VQ library uses.
+
+    Scope
+    -----
+    Modifies the global `torch.nn.functional.one_hot` binding. Any
+    code path through `F.one_hot` in this process picks up the
+    replacement, including downstream library code (vector_quantize_pytorch
+    in particular). Idempotent — calling multiple times is safe (a
+    private marker prevents double-patching).
+
+    Performance
+    -----------
+    The scatter-based path is marginally slower than native `F.one_hot`
+    in eager mode (one extra kernel launch), but the difference is
+    negligible (~µs per call) compared to the 1.3-2× wall-clock win
+    that torch.compile delivers once it can trace the full graph. The
+    patch is applied ONLY when `compile_model=True` to avoid the
+    eager-mode regression for non-compile runs.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    # Guard against double-patching.
+    if getattr(F.one_hot, "_squint_compile_safe", False):
+        return
+
+    _original_one_hot = F.one_hot
+
+    def _scatter_one_hot(tensor, num_classes: int = -1):
+        if num_classes == -1:
+            # Auto-detect form (`F.one_hot(tensor)` without explicit
+            # num_classes) — defer to original. The VQ library never
+            # uses this form, so a graph break here is acceptable.
+            return _original_one_hot(tensor, num_classes)
+        # Specialise on the codebook size (a model-level constant)
+        # rather than treating it as a symbolic value.
+        num_classes = int(num_classes)
+        out_shape = list(tensor.shape) + [num_classes]
+        out = torch.zeros(out_shape, dtype=torch.long, device=tensor.device)
+        return out.scatter(-1, tensor.unsqueeze(-1), 1)
+
+    _scatter_one_hot._squint_compile_safe = True  # type: ignore[attr-defined]
+    F.one_hot = _scatter_one_hot
+    print(
+        "Trainer: installed compile-safe F.one_hot replacement "
+        "(scatter-based, for torch.compile(dynamic=True) compatibility "
+        "with vector_quantize_pytorch.gumbel_sample)."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Train (in-process so we control the wandb project AND the artifact layout)
 # ---------------------------------------------------------------------------
 
-def train(variant: str, train_precision: Optional[str] = None):
+def train(
+        variant: str,
+        train_precision:     Optional[str] = None,
+        train_strategy:      Optional[str] = None,
+        compile_model:       Optional[bool] = None,
+        train_deterministic: Optional[bool] = None,
+    ):
     """
     Train SQUINT.
 
@@ -10843,7 +16359,19 @@ def train(variant: str, train_precision: Optional[str] = None):
         `"bf16-mixed"` in the canonical base config. Pass any
         Lightning precision string (`"32-true"`, `"bf16-mixed"`,
         `"16-mixed"`, …) to override per-run without editing the
-        base config. Bridges directly from the `--precision` CLI flag.
+        base config. Bridges from the `--precision` CLI flag.
+    train_strategy
+        Lightning Trainer(strategy=...) override. `None` (default)
+        means "use `cfg['trainer']['strategy']`", which is `"auto"`
+        in the base config (resolves to `SingleDeviceStrategy` on
+        single-GPU jobs, skipping the DDP find-unused traversal).
+        Bridges from the `--strategy` CLI flag.
+    compile_model
+        Whether to wrap the model with `torch.compile(...,
+        dynamic=True)` after `initialize_model`. `None` (default)
+        means "use `cfg['trainer']['compile_model']`", which is
+        True in the base config. Bridges from the `--no-compile`
+        CLI flag (which sets this to False).
     """
     # Make the squint package importable in case the active venv hasn't been
     # pip-installed editable. We no longer import anything from
@@ -10864,8 +16392,9 @@ def train(variant: str, train_precision: Optional[str] = None):
         initialize_model,
     )
 
-    # Determinism / numerical settings (mirror train_model.__main__).
-    torch.backends.cudnn.benchmark = False
+    # Numerical settings (cudnn.benchmark is now controlled by the
+    # Trainer via the `deterministic` cfg key — see Trainer construction
+    # below — so don't set it manually here).
     torch.set_float32_matmul_precision("medium")
 
     # ---- Resolve variant from registry ------------------------------------
@@ -10888,6 +16417,28 @@ def train(variant: str, train_precision: Optional[str] = None):
         print(
             f"Trainer: precision override from CLI = {train_precision} "
             f"(base config had {prev!r})"
+        )
+    # Same pattern for strategy + compile.
+    if train_strategy is not None:
+        prev = cfg["trainer"].get("strategy", "ddp_find_unused_parameters_true")
+        cfg["trainer"]["strategy"] = train_strategy
+        print(
+            f"Trainer: strategy override from CLI = {train_strategy} "
+            f"(base config had {prev!r})"
+        )
+    if compile_model is not None:
+        prev = cfg["trainer"].get("compile_model", False)
+        cfg["trainer"]["compile_model"] = bool(compile_model)
+        print(
+            f"Trainer: compile_model override from CLI = {bool(compile_model)} "
+            f"(base config had {prev!r})"
+        )
+    if train_deterministic is not None:
+        prev = cfg["trainer"].get("deterministic", True)
+        cfg["trainer"]["deterministic"] = bool(train_deterministic)
+        print(
+            f"Trainer: deterministic override from CLI = "
+            f"{bool(train_deterministic)} (base config had {prev!r})"
         )
 
     # ---- Resolve our own RUN_DIR ------------------------------------------
@@ -10983,13 +16534,40 @@ def train(variant: str, train_precision: Optional[str] = None):
     _ts_params = cfg["dataset"].get("train_transform_params", {})
     _train_ids = list(_ts_params.get("train_batches", []) or [])
     _val_ids   = list(_ts_params.get("val_batches",   []) or [])
-    _test_ids  = list(_ts_params.get("test_batches",  []) or [])
+    # `test_batches` may also be the sentinel string "rest" — meaning
+    # "every blob section not in train+val". This is the symmetric
+    # opposite of the train-side auto-default below. Used by
+    # `_patch_dual_spatch` (spatch_1p) so a smoke test can say "train one section,
+    # test everything else" without enumerating the other section ids
+    # up front. Keep the sentinel as-is here; it's resolved AFTER the
+    # blob is loaded (id_to_pos is needed to enumerate "rest").
+    _test_ids_raw = _ts_params.get("test_batches", []) or []
+    if isinstance(_test_ids_raw, str):
+        if _test_ids_raw != "rest":
+            raise ValueError(
+                f"test_batches must be a list of ids or the sentinel "
+                f"string 'rest'; got {_test_ids_raw!r}."
+            )
+        _test_ids_is_rest = True
+        _test_ids = []   # placeholder until we have the blob's ids
+    else:
+        _test_ids_is_rest = False
+        _test_ids = list(_test_ids_raw)
 
     _id_to_pos: dict = {}
     for _pos in range(len(dataset_blob)):
         _d = dataset_blob[_pos]
         _id_to_pos[int(_d.adata_batch_id)] = _pos
     _all_blob_ids = sorted(_id_to_pos.keys())
+
+    if _test_ids_is_rest:
+        _excluded = set(int(i) for i in _train_ids) | set(int(i) for i in _val_ids)
+        _test_ids = [int(i) for i in _all_blob_ids if int(i) not in _excluded]
+        cfg["dataset"]["train_transform_params"]["test_batches"] = list(_test_ids)
+        print(
+            f"test_batches='rest' -> resolved to all blob sections "
+            f"except train+val: {_test_ids}"
+        )
 
     if not _train_ids:
         _excluded = set(int(i) for i in _test_ids) | set(int(i) for i in _val_ids)
@@ -11120,6 +16698,46 @@ def train(variant: str, train_precision: Optional[str] = None):
         in_channels=data_batch.num_features,
         out_channels=data_batch.num_classes,
     )
+
+    # ---- Optional torch.compile wrap ----------------------------------
+    # Defaults to True via the base config. `dynamic=True` is critical
+    # because NeighborLoader yields variable-shape batches (different
+    # seed + neighbour counts per step) — without it, torch.compile
+    # recompiles every batch and loses all benefit. First batch is
+    # slow (compile + autotune); subsequent batches see the speedup.
+    #
+    # Before compiling, install the compile-safe F.one_hot replacement
+    # (scatter-based, see `_install_compile_safe_one_hot` for the full
+    # rationale). Without it, dynamo crashes on the VQ codebook's
+    # `gumbel_sample` because native F.one_hot can't handle symbolic
+    # input shapes. With the patch, the entire model (including the
+    # VQ subgraph) compiles cleanly.
+    #
+    # We also enable `torch._dynamo.config.suppress_errors = True` as
+    # a belt-and-braces safety net: if any OTHER unforeseen subgraph
+    # turns out to be incompatible, dynamo falls back to eager on
+    # that frame instead of crashing the whole training run.
+    _compile_model = bool(cfg["trainer"].get("compile_model", False))
+    if _compile_model:
+        try:
+            _install_compile_safe_one_hot()
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = True
+            print(
+                "Trainer: applying torch.compile(model, dynamic=True). "
+                "Compile-safe F.one_hot installed; suppress_errors=True "
+                "enabled as backstop."
+            )
+            model = torch.compile(model, dynamic=True)
+            print("Trainer: torch.compile applied (first batch will be slow).")
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"WARNING: torch.compile failed ({type(e).__name__}: {e}); "
+                f"falling back to eager-mode model. Pass `--no-compile` to "
+                f"silence this warning."
+            )
+    else:
+        print("Trainer: compile_model=False (eager-mode model).")
 
     # ---- Logger: wandb cloud logging, local cache lives inside run_dir ----
     logging_enabled = cfg["logging"].get("enabled", True)
@@ -11253,15 +16871,31 @@ def train(variant: str, train_precision: Optional[str] = None):
     # `.get` fallback to "32-true" keeps backward compat for any caller
     # that builds a cfg without this key.
     _train_precision = cfg["trainer"].get("precision", "32-true")
-    print(f"Trainer: precision = {_train_precision}")
+    # Strategy: "auto" by default (see base config `trainer.strategy`).
+    # `.get` fallback to the historic value preserves compat for
+    # callers that build a cfg without the key.
+    _train_strategy = cfg["trainer"].get(
+        "strategy", "ddp_find_unused_parameters_true",
+    )
+    # Determinism: False by default (see base config). `benchmark` is
+    # the inverse — when we're not enforcing determinism, let cuDNN
+    # autotune for ~5-10% speedup. Backward-compat default `True`
+    # (legacy) for any caller that builds a cfg without the new key.
+    _train_deterministic = bool(cfg["trainer"].get("deterministic", True))
+    _train_benchmark     = not _train_deterministic
+    print(f"Trainer: precision     = {_train_precision}")
+    print(f"Trainer: strategy      = {_train_strategy}")
+    print(f"Trainer: deterministic = {_train_deterministic} "
+          f"(benchmark = {_train_benchmark})")
     trainer = pl.Trainer(
         accelerator="auto",
         devices="auto",
-        deterministic=True,
+        deterministic=_train_deterministic,
+        benchmark=_train_benchmark,
         precision=_train_precision,
         logger=logger,
         callbacks=callbacks,
-        strategy="ddp_find_unused_parameters_true",
+        strategy=_train_strategy,
         max_epochs=cfg["trainer"]["max_epochs"],
         # Run val every N train epochs (N=2 by default — see base
         # config). Halves val-pass overhead at the cost of running
@@ -11947,6 +17581,13 @@ def predict(
     trainer_kwargs = dict(
         accelerator="auto",
         devices="auto",
+        # `deterministic=True` matches the training cfg (also True
+        # after the 2026-05-12 revert — see base config). Previously
+        # toggled to False to match a brief training-side
+        # `deterministic: False` experiment; that experiment was
+        # reverted because cuDNN benchmark mode destabilised the
+        # adversarial min-max game. Both train and predict now back
+        # at the historic deterministic=True.
         deterministic=True,
         logger=False,
         strategy=_trainer_strategy,
@@ -12518,6 +18159,9 @@ def run_all_pipeline(
         skip_umap: bool = False,
         skip_metrics: bool = False,
         train_precision: Optional[str] = None,
+        train_strategy: Optional[str] = None,
+        compile_model: Optional[bool] = None,
+        train_deterministic: Optional[bool] = None,
         predict_precision: Optional[str] = None,
         predict_strategy: Optional[str] = None,
         predict_compression: Optional[str] = None,
@@ -12543,7 +18187,13 @@ def run_all_pipeline(
     print("=" * 78)
     print(f"[1/6] Train  variant={variant!r}")
     print("=" * 78)
-    run_dir = train(variant, train_precision=train_precision)
+    run_dir = train(
+        variant,
+        train_precision=train_precision,
+        train_strategy=train_strategy,
+        compile_model=compile_model,
+        train_deterministic=train_deterministic,
+    )
     if run_dir is None:
         # Older train() signatures didn't return; fall back to looking up
         # the most recent run dir for this variant. Resolve the variant's
@@ -12714,6 +18364,7 @@ def main():
                        "mmb0-1b_smb1-1b_1p",
                        "chl59-8b_1p",
                        "mmb0-1b_smb1-20b_1p",
+                       "spatch_1p",
                    ],
                    help="Which dataset to build (default: "
                         "mmb0-1b_smb1-1b_1p — MERFISH + STARmap mouse "
@@ -12857,6 +18508,62 @@ def main():
              "wiring via `predict_precision` on run_all_pipeline().",
     )
 
+    # Train-time Trainer strategy. Default `None` = honour the cfg
+    # value (currently "auto"). Override to
+    # `"ddp_find_unused_parameters_true"` for the historic single-
+    # GPU DDP-wrapped behaviour, or `"ddp"` for true multi-GPU DDP
+    # without find-unused.
+    p.add_argument(
+        "--strategy", type=str, default=None,
+        help="Lightning Trainer(strategy=...) override for the TRAIN "
+             "pass. Default: None = honour `cfg['trainer']['strategy']` "
+             "(currently 'auto' — resolves to SingleDeviceStrategy on "
+             "1-GPU jobs, skipping the DDP find-unused traversal). "
+             "Override to 'ddp_find_unused_parameters_true' for the "
+             "historic single-GPU DDP-wrapped behaviour (e.g. if "
+             "torch.compile + auto-strategy interacts badly with a "
+             "specific variant). 'ddp' for true multi-GPU DDP without "
+             "find-unused (needs every param to receive a gradient "
+             "every step).",
+    )
+
+    # torch.compile control flags. Compile is ON by default in the
+    # base config (`trainer.compile_model: True`). The VQ `gumbel_sample`
+    # incompatibility is handled by `_install_compile_safe_one_hot()`
+    # which monkey-patches F.one_hot with a scatter-based equivalent
+    # that handles dynamo's symbolic shapes. If both `--compile` and
+    # `--no-compile` are passed, `--no-compile` wins.
+    p.add_argument(
+        "--compile", action="store_true",
+        help="Force torch.compile ON for the TRAIN model (already the "
+             "default in the canonical base config). Useful when a "
+             "per-variant cfg flips `compile_model: False` and you "
+             "want to override back to compile for a single run.",
+    )
+    p.add_argument(
+        "--no-compile", action="store_true",
+        help="Disable torch.compile on the TRAIN model. Default is to "
+             "compile (base config `trainer.compile_model: True`). "
+             "Compile is ~1.3-2× wall-clock on SQUINT's small-model / "
+             "many-ops regime; pass this flag if a specific variant "
+             "errors at compile time or you need bit-exact "
+             "reproduction against a pre-compile run.",
+    )
+
+    # Determinism opt-in. Default is `deterministic: False` in the base
+    # config (which enables `Trainer(benchmark=True)`, ~5-10% wall-clock
+    # saving). `--deterministic` flips it back ON for the current run
+    # — useful for publication-final runs / regression diagnostics
+    # where bit-exact within-seed reproducibility matters.
+    p.add_argument(
+        "--deterministic", action="store_true",
+        help="Force `Trainer(deterministic=True)` (default is False, "
+             "with `benchmark=True` for ~5-10% speedup). Pass this for "
+             "publication-final runs or A/B-vs-historic regression "
+             "diagnostics where bit-exact within-seed reproducibility "
+             "matters more than wall-clock.",
+    )
+
     # ---- Inference / analysis step toggles (forwarded to --all / --predict)
     # The end-to-end pipeline runs 6 steps: train, predict,
     # plot_code_indices_spatial, plot_svg_reconstruction,
@@ -12963,8 +18670,27 @@ def main():
         harmonize_anndata_var()
     if args.build_blob:
         build_blob(dataset=args.build_blob_dataset)
+    # Resolve --compile / --no-compile into a tri-state override:
+    #   `--no-compile`               → False (always wins)
+    #   `--compile` (alone)          → True
+    #   neither flag                 → None (use cfg value, currently False)
+    if args.no_compile:
+        _compile_override = False
+    elif args.compile:
+        _compile_override = True
+    else:
+        _compile_override = None
+    # `--deterministic` is a "force on" flag; default (not passed) means
+    # "use cfg value" so we pass None when the flag is absent.
+    _deterministic_override = True if args.deterministic else None
     if args.train:
-        train(args.variant, train_precision=args.precision)
+        train(
+            args.variant,
+            train_precision=args.precision,
+            train_strategy=args.strategy,
+            compile_model=_compile_override,
+            train_deterministic=_deterministic_override,
+        )
     if args.predict:
         run_dir = args.run_dir or args.wandb_run_dir
         if run_dir is None:
@@ -12995,6 +18721,9 @@ def main():
             skip_umap=args.skip_umap,
             skip_metrics=args.skip_metrics,
             train_precision=args.precision,
+            train_strategy=args.strategy,
+            compile_model=_compile_override,
+            train_deterministic=_deterministic_override,
         )
 
     # --all-dataset: loop --all over every variant in the dataset's sweep.
@@ -13010,6 +18739,9 @@ def main():
             cell_label_keys=args.cell_label_keys,
             niche_label_keys=args.niche_label_keys,
             train_precision=args.precision,
+            train_strategy=args.strategy,
+            compile_model=_compile_override,
+            train_deterministic=_deterministic_override,
             skip_predict=args.skip_predict,
             skip_code_index_plots=args.skip_code_index_plots,
             skip_svg_plots=args.skip_svg_plots,

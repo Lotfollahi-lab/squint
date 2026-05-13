@@ -497,13 +497,12 @@ class InMemoryDataModule(LightningNodeData):
             num_workers > 0; falls back to False otherwise.
           - pin_memory=True lets the data side overlap H2D copies with
             the GPU forward pass.
-          - prefetch_factor=8 lets each worker pre-build several batches
-            ahead of the current one. PyG's NeighborSampler is
-            CPU-bound, so this hides sampling latency behind GPU work.
-            Bumped from 4 -> 8 after wandb showed GPU utilisation
-            sitting at 5-10%; doubling the in-flight batches lets the
-            workers stay further ahead of the GPU consumer when
-            individual sampling calls have variable latency.
+          - prefetch_factor=8 lets each worker pre-build several
+            batches ahead of the current one. PyG's NeighborSampler
+            is CPU-bound, so this hides sampling latency behind GPU
+            work. Kept high (8) — the dataloader-throughput knobs
+            aren't part of the speedups rolled back 2026-05-12; the
+            regression is on the model / precision / optimizer side.
         Total expected speedup: 1.3-2x wall-clock on CPU-sampler-heavy
         datasets (mmb20).
 
