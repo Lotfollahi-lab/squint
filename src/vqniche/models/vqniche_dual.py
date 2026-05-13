@@ -726,6 +726,20 @@ class VQNiche_Dual(BaseModel):
             adata_batch_ids.long() if adata_batch_ids is not None else None
         )
 
+        # Cell-branch codebook embeddings — consumed by
+        # `l2_codebook_orthogonal_regularization_loss` when that loss is
+        # in `loss_names`. Always populate; the loss is only computed
+        # when the dispatcher includes it. For RVQ (most common) we
+        # take the LEVEL-1 codebook (`vq_cell.layers[0]._codebook.embed`)
+        # since cell-NMI is computed against level-1 indices.
+        # For non-residual VQ (no `.layers` attribute) we fall back to
+        # the single `_codebook` slot.
+        try:
+            _cell_cb_embed = self.encoder.vq_cell.layers[0]._codebook.embed
+        except AttributeError:
+            _cell_cb_embed = self.encoder.vq_cell._codebook.embed
+        loss_data['codebook_embeddings'] = _cell_cb_embed
+
         # Adversarial batch loss data (only when the adversary is built).
         # Loss dispatcher reads `batch_logits` and `batch_labels` keys.
         # `adv_labels` was sliced above to match `z_for_adv` (full or
