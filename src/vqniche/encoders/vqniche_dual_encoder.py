@@ -65,6 +65,8 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             vq_cell_params: dict = {},
             vq_niche_params: dict = {},
             niche_neck_params: Optional[dict] = None,
+            niche_mlp_params: Optional[dict] = None,
+            shared_mlp_params: Optional[dict] = None,
         ):
         """
         Parameters
@@ -72,8 +74,28 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         in_channels: int
             Number of input gene features.
         mlp_params: dict, optional
-            Args for the shared MLP trunk. None disables the MLP, in which
-            case both VQ branches see the raw `x` directly (uncommon).
+            Args for the SHARED / cell-branch MLP trunk. None disables
+            the MLP, in which case the cell-VQ sees raw `x` directly
+            (uncommon). When `niche_mlp_params` is also provided, this
+            MLP feeds the cell branch ONLY (the niche branch then has
+            its own MLP — see below). When `niche_mlp_params is None`
+            (legacy default), this MLP is shared between cell + niche
+            paths (legacy "shared trunk" behaviour).
+        niche_mlp_params: dict, optional
+            When provided, builds a SEPARATE niche-side MLP trunk —
+            architecturally independent from `mlp_params`. The niche
+            path becomes `x -> MLP_niche -> z_mlp_niche -> [niche_neck]
+            -> GNN -> ...`, and `z_mlp_niche`'s gradients (from the
+            adjacency BCE, nbr-NB, niche-commit) flow ONLY through
+            `MLP_niche.weight`, NOT through `MLP_cell.weight`. The
+            cell-VQ input (z_mlp_cell, from `mlp_params`) is then
+            completely shielded from spatial-loss gradients — useful
+            when the cell codebook is being pulled away from cell-
+            type-discriminative geometry by spatial pressure on the
+            shared trunk.
+            Default `None` -> niche shares the cell-side MLP (legacy).
+            For full decoupling at the same encoder shape, pass a
+            deep copy of `mlp_params`.
         gnn_name: 'SAGEConv' | 'GATv2Conv' | 'GINConv'
             GNN aggregator class for the niche branch.
         gnn_params: dict
@@ -81,7 +103,10 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         conditioning_params: dict
             Optional FiLM conditioning, applied to the GNN output (so it
             affects the niche branch only). Use `condition_list=...` to
-            enable; missing key disables it.
+            enable; missing key disables it. When `niche_mlp_params`
+            is set AND the cell/niche MLP output dims differ, FiLM
+            will fail with a dim mismatch — keep niche MLP output dim
+            equal to cell MLP output dim if you also enable FiLM.
         vq_cell_params: dict
             VQ class + args for the *cell* branch. `vq_name` selects the
             class (default 'VectorQuantize'). Quantises `z_mlp`.
@@ -90,7 +115,10 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         """
         super().__init__()
 
-        # ---- shared MLP trunk ------------------------------------------------
+        # ---- cell-side MLP trunk --------------------------------------------
+        # When `niche_mlp_params` is None (legacy), this MLP is the
+        # SHARED trunk feeding both branches. When `niche_mlp_params`
+        # is provided, this is the cell-branch-only MLP.
         if mlp_params is None:
             self.mlp_module = None
             cell_in_channels = in_channels
@@ -98,7 +126,95 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             self.mlp_module = MLP_Module(in_channels=in_channels, **mlp_params)
             cell_in_channels = self.mlp_module.out_channels
 
-        # ---- Optional NICHE NECK MLP (between z_mlp and the GNN) ------------
+        # ---- Optional SEPARATE niche-branch MLP trunk -----------------------
+        # When `niche_mlp_params` is provided, builds a second MLP
+        # module with independent weights. The niche path then uses
+        # `niche_mlp_module(batch_x)` instead of the shared
+        # `mlp_module(batch_x)`. Spatial gradients flow through
+        # `niche_mlp_module.weight` ONLY; the cell-side MLP weights
+        # are fully shielded from the adjacency BCE and nbr-NB
+        # gradients.
+        #
+        # Output dim defaults to match `cell_in_channels` so the
+        # downstream GNN / FiLM / niche-neck modules don't need
+        # config changes. If you pass a `niche_mlp_params` whose
+        # `hidden_channels[-1]` differs from the shared MLP's, you
+        # must also tune `gnn_params` / `niche_neck_params` /
+        # FiLM accordingly — and FiLM will fail if you don't.
+        if niche_mlp_params is not None:
+            self.niche_mlp_module = MLP_Module(
+                in_channels=in_channels, **niche_mlp_params,
+            )
+            niche_post_mlp_dim = self.niche_mlp_module.out_channels
+        else:
+            self.niche_mlp_module = None
+            niche_post_mlp_dim = cell_in_channels
+
+        # ---- Optional SHARED MLP trunk (3-MLP Y-shape architecture) ---------
+        # When `shared_mlp_params` is provided, builds a THIRD MLP
+        # that processes `batch_x` independently. Its output is
+        # CONCATENATED with each path-specific MLP's output before the
+        # downstream cell-VQ and GNN modules:
+        #
+        #   x ─┬─► MLP_shared  ─► z_shared ──┐
+        #      │                              │ concat
+        #      ├─► MLP_cell    ─► z_path_cell ┴─► z_mlp_cell ─► VQ_cell
+        #      │
+        #      └─► MLP_niche   ─► z_path_niche ─┐
+        #                                        ▼ concat with z_shared
+        #                                       z_mlp_niche ─► GNN ─► VQ_niche
+        #
+        # Gradient routing:
+        #   - Shared MLP receives gradients from BOTH branches
+        #     (cell-NB + cell-commit AND spatial-adj + nbr-NB +
+        #     niche-commit). It's where feature reuse happens.
+        #   - Cell-path MLP receives ONLY cell-side gradients.
+        #   - Niche-path MLP receives ONLY niche-side gradients.
+        #
+        # This is the "balanced" alternative between the two existing
+        # modes:
+        #   - Legacy (only `mlp_params` set): one shared MLP for both
+        #     paths. Cell-VQ input is fully gradient-coupled to spatial
+        #     losses via the shared trunk.
+        #   - Decoupled (`mlp_params` + `niche_mlp_params`, no
+        #     `shared_mlp_params`): two independent MLPs. Cell-VQ
+        #     input is fully shielded from spatial gradients, but
+        #     no shared feature reuse.
+        #   - Y-shape (THIS mode, all three set): shared trunk for
+        #     reused features, plus per-path MLPs for specialisation.
+        #     Cell-path MLP weights are shielded from spatial
+        #     gradients; the shared MLP weights are not.
+        #
+        # Sizing default (set by the helper
+        # `_patch_dual_shared_specific_encoders`): each of the three
+        # MLPs outputs HALF the original `mlp_params` final-layer dim.
+        # E.g. original mlp_params=[400, 400, 256] -> each MLP becomes
+        # [400, 400, 128]. The concatenated VQ_cell / GNN input stays
+        # at 256 dim — same as the legacy shared-trunk architecture —
+        # so the codebook embedding dim and downstream decoder shapes
+        # are unchanged.
+        #
+        # When `shared_mlp_params is not None`, the user is expected
+        # to also set `niche_mlp_params` (the helper does so by
+        # default); if `niche_mlp_params is None` the niche path
+        # uses the SHARED output ALONE, with no path-specific MLP —
+        # asymmetric and probably not what was intended, but allowed.
+        if shared_mlp_params is not None:
+            self.shared_mlp_module = MLP_Module(
+                in_channels=in_channels, **shared_mlp_params,
+            )
+            shared_out_dim = self.shared_mlp_module.out_channels
+        else:
+            self.shared_mlp_module = None
+            shared_out_dim = 0
+
+        # Effective dims downstream are the CONCATENATION of the
+        # shared and path-specific outputs (with shared_out_dim=0
+        # when shared is disabled).
+        vq_cell_in_channels  = cell_in_channels  + shared_out_dim
+        gnn_pre_neck_in_channels = niche_post_mlp_dim + shared_out_dim
+
+        # ---- Optional NICHE NECK MLP (between z_mlp_niche and the GNN) ------
         # When `niche_neck_params` is provided, an additional MLP is
         # inserted on the niche-side path BETWEEN z_mlp and the GNN:
         #
@@ -123,14 +239,24 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         # `cell_in_channels` so the GNN module config doesn't need to
         # change.
         if niche_neck_params is not None:
+            # Niche-neck takes the (concatenated, when shared_mlp is
+            # active) niche-side post-MLP output:
+            #   - shared + niche-specific: `shared_out_dim +
+            #     niche_post_mlp_dim`
+            #   - decoupled (no shared):    `niche_post_mlp_dim`
+            #   - shared-trunk only:        `cell_in_channels`
+            # `gnn_pre_neck_in_channels` captures all three cases via
+            # `niche_post_mlp_dim + shared_out_dim`, with
+            # `shared_out_dim=0` for the modes that don't have a
+            # shared MLP.
             self.niche_neck = MLP_Module(
-                in_channels=cell_in_channels,
+                in_channels=gnn_pre_neck_in_channels,
                 **niche_neck_params,
             )
             gnn_in_channels = self.niche_neck.out_channels
         else:
             self.niche_neck = None
-            gnn_in_channels = cell_in_channels
+            gnn_in_channels = gnn_pre_neck_in_channels
 
         # ---- GNN (consumes continuous z_mlp OR niche_neck(z_mlp)) -----------
         if not gnn_params or gnn_params.get('num_layers', 0) == 0:
@@ -154,9 +280,30 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         # the same biological identity end up assigned to the same code.
         # Conditioning vector is per-cell (built upstream by the data loader
         # from `adata.obs['batch']` or cell-id parsing), one-hot encoded.
+        #
+        # FiLM dim policy by encoder mode:
+        #   - Shared trunk / decoupled: FiLM acts on each path's post-
+        #     MLP output, which has dim `cell_in_channels` (cell-side
+        #     and niche-side MLPs match by convention; if user sets a
+        #     different `niche_mlp_params['hidden_channels'][-1]`,
+        #     they must keep it equal to the cell-side or disable
+        #     FiLM — there's a single FiLM module).
+        #   - Y-shape (shared_mlp_module set): FiLM acts on the SHARED
+        #     output BEFORE concat with the path-specific MLPs. The
+        #     path-specific MLPs DON'T see FiLM here. Rationale: the
+        #     shared trunk is where batch-correlated features would
+        #     come in (shared by both branches); the path-specific
+        #     parts can stay unconditioned since they're branch-
+        #     specialised. If you want FiLM on the path-specific
+        #     outputs too, add a per-path FiLM downstream — not
+        #     supported in this module yet.
         if 'condition_list' in conditioning_params:
+            film_in_channels = (
+                shared_out_dim if self.shared_mlp_module is not None
+                else cell_in_channels
+            )
             self.conditioning_module = FiLM(
-                in_channels=cell_in_channels,        # FiLM at MLP output
+                in_channels=film_in_channels,
                 **conditioning_params,
             )
         else:
@@ -164,7 +311,12 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
 
         # ---- VQ_cell --------------------------------------------------------
         # Quantizes the per-cell MLP output (pre-aggregation).
-        vq_cell_params['dim'] = cell_in_channels
+        # In Y-shape mode (shared_mlp_params set), the VQ_cell input
+        # is `concat(z_shared, z_path_cell)`, so the codebook embedding
+        # dim equals `cell_in_channels + shared_out_dim`. In the
+        # legacy/decoupled modes `shared_out_dim=0` so this reduces to
+        # the prior behaviour.
+        vq_cell_params['dim'] = vq_cell_in_channels
         self.vq_cell = self._init_vq(vq_cell_params)
 
         # ---- VQ_niche -------------------------------------------------------
@@ -173,7 +325,9 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         self.vq_niche = self._init_vq(vq_niche_params)
 
         # Expose dims so the model can size its decoders correctly.
-        self.cell_dim  = cell_in_channels
+        # `cell_dim` is the dim of `z_q_cell` (= VQ_cell embedding
+        # dim), which the cell decoder consumes.
+        self.cell_dim  = vq_cell_in_channels
         self.niche_dim = niche_in_channels
 
     @staticmethod
@@ -204,30 +358,87 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         idx_cell:   (N,) or (N, Q)       cell-codebook indices
         idx_niche:  (N,) or (N, Q)       niche-codebook indices
         """
-        # MLP (shared trunk)
-        z_mlp = self.mlp_module(batch_x) if self.mlp_module is not None else batch_x
+        # ---- shared MLP (Y-shape mode) --------------------------------------
+        # If a shared MLP trunk is configured, compute it ONCE on
+        # `batch_x` and apply FiLM (if any) here. The result will be
+        # concatenated with each path-specific MLP's output below.
+        if self.shared_mlp_module is not None:
+            z_shared = self.shared_mlp_module(batch_x)
+            if self.conditioning_module is not None:
+                z_shared = self.conditioning_module(
+                    x=z_shared, conditions=batch_encoder_conditions,
+                )
+        else:
+            z_shared = None
 
-        # FiLM applied at the MLP output (post-MLP, pre-VQ-cell, pre-GNN) so
-        # both branches inherit a batch-corrected representation and the
-        # cell + niche codebooks become batch-invariant.
-        if self.conditioning_module is not None:
-            z_mlp = self.conditioning_module(
-                x=z_mlp, conditions=batch_encoder_conditions,
+        # ---- cell-side MLP --------------------------------------------------
+        z_mlp_cell_path = (
+            self.mlp_module(batch_x) if self.mlp_module is not None else batch_x
+        )
+
+        # FiLM on the cell-path output ONLY when the shared MLP is
+        # NOT in play (legacy / decoupled modes). In Y-shape mode
+        # FiLM was applied to `z_shared` already.
+        if self.conditioning_module is not None and self.shared_mlp_module is None:
+            z_mlp_cell_path = self.conditioning_module(
+                x=z_mlp_cell_path, conditions=batch_encoder_conditions,
             )
 
-        # GNN consumes the conditioned (continuous) z_mlp, optionally
-        # routed through a niche-side neck MLP first (see __init__).
-        # When `self.niche_neck is None` (default), this is identical
-        # to the legacy behaviour `z_gnn = self.gnn_module(z_mlp, ...)`.
+        # Cell-VQ input: concat of [shared, cell-path] in Y-shape
+        # mode; cell-path only otherwise. `torch.cat` along the last
+        # axis since both tensors are (N, dim).
+        if z_shared is not None:
+            z_mlp = torch.cat([z_shared, z_mlp_cell_path], dim=-1)
+        else:
+            z_mlp = z_mlp_cell_path
+
+        # ---- niche-side MLP -------------------------------------------------
+        # If a separate niche MLP is configured (`niche_mlp_module is
+        # not None`), the niche path runs its OWN MLP on `batch_x`
+        # with INDEPENDENT weights — spatial-loss gradients flow only
+        # through `niche_mlp_module.weight`, never reaching the
+        # cell-side MLP. This is the "decoupled encoders" architecture.
+        #
+        # Default (`niche_mlp_module is None`): both branches share
+        # the cell-side `z_mlp_cell_path` (legacy shared-trunk
+        # behaviour) — the cell-VQ input is gradient-coupled to the
+        # spatial losses via the shared MLP weights.
+        if self.niche_mlp_module is not None:
+            z_mlp_niche_path = self.niche_mlp_module(batch_x)
+            # FiLM on the niche path only in NON-Y-shape mode
+            # (mirrors the cell-path policy above).
+            if self.conditioning_module is not None and self.shared_mlp_module is None:
+                z_mlp_niche_path = self.conditioning_module(
+                    x=z_mlp_niche_path, conditions=batch_encoder_conditions,
+                )
+        else:
+            # No path-specific niche MLP. In legacy mode this means
+            # niche reuses the cell-side output. In Y-shape mode WITH
+            # shared MLP but no niche-specific MLP, niche gets just
+            # the shared output (unusual, but the helper sets the
+            # niche-specific MLP by default so this is rare).
+            z_mlp_niche_path = z_mlp_cell_path
+
+        # Niche-pre-neck input: concat of [shared, niche-path] in
+        # Y-shape mode; niche-path only otherwise.
+        if z_shared is not None:
+            z_mlp_niche = torch.cat([z_shared, z_mlp_niche_path], dim=-1)
+        else:
+            z_mlp_niche = z_mlp_niche_path
+
+        # ---- niche-side pipeline: [niche_neck] -> GNN -> VQ_niche -----------
         gnn_input = (
-            self.niche_neck(z_mlp) if self.niche_neck is not None else z_mlp
+            self.niche_neck(z_mlp_niche) if self.niche_neck is not None
+            else z_mlp_niche
         )
         z_gnn = self.gnn_module(gnn_input, batch_edge_index)
 
-        # Two independent quantizations. NOTE: cell-VQ takes `z_mlp`
-        # directly (NOT the niche_neck output) — the whole point of
-        # niche_neck is to decouple the niche path from the cell-VQ
-        # input.
+        # Two independent quantizations. NOTE: cell-VQ takes
+        # `z_mlp` (which is `concat(z_shared, z_mlp_cell_path)` in
+        # Y-shape mode, or just `z_mlp_cell_path` otherwise) — never
+        # the niche-side output. The whole point of decoupled / Y-
+        # shape encoders is to keep the cell-VQ input free of niche-
+        # branch gradient flow.
         z_q_cell,  idx_cell,  _ = self.vq_cell(z_mlp)
         z_q_niche, idx_niche, _ = self.vq_niche(z_gnn)
 

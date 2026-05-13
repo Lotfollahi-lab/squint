@@ -95,6 +95,7 @@ class VQNiche_Dual(BaseModel):
             loss_params: Optional[dict] = None,
             decoder_covariate_dim: int = 0,
             decoder_covariate_embed_dim: int = 16,
+            decoupled_decoder_covariate: bool = False,
             adversarial_batch_dim: int = 0,
             adversarial_alpha: float = 1.0,
             adversarial_hidden_channels: Optional[List[int]] = None,
@@ -164,14 +165,53 @@ class VQNiche_Dual(BaseModel):
         self.decoder_covariate_embed_dim = (
             int(decoder_covariate_embed_dim) if self.decoder_covariate_dim > 0 else 0
         )
+        # `decoupled_decoder_covariate` -> use TWO separate `nn.Embedding`
+        # modules, one per decoder. Each decoder's batch covariate then
+        # receives gradients from THAT decoder's reconstruction loss only;
+        # the cell-decoder's batch embedding never feels nbr-NB gradients
+        # and vice versa.
+        #
+        # Why this matters: with a single shared `batch_embedding`, every
+        # row of `weight` is updated by gradients from BOTH decoders. In a
+        # `+decoupled-enc` variant the encoder MLPs and codebooks are
+        # already isolated, but the decoder-side batch covariate then
+        # remains as the last shared learnable parameter — its updates
+        # mix cell-NB and nbr-NB signal. For "strictly decoupled"
+        # architectures we want this gone too.
+        #
+        # Legacy default (`decoupled_decoder_covariate=False`): single
+        # shared embedding, identical to the previous behaviour.
+        self.decoupled_decoder_covariate = bool(decoupled_decoder_covariate)
         if self.decoder_covariate_dim > 0:
-            self.batch_embedding = torch.nn.Embedding(
-                num_embeddings=self.decoder_covariate_dim,
-                embedding_dim=self.decoder_covariate_embed_dim,
-            )
-            torch.nn.init.normal_(
-                self.batch_embedding.weight, mean=0.0, std=0.02,
-            )
+            if self.decoupled_decoder_covariate:
+                # Two independent embeddings — same shape, independent
+                # weights. Same init scheme (N(0, 0.02²)) as the legacy
+                # path so behaviour at step 0 is identical to the
+                # shared-embedding case modulo the doubled parameter
+                # count.
+                self.batch_embedding_cell = torch.nn.Embedding(
+                    num_embeddings=self.decoder_covariate_dim,
+                    embedding_dim=self.decoder_covariate_embed_dim,
+                )
+                self.batch_embedding_niche = torch.nn.Embedding(
+                    num_embeddings=self.decoder_covariate_dim,
+                    embedding_dim=self.decoder_covariate_embed_dim,
+                )
+                torch.nn.init.normal_(
+                    self.batch_embedding_cell.weight, mean=0.0, std=0.02,
+                )
+                torch.nn.init.normal_(
+                    self.batch_embedding_niche.weight, mean=0.0, std=0.02,
+                )
+            else:
+                # Legacy: one embedding feeding both decoders.
+                self.batch_embedding = torch.nn.Embedding(
+                    num_embeddings=self.decoder_covariate_dim,
+                    embedding_dim=self.decoder_covariate_embed_dim,
+                )
+                torch.nn.init.normal_(
+                    self.batch_embedding.weight, mean=0.0, std=0.02,
+                )
 
         cell_decoder_in  = self.encoder.cell_dim  + self.decoder_covariate_embed_dim
         niche_decoder_in = self.encoder.niche_dim + self.decoder_covariate_embed_dim
@@ -455,19 +495,40 @@ class VQNiche_Dual(BaseModel):
                     "passed to forward(). Pass `batch.adata_batch_ids` from "
                     "the step methods."
                 )
-            cov = self.batch_embedding(adata_batch_ids.long())
-            if (
+            ids_long = adata_batch_ids.long()
+            unseen = (
                 adata_batch_ids_unseen_mask is not None
                 and adata_batch_ids_unseen_mask.any()
-            ):
-                mean_emb = self.batch_embedding.weight.mean(dim=0, keepdim=True)
-                cov = torch.where(
-                    adata_batch_ids_unseen_mask.unsqueeze(-1).to(cov.device),
-                    mean_emb.to(cov.device).expand_as(cov),
-                    cov,
-                )
-            z_q_cell_in  = torch.cat([z_q_cell,  cov], dim=-1)
-            z_q_niche_in = torch.cat([z_q_niche, cov], dim=-1)
+            )
+
+            def _lookup(emb: torch.nn.Embedding) -> torch.Tensor:
+                """Embedding lookup with the same unseen-batch handling
+                as the legacy single-embedding path: novel cells get the
+                MEAN of all train embeddings (neutral / centroid covariate)."""
+                cov = emb(ids_long)
+                if unseen:
+                    mean_emb = emb.weight.mean(dim=0, keepdim=True)
+                    cov = torch.where(
+                        adata_batch_ids_unseen_mask.unsqueeze(-1).to(cov.device),
+                        mean_emb.to(cov.device).expand_as(cov),
+                        cov,
+                    )
+                return cov
+
+            if self.decoupled_decoder_covariate:
+                # Two independent lookups: cell decoder's covariate is
+                # updated by cell-NB gradients only; niche decoder's
+                # covariate by nbr-NB gradients only. No cross-branch
+                # gradient flow through the batch covariate.
+                cov_cell  = _lookup(self.batch_embedding_cell)
+                cov_niche = _lookup(self.batch_embedding_niche)
+                z_q_cell_in  = torch.cat([z_q_cell,  cov_cell],  dim=-1)
+                z_q_niche_in = torch.cat([z_q_niche, cov_niche], dim=-1)
+            else:
+                # Legacy: one shared embedding feeding both decoders.
+                cov = _lookup(self.batch_embedding)
+                z_q_cell_in  = torch.cat([z_q_cell,  cov], dim=-1)
+                z_q_niche_in = torch.cat([z_q_niche, cov], dim=-1)
         else:
             z_q_cell_in  = z_q_cell
             z_q_niche_in = z_q_niche

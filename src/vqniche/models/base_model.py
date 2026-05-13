@@ -18,6 +18,8 @@ from vqniche.loss import (
     nb_attribute_reconstruction_loss,
     nb_nbr_attribute_reconstruction_loss,
     nb_nbr_attribute_reconstruction_loss_dual,
+    contrastive_cell_attribute_loss,
+    contrastive_cell_attribute_within_batch_loss,
     mse_adjacency_reconstruction_loss,
     bce_adjacency_reconstruction_loss,
     bce_cosine_adjacency_reconstruction_loss,
@@ -304,6 +306,54 @@ class BaseModel(pl.LightningModule):
                     wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
                     if wt_attr_reconstr is not None:
                         loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
+
+            elif loss_fn_name == 'contrastive_cell_attribute_loss':
+                # NT-Xent contrastive auxiliary loss on the pre-quantization
+                # cell-branch latent (`quantizer_input_cell` = z_mlp_cell of
+                # the seed cells). Positive pairs are the top-k cells with
+                # the most similar log1p gene-expression profile in the
+                # FULL mini-batch (any section); negatives are the rest.
+                # Pulls same-type cells together in `z_mlp_cell` space and
+                # pushes different-type apart — a between-cell objective
+                # that complements NB's within-cell objective. Tunables
+                # come from loss_kwargs; all are optional with sensible
+                # defaults in the loss fn.
+                loss_fn = contrastive_cell_attribute_loss
+                loss_fn_data_keys = ['quantizer_input_cell', 'target_attr']
+                for k in (
+                    'k_pos',
+                    'temperature',
+                    'log_transform_gene_space',
+                    'wt_contrastive_cell',
+                ):
+                    v = loss_kwargs.get(k)
+                    if v is not None:
+                        loss_fn_params[k] = v
+
+            elif loss_fn_name == 'contrastive_cell_attribute_within_batch_loss':
+                # Within-section variant of the contrastive cell loss. Both
+                # positive-pair candidates AND the NT-Xent denominator are
+                # restricted to cells sharing the anchor's adata_batch_id.
+                # Same architectural reasoning as
+                # `adj_within_section_only=True` on the cosine adjacency
+                # BCE: without the restriction, cross-section pairs leak
+                # into the gradient and push biologically-similar cells
+                # from different MERFISH/STARmap sections apart — counter
+                # to the batch-integration objective.
+                loss_fn = contrastive_cell_attribute_within_batch_loss
+                loss_fn_data_keys = [
+                    'quantizer_input_cell', 'target_attr',
+                    'node_adata_batch_ids', 'batch_size',
+                ]
+                for k in (
+                    'k_pos',
+                    'temperature',
+                    'log_transform_gene_space',
+                    'wt_contrastive_cell',
+                ):
+                    v = loss_kwargs.get(k)
+                    if v is not None:
+                        loss_fn_params[k] = v
 
             elif loss_fn_name == 'bce_cosine_adjacency_reconstruction_loss':
                 # NicheCompass-style adjacency reconstruction via cosine

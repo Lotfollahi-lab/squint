@@ -75,10 +75,25 @@ warnings.filterwarnings(
 )
 
 import anndata as ad
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.sparse as sp
 import squidpy as sq
+
+
+# Keep titles + axis text editable in the SVG output (the PNG is
+# unaffected). With the default `svg.fonttype="path"` matplotlib
+# converts every text element to vector paths so the appearance is
+# pinned regardless of fonts on the viewer's machine — but that means
+# Illustrator / Inkscape sees only shapes, not editable text. Setting
+# `'none'` writes `<text>` elements that reference the font BY NAME,
+# so figure titles / labels remain editable downstream (as long as
+# the viewer has the font available; falls back to a sans-serif
+# substitute otherwise). `pdf.fonttype=42` is the analogous setting
+# for any PDF exports.
+mpl.rcParams["svg.fonttype"] = "none"
+mpl.rcParams["pdf.fonttype"] = 42
 
 
 def _save_dual(fig, out_path, **savefig_kwargs) -> None:
@@ -196,7 +211,10 @@ def _spatial_panel(
             linewidths=0, rasterized=True,
         )
     ax.set_aspect("equal")
-    ax.set_title(title, fontsize=8)
+    # Title fontsize bumped 8 -> 14 to be readable when the figure is
+    # placed in a paper / slide deck. Adjust this single constant if
+    # downstream layouts want a different size.
+    ax.set_title(title, fontsize=14)
     ax.set_xticks([])
     ax.set_yticks([])
     plt.colorbar(sc_h, ax=ax, fraction=0.046, pad=0.02)
@@ -331,10 +349,14 @@ def plot_batch(
     n_cols = len(layout)
     n_rows = len(gene_list)
 
-    # ~4 inches per panel column keeps panels square-ish at 3 in row height.
+    # Per-column width reduced 4 -> 3 inches to cut horizontal
+    # whitespace between panels. With `set_aspect("equal")` on each
+    # scatter and `tight_layout()` below, the panels remain square-ish
+    # and the figure ends up substantially narrower for the same
+    # n_cols * n_rows layout. Row height kept at 3 inches.
     fig, axes = plt.subplots(
         n_rows, n_cols,
-        figsize=(4 * n_cols, 3 * n_rows),
+        figsize=(3 * n_cols, 3 * n_rows),
         squeeze=False,
     )
 

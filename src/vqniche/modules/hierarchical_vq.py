@@ -101,6 +101,22 @@ class ResidualVQ_Squint(nn.Module):
             sync_kmeans: bool = True,
             commitment_weight: float = 0.0,   # external commit loss is used
             sample_codebook_temp: float = 0.0,
+            # ----- codebook-diversity loss (lucidrains feature) ---------------
+            # When > 0, the inner VectorQuantize adds a softmax-similarity
+            # penalty that pushes codes APART in the embedding sphere on
+            # every forward pass. This is the SwAV/DINO-style "prototype
+            # repulsion" signal — it directly penalises code collapse and
+            # tends to produce more distinct, well-separated centroids.
+            #
+            # Default 0.0 = legacy behaviour (lucidrains' VectorQuantize
+            # doesn't add the term unless weight > 0).
+            #
+            # `codebook_diversity_temperature` softens the within-codebook
+            # similarity histogram before the softmax. Larger T = softer
+            # repulsion across many codes; smaller T = sharper, focuses
+            # on the few most similar pairs.
+            codebook_diversity_loss_weight: float = 0.0,
+            codebook_diversity_temperature: float = 100.0,
         ):
         super().__init__()
         codebook_sizes = _normalize_codebook_sizes(codebook_size, num_quantizers)
@@ -127,6 +143,11 @@ class ResidualVQ_Squint(nn.Module):
                 threshold_ema_dead_code=(threshold_ema_dead_code if i == 0 else 0),
                 commitment_weight=commitment_weight,
                 sample_codebook_temp=sample_codebook_temp,
+                # Diversity loss applies per-codebook; identical weight +
+                # temperature for every level. Per-level tuning isn't worth
+                # the complexity given a 2-level RVQ.
+                codebook_diversity_loss_weight=codebook_diversity_loss_weight,
+                codebook_diversity_temperature=codebook_diversity_temperature,
             )
             for i, k in enumerate(codebook_sizes)
         ])

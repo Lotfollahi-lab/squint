@@ -611,6 +611,18 @@ def initialize_model(
         model_param_dict['decoder_covariate_dim'] = int(
             config['model'].get('decoder_covariate_dim', 0)
         )
+        # Embedding dimensionality for the decoder covariate. Optional
+        # — falls back to the model's default (16) when absent.
+        if 'decoder_covariate_embed_dim' in config['model']:
+            model_param_dict['decoder_covariate_embed_dim'] = int(
+                config['model']['decoder_covariate_embed_dim']
+            )
+        # `decoupled_decoder_covariate=True` -> two independent
+        # nn.Embedding modules (one per decoder) instead of one shared
+        # embedding. Default False = legacy single-embedding behaviour.
+        model_param_dict['decoupled_decoder_covariate'] = bool(
+            config['model'].get('decoupled_decoder_covariate', False)
+        )
         # Domain-adversarial batch-invariance head. Set in `train()` after
         # data load (n_unique_batches). Default 0 = off.
         model_param_dict['adversarial_batch_dim'] = int(

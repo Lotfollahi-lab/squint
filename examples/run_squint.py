@@ -1502,6 +1502,13 @@ def _default_rvq_params(codebook_sizes=(30, 200)) -> dict:
         "sync_kmeans": True,
         "commitment_weight": 0.0,
         "sample_codebook_temp": 0.0,
+        # Codebook-diversity loss (lucidrains feature) — propagated to
+        # EVERY inner VectorQuantize level. 0.0 = legacy off. >0 adds a
+        # softmax-similarity repulsion that pushes codes apart on the
+        # embedding sphere (SwAV-style prototype repulsion). Use the
+        # `_patch_dual_codebook_diversity` patch to enable.
+        "codebook_diversity_loss_weight": 0.0,
+        "codebook_diversity_temperature": 100.0,
     }
 
 
@@ -1735,6 +1742,114 @@ def _patch_dual_no_spatial(cfg: dict) -> dict:
     return cfg
 
 
+def _patch_dual_no_cell_nb(cfg: dict) -> dict:
+    """
+    Drop ONLY the cell-branch NB reconstruction loss
+    (`nb_attribute_reconstruction_loss`). The cell commit loss
+    (`mse_commit_loss_cell`) STAYS — so the cell-VQ still commits to
+    its codebook and EMA updates continue normally.
+
+    Difference from `_patch_dual_no_cell_recon`
+    ------------------------------------------
+    `_patch_dual_no_cell_recon` removes BOTH the cell-NB and the cell-
+    commit loss; under that patch the cell-VQ has no gradient signal
+    at all (encoder isn't pulled toward codebook, codebook still
+    updates via EMA from whatever z_mlp happens to be). This patch
+    is more surgical: it removes ONLY the cell-NB while keeping the
+    encoder→nearest-code commit pressure intact.
+
+    Intended use: diagnostic when paired with the LEGACY SHARED-MLP
+    trunk (i.e. NO `+decoupled-enc`). Under that configuration
+    `z_mlp` is shaped by:
+      - cell-commit  (pulls z_mlp toward nearest cell codebook entry)
+      - nbr-NB       (via the same shared trunk, fed into the GNN)
+      - niche-commit (via the GNN path)
+      - adjacency-BCE (on z_gnn, niche-side)
+
+    If `cell_code_indices[level_0]` NMI is still high under this
+    setting, the spatial losses on the shared trunk are doing the
+    cell-type discrimination — the cell-NB term was only ever
+    decorating a partition that the niche-side gradients already
+    aligned with cell types via the shared `z_mlp`. If it crashes,
+    cell-NB was load-bearing for cell-NMI.
+
+    Sibling of `_patch_dual_no_cell_recon` (drops both terms) and
+    `_patch_dual_no_recon` (drops every reconstruction term, keeps
+    both commits).
+    """
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    if "nb_attribute_reconstruction_loss" in losses:
+        losses.remove("nb_attribute_reconstruction_loss")
+    return cfg
+
+
+def _patch_dual_no_recon(cfg: dict) -> dict:
+    """
+    Drop ALL reconstruction losses (cell-NB + nbr-NB + adjacency-BCE)
+    while keeping the commit losses alive. The encoder still receives
+    gradient signal — but ONLY from the VQ commit term that pulls
+    `z_mlp` toward its nearest codebook entry. The codebook still
+    updates via EMA from whatever `z_mlp` samples are assigned to
+    each code.
+
+    Intended use: a NEGATIVE TEST for the architectural-leakage
+    hypothesis.
+
+    Reasoning
+    ---------
+    After s41–s43 the architecture is strictly decoupled (no parameter
+    shared between the cell and niche branches downstream of the input
+    tensor). If cell-NMI did NOT improve under that decoupling, the
+    leakage hypothesis is wrong and the cell-NMI ceiling is set by one
+    of:
+      (1) codebook K₁ is too small vs cell-type cardinality,
+      (2) the NB-reconstruction objective doesn't isolate cell-type
+          identity (it also encodes state / depth / within-type
+          variation),
+      (3) k-means init on the *raw* z_mlp dominates, with EMA unable
+          to escape the basin.
+
+    Stripping reconstruction discriminates (3) from (1+2):
+      - cell-NMI similar to the best s43 run -> structure is driven by
+        k-means init / data geometry, NOT reconstruction. The codebook
+        finds the same partition with or without NB pressure.
+      - cell-NMI crashes to baseline -> reconstruction IS the driver,
+        we're at its resolution ceiling, and the next move is K₁ ↑ or
+        a fundamentally different objective (contrastive, code-
+        orthogonality, etc.).
+
+    What stays alive
+    ----------------
+      - mse_commit_loss_cell   (encoder -> nearest cell codebook entry)
+      - mse_commit_loss_niche  (z_gnn -> nearest niche codebook entry)
+      - EMA codebook updates (these are NOT gradient-based — they fire
+        every step regardless of which losses are in the loss list)
+
+    What goes
+    ---------
+      - nb_attribute_reconstruction_loss              (cell NB)
+      - nb_attribute_reconstruction_loss_nbr_dual     (nbr NB)
+      - nb_attribute_reconstruction_loss_nbr          (legacy single-codebook nbr NB)
+      - bce_cosine_adjacency_reconstruction_loss      (adjacency BCE on z_gnn)
+      - bce_adjacency_reconstruction_loss             (legacy single-codebook adj-BCE)
+
+    Apply LAST in the patch chain so no later patch re-adds a recon
+    loss name (none of the current patches do this, but conventional
+    safety).
+    """
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    for ln in (
+        "nb_attribute_reconstruction_loss",
+        "nb_attribute_reconstruction_loss_nbr_dual",
+        "nb_attribute_reconstruction_loss_nbr",
+        "bce_cosine_adjacency_reconstruction_loss",
+        "bce_adjacency_reconstruction_loss",
+    ):
+        if ln in losses:
+            losses.remove(ln)
+    return cfg
+
+
 def _patch_dual_batch_lr(
         cfg: dict,
         batch_size: Optional[int] = None,
@@ -1801,6 +1916,49 @@ def _patch_dual_no_batch_int(cfg: dict) -> dict:
     return cfg
 
 
+def _patch_dual_no_encoder_film(cfg: dict) -> dict:
+    """
+    Disable the ENCODER-SIDE FiLM (`conditioning_module`) by removing
+    its `condition_list`. The decoders' FiLM modules are left alive —
+    each decoder owns its own FiLM instance — and `+decoder-cov` still
+    threads the batch one-hot through the decoder inputs.
+
+    Why this matters specifically for `+decoupled-enc`
+    --------------------------------------------------
+    The encoder's `conditioning_module` is a SINGLE FiLM instance that
+    is called on BOTH `z_mlp_cell_path` and `z_mlp_niche_path` (see
+    `vqniche_dual_encoder.py`, lines ~382 + ~410). Its affine MLP
+    therefore receives gradients from cell-side losses AND every
+    spatial loss in the niche path. Even when the cell and niche MLP
+    trunks are fully decoupled via `niche_mlp_params`, the FiLM update
+    driven by spatial gradients re-enters the cell path on the next
+    forward — a backdoor that defeats the point of decoupling.
+
+    This patch shuts that backdoor by removing `condition_list` from
+    `encoder_params.conditioning_params`. The encoder build then takes
+    the `else` branch at `vqniche_dual_encoder.py` line 309 and sets
+    `self.conditioning_module = None`, so no FiLM module is ever
+    instantiated on the encoder side.
+
+    Use this WITH `+decoupled-enc` (or `+shared-specific-enc`) to get
+    the strict architectural decoupling you intuited; using it on a
+    legacy single-trunk variant just drops FiLM with no other effect.
+
+    No-op if the cfg has no encoder `conditioning_params` to begin
+    with.
+    """
+    enc = cfg["model"]["encoder_params"]
+    cp = enc.get("conditioning_params")
+    if not cp:
+        return cfg
+    # Remove just `condition_list` (the key the encoder checks at build
+    # time, `vqniche_dual_encoder.py:300`). Keep the rest of the dict
+    # so any downstream consumer that snapshots the cfg sees a sensible
+    # record of "FiLM was configured but disabled".
+    cp.pop("condition_list", None)
+    return cfg
+
+
 def _patch_dual_niche_neck(
         cfg: dict,
         hidden_channels: Optional[List[int]] = None,
@@ -1834,6 +1992,206 @@ def _patch_dual_niche_neck(
         "act":              "relu",
         "norm":             norm,
     }
+    return cfg
+
+
+def _patch_dual_decoupled_encoders(
+        cfg: dict,
+        niche_mlp_params: Optional[dict] = None,
+    ) -> dict:
+    """
+    Decouple the niche-branch encoder from the cell-branch encoder by
+    building a SEPARATE niche-side MLP module (independent weights).
+
+    Default architecture (legacy, when this patch is NOT applied):
+
+        x  ─►  shared MLP  ─►  z_mlp ─┬─► VQ_cell  (cell branch)
+                                       └─► [niche_neck?] ─► GNN ─► VQ_niche
+
+    Spatial-loss gradients (adjacency BCE, nbr-NB, niche-commit) flow
+    through the GNN, into `z_mlp`, and update the SHARED MLP's weights
+    — which ALSO produces the input to VQ_cell. The cell-VQ input is
+    therefore gradient-coupled to the spatial losses and the cell
+    codebook can end up encoding spatial / neighbourhood information
+    rather than purely cell-intrinsic signal.
+
+    After this patch:
+
+        x ─┬─► MLP_cell   ─► z_mlp_cell  ─► VQ_cell  (cell branch)
+           │
+           └─► MLP_niche  ─► z_mlp_niche ─► [niche_neck?] ─► GNN ─► VQ_niche
+
+    `MLP_cell` and `MLP_niche` have INDEPENDENT weights. Spatial-loss
+    gradients update `MLP_niche.weight` only — the cell-side MLP is
+    structurally shielded.
+
+    Parameters
+    ----------
+    niche_mlp_params : dict, optional
+        Architecture for the new niche-side MLP. When `None` (the
+        default), uses a deep copy of `cfg['model']['encoder_params']
+        ['mlp_params']` — i.e. the niche MLP has the same shape as
+        the cell-side MLP, just independent weights. Pass an explicit
+        dict to give the niche side a different architecture.
+        IMPORTANT: keep `niche_mlp_params['hidden_channels'][-1]`
+        equal to the cell-side `mlp_params['hidden_channels'][-1]`
+        if FiLM batch correction is enabled (FiLM shares one module
+        across both paths).
+
+    Use cases
+    ---------
+      - Cell-NMI is dragged down by spatial information bleeding into
+        the cell codes (the canonical scenario for this knob).
+      - You want a fair test of whether the dual-VQ architecture's
+        cell branch is intrinsically cell-type-discriminative — this
+        is the cleanest "cell branch sees no spatial gradient" setup.
+
+    Caveats
+    -------
+      - Doubles the encoder MLP parameter count (roughly).
+      - Niche-side per-sample compute roughly doubles too (one extra
+        MLP pass per training step).
+      - Compatible with `_patch_dual_niche_neck` — the niche_neck is
+        applied AFTER the new niche MLP, so the full niche path is
+        `x -> MLP_niche -> niche_neck -> GNN`.
+    """
+    enc = cfg["model"]["encoder_params"]
+    if niche_mlp_params is None:
+        niche_mlp_params = _copy(enc.get("mlp_params", {})) or {}
+    enc["niche_mlp_params"] = niche_mlp_params
+    return cfg
+
+
+def _patch_dual_shared_specific_encoders(
+        cfg: dict,
+        shared_mlp_params: Optional[dict] = None,
+        path_mlp_params: Optional[dict] = None,
+        shared_last_dim: Optional[int] = None,
+        path_last_dim: Optional[int] = None,
+    ) -> dict:
+    """
+    Y-shape encoder architecture — one SHARED MLP + one PATH-SPECIFIC
+    MLP per branch, with the shared output CONCATENATED into each
+    path's downstream input.
+
+    Architecture:
+
+        x ─┬─►  MLP_shared  ─►  z_shared ────────────┐
+           │                                         │ concat
+           ├─►  MLP_cell    ─►  z_path_cell    ─► z_mlp_cell ─► VQ_cell
+           │
+           └─►  MLP_niche   ─►  z_path_niche   ─► z_mlp_niche ─► GNN ─► VQ_niche
+                                                  ▲
+                                          (concat with z_shared)
+
+    Gradient routing:
+      - Shared MLP receives gradients from BOTH branches (cell-NB +
+        cell-commit AND spatial-adj + nbr-NB + niche-commit).
+        Feature reuse happens here.
+      - Cell-path MLP receives ONLY cell-side gradients (no spatial
+        leakage).
+      - Niche-path MLP receives ONLY niche-side gradients.
+
+    Compared to the existing encoder modes on this codebase:
+      - Legacy (only `mlp_params` in cfg): single shared MLP — full
+        spatial-gradient leakage into the cell-VQ input.
+      - Decoupled (`_patch_dual_decoupled_encoders`): TWO independent
+        MLPs — full gradient isolation but no feature reuse.
+      - Y-shape (this helper): THREE MLPs — shared core + two
+        specialised paths. The cell-path MLP weights are insulated
+        from spatial gradients; the shared trunk's weights are NOT
+        (they see gradients from both branches).
+
+    Default sizing
+    --------------
+    By default the helper HALVES the last layer dim of the cfg's
+    `mlp_params` and uses that for all three MLPs:
+
+        mlp_params (in cfg) = {hidden_channels: [400, 400, 256], ...}
+                            ↓
+        shared_mlp_params   = {hidden_channels: [400, 400, 128], ...}
+        path_mlp_params     = {hidden_channels: [400, 400, 128], ...}
+
+    Effective downstream dims stay at the original 256:
+      - VQ_cell input  = 128 (shared) + 128 (cell-path) = 256
+      - GNN input      = 128 (shared) + 128 (niche-path) = 256
+
+    so codebook embedding dims, GNN config, and decoder shapes are
+    UNCHANGED relative to the legacy shared-trunk variant.
+
+    Parameters
+    ----------
+    shared_mlp_params : dict, optional
+        Architecture for the shared trunk. `None` -> half-dim deep
+        copy of `cfg['model']['encoder_params']['mlp_params']`.
+    path_mlp_params : dict, optional
+        Architecture for EACH of the two path-specific MLPs (cell
+        and niche). The two paths share the SHAPE (this dict) but
+        get INDEPENDENT WEIGHTS. `None` -> half-dim deep copy of
+        the cfg's `mlp_params`.
+
+    Use cases
+    ---------
+      - Cell-NMI is dragged by spatial information leaking into z_mlp
+        but you want SOME shared feature reuse for parameter
+        efficiency. This is the balanced fix.
+      - You expect the cell + niche branches to share low-level
+        features (e.g. raw gene-expression pattern recognition) but
+        diverge in the higher-level abstraction toward each branch's
+        own discrimination target.
+
+    Caveats
+    -------
+      - Increases the encoder MLP parameter count by ~50% (three
+        MLPs vs one). Compute scales similarly.
+      - The shared trunk is STILL gradient-coupled to spatial losses.
+        If your goal is FULL gradient isolation of the cell branch
+        from spatial pulls, use `_patch_dual_decoupled_encoders`
+        instead.
+    """
+    import copy as _cp
+    enc = cfg["model"]["encoder_params"]
+    base_mlp = _cp.deepcopy(enc.get("mlp_params", {}))
+
+    def _halve_last(mlp_cfg: dict) -> dict:
+        """Return a deep copy of `mlp_cfg` with its last hidden
+        layer dim halved. No-op if `hidden_channels` is absent."""
+        out = _cp.deepcopy(mlp_cfg)
+        h = out.get("hidden_channels")
+        if h:
+            h = list(h)
+            h[-1] = max(1, h[-1] // 2)
+            out["hidden_channels"] = h
+        return out
+
+    def _override_last(mlp_cfg: dict, last_dim: int) -> dict:
+        """Return a deep copy of `mlp_cfg` with its last hidden layer
+        dim replaced by `last_dim`. No-op if `hidden_channels` is
+        absent."""
+        out = _cp.deepcopy(mlp_cfg)
+        h = out.get("hidden_channels")
+        if h:
+            h = list(h)
+            h[-1] = int(last_dim)
+            out["hidden_channels"] = h
+        return out
+
+    if shared_mlp_params is None:
+        shared_mlp_params = _halve_last(base_mlp)
+    if path_mlp_params is None:
+        path_mlp_params = _halve_last(base_mlp)
+
+    # Shortcut overrides — apply AFTER the default fallback so callers
+    # can pass just `shared_last_dim=` / `path_last_dim=` to vary the
+    # bottleneck while keeping the trunk shape inherited from the cfg.
+    if shared_last_dim is not None:
+        shared_mlp_params = _override_last(shared_mlp_params, shared_last_dim)
+    if path_last_dim is not None:
+        path_mlp_params = _override_last(path_mlp_params, path_last_dim)
+
+    enc["shared_mlp_params"] = shared_mlp_params
+    enc["mlp_params"] = _cp.deepcopy(path_mlp_params)       # cell-path MLP
+    enc["niche_mlp_params"] = _cp.deepcopy(path_mlp_params) # niche-path MLP
     return cfg
 
 
@@ -2013,6 +2371,179 @@ def _patch_dual_codebook_orth_reg(
     cfg["model"]["loss_params"]["loss_kwargs"]["wt_codebook_orthogonal_regularization"] = float(
         wt_codebook_orthogonal_regularization
     )
+    return cfg
+
+
+def _patch_dual_contrastive_cell(
+        cfg: dict,
+        wt_contrastive_cell: float = 1.0,
+        k_pos: int = 5,
+        temperature: float = 0.1,
+        log_transform_gene_space: bool = True,
+    ) -> dict:
+    """
+    Add the NT-Xent contrastive auxiliary loss on the pre-quantization
+    cell-branch latent (`contrastive_cell_attribute_loss`).
+
+    The loss reads `quantizer_input_cell` (= z_mlp_cell of seed cells)
+    and `target_attr` (= raw counts of seed cells) from `loss_data`.
+    For each anchor cell it picks the top-`k_pos` other cells in the
+    batch with the most similar log1p gene-expression profile as
+    positive pairs, then runs NT-Xent in cosine-similarity space at
+    `temperature`. This pulls same-type cells together in z_mlp space
+    and pushes different-type apart — an explicit between-cell
+    objective that complements NB's within-cell objective.
+
+    Rationale (per the s44 negative-test result + s46 weight-escalation
+    plateau): NB reconstruction at any weight saturates cell-NMI around
+    the level achievable from "data-structure k-means", because NB
+    optimises per-cell rate prediction, not between-cell cluster
+    separation. The contrastive loss directly optimises the latter.
+
+    Parameters
+    ----------
+    wt_contrastive_cell : float
+        Loss weight. 0.5-2.0 is the useful range; 1.0 matches the
+        scale of cell-NB at its default weight (~0.5-1.0 nat).
+    k_pos : int
+        Number of positive pairs per anchor (top-k nearest neighbours
+        in log1p gene-expression cosine similarity). 3-10 is sensible
+        for spatial transcriptomics; 5 is a good default.
+    temperature : float
+        NT-Xent softmax temperature. SimCLR convention is 0.1. Smaller
+        -> sharper attraction / repulsion.
+    log_transform_gene_space : bool
+        Whether to log1p the raw counts before computing pair
+        similarities. Strongly recommended (raw counts have huge
+        dynamic range; a few highly-expressed genes dominate cosine
+        similarity without log1p).
+    """
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    if "contrastive_cell_attribute_loss" not in losses:
+        losses.append("contrastive_cell_attribute_loss")
+    lk = cfg["model"]["loss_params"]["loss_kwargs"]
+    lk["wt_contrastive_cell"]       = float(wt_contrastive_cell)
+    lk["k_pos"]                     = int(k_pos)
+    lk["temperature"]               = float(temperature)
+    lk["log_transform_gene_space"]  = bool(log_transform_gene_space)
+    return cfg
+
+
+def _patch_dual_contrastive_cell_within_batch(
+        cfg: dict,
+        wt_contrastive_cell: float = 1.0,
+        k_pos: int = 5,
+        temperature: float = 0.1,
+        log_transform_gene_space: bool = True,
+    ) -> dict:
+    """
+    Within-batch variant of `_patch_dual_contrastive_cell`. Adds the
+    `contrastive_cell_attribute_within_batch_loss` to the loss list —
+    same NT-Xent formulation as the global variant, but BOTH positive-
+    pair candidates AND the NT-Xent denominator are restricted to
+    cells sharing the anchor's `adata_batch_id` (== same MERFISH /
+    STARmap section, etc.).
+
+    Why use this over the global variant
+    ------------------------------------
+    Mirrors `adj_within_section_only=True` on the cosine adjacency
+    BCE. Without the restriction, the global NT-Xent denominator
+    includes cross-section pairs and its gradient pushes
+    biologically-similar cells from different sections APART — which
+    directly counters the batch-integration objective that the
+    decoder-side batch covariate (`+decoder-cov`) and the spatial-
+    graph training are trying to achieve. With the restriction,
+    cross-section pairs are unpressured (neither pulled together nor
+    pushed apart) and the encoder is left free to learn a batch-
+    invariant cluster geometry without being fought against by this
+    auxiliary loss.
+
+    Numerical correctness was validated on a 5-test suite covering
+    (i) finite/non-negative loss on aligned input, (ii) combined loss
+    == average of per-batch losses (no cross-batch leakage in the
+    forward), (iii) singleton-batch anchors contribute 0, (iv) batch
+    1's z does NOT enter batch 0 anchors' gradients, (v) hand-
+    computed tiny case agrees with expected magnitude.
+
+    Parameters (same semantics as `_patch_dual_contrastive_cell`)
+    ----------
+    wt_contrastive_cell : float
+        Loss weight. With B=512 split across 2 sections (~256 each),
+        the per-anchor contrastive term is bounded by log(256) ≈ 5.5
+        nats — comparable to cell-NB at its default weight=1 mass per
+        cell summed over genes (~0.5-1 nat). Practical sweep range
+        spans 1-1000.
+    k_pos, temperature, log_transform_gene_space :
+        Identical to the global variant.
+
+    Requires
+    --------
+    `loss_data['node_adata_batch_ids']` must be populated by the
+    model's `_step` (it is, unconditionally, in `VQNiche_Dual._step`).
+    If absent the loss raises rather than silently falling back to
+    the global behaviour.
+    """
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    if "contrastive_cell_attribute_within_batch_loss" not in losses:
+        losses.append("contrastive_cell_attribute_within_batch_loss")
+    lk = cfg["model"]["loss_params"]["loss_kwargs"]
+    lk["wt_contrastive_cell"]       = float(wt_contrastive_cell)
+    lk["k_pos"]                     = int(k_pos)
+    lk["temperature"]               = float(temperature)
+    lk["log_transform_gene_space"]  = bool(log_transform_gene_space)
+    return cfg
+
+
+def _patch_dual_codebook_diversity(
+        cfg: dict,
+        weight: float = 1.0,
+        temperature: float = 100.0,
+        branch: str = "cell",
+    ) -> dict:
+    """
+    Enable lucidrains' codebook-diversity loss on the VQ codebook(s).
+    The loss is computed INSIDE the VQ module on every forward pass:
+    it takes the cosine-similarity matrix of the codes, applies a
+    softmax at `temperature`, and penalises the resulting entropy
+    being far from uniform — effectively a SwAV-style repulsion that
+    keeps codes spread out on the embedding sphere.
+
+    For ResidualVQ_Squint this applies to EVERY level (L1 + L2 + ...)
+    with the same weight + temperature. Per-level tuning isn't worth
+    the complexity given a 2-level RVQ.
+
+    Parameters
+    ----------
+    weight : float
+        Diversity loss weight. 0.1-10 is the useful range; 1.0 keeps
+        the term comparable in scale to the NB-cell loss (~0.5-1 nat).
+        Lucidrains' implementation adds it inside the VQ module's own
+        `forward` return value, where it joins the commit loss list.
+    temperature : float
+        Softmax temperature on the within-codebook similarity matrix
+        before computing the diversity term. Larger T -> softer
+        repulsion across more code pairs; smaller T -> sharper, focuses
+        on the most-similar pairs. 100.0 (lucidrains default) works
+        well for codebook sizes 30-200.
+    branch : 'cell' | 'niche' | 'both'
+        Which VQ slot(s) to apply the diversity loss to.
+
+    Mechanism
+    ---------
+    Sets `codebook_diversity_loss_weight` and
+    `codebook_diversity_temperature` in `vq_cell_params` /
+    `vq_niche_params`. `ResidualVQ_Squint.__init__` plumbs these
+    through to every inner `VectorQuantize` module.
+    """
+    if branch not in ("cell", "niche", "both"):
+        raise ValueError(f"branch must be 'cell'/'niche'/'both', got {branch!r}")
+    enc = cfg["model"]["encoder_params"]
+    if branch in ("cell", "both"):
+        enc["vq_cell_params"]["codebook_diversity_loss_weight"]  = float(weight)
+        enc["vq_cell_params"]["codebook_diversity_temperature"]  = float(temperature)
+    if branch in ("niche", "both"):
+        enc["vq_niche_params"]["codebook_diversity_loss_weight"] = float(weight)
+        enc["vq_niche_params"]["codebook_diversity_temperature"] = float(temperature)
     return cfg
 
 
@@ -2950,6 +3481,55 @@ def _patch_dual_decoder_covariate(
     """
     cfg["model"]["decoder_covariate_dim_request"] = True
     cfg["model"]["decoder_covariate_embed_dim"]   = int(embed_dim)
+    return cfg
+
+
+def _patch_dual_decoupled_decoder_cov(cfg: dict) -> dict:
+    """
+    Split the decoder-covariate `nn.Embedding` into TWO independent
+    modules — one per decoder. Each decoder's batch covariate then
+    receives gradients from THAT decoder's reconstruction loss ONLY;
+    no parameter is shared between the cell-NB pathway and the
+    nbr-NB pathway downstream of the codebook.
+
+    Why this matters under `+decoupled-enc`
+    --------------------------------------
+    Architectural gradient-isolation audit of the dual model under
+    `+decoupled-enc` (`vqniche_dual_encoder.py` + `vqniche_dual.py`):
+
+      Module                         Per-branch?  Shared?
+      ─────────────────────────────  ───────────  ──────────
+      mlp_module (cell trunk)        cell-only    no
+      niche_mlp_module (niche trunk) niche-only   no
+      vq_cell                        cell-only    no
+      vq_niche                       niche-only   no
+      gnn_module, niche_neck         niche-only   no
+      attribute_decoder_cell         cell-only    no
+      attribute_decoder_niche        niche-only   no
+      encoder.conditioning_module    n/a          NOT BUILT (no `condition_list` in cfg by default)
+      batch_embedding                BOTH         **YES (single nn.Embedding)**
+
+    Without this patch the `batch_embedding`'s rows receive gradient
+    updates from cell-NB AND nbr-NB on every step — the last remaining
+    learnable parameter shared between the two branches. With this
+    patch, that's gone too: `batch_embedding_cell` is updated by
+    cell-NB only, `batch_embedding_niche` by nbr-NB only.
+
+    Sizing
+    ------
+    Doubles the number of decoder-covariate parameters (was
+    `n_batches × 16` floats, now `2 × n_batches × 16`). Negligible
+    relative to the rest of the model.
+
+    Requires
+    --------
+    Must be applied AFTER `_patch_dual_decoder_covariate` (which sets
+    `decoder_covariate_dim_request=True`); the runtime resolves the
+    actual `decoder_covariate_dim` from the dataloader. No-op if
+    `+decoder-cov` isn't enabled — the model sees the flag but the
+    `decoder_covariate_dim==0` branch skips embedding creation entirely.
+    """
+    cfg["model"]["decoupled_decoder_covariate"] = True
     return cfg
 
 
@@ -5042,6 +5622,165 @@ VARIANTS: dict = {
                                 n_neighs=16,
                             ),
                             num_neighbors=[16],
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "DECOUPLED-ENCODERS sibling of the current best variant "
+            "(`+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+"
+            "lr7e-4+within-sec`). Same architecture as the parent on "
+            "every axis EXCEPT the encoder: instead of a shared MLP "
+            "trunk feeding both branches, this variant builds a "
+            "SEPARATE niche-side MLP with INDEPENDENT weights.\n\n"
+            "Architecture diff:\n"
+            "  Parent (shared trunk):\n"
+            "    x  ->  shared MLP  ->  z_mlp ─┬─► VQ_cell\n"
+            "                                  └─► GNN ─► VQ_niche\n"
+            "  This variant (decoupled):\n"
+            "    x ─┬─►  MLP_cell   ─►  z_mlp_cell  ─► VQ_cell\n"
+            "       └─►  MLP_niche  ─►  z_mlp_niche ─► GNN ─► VQ_niche\n\n"
+            "Both MLPs share the [400, 400, 256] architecture but have "
+            "INDEPENDENT WEIGHTS — spatial-loss gradients (adjacency "
+            "BCE + nbr-NB + niche-commit) update `MLP_niche.weight` "
+            "only, NEVER reaching `MLP_cell`. The cell-VQ input is "
+            "structurally shielded from spatial-loss pull.\n\n"
+            "Hypothesis (user's): cell-NMI on the parent variant is "
+            "dragged down because the shared encoder MLP's gradients "
+            "encode spatial information into z_mlp (which then "
+            "becomes the cell-VQ input). Decoupling the MLPs lets the "
+            "cell encoder optimise PURELY for cell-NB reconstruction "
+            "while the niche encoder owns the spatial pulls. Expected: "
+            "cell-NMI lifts, niche metrics roughly stable (the niche "
+            "branch sees no architectural change).\n\n"
+            "Cost: doubles the encoder MLP parameter count and adds "
+            "one extra MLP pass per training step (negligible vs the "
+            "GNN + decoder cost).\n\n"
+            "REQUIRES BLOB REBUILD (k=16 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512", "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared-specific-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "SHARED + PATH-SPECIFIC encoders (Y-shape) sibling of the "
+            "current best variant. Same architecture as the parent on "
+            "every axis EXCEPT the encoder: instead of a single shared "
+            "MLP trunk, this variant uses THREE MLPs — a shared trunk "
+            "plus one path-specific MLP per branch — and concatenates "
+            "the shared output with each path's output before the "
+            "downstream cell-VQ / GNN modules.\n\n"
+            "Architecture diff:\n"
+            "  Parent (shared trunk only):\n"
+            "    x  ->  MLP  ->  z_mlp ─┬─► VQ_cell\n"
+            "                            └─► GNN ─► VQ_niche\n"
+            "  This variant (Y-shape):\n"
+            "    x ─┬─►  MLP_shared (->128) ─► z_shared ──┐\n"
+            "       │                                      │ concat\n"
+            "       ├─►  MLP_cell   (->128) ─► z_cell_p   ┴─► VQ_cell (256-dim)\n"
+            "       │\n"
+            "       └─►  MLP_niche  (->128) ─► z_niche_p ─► (concat w/ shared) ─► GNN ─► VQ_niche\n\n"
+            "Default sizing halves the last-layer dim of `mlp_params` "
+            "[400, 400, 256] for all THREE MLPs ([400, 400, 128]), so "
+            "the concatenated downstream input is still 256-dim — "
+            "codebook dim, GNN config, decoders are all unchanged.\n\n"
+            "Gradient routing:\n"
+            "  - Shared MLP: receives gradients from BOTH branches.\n"
+            "  - Cell-path MLP: receives ONLY cell-side gradients\n"
+            "    (cell-NB + cell-commit). Shielded from spatial pulls.\n"
+            "  - Niche-path MLP: receives ONLY niche-side gradients\n"
+            "    (adj-BCE + nbr-NB + niche-commit). Shielded from\n"
+            "    cell-side pulls.\n\n"
+            "Intermediate between the legacy shared trunk (full "
+            "gradient coupling) and `+decoupled-enc` (full gradient "
+            "isolation). The shared part allows feature reuse for "
+            "parameter efficiency; the path-specific parts give each "
+            "branch room to specialise. The shared trunk is still "
+            "spatial-gradient-touched — if you need FULL isolation "
+            "of the cell branch from spatial pulls, use "
+            "`+decoupled-enc` instead.\n\n"
+            "REQUIRES BLOB REBUILD (k=16 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+shared-specific-enc(3 MLPs, each [400, 400, 128] last-layer)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512", "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_shared_specific_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
                         ),
                         weight=5.0,
                     ),
@@ -17693,6 +18432,4339 @@ VARIANTS: dict = {
             wt_codebook_orthogonal_regularization=200.0,
         ),
     },
+    # -----------------------------------------------------------------------
+    # s42 sweep — 16 ablations: encoder architecture size sweep
+    # -----------------------------------------------------------------------
+    # Hypothesis: the current best variant has cell-NMI dragged down by
+    # spatial-gradient leakage into z_mlp. Two structural fixes were added:
+    #   - +decoupled-enc: two INDEPENDENT MLPs (cell + niche paths)
+    #   - +shared-specific-enc: shared trunk + two path-specific MLPs
+    # s42 sweeps the SIZE of each architecture.
+    #
+    # Variants 1-8: +decoupled-enc, varying the trunk shape
+    #   v1 [256]            — shallow single-layer
+    #   v2 [400, 256]       — 2-layer (medium depth)
+    #   v3 [400, 400, 64]   — default depth, TIGHT latent 64
+    #   v4 [400, 400, 128]  — default depth, mid latent 128
+    #   v5 [400, 400, 256]  — default enc-deeper (decoupled-enc control)
+    #   v6 [400, 400, 512]  — default depth, WIDE latent 512
+    #   v7 [200, 200, 128]  — narrower trunk + tight latent
+    #   v8 [800, 800, 256]  — wider trunk
+    #
+    # Variants 9-16: +shared-specific-enc, varying (shared_last_dim, path_last_dim)
+    #   total concat dim = shared + path (= VQ_cell embed dim, = GNN input dim)
+    #   v9  (64, 64)    — tight total 128
+    #   v10 (128, 128)  — default total 256 (Y-shape control)
+    #   v11 (256, 256)  — wide total 512
+    #   v12 (192, 64)   — total 256, shared dominates
+    #   v13 (64, 192)   — total 256, path dominates
+    #   v14 (128, 64)   — total 192, moderate shared-bigger
+    #   v15 (64, 128)   — total 192, moderate path-bigger
+    #   v16 (192, 128)  — total 320, both larger
+    #
+    # Submit via:
+    #   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v42
+    "s42_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s42 sweep, variant 1 (decoupled-enc): two independent encoder MLPs (cell + niche paths), both shaped [256]. Spatial-loss gradients NEVER reach the cell MLP — the cell-VQ input is structurally shielded from spatial pulls. Tests trunk shape + latent-dim sensitivity for the decoupled mode. Base: cell-w5.0 + no-batch-int + within-sec + dec-w32 + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256])",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s42_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-256+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s42 sweep, variant 2 (decoupled-enc): two independent encoder MLPs (cell + niche paths), both shaped [400, 256]. Spatial-loss gradients NEVER reach the cell MLP — the cell-VQ input is structurally shielded from spatial pulls. Tests trunk shape + latent-dim sensitivity for the decoupled mode. Base: cell-w5.0 + no-batch-int + within-sec + dec-w32 + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 256])",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s42_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-400-64+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s42 sweep, variant 3 (decoupled-enc): two independent encoder MLPs (cell + niche paths), both shaped [400, 400, 64]. Spatial-loss gradients NEVER reach the cell MLP — the cell-VQ input is structurally shielded from spatial pulls. Tests trunk shape + latent-dim sensitivity for the decoupled mode. Base: cell-w5.0 + no-batch-int + within-sec + dec-w32 + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 64])",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 64],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s42_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-400-128+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s42 sweep, variant 4 (decoupled-enc): two independent encoder MLPs (cell + niche paths), both shaped [400, 400, 128]. Spatial-loss gradients NEVER reach the cell MLP — the cell-VQ input is structurally shielded from spatial pulls. Tests trunk shape + latent-dim sensitivity for the decoupled mode. Base: cell-w5.0 + no-batch-int + within-sec + dec-w32 + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 128])",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 128],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s42_v5_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-400-256+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s42 sweep, variant 5 (decoupled-enc): two independent encoder MLPs (cell + niche paths), both shaped [400, 400, 256]. Spatial-loss gradients NEVER reach the cell MLP — the cell-VQ input is structurally shielded from spatial pulls. Tests trunk shape + latent-dim sensitivity for the decoupled mode. Base: cell-w5.0 + no-batch-int + within-sec + dec-w32 + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s42_v6_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-400-512+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s42 sweep, variant 6 (decoupled-enc): two independent encoder MLPs (cell + niche paths), both shaped [400, 400, 512]. Spatial-loss gradients NEVER reach the cell MLP — the cell-VQ input is structurally shielded from spatial pulls. Tests trunk shape + latent-dim sensitivity for the decoupled mode. Base: cell-w5.0 + no-batch-int + within-sec + dec-w32 + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 512])",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 512],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s42_v7_dualvq+rvq-both+decoder-cov+no-batch-int+enc-200-200-128+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s42 sweep, variant 7 (decoupled-enc): two independent encoder MLPs (cell + niche paths), both shaped [200, 200, 128]. Spatial-loss gradients NEVER reach the cell MLP — the cell-VQ input is structurally shielded from spatial pulls. Tests trunk shape + latent-dim sensitivity for the decoupled mode. Base: cell-w5.0 + no-batch-int + within-sec + dec-w32 + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[200, 200, 128])",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[200, 200, 128],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s42_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-800-800-256+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s42 sweep, variant 8 (decoupled-enc): two independent encoder MLPs (cell + niche paths), both shaped [800, 800, 256]. Spatial-loss gradients NEVER reach the cell MLP — the cell-VQ input is structurally shielded from spatial pulls. Tests trunk shape + latent-dim sensitivity for the decoupled mode. Base: cell-w5.0 + no-batch-int + within-sec + dec-w32 + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[800, 800, 256])",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[800, 800, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s42_v9_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared64-path64+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s42 sweep, variant 9 (Y-shape encoder): shared trunk + two path-specific MLPs. Shared MLP last dim=64, path MLP last dim=64, downstream concat dim=128 (= VQ_cell embed dim, also = GNN input dim). All three MLPs inherit the trunk shape [400, 400, *] from enc-deeper. Tests the trade-off between shared (gradient-coupled, parameter-efficient feature reuse) and path-specific (gradient-isolated, specialised) capacity. Base: cell-w5.0 + no-batch-int + within-sec + enc-deeper + dec-w32 + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+shared-specific-enc(shared_last=64, path_last=64, concat_dim=128)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_shared_specific_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            shared_last_dim=64,
+                            path_last_dim=64,
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s42_v10_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared128-path128+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s42 sweep, variant 10 (Y-shape encoder): shared trunk + two path-specific MLPs. Shared MLP last dim=128, path MLP last dim=128, downstream concat dim=256 (= VQ_cell embed dim, also = GNN input dim). All three MLPs inherit the trunk shape [400, 400, *] from enc-deeper. Tests the trade-off between shared (gradient-coupled, parameter-efficient feature reuse) and path-specific (gradient-isolated, specialised) capacity. Base: cell-w5.0 + no-batch-int + within-sec + enc-deeper + dec-w32 + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+shared-specific-enc(shared_last=128, path_last=128, concat_dim=256)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_shared_specific_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            shared_last_dim=128,
+                            path_last_dim=128,
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s42_v11_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared256-path256+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s42 sweep, variant 11 (Y-shape encoder): shared trunk + two path-specific MLPs. Shared MLP last dim=256, path MLP last dim=256, downstream concat dim=512 (= VQ_cell embed dim, also = GNN input dim). All three MLPs inherit the trunk shape [400, 400, *] from enc-deeper. Tests the trade-off between shared (gradient-coupled, parameter-efficient feature reuse) and path-specific (gradient-isolated, specialised) capacity. Base: cell-w5.0 + no-batch-int + within-sec + enc-deeper + dec-w32 + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+shared-specific-enc(shared_last=256, path_last=256, concat_dim=512)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_shared_specific_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            shared_last_dim=256,
+                            path_last_dim=256,
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s42_v12_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared192-path64+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s42 sweep, variant 12 (Y-shape encoder): shared trunk + two path-specific MLPs. Shared MLP last dim=192, path MLP last dim=64, downstream concat dim=256 (= VQ_cell embed dim, also = GNN input dim). All three MLPs inherit the trunk shape [400, 400, *] from enc-deeper. Tests the trade-off between shared (gradient-coupled, parameter-efficient feature reuse) and path-specific (gradient-isolated, specialised) capacity. Base: cell-w5.0 + no-batch-int + within-sec + enc-deeper + dec-w32 + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+shared-specific-enc(shared_last=192, path_last=64, concat_dim=256)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_shared_specific_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            shared_last_dim=192,
+                            path_last_dim=64,
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s42_v13_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared64-path192+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s42 sweep, variant 13 (Y-shape encoder): shared trunk + two path-specific MLPs. Shared MLP last dim=64, path MLP last dim=192, downstream concat dim=256 (= VQ_cell embed dim, also = GNN input dim). All three MLPs inherit the trunk shape [400, 400, *] from enc-deeper. Tests the trade-off between shared (gradient-coupled, parameter-efficient feature reuse) and path-specific (gradient-isolated, specialised) capacity. Base: cell-w5.0 + no-batch-int + within-sec + enc-deeper + dec-w32 + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+shared-specific-enc(shared_last=64, path_last=192, concat_dim=256)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_shared_specific_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            shared_last_dim=64,
+                            path_last_dim=192,
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s42_v14_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared128-path64+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s42 sweep, variant 14 (Y-shape encoder): shared trunk + two path-specific MLPs. Shared MLP last dim=128, path MLP last dim=64, downstream concat dim=192 (= VQ_cell embed dim, also = GNN input dim). All three MLPs inherit the trunk shape [400, 400, *] from enc-deeper. Tests the trade-off between shared (gradient-coupled, parameter-efficient feature reuse) and path-specific (gradient-isolated, specialised) capacity. Base: cell-w5.0 + no-batch-int + within-sec + enc-deeper + dec-w32 + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+shared-specific-enc(shared_last=128, path_last=64, concat_dim=192)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_shared_specific_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            shared_last_dim=128,
+                            path_last_dim=64,
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s42_v15_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared64-path128+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s42 sweep, variant 15 (Y-shape encoder): shared trunk + two path-specific MLPs. Shared MLP last dim=64, path MLP last dim=128, downstream concat dim=192 (= VQ_cell embed dim, also = GNN input dim). All three MLPs inherit the trunk shape [400, 400, *] from enc-deeper. Tests the trade-off between shared (gradient-coupled, parameter-efficient feature reuse) and path-specific (gradient-isolated, specialised) capacity. Base: cell-w5.0 + no-batch-int + within-sec + enc-deeper + dec-w32 + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+shared-specific-enc(shared_last=64, path_last=128, concat_dim=192)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_shared_specific_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            shared_last_dim=64,
+                            path_last_dim=128,
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s42_v16_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared192-path128+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s42 sweep, variant 16 (Y-shape encoder): shared trunk + two path-specific MLPs. Shared MLP last dim=192, path MLP last dim=128, downstream concat dim=320 (= VQ_cell embed dim, also = GNN input dim). All three MLPs inherit the trunk shape [400, 400, *] from enc-deeper. Tests the trade-off between shared (gradient-coupled, parameter-efficient feature reuse) and path-specific (gradient-isolated, specialised) capacity. Base: cell-w5.0 + no-batch-int + within-sec + enc-deeper + dec-w32 + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+shared-specific-enc(shared_last=192, path_last=128, concat_dim=320)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_shared_specific_encoders(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            shared_last_dim=192,
+                            path_last_dim=128,
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    # -----------------------------------------------------------------------
+    # s43 sweep — 16 ablations: strictly-decoupled architecture SIZE grid
+    # -----------------------------------------------------------------------
+    # `+decoupled-enc` separates the cell + niche encoder MLPs. `+decoupled-
+    # dec-cov` further splits the decoder's batch embedding into TWO
+    # independent nn.Embeddings — one per decoder. Together they remove
+    # EVERY learnable parameter shared between the cell and niche pathways.
+    # (Encoder FiLM is already OFF by default in the dual cfg — no patch.)
+    #
+    # 4 × 4 grid of (encoder shape × decoder width):
+    #   E1 [128]            shallow + tight latent 128
+    #   E2 [256]            shallow, latent 256
+    #   E3 [256, 128]       2-layer narrow + tight latent 128
+    #   E4 [400, 256]       2-layer medium, latent 256
+    #
+    #   D1 [32]    current default — control
+    #   D2 [64]
+    #   D3 [128]
+    #   D4 [256]
+    #
+    # Variant index order: v(4*i+j+1) = (E(i+1), D(j+1)), 0<=i,j<4.
+    #
+    # Submit via:
+    #   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v43
+    "s43_v1_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-128+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s43 sweep, variant 1: STRICTLY decoupled architecture + (encoder shape [128], decoder width [32]). `+decoupled-enc` separates the cell-side and niche-side MLPs; `+decoupled-dec-cov` further splits the decoder-side batch embedding (`batch_embedding`) into TWO independent `nn.Embedding` modules so each decoder owns its own batch covariate. Combined with `+decoupled-enc`, this leaves ZERO learnable parameters shared between the cell and niche pathways. (Encoder FiLM is OFF by default in the dual cfg — no patch needed for that.) Tests the (shallow encoder × wide decoder) trade-off under the strictly-decoupled architecture. Base: cell-w5.0 + no-batch-int + within-sec + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[128])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_decoupled_encoders(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[128],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    "s43_v2_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-128+dec-w64+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s43 sweep, variant 2: STRICTLY decoupled architecture + (encoder shape [128], decoder width [64]). `+decoupled-enc` separates the cell-side and niche-side MLPs; `+decoupled-dec-cov` further splits the decoder-side batch embedding (`batch_embedding`) into TWO independent `nn.Embedding` modules so each decoder owns its own batch covariate. Combined with `+decoupled-enc`, this leaves ZERO learnable parameters shared between the cell and niche pathways. (Encoder FiLM is OFF by default in the dual cfg — no patch needed for that.) Tests the (shallow encoder × wide decoder) trade-off under the strictly-decoupled architecture. Base: cell-w5.0 + no-batch-int + within-sec + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[128])",
+            "+dec-w=[64]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_decoupled_encoders(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[128],
+                                            ),
+                                            hidden_channels=[64],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    "s43_v3_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-128+dec-w128+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s43 sweep, variant 3: STRICTLY decoupled architecture + (encoder shape [128], decoder width [128]). `+decoupled-enc` separates the cell-side and niche-side MLPs; `+decoupled-dec-cov` further splits the decoder-side batch embedding (`batch_embedding`) into TWO independent `nn.Embedding` modules so each decoder owns its own batch covariate. Combined with `+decoupled-enc`, this leaves ZERO learnable parameters shared between the cell and niche pathways. (Encoder FiLM is OFF by default in the dual cfg — no patch needed for that.) Tests the (shallow encoder × wide decoder) trade-off under the strictly-decoupled architecture. Base: cell-w5.0 + no-batch-int + within-sec + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[128])",
+            "+dec-w=[128]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_decoupled_encoders(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[128],
+                                            ),
+                                            hidden_channels=[128],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    "s43_v4_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-128+dec-w256+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s43 sweep, variant 4: STRICTLY decoupled architecture + (encoder shape [128], decoder width [256]). `+decoupled-enc` separates the cell-side and niche-side MLPs; `+decoupled-dec-cov` further splits the decoder-side batch embedding (`batch_embedding`) into TWO independent `nn.Embedding` modules so each decoder owns its own batch covariate. Combined with `+decoupled-enc`, this leaves ZERO learnable parameters shared between the cell and niche pathways. (Encoder FiLM is OFF by default in the dual cfg — no patch needed for that.) Tests the (shallow encoder × wide decoder) trade-off under the strictly-decoupled architecture. Base: cell-w5.0 + no-batch-int + within-sec + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[128])",
+            "+dec-w=[256]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_decoupled_encoders(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[128],
+                                            ),
+                                            hidden_channels=[256],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    "s43_v5_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s43 sweep, variant 5: STRICTLY decoupled architecture + (encoder shape [256], decoder width [32]). `+decoupled-enc` separates the cell-side and niche-side MLPs; `+decoupled-dec-cov` further splits the decoder-side batch embedding (`batch_embedding`) into TWO independent `nn.Embedding` modules so each decoder owns its own batch covariate. Combined with `+decoupled-enc`, this leaves ZERO learnable parameters shared between the cell and niche pathways. (Encoder FiLM is OFF by default in the dual cfg — no patch needed for that.) Tests the (shallow encoder × wide decoder) trade-off under the strictly-decoupled architecture. Base: cell-w5.0 + no-batch-int + within-sec + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_decoupled_encoders(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[256],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    "s43_v6_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256+dec-w64+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s43 sweep, variant 6: STRICTLY decoupled architecture + (encoder shape [256], decoder width [64]). `+decoupled-enc` separates the cell-side and niche-side MLPs; `+decoupled-dec-cov` further splits the decoder-side batch embedding (`batch_embedding`) into TWO independent `nn.Embedding` modules so each decoder owns its own batch covariate. Combined with `+decoupled-enc`, this leaves ZERO learnable parameters shared between the cell and niche pathways. (Encoder FiLM is OFF by default in the dual cfg — no patch needed for that.) Tests the (shallow encoder × wide decoder) trade-off under the strictly-decoupled architecture. Base: cell-w5.0 + no-batch-int + within-sec + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256])",
+            "+dec-w=[64]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_decoupled_encoders(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[256],
+                                            ),
+                                            hidden_channels=[64],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    "s43_v7_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256+dec-w128+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s43 sweep, variant 7: STRICTLY decoupled architecture + (encoder shape [256], decoder width [128]). `+decoupled-enc` separates the cell-side and niche-side MLPs; `+decoupled-dec-cov` further splits the decoder-side batch embedding (`batch_embedding`) into TWO independent `nn.Embedding` modules so each decoder owns its own batch covariate. Combined with `+decoupled-enc`, this leaves ZERO learnable parameters shared between the cell and niche pathways. (Encoder FiLM is OFF by default in the dual cfg — no patch needed for that.) Tests the (shallow encoder × wide decoder) trade-off under the strictly-decoupled architecture. Base: cell-w5.0 + no-batch-int + within-sec + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256])",
+            "+dec-w=[128]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_decoupled_encoders(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[256],
+                                            ),
+                                            hidden_channels=[128],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    "s43_v8_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256+dec-w256+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s43 sweep, variant 8: STRICTLY decoupled architecture + (encoder shape [256], decoder width [256]). `+decoupled-enc` separates the cell-side and niche-side MLPs; `+decoupled-dec-cov` further splits the decoder-side batch embedding (`batch_embedding`) into TWO independent `nn.Embedding` modules so each decoder owns its own batch covariate. Combined with `+decoupled-enc`, this leaves ZERO learnable parameters shared between the cell and niche pathways. (Encoder FiLM is OFF by default in the dual cfg — no patch needed for that.) Tests the (shallow encoder × wide decoder) trade-off under the strictly-decoupled architecture. Base: cell-w5.0 + no-batch-int + within-sec + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256])",
+            "+dec-w=[256]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_decoupled_encoders(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[256],
+                                            ),
+                                            hidden_channels=[256],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    "s43_v9_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256-128+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s43 sweep, variant 9: STRICTLY decoupled architecture + (encoder shape [256, 128], decoder width [32]). `+decoupled-enc` separates the cell-side and niche-side MLPs; `+decoupled-dec-cov` further splits the decoder-side batch embedding (`batch_embedding`) into TWO independent `nn.Embedding` modules so each decoder owns its own batch covariate. Combined with `+decoupled-enc`, this leaves ZERO learnable parameters shared between the cell and niche pathways. (Encoder FiLM is OFF by default in the dual cfg — no patch needed for that.) Tests the (shallow encoder × wide decoder) trade-off under the strictly-decoupled architecture. Base: cell-w5.0 + no-batch-int + within-sec + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256, 128])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_decoupled_encoders(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[256, 128],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    "s43_v10_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256-128+dec-w64+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s43 sweep, variant 10: STRICTLY decoupled architecture + (encoder shape [256, 128], decoder width [64]). `+decoupled-enc` separates the cell-side and niche-side MLPs; `+decoupled-dec-cov` further splits the decoder-side batch embedding (`batch_embedding`) into TWO independent `nn.Embedding` modules so each decoder owns its own batch covariate. Combined with `+decoupled-enc`, this leaves ZERO learnable parameters shared between the cell and niche pathways. (Encoder FiLM is OFF by default in the dual cfg — no patch needed for that.) Tests the (shallow encoder × wide decoder) trade-off under the strictly-decoupled architecture. Base: cell-w5.0 + no-batch-int + within-sec + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256, 128])",
+            "+dec-w=[64]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_decoupled_encoders(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[256, 128],
+                                            ),
+                                            hidden_channels=[64],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    "s43_v11_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256-128+dec-w128+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s43 sweep, variant 11: STRICTLY decoupled architecture + (encoder shape [256, 128], decoder width [128]). `+decoupled-enc` separates the cell-side and niche-side MLPs; `+decoupled-dec-cov` further splits the decoder-side batch embedding (`batch_embedding`) into TWO independent `nn.Embedding` modules so each decoder owns its own batch covariate. Combined with `+decoupled-enc`, this leaves ZERO learnable parameters shared between the cell and niche pathways. (Encoder FiLM is OFF by default in the dual cfg — no patch needed for that.) Tests the (shallow encoder × wide decoder) trade-off under the strictly-decoupled architecture. Base: cell-w5.0 + no-batch-int + within-sec + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256, 128])",
+            "+dec-w=[128]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_decoupled_encoders(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[256, 128],
+                                            ),
+                                            hidden_channels=[128],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    "s43_v12_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256-128+dec-w256+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s43 sweep, variant 12: STRICTLY decoupled architecture + (encoder shape [256, 128], decoder width [256]). `+decoupled-enc` separates the cell-side and niche-side MLPs; `+decoupled-dec-cov` further splits the decoder-side batch embedding (`batch_embedding`) into TWO independent `nn.Embedding` modules so each decoder owns its own batch covariate. Combined with `+decoupled-enc`, this leaves ZERO learnable parameters shared between the cell and niche pathways. (Encoder FiLM is OFF by default in the dual cfg — no patch needed for that.) Tests the (shallow encoder × wide decoder) trade-off under the strictly-decoupled architecture. Base: cell-w5.0 + no-batch-int + within-sec + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256, 128])",
+            "+dec-w=[256]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_decoupled_encoders(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[256, 128],
+                                            ),
+                                            hidden_channels=[256],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    "s43_v13_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-400-256+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s43 sweep, variant 13: STRICTLY decoupled architecture + (encoder shape [400, 256], decoder width [32]). `+decoupled-enc` separates the cell-side and niche-side MLPs; `+decoupled-dec-cov` further splits the decoder-side batch embedding (`batch_embedding`) into TWO independent `nn.Embedding` modules so each decoder owns its own batch covariate. Combined with `+decoupled-enc`, this leaves ZERO learnable parameters shared between the cell and niche pathways. (Encoder FiLM is OFF by default in the dual cfg — no patch needed for that.) Tests the (shallow encoder × wide decoder) trade-off under the strictly-decoupled architecture. Base: cell-w5.0 + no-batch-int + within-sec + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_decoupled_encoders(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[400, 256],
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    "s43_v14_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-400-256+dec-w64+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s43 sweep, variant 14: STRICTLY decoupled architecture + (encoder shape [400, 256], decoder width [64]). `+decoupled-enc` separates the cell-side and niche-side MLPs; `+decoupled-dec-cov` further splits the decoder-side batch embedding (`batch_embedding`) into TWO independent `nn.Embedding` modules so each decoder owns its own batch covariate. Combined with `+decoupled-enc`, this leaves ZERO learnable parameters shared between the cell and niche pathways. (Encoder FiLM is OFF by default in the dual cfg — no patch needed for that.) Tests the (shallow encoder × wide decoder) trade-off under the strictly-decoupled architecture. Base: cell-w5.0 + no-batch-int + within-sec + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 256])",
+            "+dec-w=[64]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_decoupled_encoders(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[400, 256],
+                                            ),
+                                            hidden_channels=[64],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    "s43_v15_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-400-256+dec-w128+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s43 sweep, variant 15: STRICTLY decoupled architecture + (encoder shape [400, 256], decoder width [128]). `+decoupled-enc` separates the cell-side and niche-side MLPs; `+decoupled-dec-cov` further splits the decoder-side batch embedding (`batch_embedding`) into TWO independent `nn.Embedding` modules so each decoder owns its own batch covariate. Combined with `+decoupled-enc`, this leaves ZERO learnable parameters shared between the cell and niche pathways. (Encoder FiLM is OFF by default in the dual cfg — no patch needed for that.) Tests the (shallow encoder × wide decoder) trade-off under the strictly-decoupled architecture. Base: cell-w5.0 + no-batch-int + within-sec + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 256])",
+            "+dec-w=[128]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_decoupled_encoders(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[400, 256],
+                                            ),
+                                            hidden_channels=[128],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    "s43_v16_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-400-256+dec-w256+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s43 sweep, variant 16: STRICTLY decoupled architecture + (encoder shape [400, 256], decoder width [256]). `+decoupled-enc` separates the cell-side and niche-side MLPs; `+decoupled-dec-cov` further splits the decoder-side batch embedding (`batch_embedding`) into TWO independent `nn.Embedding` modules so each decoder owns its own batch covariate. Combined with `+decoupled-enc`, this leaves ZERO learnable parameters shared between the cell and niche pathways. (Encoder FiLM is OFF by default in the dual cfg — no patch needed for that.) Tests the (shallow encoder × wide decoder) trade-off under the strictly-decoupled architecture. Base: cell-w5.0 + no-batch-int + within-sec + knn16 + sampler16 + bs=512 + lr=7e-4. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 256])",
+            "+dec-w=[256]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_decoupled_encoders(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=(30, 90)),
+                                                        branch="cell", codebook_sizes=(30, 90),
+                                                    ),
+                                                ),
+                                                hidden_channels=[400, 256],
+                                            ),
+                                            hidden_channels=[256],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    # -----------------------------------------------------------------------
+    # s44 sweep — 1 ablation: negative test of architectural-leakage hypothesis
+    # -----------------------------------------------------------------------
+    # Spine identical to s43_v5; only +no-recon added on top. Direct A/B for
+    # the diagnostic question: does the cell codebook get its structure from
+    # the reconstruction signal, or from k-means init + EMA on raw z_mlp?
+    #
+    # Submit via:
+    #   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v44
+    "s44_v1_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+no-recon+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s44 NEGATIVE TEST: identical spine to s43_v5 (strictly decoupled encoders + decoupled decoder-cov, encoder=[256], decoder=[32]) with the ONE additional change of `+no-recon`: every reconstruction loss is removed. Only the commit losses (mse_commit_loss_cell + mse_commit_loss_niche) remain in the loss list; EMA codebook updates still fire every step. The encoder receives gradient signal ONLY from the commit pull toward the nearest codebook entry. \n\nCell-NMI is computed DIRECTLY on the discrete L0 macro-code index `cell_code_indices[level_0]` (= K1=30 partition over all cells) against the `cell_type` label — no Leiden, no continuous embedding. So the ceiling for level_0 NMI is hard-bounded by K1=30 vs the cell-type cardinality of the dataset; raising K1 (e.g. +rvq(cell, [60, 90])) is the most direct lever on this metric. The `cell_code_indices[composite]` view (up to K1*K2=2700 leaves) is the more sensitive diagnostic when level_0 NMI is at the cardinality ceiling. \n\nHypothesis discrimination for THIS variant: if cell-NMI here is similar to s43_v5's cell-NMI, then reconstruction wasn't the lever — k-means initialisation on z_mlp (just a random projection of gene expression) plus EMA already produces a 30-cluster partition that's as cell-type-aligned as the model achieves with full training. Architectural changes can't push past that init-driven ceiling. If cell-NMI crashes to baseline here, reconstruction IS the driver and the level_0 ceiling is whatever s43 produces — K1 has to go up. \n\nRemoved from loss_names: nb_attribute_reconstruction_loss, nb_attribute_reconstruction_loss_nbr_dual, bce_cosine_adjacency_reconstruction_loss. Kept: mse_commit_loss_cell, mse_commit_loss_niche. (cell-w=5.0 is a no-op here since cell-NB is gone, kept in the spine for variant-name comparability with s43_v5.) REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0  (no-op: cell-NB is removed)",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True  (no-op: adj-BCE is removed)",
+            "+decoupled-enc(niche MLP = independent copy of cell MLP)",
+            "+no-recon(drops cell-NB + nbr-NB + adj-BCE; keeps commits)",
+        ],
+        "build": lambda: _patch_dual_no_recon(
+            _patch_dual_decoupled_decoder_cov(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_decoupled_encoders(
+                                    _patch_dual_sampler_neighbors(
+                                        _patch_dual_graph_knn(
+                                            _patch_dual_decoder_width(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[256],
+                                                ),
+                                                hidden_channels=[32],
+                                            ),
+                                            n_neighs=16,
+                                        ),
+                                        num_neighbors=[16],
+                                    ),
+                                ),
+                                weight=5.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+            ),
+        ),
+    },
+    # -----------------------------------------------------------------------
+    # s45 sweep — 1 diagnostic: shared MLP trunk + no cell-NB
+    # -----------------------------------------------------------------------
+    # Pairs with s44_v1 (decoupled enc + no recon) as a 2x2 diagnostic.
+    # Tests whether the niche-side losses on the SHARED z_mlp are doing
+    # cell-type discrimination by themselves, without cell-NB pressure.
+    #
+    # Submit via:
+    #   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v45
+    "s45_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+no-cell-nb+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s45 DIAGNOSTIC: identical spine to the s42 winner (SHARED MLP trunk — no +decoupled-enc, `+enc-deeper` = [400, 400, 256], +rvq-both [30, 90], +decoder-cov, +no-batch-int, +dec-w32, knn16, sampler16, cell-w5.0, bs=512, lr=7e-4, within-sec). Only modification: `+no-cell-nb` drops `nb_attribute_reconstruction_loss` while keeping `mse_commit_loss_cell` and the entire niche-side loss stack (`nb_attribute_reconstruction_loss_nbr_dual`, `mse_commit_loss_niche`, `bce_cosine_adjacency_reconstruction_loss`). \n\nWhat gets gradient signal in this variant: z_mlp (shared trunk) is shaped by cell-commit + nbr-NB + niche-commit + adjacency-BCE (the last three all flow through the shared trunk because there's no +decoupled-enc). The cell decoder still runs but receives no gradient signal — its outputs are unsupervised. \n\nHypothesis test for `cell_code_indices[level_0]` NMI (= K1=30 macro codes vs cell_type, directly via normalized_mutual_info_score). \n  - level_0 NMI ≈ s42 winner: spatial-side losses on the shared     trunk were doing the cell-type discrimination; cell-NB was     decorative for this metric. \n  - level_0 NMI crashes: cell-NB was load-bearing for the L0     partition and the niche-side gradients on the shared trunk     were NOT producing cell-type-aligned z_mlp geometry. \n\nPairs with s44_v1 (decoupled enc + no recon at all) as a 2x2 negative-test matrix: \n      shared trunk  decoupled trunk \n  full recon:  s42 winner    s43_v5         \n  no cell-NB:  s45_v1        (s44_v1 = no recon at all) \n\n(cell-w=5.0 is a no-op here since cell-NB is removed; kept in the spine for variant-name comparability with the s42 winner.)"
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0  (no-op: cell-NB is removed)",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+no-cell-nb(drops nb_attribute_reconstruction_loss; keeps mse_commit_loss_cell)",
+        ],
+        "build": lambda: _patch_dual_no_cell_nb(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=5.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+        ),
+    },
+    # -----------------------------------------------------------------------
+    # s46 sweep — 4 ablations: drastically increased cell-NB weight
+    # -----------------------------------------------------------------------
+    # Follow-up to s44_v1's negative-test finding: cell-NB at wt=5
+    # contributes ~0.15 NMI to cell_code_indices[level_0]. This sweep
+    # tests whether pushing the weight to 100 / 300 / 500 / 1000 (vs
+    # the s42 winner's 5.0) continues to raise cell-NMI or saturates /
+    # causes the niche branch to collapse from gradient imbalance.
+    #
+    # Spine: s42 winner (shared MLP, `+enc-deeper`).
+    # Only knob changed: cell-NB weight.
+    #
+    # Submit via:
+    #   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v46
+    "s46_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w100+bs512+lr7e-4+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s46 sweep, variant 1: identical spine to the s42 winner (shared MLP, `+enc-deeper` = [400, 400, 256], RVQ-both [30, 90], +decoder-cov, +no-batch-int, +dec-w=[32], knn16, sampler16, bs=512, lr=7e-4, within-sec) — but with `wt_attr_reconstr=100` (vs the s42 winner's 5.0). \n\nContext: s44_v1 (no-recon ablation) brought cell-NMI on `cell_code_indices[level_0]` from 0.4 down to 0.25 and simultaneously RAISED the niche-NMI of cell codes (codes drifted into spatial structure once cell-NB pressure was removed). cell-NB is therefore the cell-NMI lever in the shared-trunk design. This sweep tests whether pushing the weight 20x-200x continues to lift cell-NMI, saturates, or causes the niche branch to collapse (since the same shared `z_mlp` is increasingly dominated by cell-NB gradient mass). \n\nExpected response curve: \n  - cell-NMI on cell codes: monotonic up until saturation. \n  - niche-NMI on cell codes: monotonic down (codes become     more cell-only, less spatial). \n  - niche-NMI on niche codes: may drop (niche branch's z_mlp     is now shaped primarily by cell-NB; the spatial losses     are gradient-overpowered). \n  - Pearson reconstruction: should improve on cell-branch     metrics, may worsen on nbr-branch metrics. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=100.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                        hidden_channels=[400, 400, 256],
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=100.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s46_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w300+bs512+lr7e-4+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s46 sweep, variant 2: identical spine to the s42 winner (shared MLP, `+enc-deeper` = [400, 400, 256], RVQ-both [30, 90], +decoder-cov, +no-batch-int, +dec-w=[32], knn16, sampler16, bs=512, lr=7e-4, within-sec) — but with `wt_attr_reconstr=300` (vs the s42 winner's 5.0). \n\nContext: s44_v1 (no-recon ablation) brought cell-NMI on `cell_code_indices[level_0]` from 0.4 down to 0.25 and simultaneously RAISED the niche-NMI of cell codes (codes drifted into spatial structure once cell-NB pressure was removed). cell-NB is therefore the cell-NMI lever in the shared-trunk design. This sweep tests whether pushing the weight 20x-200x continues to lift cell-NMI, saturates, or causes the niche branch to collapse (since the same shared `z_mlp` is increasingly dominated by cell-NB gradient mass). \n\nExpected response curve: \n  - cell-NMI on cell codes: monotonic up until saturation. \n  - niche-NMI on cell codes: monotonic down (codes become     more cell-only, less spatial). \n  - niche-NMI on niche codes: may drop (niche branch's z_mlp     is now shaped primarily by cell-NB; the spatial losses     are gradient-overpowered). \n  - Pearson reconstruction: should improve on cell-branch     metrics, may worsen on nbr-branch metrics. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=300.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                        hidden_channels=[400, 400, 256],
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=300.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s46_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w500+bs512+lr7e-4+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s46 sweep, variant 3: identical spine to the s42 winner (shared MLP, `+enc-deeper` = [400, 400, 256], RVQ-both [30, 90], +decoder-cov, +no-batch-int, +dec-w=[32], knn16, sampler16, bs=512, lr=7e-4, within-sec) — but with `wt_attr_reconstr=500` (vs the s42 winner's 5.0). \n\nContext: s44_v1 (no-recon ablation) brought cell-NMI on `cell_code_indices[level_0]` from 0.4 down to 0.25 and simultaneously RAISED the niche-NMI of cell codes (codes drifted into spatial structure once cell-NB pressure was removed). cell-NB is therefore the cell-NMI lever in the shared-trunk design. This sweep tests whether pushing the weight 20x-200x continues to lift cell-NMI, saturates, or causes the niche branch to collapse (since the same shared `z_mlp` is increasingly dominated by cell-NB gradient mass). \n\nExpected response curve: \n  - cell-NMI on cell codes: monotonic up until saturation. \n  - niche-NMI on cell codes: monotonic down (codes become     more cell-only, less spatial). \n  - niche-NMI on niche codes: may drop (niche branch's z_mlp     is now shaped primarily by cell-NB; the spatial losses     are gradient-overpowered). \n  - Pearson reconstruction: should improve on cell-branch     metrics, may worsen on nbr-branch metrics. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=500.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                        hidden_channels=[400, 400, 256],
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=500.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s46_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1000+bs512+lr7e-4+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s46 sweep, variant 4: identical spine to the s42 winner (shared MLP, `+enc-deeper` = [400, 400, 256], RVQ-both [30, 90], +decoder-cov, +no-batch-int, +dec-w=[32], knn16, sampler16, bs=512, lr=7e-4, within-sec) — but with `wt_attr_reconstr=1000` (vs the s42 winner's 5.0). \n\nContext: s44_v1 (no-recon ablation) brought cell-NMI on `cell_code_indices[level_0]` from 0.4 down to 0.25 and simultaneously RAISED the niche-NMI of cell codes (codes drifted into spatial structure once cell-NB pressure was removed). cell-NB is therefore the cell-NMI lever in the shared-trunk design. This sweep tests whether pushing the weight 20x-200x continues to lift cell-NMI, saturates, or causes the niche branch to collapse (since the same shared `z_mlp` is increasingly dominated by cell-NB gradient mass). \n\nExpected response curve: \n  - cell-NMI on cell codes: monotonic up until saturation. \n  - niche-NMI on cell codes: monotonic down (codes become     more cell-only, less spatial). \n  - niche-NMI on niche codes: may drop (niche branch's z_mlp     is now shaped primarily by cell-NB; the spatial losses     are gradient-overpowered). \n  - Pearson reconstruction: should improve on cell-branch     metrics, may worsen on nbr-branch metrics. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1000.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                        hidden_channels=[400, 400, 256],
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=1000.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    # -----------------------------------------------------------------------
+    # s47 sweep — 8 ablations: contrastive + codebook diversity
+    # -----------------------------------------------------------------------
+    # Spine: s42 winner with cell-w lowered 5.0 -> 1.0 (s46 escalation did
+    # not help). New aux losses on top:
+    #   v1-v4: contrastive only (NT-Xent on z_mlp_cell, top-k log1p-gene-
+    #          expression nearest neighbours as positives)
+    #   v5-v6: codebook diversity only (SwAV-style code repulsion)
+    #   v7-v8: contrastive + diversity combined
+    #
+    # Submit via:
+    #   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v47
+    "s47_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrast-w0.5-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s47 sweep, variant 1: s42 winner spine with cell-w lowered 5.0 -> 1.0 (per user: weight escalation didn't help), plus contrastive cell loss (wt=0.5, k_pos=5, temp=0.1). \n\nContrastive (when active): NT-Xent on `quantizer_input_cell` (= z_mlp_cell of seed cells). Positive pairs are the top-k cells with the most similar log1p gene-expression profile in the batch; negatives are the rest. Pulls same-type cells together in z_mlp space and pushes different-type apart — a between-cell objective that complements NB's within-cell objective. \n\nDiversity (when active): lucidrains' codebook-diversity loss on every level of the cell-branch RVQ (L1 K=30 + L2 K=90). Penalises softmax-similarity between codes -> pushes codes apart on the cosine-sphere -> reduces dead-code collapse and keeps cluster centroids well-separated by construction. \n\nHypothesis: contrastive directly attacks the NB/NMI objective mismatch (per the s46 weight-escalation plateau result). Diversity attacks the K1=30 'codes collapse together' failure mode independently. Combined (v7, v8): both at once. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell(wt=0.5, k_pos=5, temperature=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            wt_contrastive_cell=0.5,
+            k_pos=5, temperature=0.1,
+        ),
+    },
+    "s47_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrast-w1.0-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s47 sweep, variant 2: s42 winner spine with cell-w lowered 5.0 -> 1.0 (per user: weight escalation didn't help), plus contrastive cell loss (wt=1.0, k_pos=5, temp=0.1). \n\nContrastive (when active): NT-Xent on `quantizer_input_cell` (= z_mlp_cell of seed cells). Positive pairs are the top-k cells with the most similar log1p gene-expression profile in the batch; negatives are the rest. Pulls same-type cells together in z_mlp space and pushes different-type apart — a between-cell objective that complements NB's within-cell objective. \n\nDiversity (when active): lucidrains' codebook-diversity loss on every level of the cell-branch RVQ (L1 K=30 + L2 K=90). Penalises softmax-similarity between codes -> pushes codes apart on the cosine-sphere -> reduces dead-code collapse and keeps cluster centroids well-separated by construction. \n\nHypothesis: contrastive directly attacks the NB/NMI objective mismatch (per the s46 weight-escalation plateau result). Diversity attacks the K1=30 'codes collapse together' failure mode independently. Combined (v7, v8): both at once. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell(wt=1.0, k_pos=5, temperature=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            wt_contrastive_cell=1.0,
+            k_pos=5, temperature=0.1,
+        ),
+    },
+    "s47_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrast-w2.0-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s47 sweep, variant 3: s42 winner spine with cell-w lowered 5.0 -> 1.0 (per user: weight escalation didn't help), plus contrastive cell loss (wt=2.0, k_pos=5, temp=0.1). \n\nContrastive (when active): NT-Xent on `quantizer_input_cell` (= z_mlp_cell of seed cells). Positive pairs are the top-k cells with the most similar log1p gene-expression profile in the batch; negatives are the rest. Pulls same-type cells together in z_mlp space and pushes different-type apart — a between-cell objective that complements NB's within-cell objective. \n\nDiversity (when active): lucidrains' codebook-diversity loss on every level of the cell-branch RVQ (L1 K=30 + L2 K=90). Penalises softmax-similarity between codes -> pushes codes apart on the cosine-sphere -> reduces dead-code collapse and keeps cluster centroids well-separated by construction. \n\nHypothesis: contrastive directly attacks the NB/NMI objective mismatch (per the s46 weight-escalation plateau result). Diversity attacks the K1=30 'codes collapse together' failure mode independently. Combined (v7, v8): both at once. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell(wt=2.0, k_pos=5, temperature=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            wt_contrastive_cell=2.0,
+            k_pos=5, temperature=0.1,
+        ),
+    },
+    "s47_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrast-w1.0-k10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s47 sweep, variant 4: s42 winner spine with cell-w lowered 5.0 -> 1.0 (per user: weight escalation didn't help), plus contrastive cell loss (wt=1.0, k_pos=10, temp=0.1). \n\nContrastive (when active): NT-Xent on `quantizer_input_cell` (= z_mlp_cell of seed cells). Positive pairs are the top-k cells with the most similar log1p gene-expression profile in the batch; negatives are the rest. Pulls same-type cells together in z_mlp space and pushes different-type apart — a between-cell objective that complements NB's within-cell objective. \n\nDiversity (when active): lucidrains' codebook-diversity loss on every level of the cell-branch RVQ (L1 K=30 + L2 K=90). Penalises softmax-similarity between codes -> pushes codes apart on the cosine-sphere -> reduces dead-code collapse and keeps cluster centroids well-separated by construction. \n\nHypothesis: contrastive directly attacks the NB/NMI objective mismatch (per the s46 weight-escalation plateau result). Diversity attacks the K1=30 'codes collapse together' failure mode independently. Combined (v7, v8): both at once. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell(wt=1.0, k_pos=10, temperature=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            wt_contrastive_cell=1.0,
+            k_pos=10, temperature=0.1,
+        ),
+    },
+    "s47_v5_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+diversity-w1+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s47 sweep, variant 5: s42 winner spine with cell-w lowered 5.0 -> 1.0 (per user: weight escalation didn't help), plus codebook diversity on cell-VQ (wt=1.0, temp=100.0). \n\nContrastive (when active): NT-Xent on `quantizer_input_cell` (= z_mlp_cell of seed cells). Positive pairs are the top-k cells with the most similar log1p gene-expression profile in the batch; negatives are the rest. Pulls same-type cells together in z_mlp space and pushes different-type apart — a between-cell objective that complements NB's within-cell objective. \n\nDiversity (when active): lucidrains' codebook-diversity loss on every level of the cell-branch RVQ (L1 K=30 + L2 K=90). Penalises softmax-similarity between codes -> pushes codes apart on the cosine-sphere -> reduces dead-code collapse and keeps cluster centroids well-separated by construction. \n\nHypothesis: contrastive directly attacks the NB/NMI objective mismatch (per the s46 weight-escalation plateau result). Diversity attacks the K1=30 'codes collapse together' failure mode independently. Combined (v7, v8): both at once. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+codebook-diversity(branch=cell, wt=1.0, temperature=100.0)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            weight=1.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s47_v6_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+diversity-w10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s47 sweep, variant 6: s42 winner spine with cell-w lowered 5.0 -> 1.0 (per user: weight escalation didn't help), plus codebook diversity on cell-VQ (wt=10.0, temp=100.0). \n\nContrastive (when active): NT-Xent on `quantizer_input_cell` (= z_mlp_cell of seed cells). Positive pairs are the top-k cells with the most similar log1p gene-expression profile in the batch; negatives are the rest. Pulls same-type cells together in z_mlp space and pushes different-type apart — a between-cell objective that complements NB's within-cell objective. \n\nDiversity (when active): lucidrains' codebook-diversity loss on every level of the cell-branch RVQ (L1 K=30 + L2 K=90). Penalises softmax-similarity between codes -> pushes codes apart on the cosine-sphere -> reduces dead-code collapse and keeps cluster centroids well-separated by construction. \n\nHypothesis: contrastive directly attacks the NB/NMI objective mismatch (per the s46 weight-escalation plateau result). Diversity attacks the K1=30 'codes collapse together' failure mode independently. Combined (v7, v8): both at once. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+codebook-diversity(branch=cell, wt=10.0, temperature=100.0)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            weight=10.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s47_v7_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrast-w1.0-k5+diversity-w1+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s47 sweep, variant 7: s42 winner spine with cell-w lowered 5.0 -> 1.0 (per user: weight escalation didn't help), plus contrastive cell loss (wt=1.0, k_pos=5, temp=0.1) + codebook diversity on cell-VQ (wt=1.0, temp=100.0). \n\nContrastive (when active): NT-Xent on `quantizer_input_cell` (= z_mlp_cell of seed cells). Positive pairs are the top-k cells with the most similar log1p gene-expression profile in the batch; negatives are the rest. Pulls same-type cells together in z_mlp space and pushes different-type apart — a between-cell objective that complements NB's within-cell objective. \n\nDiversity (when active): lucidrains' codebook-diversity loss on every level of the cell-branch RVQ (L1 K=30 + L2 K=90). Penalises softmax-similarity between codes -> pushes codes apart on the cosine-sphere -> reduces dead-code collapse and keeps cluster centroids well-separated by construction. \n\nHypothesis: contrastive directly attacks the NB/NMI objective mismatch (per the s46 weight-escalation plateau result). Diversity attacks the K1=30 'codes collapse together' failure mode independently. Combined (v7, v8): both at once. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell(wt=1.0, k_pos=5, temperature=0.1)",
+            "+codebook-diversity(branch=cell, wt=1.0, temperature=100.0)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell(
+            _patch_dual_codebook_diversity(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            weight=1.0, temperature=100.0, branch="cell",
+        ),
+            wt_contrastive_cell=1.0,
+            k_pos=5, temperature=0.1,
+        ),
+    },
+    "s47_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrast-w1.0-k5+diversity-w10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s47 sweep, variant 8: s42 winner spine with cell-w lowered 5.0 -> 1.0 (per user: weight escalation didn't help), plus contrastive cell loss (wt=1.0, k_pos=5, temp=0.1) + codebook diversity on cell-VQ (wt=10.0, temp=100.0). \n\nContrastive (when active): NT-Xent on `quantizer_input_cell` (= z_mlp_cell of seed cells). Positive pairs are the top-k cells with the most similar log1p gene-expression profile in the batch; negatives are the rest. Pulls same-type cells together in z_mlp space and pushes different-type apart — a between-cell objective that complements NB's within-cell objective. \n\nDiversity (when active): lucidrains' codebook-diversity loss on every level of the cell-branch RVQ (L1 K=30 + L2 K=90). Penalises softmax-similarity between codes -> pushes codes apart on the cosine-sphere -> reduces dead-code collapse and keeps cluster centroids well-separated by construction. \n\nHypothesis: contrastive directly attacks the NB/NMI objective mismatch (per the s46 weight-escalation plateau result). Diversity attacks the K1=30 'codes collapse together' failure mode independently. Combined (v7, v8): both at once. \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell(wt=1.0, k_pos=5, temperature=0.1)",
+            "+codebook-diversity(branch=cell, wt=10.0, temperature=100.0)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell(
+            _patch_dual_codebook_diversity(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            weight=10.0, temperature=100.0, branch="cell",
+        ),
+            wt_contrastive_cell=1.0,
+            k_pos=5, temperature=0.1,
+        ),
+    },
+    # -----------------------------------------------------------------------
+    # s48 sweep — 8 ablations: within-batch contrastive cell loss
+    # -----------------------------------------------------------------------
+    # Same architecture as s42 winner (cell-w=1.0). Adds the WITHIN-BATCH
+    # variant of the contrastive cell loss (restrict positives + NT-Xent
+    # denominator to same-section cells). Variants 1-6 weight-sweep over
+    # 1, 10, 30, 100, 300, 1000. v7 doubles k_pos at wt=100. v8 stacks
+    # codebook diversity at wt=1 on top of wt=100 contrastive.
+    #
+    # Numerical correctness of the within-batch loss validated by 5-test
+    # suite (see contrastive_cell_attribute.py docstring).
+    #
+    # Submit via:
+    #   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v48
+    "s48_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrastWB-w1-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s48 sweep, variant 1: s42 winner spine with cell-w=1.0 + WITHIN-BATCH contrastive (wt=1.0, k_pos=5, temp=0.1). \n\nWITHIN-BATCH variant of the contrastive cell loss: BOTH the positive-pair candidate set AND the NT-Xent denominator are restricted to cells sharing the anchor's adata_batch_id. This mirrors `adj_within_section_only=True` on the cosine adjacency BCE — without the restriction, cross-section pairs leak into the gradient and push biologically-similar cells from different MERFISH/STARmap sections apart (counter to the batch-integration objective). With the restriction, cross-section pairs are left unpressured. \n\nSweep design: variants 1-6 weight-sweep at k_pos=5 over four orders of magnitude (1, 10, 30, 100, 300, 1000). The s47 global-variant range topped out at 2.0; the within-batch version has roughly halved per-anchor mass (denominator over ~256 instead of ~512 cells) so higher weights are needed to reach comparable per-cell gradient mass. v7 doubles k_pos at the centre weight; v8 stacks codebook diversity at wt=1 on top of the same centre weight. \n\nNumerical correctness validated by a 5-test suite (finite/non-negative loss, combined == per-batch average, singleton skipped, zero cross-batch gradient flow, hand-computed tiny case). \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=1.0, k_pos=5, temperature=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            wt_contrastive_cell=1.0,
+            k_pos=5, temperature=0.1,
+        ),
+    },
+    "s48_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s48 sweep, variant 2: s42 winner spine with cell-w=1.0 + WITHIN-BATCH contrastive (wt=10.0, k_pos=5, temp=0.1). \n\nWITHIN-BATCH variant of the contrastive cell loss: BOTH the positive-pair candidate set AND the NT-Xent denominator are restricted to cells sharing the anchor's adata_batch_id. This mirrors `adj_within_section_only=True` on the cosine adjacency BCE — without the restriction, cross-section pairs leak into the gradient and push biologically-similar cells from different MERFISH/STARmap sections apart (counter to the batch-integration objective). With the restriction, cross-section pairs are left unpressured. \n\nSweep design: variants 1-6 weight-sweep at k_pos=5 over four orders of magnitude (1, 10, 30, 100, 300, 1000). The s47 global-variant range topped out at 2.0; the within-batch version has roughly halved per-anchor mass (denominator over ~256 instead of ~512 cells) so higher weights are needed to reach comparable per-cell gradient mass. v7 doubles k_pos at the centre weight; v8 stacks codebook diversity at wt=1 on top of the same centre weight. \n\nNumerical correctness validated by a 5-test suite (finite/non-negative loss, combined == per-batch average, singleton skipped, zero cross-batch gradient flow, hand-computed tiny case). \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, temperature=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            wt_contrastive_cell=10.0,
+            k_pos=5, temperature=0.1,
+        ),
+    },
+    "s48_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrastWB-w30-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s48 sweep, variant 3: s42 winner spine with cell-w=1.0 + WITHIN-BATCH contrastive (wt=30.0, k_pos=5, temp=0.1). \n\nWITHIN-BATCH variant of the contrastive cell loss: BOTH the positive-pair candidate set AND the NT-Xent denominator are restricted to cells sharing the anchor's adata_batch_id. This mirrors `adj_within_section_only=True` on the cosine adjacency BCE — without the restriction, cross-section pairs leak into the gradient and push biologically-similar cells from different MERFISH/STARmap sections apart (counter to the batch-integration objective). With the restriction, cross-section pairs are left unpressured. \n\nSweep design: variants 1-6 weight-sweep at k_pos=5 over four orders of magnitude (1, 10, 30, 100, 300, 1000). The s47 global-variant range topped out at 2.0; the within-batch version has roughly halved per-anchor mass (denominator over ~256 instead of ~512 cells) so higher weights are needed to reach comparable per-cell gradient mass. v7 doubles k_pos at the centre weight; v8 stacks codebook diversity at wt=1 on top of the same centre weight. \n\nNumerical correctness validated by a 5-test suite (finite/non-negative loss, combined == per-batch average, singleton skipped, zero cross-batch gradient flow, hand-computed tiny case). \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=30.0, k_pos=5, temperature=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            wt_contrastive_cell=30.0,
+            k_pos=5, temperature=0.1,
+        ),
+    },
+    "s48_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrastWB-w100-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s48 sweep, variant 4: s42 winner spine with cell-w=1.0 + WITHIN-BATCH contrastive (wt=100.0, k_pos=5, temp=0.1). \n\nWITHIN-BATCH variant of the contrastive cell loss: BOTH the positive-pair candidate set AND the NT-Xent denominator are restricted to cells sharing the anchor's adata_batch_id. This mirrors `adj_within_section_only=True` on the cosine adjacency BCE — without the restriction, cross-section pairs leak into the gradient and push biologically-similar cells from different MERFISH/STARmap sections apart (counter to the batch-integration objective). With the restriction, cross-section pairs are left unpressured. \n\nSweep design: variants 1-6 weight-sweep at k_pos=5 over four orders of magnitude (1, 10, 30, 100, 300, 1000). The s47 global-variant range topped out at 2.0; the within-batch version has roughly halved per-anchor mass (denominator over ~256 instead of ~512 cells) so higher weights are needed to reach comparable per-cell gradient mass. v7 doubles k_pos at the centre weight; v8 stacks codebook diversity at wt=1 on top of the same centre weight. \n\nNumerical correctness validated by a 5-test suite (finite/non-negative loss, combined == per-batch average, singleton skipped, zero cross-batch gradient flow, hand-computed tiny case). \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=100.0, k_pos=5, temperature=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            wt_contrastive_cell=100.0,
+            k_pos=5, temperature=0.1,
+        ),
+    },
+    "s48_v5_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrastWB-w300-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s48 sweep, variant 5: s42 winner spine with cell-w=1.0 + WITHIN-BATCH contrastive (wt=300.0, k_pos=5, temp=0.1). \n\nWITHIN-BATCH variant of the contrastive cell loss: BOTH the positive-pair candidate set AND the NT-Xent denominator are restricted to cells sharing the anchor's adata_batch_id. This mirrors `adj_within_section_only=True` on the cosine adjacency BCE — without the restriction, cross-section pairs leak into the gradient and push biologically-similar cells from different MERFISH/STARmap sections apart (counter to the batch-integration objective). With the restriction, cross-section pairs are left unpressured. \n\nSweep design: variants 1-6 weight-sweep at k_pos=5 over four orders of magnitude (1, 10, 30, 100, 300, 1000). The s47 global-variant range topped out at 2.0; the within-batch version has roughly halved per-anchor mass (denominator over ~256 instead of ~512 cells) so higher weights are needed to reach comparable per-cell gradient mass. v7 doubles k_pos at the centre weight; v8 stacks codebook diversity at wt=1 on top of the same centre weight. \n\nNumerical correctness validated by a 5-test suite (finite/non-negative loss, combined == per-batch average, singleton skipped, zero cross-batch gradient flow, hand-computed tiny case). \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=300.0, k_pos=5, temperature=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            wt_contrastive_cell=300.0,
+            k_pos=5, temperature=0.1,
+        ),
+    },
+    "s48_v6_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrastWB-w1000-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s48 sweep, variant 6: s42 winner spine with cell-w=1.0 + WITHIN-BATCH contrastive (wt=1000.0, k_pos=5, temp=0.1). \n\nWITHIN-BATCH variant of the contrastive cell loss: BOTH the positive-pair candidate set AND the NT-Xent denominator are restricted to cells sharing the anchor's adata_batch_id. This mirrors `adj_within_section_only=True` on the cosine adjacency BCE — without the restriction, cross-section pairs leak into the gradient and push biologically-similar cells from different MERFISH/STARmap sections apart (counter to the batch-integration objective). With the restriction, cross-section pairs are left unpressured. \n\nSweep design: variants 1-6 weight-sweep at k_pos=5 over four orders of magnitude (1, 10, 30, 100, 300, 1000). The s47 global-variant range topped out at 2.0; the within-batch version has roughly halved per-anchor mass (denominator over ~256 instead of ~512 cells) so higher weights are needed to reach comparable per-cell gradient mass. v7 doubles k_pos at the centre weight; v8 stacks codebook diversity at wt=1 on top of the same centre weight. \n\nNumerical correctness validated by a 5-test suite (finite/non-negative loss, combined == per-batch average, singleton skipped, zero cross-batch gradient flow, hand-computed tiny case). \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=1000.0, k_pos=5, temperature=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            wt_contrastive_cell=1000.0,
+            k_pos=5, temperature=0.1,
+        ),
+    },
+    "s48_v7_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrastWB-w100-k10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s48 sweep, variant 7: s42 winner spine with cell-w=1.0 + WITHIN-BATCH contrastive (wt=100.0, k_pos=10, temp=0.1). \n\nWITHIN-BATCH variant of the contrastive cell loss: BOTH the positive-pair candidate set AND the NT-Xent denominator are restricted to cells sharing the anchor's adata_batch_id. This mirrors `adj_within_section_only=True` on the cosine adjacency BCE — without the restriction, cross-section pairs leak into the gradient and push biologically-similar cells from different MERFISH/STARmap sections apart (counter to the batch-integration objective). With the restriction, cross-section pairs are left unpressured. \n\nSweep design: variants 1-6 weight-sweep at k_pos=5 over four orders of magnitude (1, 10, 30, 100, 300, 1000). The s47 global-variant range topped out at 2.0; the within-batch version has roughly halved per-anchor mass (denominator over ~256 instead of ~512 cells) so higher weights are needed to reach comparable per-cell gradient mass. v7 doubles k_pos at the centre weight; v8 stacks codebook diversity at wt=1 on top of the same centre weight. \n\nNumerical correctness validated by a 5-test suite (finite/non-negative loss, combined == per-batch average, singleton skipped, zero cross-batch gradient flow, hand-computed tiny case). \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=100.0, k_pos=10, temperature=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            wt_contrastive_cell=100.0,
+            k_pos=10, temperature=0.1,
+        ),
+    },
+    "s48_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrastWB-w100-k5+diversity-w1+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s48 sweep, variant 8: s42 winner spine with cell-w=1.0 + WITHIN-BATCH contrastive (wt=100.0, k_pos=5, temp=0.1) + cell-VQ codebook diversity (wt=1.0, temp=100.0). \n\nWITHIN-BATCH variant of the contrastive cell loss: BOTH the positive-pair candidate set AND the NT-Xent denominator are restricted to cells sharing the anchor's adata_batch_id. This mirrors `adj_within_section_only=True` on the cosine adjacency BCE — without the restriction, cross-section pairs leak into the gradient and push biologically-similar cells from different MERFISH/STARmap sections apart (counter to the batch-integration objective). With the restriction, cross-section pairs are left unpressured. \n\nSweep design: variants 1-6 weight-sweep at k_pos=5 over four orders of magnitude (1, 10, 30, 100, 300, 1000). The s47 global-variant range topped out at 2.0; the within-batch version has roughly halved per-anchor mass (denominator over ~256 instead of ~512 cells) so higher weights are needed to reach comparable per-cell gradient mass. v7 doubles k_pos at the centre weight; v8 stacks codebook diversity at wt=1 on top of the same centre weight. \n\nNumerical correctness validated by a 5-test suite (finite/non-negative loss, combined == per-batch average, singleton skipped, zero cross-batch gradient flow, hand-computed tiny case). \n\nREQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=100.0, k_pos=5, temperature=0.1)",
+            "+codebook-diversity(branch=cell, wt=1.0, temperature=100.0)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_codebook_diversity(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            weight=1.0, temperature=100.0, branch="cell",
+        ),
+            wt_contrastive_cell=100.0,
+            k_pos=5, temperature=0.1,
+        ),
+    },
+    # -----------------------------------------------------------------------
+    # s49 sweep — 24 ablations on the s48_v2 spine (contrastWB-w10-k5)
+    # -----------------------------------------------------------------------
+    # Spine = s42 winner + cell-w=1.0 + within-batch contrastive cell loss
+    # (wt=10, k=5). Axes explored:
+    #   v1     cell-w back to 5
+    #   v2-v5  encoder sizes (smaller, single-layer, decoupled one-layer)
+    #   v6-v8  codebook diversity at higher weights (10, 100, 300)
+    #   v9-v12 L2 codebook sweep (L1 fixed at 30; L2 in {30, 60, 200, 500})
+    #   v13-v14 decoupled batch embedding
+    #   v15-v18 epoch sweep at contrastive=1000 (ep 120, 160, 240, 320)
+    #   v19-v20 decoupled-enc + contrastive {200, 1000}
+    #   v21-v22 Y-shape (shared-specific-enc) + contrastive {200, 1000}
+    #   v23-v24 synergistic combinations
+    #
+    # Submit via:
+    #   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v49
+    "s49_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5+bs512+lr7e-4+within-sec+cell-w5+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 1: cell-w bumped 1.0 -> 5.0 on top of s48_v2 spine. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, T=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=5.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+        ),
+    },
+    "s49_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+enc-256-128+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 2: smaller encoder trunk [256, 128] (was [400, 400, 256]). Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256, 128])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, T=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[256, 128],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+        ),
+    },
+    "s49_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+enc-128+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 3: single-layer encoder trunk [128] -- tight latent. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[128])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, T=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[128],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+        ),
+    },
+    "s49_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+enc-256+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 4: single-layer encoder trunk [256] -- latent 256. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, T=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[256],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+        ),
+    },
+    "s49_v5_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc-256+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 5: DECOUPLED encoders, one-layer [256] MLP per branch -- user's specific request. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, T=0.1)",
+            "+decoupled-enc(independent niche MLP)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_decoupled_encoders(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[256],
+        ),
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+        ),
+    },
+    "s49_v6_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 6: cell-VQ codebook diversity loss at wt=10 (alongside contrastive). Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10.0, T=100.0)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+        ),
+            weight=10.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s49_v7_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 7: cell-VQ codebook diversity loss at wt=100. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=100.0, T=100.0)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+        ),
+            weight=100.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s49_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w300+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 8: cell-VQ codebook diversity loss at wt=300 (very high). Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=300.0, T=100.0)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+        ),
+            weight=300.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s49_v9_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+rvq-cell-30-30+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 9: cell RVQ L2 shrunk 90 -> 30. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(cell=[30, 30], niche=[30,90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, T=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 30),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+        ),
+    },
+    "s49_v10_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+rvq-cell-30-60+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 10: cell RVQ L2 shrunk 90 -> 60. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(cell=[30, 60], niche=[30,90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, T=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 60),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+        ),
+    },
+    "s49_v11_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+rvq-cell-30-200+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 11: cell RVQ L2 grown 90 -> 200. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(cell=[30, 200], niche=[30,90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, T=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 200),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+        ),
+    },
+    "s49_v12_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+rvq-cell-30-500+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 12: cell RVQ L2 grown 90 -> 500 (very large composite codebook). Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(cell=[30, 500], niche=[30,90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, T=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 500),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+        ),
+    },
+    "s49_v13_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-dec-cov+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 13: split decoder batch_embedding into independent per-decoder modules. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, T=0.1)",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+        ),
+        ),
+    },
+    "s49_v14_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-dec-cov+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 14: decoupled decoder batch_embedding + diversity-w10 combination. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, T=0.1)",
+            "+decoupled-dec-cov(separate nn.Embedding per decoder)",
+            "+codebook-diversity(branch=cell, wt=10.0, T=100.0)",
+        ],
+        "build": lambda: _patch_dual_decoupled_decoder_cov(
+            _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+        ),
+            weight=10.0, temperature=100.0, branch="cell",
+        ),
+        ),
+    },
+    "s49_v15_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+contrastWB-w1000-k5+ep120+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 15: contrastive wt=1000 (vs spine 10), epochs 80 -> 120. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=1000.0, k_pos=5, T=0.1)",
+            "+max_epochs=120",
+        ],
+        "build": lambda: _patch_dual_max_epochs(
+            _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=1000.0, k_pos=5, temperature=0.1,
+        ),
+            max_epochs=120,
+        ),
+    },
+    "s49_v16_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+contrastWB-w1000-k5+ep160+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 16: contrastive wt=1000, epochs 80 -> 160. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=1000.0, k_pos=5, T=0.1)",
+            "+max_epochs=160",
+        ],
+        "build": lambda: _patch_dual_max_epochs(
+            _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=1000.0, k_pos=5, temperature=0.1,
+        ),
+            max_epochs=160,
+        ),
+    },
+    "s49_v17_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+contrastWB-w1000-k5+ep240+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 17: contrastive wt=1000, epochs 80 -> 240. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=1000.0, k_pos=5, T=0.1)",
+            "+max_epochs=240",
+        ],
+        "build": lambda: _patch_dual_max_epochs(
+            _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=1000.0, k_pos=5, temperature=0.1,
+        ),
+            max_epochs=240,
+        ),
+    },
+    "s49_v18_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+contrastWB-w1000-k5+ep320+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 18: contrastive wt=1000, epochs 80 -> 320 (4x default). Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=1000.0, k_pos=5, T=0.1)",
+            "+max_epochs=320",
+        ],
+        "build": lambda: _patch_dual_max_epochs(
+            _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=1000.0, k_pos=5, temperature=0.1,
+        ),
+            max_epochs=320,
+        ),
+    },
+    "s49_v19_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+contrastWB-w200-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 19: +decoupled-enc + contrastive wt=200. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=200.0, k_pos=5, T=0.1)",
+            "+decoupled-enc(independent niche MLP)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_decoupled_encoders(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=200.0, k_pos=5, temperature=0.1,
+        ),
+    },
+    "s49_v20_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+contrastWB-w1000-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 20: +decoupled-enc + contrastive wt=1000. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=1000.0, k_pos=5, T=0.1)",
+            "+decoupled-enc(independent niche MLP)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_decoupled_encoders(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=1000.0, k_pos=5, temperature=0.1,
+        ),
+    },
+    "s49_v21_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+shared-specific-enc+contrastWB-w200-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 21: +shared-specific-enc (Y-shape) + contrastive wt=200. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=200.0, k_pos=5, T=0.1)",
+            "+shared-specific-enc(Y-shape, default halved-dim)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_shared_specific_encoders(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=200.0, k_pos=5, temperature=0.1,
+        ),
+    },
+    "s49_v22_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+shared-specific-enc+contrastWB-w1000-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 22: +shared-specific-enc (Y-shape) + contrastive wt=1000. Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=1000.0, k_pos=5, T=0.1)",
+            "+shared-specific-enc(Y-shape, default halved-dim)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_shared_specific_encoders(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=1000.0, k_pos=5, temperature=0.1,
+        ),
+    },
+    "s49_v23_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 23: decoupled-enc + diversity-w10 (architectural isolation + code repulsion). Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, T=0.1)",
+            "+decoupled-enc(independent niche MLP)",
+            "+codebook-diversity(branch=cell, wt=10.0, T=100.0)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_decoupled_encoders(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 90),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+        ),
+            weight=10.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s49_v24_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+rvq-cell-30-200+contrastWB-w200-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49 sweep, variant 24: L2=200 codebook + contrastive wt=200 (size + stronger contrastive combo). Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(cell=[30, 200], niche=[30,90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=200.0, k_pos=5, T=0.1)",
+        ],
+        "build": lambda: _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+            _patch_dual_batch_lr(
+            _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+            _patch_dual_decoder_width(
+            _patch_dual_encoder_deeper(
+            _patch_dual_decoder_covariate(
+            _patch_dual_rvq(
+            _patch_dual_rvq(
+            _BD(),
+            branch="niche", codebook_sizes=(30, 90),
+        ),
+            branch="cell", codebook_sizes=(30, 200),
+        ),
+        ),
+            hidden_channels=[400, 400, 256],
+        ),
+            hidden_channels=[32],
+        ),
+            n_neighs=16,
+        ),
+            num_neighbors=[16],
+        ),
+            weight=1.0,
+        ),
+            batch_size=512, lr=7e-4,
+        ),
+        ),
+            enabled=True,
+        ),
+            wt_contrastive_cell=200.0, k_pos=5, temperature=0.1,
+        ),
+    },
 }
 
 
@@ -21275,6 +26347,160 @@ DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v40"] = [
 ]
 
 
+# -----------------------------------------------------------------------
+# s42 sweep — encoder architecture size sweep.
+# 8 decoupled-enc variants (vary trunk shape) +
+# 8 shared-specific-enc variants (vary shared / path last-layer dims).
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v42
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v42"] = [
+    # 8 decoupled-enc variants (vary _patch_dual_encoder_deeper hidden_channels)
+    "s42_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s42_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-256+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s42_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-400-64+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s42_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-400-128+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s42_v5_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-400-256+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s42_v6_dualvq+rvq-both+decoder-cov+no-batch-int+enc-400-400-512+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s42_v7_dualvq+rvq-both+decoder-cov+no-batch-int+enc-200-200-128+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s42_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-800-800-256+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    # 8 shared-specific-enc (Y-shape) variants (vary shared_last_dim, path_last_dim)
+    "s42_v9_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared64-path64+mmb0-1b_smb1-1b_1p",
+    "s42_v10_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared128-path128+mmb0-1b_smb1-1b_1p",
+    "s42_v11_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared256-path256+mmb0-1b_smb1-1b_1p",
+    "s42_v12_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared192-path64+mmb0-1b_smb1-1b_1p",
+    "s42_v13_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared64-path192+mmb0-1b_smb1-1b_1p",
+    "s42_v14_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared128-path64+mmb0-1b_smb1-1b_1p",
+    "s42_v15_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared64-path128+mmb0-1b_smb1-1b_1p",
+    "s42_v16_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+shared192-path128+mmb0-1b_smb1-1b_1p",
+]
+
+
+# -----------------------------------------------------------------------
+# s43 sweep — strictly-decoupled architecture, encoder × decoder size grid.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v43
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v43"] = [
+    "s43_v1_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-128+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s43_v2_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-128+dec-w64+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s43_v3_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-128+dec-w128+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s43_v4_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-128+dec-w256+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s43_v5_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s43_v6_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256+dec-w64+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s43_v7_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256+dec-w128+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s43_v8_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256+dec-w256+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s43_v9_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256-128+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s43_v10_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256-128+dec-w64+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s43_v11_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256-128+dec-w128+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s43_v12_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256-128+dec-w256+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s43_v13_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-400-256+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s43_v14_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-400-256+dec-w64+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s43_v15_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-400-256+dec-w128+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+    "s43_v16_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-400-256+dec-w256+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+mmb0-1b_smb1-1b_1p",
+]
+
+
+# -----------------------------------------------------------------------
+# s44 sweep — 1 negative-test variant (no-recon on the s43_v5 spine).
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v44
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v44"] = [
+    "s44_v1_dualvq+rvq-both+decoder-cov+decoupled-dec-cov+no-batch-int+enc-256+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+decoupled-enc+no-recon+mmb0-1b_smb1-1b_1p",
+]
+
+
+# -----------------------------------------------------------------------
+# s45 sweep — shared MLP + no cell-NB diagnostic.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v45
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v45"] = [
+    "s45_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+no-cell-nb+mmb0-1b_smb1-1b_1p",
+]
+
+
+# -----------------------------------------------------------------------
+# s46 sweep — cell-NB weight escalation on the s42 winner spine.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v46
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v46"] = [
+    "s46_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w100+bs512+lr7e-4+within-sec+mmb0-1b_smb1-1b_1p",
+    "s46_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w300+bs512+lr7e-4+within-sec+mmb0-1b_smb1-1b_1p",
+    "s46_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w500+bs512+lr7e-4+within-sec+mmb0-1b_smb1-1b_1p",
+    "s46_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1000+bs512+lr7e-4+within-sec+mmb0-1b_smb1-1b_1p",
+]
+
+
+# -----------------------------------------------------------------------
+# s47 sweep — contrastive cell aux loss + codebook diversity.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v47
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v47"] = [
+    "s47_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrast-w0.5-k5+mmb0-1b_smb1-1b_1p",
+    "s47_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrast-w1.0-k5+mmb0-1b_smb1-1b_1p",
+    "s47_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrast-w2.0-k5+mmb0-1b_smb1-1b_1p",
+    "s47_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrast-w1.0-k10+mmb0-1b_smb1-1b_1p",
+    "s47_v5_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+diversity-w1+mmb0-1b_smb1-1b_1p",
+    "s47_v6_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+diversity-w10+mmb0-1b_smb1-1b_1p",
+    "s47_v7_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrast-w1.0-k5+diversity-w1+mmb0-1b_smb1-1b_1p",
+    "s47_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrast-w1.0-k5+diversity-w10+mmb0-1b_smb1-1b_1p",
+]
+
+
+# -----------------------------------------------------------------------
+# s48 sweep — within-batch contrastive cell loss weight sweep.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v48
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v48"] = [
+    "s48_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrastWB-w1-k5+mmb0-1b_smb1-1b_1p",
+    "s48_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s48_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrastWB-w30-k5+mmb0-1b_smb1-1b_1p",
+    "s48_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrastWB-w100-k5+mmb0-1b_smb1-1b_1p",
+    "s48_v5_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrastWB-w300-k5+mmb0-1b_smb1-1b_1p",
+    "s48_v6_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrastWB-w1000-k5+mmb0-1b_smb1-1b_1p",
+    "s48_v7_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrastWB-w100-k10+mmb0-1b_smb1-1b_1p",
+    "s48_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1.0+bs512+lr7e-4+within-sec+contrastWB-w100-k5+diversity-w1+mmb0-1b_smb1-1b_1p",
+]
+
+
+# -----------------------------------------------------------------------
+# s49 sweep — 24 ablations on the s48_v2 (contrastWB-w10) spine.
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v49
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v49"] = [
+    "s49_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5+bs512+lr7e-4+within-sec+cell-w5+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+enc-256-128+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+enc-128+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+enc-256+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v5_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc-256+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v6_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v7_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w100+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+diversity-w300+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v9_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+rvq-cell-30-30+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v10_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+rvq-cell-30-60+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v11_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+rvq-cell-30-200+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v12_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+rvq-cell-30-500+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v13_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-dec-cov+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v14_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-dec-cov+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v15_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+contrastWB-w1000-k5+ep120+mmb0-1b_smb1-1b_1p",
+    "s49_v16_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+contrastWB-w1000-k5+ep160+mmb0-1b_smb1-1b_1p",
+    "s49_v17_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+contrastWB-w1000-k5+ep240+mmb0-1b_smb1-1b_1p",
+    "s49_v18_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+contrastWB-w1000-k5+ep320+mmb0-1b_smb1-1b_1p",
+    "s49_v19_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+contrastWB-w200-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v20_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+contrastWB-w1000-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v21_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+shared-specific-enc+contrastWB-w200-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v22_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+shared-specific-enc+contrastWB-w1000-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v23_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+    "s49_v24_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+rvq-cell-30-200+contrastWB-w200-k5+mmb0-1b_smb1-1b_1p",
+]
+
+
 def _ablation_summary(variant: str) -> dict:
     """A small, human-readable record of what this run is. Saved next to the
     full materialised config so you can grep / cat the summary without
@@ -21599,6 +26825,7 @@ def train(
 
     import torch
     import pytorch_lightning as pl
+    import wandb
     from pytorch_lightning.loggers import WandbLogger
 
     from vqniche.initializers.initialize import (
@@ -21977,6 +27204,12 @@ def train(
                 return tag
             keep = max_len - len(prefix) - 1  # leave 1 char for an ellipsis marker
             return f"{prefix}{value[:keep]}~"
+        # `init_timeout=300` raises the default `wandb.init` 90s ceiling
+        # so the LSF cluster's slow handshake to api.wandb.ai (especially
+        # from the DDP child rank, which re-runs wandb.init) doesn't
+        # crash long-running ablations. `WANDB_INIT_TIMEOUT=300` is also
+        # set in main() so children inherit it; this kwarg makes the
+        # value self-documenting at the construction site.
         logger = WandbLogger(
             save_dir=str(run_dir),                    # local cache -> <run_dir>/wandb/
             project=WANDB_PROJECT,
@@ -21992,6 +27225,7 @@ def train(
             ],
             mode="offline" if cfg["logging"]["offline"] else "online",
             log_model=cfg["logging"]["log_model"],
+            settings=wandb.Settings(init_timeout=300),
             config={
                 # Hoist run identity to the top of the wandb Config panel.
                 "timestamp":         timestamp,
@@ -23565,6 +28799,19 @@ def run_dataset_pipeline(
 
 
 def main():
+    # ----- wandb robustness -------------------------------------------------
+    # The default `wandb.init` timeout is 90 seconds, which is too tight
+    # on the Sanger LSF cluster where the network handshake to
+    # api.wandb.ai is sometimes slow — especially in DDP runs where the
+    # child rank's `wandb.init` (forked via PL's subprocess_script
+    # launcher) re-handshakes and can hit the ceiling. Bumping the
+    # timeout to 300s (and propagating via env var so DDP children
+    # inherit it) avoids the
+    #     wandb.errors.errors.CommError: Run initialization has timed
+    #     out after 90.0 sec
+    # crash that otherwise loses an entire run mid-training.
+    os.environ.setdefault("WANDB_INIT_TIMEOUT", "300")
+
     p = argparse.ArgumentParser()
     p.add_argument("--patch-uns", action="store_true",
                    help="Patch .uns/.obs of the two .h5ad files (one-time, only if missing).")
