@@ -259,7 +259,18 @@ class BaseModel(pl.LightningModule):
                 loss_fn = bce_adjacency_reconstruction_loss
 
                 loss_fn_data_keys = ['batch_size', 'h_adj', 'batch_edge_index']
-                
+
+                # Within-section pair scope. Default True: cross-section
+                # pairs are dropped from the BCE so two biologically-
+                # similar cells from different AnnData sections aren't
+                # pushed apart by the spatial-adjacency loss (which was
+                # the legacy global-pair behaviour). Set
+                # `loss_kwargs['adj_within_section_only'] = False` to
+                # revert to legacy. Requires the model's `_step` to put a
+                # per-node `node_adata_batch_ids` tensor in the loss data.
+                if loss_kwargs.get('adj_within_section_only', True):
+                    loss_fn_data_keys.append('node_adata_batch_ids')
+
                 edge_sampling_ratio = loss_kwargs.get('edge_sampling_ratio')
                 if edge_sampling_ratio is not None:
                     loss_fn_params['edge_sampling_ratio'] = edge_sampling_ratio
@@ -309,6 +320,12 @@ class BaseModel(pl.LightningModule):
                         f"{{'z_gnn', 'z_q_niche'}}, got {adj_input!r}."
                     )
                 loss_fn_data_keys = ['batch_size', 'batch_edge_index', adj_input]
+
+                # Within-section pair scope (default True). See the
+                # `bce_adjacency_reconstruction_loss` branch above for
+                # rationale + opt-out flag.
+                if loss_kwargs.get('adj_within_section_only', True):
+                    loss_fn_data_keys.append('node_adata_batch_ids')
 
                 edge_sampling_ratio = loss_kwargs.get('edge_sampling_ratio')
                 if edge_sampling_ratio is not None:

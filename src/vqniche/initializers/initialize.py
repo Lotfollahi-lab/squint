@@ -646,6 +646,15 @@ def initialize_model(
         model_param_dict['adversarial_apply_to'] = str(
             config['model'].get('adversarial_apply_to', 'full')
         )
+        # Number of training epochs during which the VQ codebook is
+        # frozen (no lazy init, no EMA updates, no dead-code expiry;
+        # commit loss is zeroed in `_step`). Set to >0 to defer code
+        # initialisation until z_mlp has been shaped by reconstruction
+        # + integration losses, mitigating early-epoch batch-correlated
+        # code lock-in. Default 0 = legacy behaviour.
+        model_param_dict['vq_warmup_epochs'] = int(
+            config['model'].get('vq_warmup_epochs', 0)
+        )
 
     if model_name in ('VQNiche', 'VQNiche_Dual'):
         # Both VQNiche variants accept imputation_params (VQNiche_Dual

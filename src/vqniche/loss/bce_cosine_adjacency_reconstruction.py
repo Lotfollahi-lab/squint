@@ -36,6 +36,7 @@ def bce_cosine_adjacency_reconstruction_loss(
         use_pos_weight: bool = False,
         cosine_temperature: float = 0.1,
         wt_adj_reconstr: float = 1.0,
+        node_adata_batch_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
     """
     BCE between the observed adjacency and the cosine-similarity-derived
@@ -60,6 +61,29 @@ def bce_cosine_adjacency_reconstruction_loss(
 
     Exactly one of `z_q_niche` / `z_gnn` must be supplied. The dispatcher
     picks based on `loss_kwargs['adj_loss_input']`.
+
+    Within-section vs global pair scope
+    -----------------------------------
+    When `node_adata_batch_ids` is supplied (per-node section / adata_batch
+    id, shape `(B+S,)`), every (seed_i, node_j) pair where
+    `node_adata_batch_ids[i] != node_adata_batch_ids[j]` is dropped from
+    the BCE — both as a candidate negative AND from positive-weight
+    accounting. Positive edges in `batch_edge_index` are intra-section by
+    construction (the spatial k-NN graph is built per-AnnData, so no
+    cross-section edges can exist), so this mask only ever drops negative
+    pairs.
+
+    Rationale: two biologically-similar cells (e.g. same niche type) in
+    two different sections have high cosine similarity in z_gnn / z_q_niche,
+    but no graph edge between them by construction of the multi-section
+    blob. The legacy global BCE treats this as a "wrong prediction" and
+    pushes them apart — directly anti-integration. Restricting the loss to
+    within-section pairs matches NicheCompass's slide-by-slide training
+    semantics: the loss never asks "do these two cells from different
+    slides look connected?" because it can't tell.
+
+    When `node_adata_batch_ids is None` (legacy default for callers that
+    don't pass it), the loss falls back to the global all-pairs behaviour.
 
     Other parameters
     ----------------
@@ -87,6 +111,11 @@ def bce_cosine_adjacency_reconstruction_loss(
         typically weight it 100–500× to balance against gene-expression NB
         (~150 nats). Don't leave it at 1.0 if you also want spatial
         coherence in the codes.
+    node_adata_batch_ids: Optional[torch.Tensor]
+        Per-node adata_batch_id (section id), shape `(B+S,)` long. When
+        given, restrict the BCE to within-section pairs (see "Within-
+        section vs global pair scope" above). Pass `None` to keep legacy
+        global behaviour.
 
     Returns
     -------
@@ -108,6 +137,12 @@ def bce_cosine_adjacency_reconstruction_loss(
     # L2-normalise so that x · y == cosine_similarity(x, y) for unit vectors.
     z_norm = F.normalize(embedding, p=2, dim=-1)
 
+    # Pre-compute per-node section ids cast to long if we'll need them.
+    if node_adata_batch_ids is not None:
+        section_ids = node_adata_batch_ids.long()
+    else:
+        section_ids = None
+
     if edge_sampling_ratio is None:
         # ---- dense pair-wise --------------------------------------------------
         # cosine[i, j] = z_norm[i] · z_norm[j]    for i in seeds, j in induced subgraph
@@ -118,30 +153,86 @@ def bce_cosine_adjacency_reconstruction_loss(
                         edge_index=batch_edge_index,
                     )[:batch_size]
 
-        if use_pos_weight:
-            n_pos = adj_batch.sum()
-            n_neg = adj_batch.numel() - n_pos
-            pos_weight = n_neg / n_pos.clamp(min=1)
-        else:
-            pos_weight = None
+        if section_ids is None:
+            # Legacy: BCE over ALL (seed, induced-subgraph-node) pairs.
+            if use_pos_weight:
+                n_pos = adj_batch.sum()
+                n_neg = adj_batch.numel() - n_pos
+                pos_weight = n_neg / n_pos.clamp(min=1)
+            else:
+                pos_weight = None
 
-        bce_loss = F.binary_cross_entropy_with_logits(
-            input=adj_logits,
-            target=adj_batch.detach().to(adj_logits.dtype),
-            reduction='mean',
-            pos_weight=pos_weight,
-        )
+            bce_loss = F.binary_cross_entropy_with_logits(
+                input=adj_logits,
+                target=adj_batch.detach().to(adj_logits.dtype),
+                reduction='mean',
+                pos_weight=pos_weight,
+            )
+        else:
+            # Within-section: zero-weight every cross-section pair so
+            # only intra-section (seed, node) pairs contribute.
+            # same_section[i, j] = section_ids[seed_i] == section_ids[node_j]
+            seed_ids = section_ids[:batch_size]                       # (batch_size,)
+            same_section = seed_ids.unsqueeze(1) == section_ids.unsqueeze(0)
+            # adj_batch positives are intra-section by construction (no
+            # cross-section edges exist), so same_section already covers
+            # every positive — we only ever drop cross-section negatives.
+            n_pairs_kept = same_section.sum().clamp(min=1)
+
+            if use_pos_weight:
+                pos_mask = adj_batch.bool() & same_section
+                n_pos = pos_mask.sum()
+                n_neg = n_pairs_kept - n_pos
+                pos_weight = n_neg / n_pos.clamp(min=1)
+            else:
+                pos_weight = None
+
+            bce_unreduced = F.binary_cross_entropy_with_logits(
+                input=adj_logits,
+                target=adj_batch.detach().to(adj_logits.dtype),
+                reduction='none',
+                pos_weight=pos_weight,
+            )
+            weight = same_section.to(bce_unreduced.dtype)
+            bce_loss = (bce_unreduced * weight).sum() / n_pairs_kept
 
     else:
         # ---- sampled positives + negatives ----------------------------------
         n_pos_edges = batch_edge_index.shape[1]
 
+        # When restricting to within-section, oversample negatives by a
+        # safety factor and then filter cross-section ones out. The
+        # fraction of within-section pairs is ~1 / n_sections under
+        # uniform negative sampling; multiply the request by a healthy
+        # factor (max 8x) so we end up with roughly the legacy count
+        # after filtering even at high section counts. The cap avoids
+        # ballooning the kernel matrix when section count is huge.
+        if section_ids is not None:
+            n_sections = int(section_ids.max().item()) + 1 if section_ids.numel() > 0 else 1
+            oversample_factor = min(max(n_sections, 2), 8)
+        else:
+            oversample_factor = 1
+
         batch_non_edge_index = negative_sampling(
             edge_index=batch_edge_index,
-            num_neg_samples=int(n_pos_edges * edge_sampling_ratio),
+            num_neg_samples=int(n_pos_edges * edge_sampling_ratio * oversample_factor),
             method='sparse',
             force_undirected=True,
         )
+
+        if section_ids is not None:
+            # Drop cross-section negatives (positives are intra-section
+            # by construction).
+            src_ids = section_ids[batch_non_edge_index[0]]
+            dst_ids = section_ids[batch_non_edge_index[1]]
+            within = src_ids == dst_ids
+            batch_non_edge_index = batch_non_edge_index[:, within]
+            # Truncate to the originally-requested count if oversampling
+            # left more than asked.
+            target_n_neg = int(n_pos_edges * edge_sampling_ratio)
+            if batch_non_edge_index.shape[1] > target_n_neg:
+                batch_non_edge_index = batch_non_edge_index[:, :target_n_neg]
+
         n_neg_edges = batch_non_edge_index.shape[1]
 
         edge_non_edge_index = torch.cat(

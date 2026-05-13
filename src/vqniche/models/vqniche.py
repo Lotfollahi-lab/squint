@@ -621,6 +621,13 @@ class VQNiche(BaseModel):
                         'dispersion': self._resolve_dispersion(h_quantized[:batch_size]), # attribute reconstruction loss
                         'h_adj': h_adj_batch, # adjacency reconstruction loss
                         'batch_edge_index': train_batch.edge_index, # adjacency reconstruction loss
+                        # Per-node section ids — consumed by the BCE adjacency
+                        # losses when `adj_within_section_only=True` (default)
+                        # to drop cross-section pairs from the negative set.
+                        # Set unconditionally; the dispatcher only reads it
+                        # when the flag is on, so legacy variants are
+                        # unaffected if no flag is set.
+                        'node_adata_batch_ids': getattr(train_batch, 'adata_batch_ids', None),
                         'logits': unnormalized_logits_batch[:batch_size], # label prediction loss
                         'labels': train_batch.y[:batch_size], # label prediction loss
                         'h_spatial_prior': h_spatial_prior, # spatial prior loss

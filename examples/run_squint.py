@@ -490,7 +490,7 @@ def make_dataset_blob_config() -> dict:
                 # from the same pre-built blob. Rebuilding the blob is
                 # required ONCE to populate the extra graphs:
                 #   python examples/run_squint.py --build-blob
-                "n_neighs_list": [6, 8, 12, 16],  # SQUINT default 8-NN + knn ablations
+                "n_neighs_list": [6, 8, 12, 16, 20, 24],  # SQUINT default 8-NN + knn ablations
                 "radius_list": None,
                 "include_self_loop": True,
                 "k": {
@@ -1771,27 +1771,31 @@ def _patch_dual_batch_lr(
 
 def _patch_dual_no_batch_int(cfg: dict) -> dict:
     """
-    Drop EVERY batch-integration loss (adversarial CE + MMD). The
-    cell-side encoder + decoders + VQ codebooks still train normally;
-    no explicit batch-correction signal is applied. Useful for testing
-    whether SQUINT's per-batch decoder-covariate (`+decoder-cov`) is
-    enough to handle batch differences on its own, without an
-    encoder-side correction.
+    Drop EVERY batch-integration loss (adversarial CE + MMD-batch +
+    MMD-prior). The cell-side encoder + decoders + VQ codebooks still
+    train normally; no explicit batch-correction signal is applied.
+    Useful for testing whether SQUINT's per-batch decoder-covariate
+    (`+decoder-cov`) is enough to handle batch differences on its own,
+    without an encoder-side correction.
 
-    Removes both:
-      - `adversarial_cross_entropy_batch_loss` (the GRL adversarial CE)
-      - `mmd_batch_loss`                       (the kernel MMD term)
+    Removes:
+      - `adversarial_batch_loss`               (current adv-GRL name)
+      - `adversarial_cross_entropy_batch_loss` (legacy adv-GRL name)
+      - `mmd_batch_loss`                       (pairwise per-batch MMD)
+      - `mmd_prior_loss`                       (MMD against isotropic prior)
     """
     losses = cfg["model"]["loss_params"]["loss_names"]
     for ln in (
+        "adversarial_batch_loss",
         "adversarial_cross_entropy_batch_loss",
         "mmd_batch_loss",
+        "mmd_prior_loss",
     ):
         if ln in losses:
             losses.remove(ln)
-    # Also disable the adversarial classifier head + GRL alpha; keep
-    # them out of the optimizer + forward path so the no-adv config
-    # is truly "no batch integration" rather than "GRL with alpha=0".
+    # Also disable the adversarial classifier head + GRL alpha so the
+    # head isn't built into the model graph at all (otherwise it
+    # consumes optimizer state and forward-pass time for nothing).
     cfg["model"]["adversarial_batch_dim_request"] = False
     cfg["model"]["adversarial_alpha"] = 0.0
     return cfg
@@ -1969,6 +1973,63 @@ def _patch_dual_attr_recon_nbr_weight(cfg: dict, weight: float) -> dict:
         per-batch gene means, nbr_iLISI suffers further.
     """
     cfg["model"]["loss_params"]["loss_kwargs"]["wt_attr_reconstr_nbr"] = float(weight)
+    return cfg
+
+
+def _patch_dual_vq_warmup(cfg: dict, vq_warmup_epochs: int = 10) -> dict:
+    """
+    Defer codebook init + EMA updates for the first `vq_warmup_epochs`
+    training epochs.
+
+    Mechanism (see `VQNiche_Dual.on_train_epoch_start` and the
+    `freeze_updates` buffer on `CosineSimCodebook` / `EuclideanCodebook`):
+      - During warmup: lazy kmeans-init is held off, EMA updates are
+        skipped, dead-code expiry is skipped. Commit losses are zeroed
+        in `_step` (so the encoder isn't pulled toward arbitrary
+        uniform-init codes).
+      - At epoch `vq_warmup_epochs`: the next forward pass triggers
+        natural kmeans-init on a z_mlp distribution that has been
+        shaped by the reconstruction + integration losses, so the
+        initial code centroids are much less batch-correlated than
+        they would be at epoch 0.
+
+    Hypothesis: the EMA update over batch-correlated early-epoch
+    z_mlp locks some codes into "this batch only" territory; once
+    that happens, the dead-code revival is the only way to recover,
+    and it doesn't fire on codes that ARE active (just active on
+    one batch). Warmup avoids this lock-in.
+
+    Parameters
+    ----------
+    vq_warmup_epochs : int
+        Number of epochs to freeze the codebook. Default 10. Set 0
+        to disable (legacy behaviour).
+    """
+    cfg["model"]["vq_warmup_epochs"] = int(vq_warmup_epochs)
+    return cfg
+
+
+def _patch_dual_adj_within_section_only(cfg: dict, enabled: bool = True) -> dict:
+    """
+    Set `loss_kwargs['adj_within_section_only']` (default in code: True).
+
+    When True, the BCE adjacency reconstruction loss only computes BCE
+    over within-section pairs — cross-section pairs (which are negatives
+    by construction, since spatial edges are intra-section) are dropped
+    from the candidate-negative pool and from positive-weight accounting.
+    This prevents the loss from pushing apart biologically-similar
+    cells in different AnnData sections, an anti-integration pressure
+    baked into the legacy global-pair behaviour.
+
+    Use this helper to set the flag EXPLICITLY in a variant's
+    materialised YAML even though True is the code default — useful for
+    sweeps where you want the YAML to record the choice unambiguously
+    next to the runs that explicitly chose `enabled=False`.
+
+    See `bce_cosine_adjacency_reconstruction_loss` for the masking
+    implementation details.
+    """
+    cfg["model"]["loss_params"]["loss_kwargs"]["adj_within_section_only"] = bool(enabled)
     return cfg
 
 
@@ -4201,6 +4262,988 @@ VARIANTS: dict = {
             num_neighbors=[16],
         ),
     },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "No-batch-integration sibling of `+enc-deeper+dec-w32+"
+            "knn16+sampler16`. Same architecture (RVQ (30, 90), "
+            "decoder-cov embed=16, encoder MLP [400, 400, 256], "
+            "1-layer SAGE GNN h=256, decoders [32], k=16 spatial "
+            "graph + sampler [16]) — but with EVERY explicit batch-"
+            "integration loss DROPPED (no adv, no mmd-batch, no "
+            "mmd-prior). The within-section BCE adjacency scope "
+            "(`adj_within_section_only=True`) is set explicitly: "
+            "cross-section pairs are dropped from the cosine BCE "
+            "negative pool, so the spatial-adjacency loss is no "
+            "longer an anti-integration pressure.\n\n"
+            "Hypothesis to test (the s36 sweep showed promising "
+            "no-batch-int results — this variant is the multi-seed "
+            "version of `s36_v10` / `s37_v9`): with the BCE fix in "
+            "place, the decoder covariate is sufficient to handle "
+            "batch effects on its own and an explicit z_mlp "
+            "integration loss is not needed.\n\n"
+            "Architecturally identical to `s36_v10_...` and "
+            "`s37_v9_...`; this is the canonical (sweep-prefix-free) "
+            "name intended for `submit_multi_seed.sh` so the run "
+            "directory lives at the same level as the other "
+            "multi-seed comparators.\n\n"
+            "REQUIRES BLOB REBUILD (k=16 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)  (REQUIRES blob rebuild)",
+            "+sampler([16])",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_sampler_neighbors(
+                    _patch_dual_graph_knn(
+                        _patch_dual_decoder_width(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                            ),
+                            hidden_channels=[32],
+                        ),
+                        n_neighs=16,
+                    ),
+                    num_neighbors=[16],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+bs512+lr7e-4+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Batch=512 / lr=7e-4 sibling of the canonical no-batch-"
+            "int +enc-deeper+dec-w32+knn16+sampler16 spine. "
+            "sqrt-scaled 2× the base bs=256/lr=5e-4. Larger batch = "
+            "smoother per-step gradient; sqrt-lr keeps the per-"
+            "sample gradient roughly constant.\n\n"
+            "Differs from `s38_v12`: that variant carries cell-"
+            "w=2.0 on top; this one keeps cell-w at the default 1.0 "
+            "so the bs/lr axis is isolated.\n\n"
+            "REQUIRES BLOB REBUILD (k=16 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+batch_size=512", "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_sampler_neighbors(
+                        _patch_dual_graph_knn(
+                            _patch_dual_decoder_width(
+                                _patch_dual_encoder_deeper(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                ),
+                                hidden_channels=[32],
+                            ),
+                            n_neighs=16,
+                        ),
+                        num_neighbors=[16],
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+bs1024+lr1e-3+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Batch=1024 / lr=1e-3 sibling of the canonical no-batch-"
+            "int +enc-deeper+dec-w32+knn16+sampler16 spine. "
+            "sqrt-scaled 4× the base bs=256/lr=5e-4.\n\n"
+            "REQUIRES BLOB REBUILD (k=16 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+batch_size=1024", "+lr=1e-3",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_sampler_neighbors(
+                        _patch_dual_graph_knn(
+                            _patch_dual_decoder_width(
+                                _patch_dual_encoder_deeper(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                ),
+                                hidden_channels=[32],
+                            ),
+                            n_neighs=16,
+                        ),
+                        num_neighbors=[16],
+                    ),
+                    batch_size=1024, lr=1e-3,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+bs2048+lr1.4e-3+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Batch=2048 / lr=1.4e-3 sibling of the canonical no-"
+            "batch-int +enc-deeper+dec-w32+knn16+sampler16 spine. "
+            "sqrt-scaled 8× the base bs=256/lr=5e-4 (lr 5e-4 × "
+            "sqrt(8) ≈ 1.414e-3).\n\n"
+            "REQUIRES BLOB REBUILD (k=16 in `n_neighs_list`) and "
+            "MORE GPU MEMORY — bs=2048 with the knn16+sampler16 "
+            "stack is ~8× the per-step memory of the bs=256 base. "
+            "Set `LSF_MEM_MB=200000` or higher when submitting."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+batch_size=2048", "+lr=1.4e-3",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_sampler_neighbors(
+                        _patch_dual_graph_knn(
+                            _patch_dual_decoder_width(
+                                _patch_dual_encoder_deeper(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                ),
+                                hidden_channels=[32],
+                            ),
+                            n_neighs=16,
+                        ),
+                        num_neighbors=[16],
+                    ),
+                    batch_size=2048, lr=1.4e-3,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+bs4096+lr2e-3+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Batch=4096 / lr=2e-3 sibling of the canonical no-"
+            "batch-int +enc-deeper+dec-w32+knn16+sampler16 spine. "
+            "sqrt-scaled 16× the base bs=256/lr=5e-4 — extends the "
+            "ladder beyond the user-requested 3 sizes (512/1024/"
+            "2048) so the bs sweep brackets the historic 8x-16x "
+            "regime cleanly.\n\n"
+            "REQUIRES BLOB REBUILD (k=16 in `n_neighs_list`) and "
+            "SIGNIFICANT GPU memory — bs=4096 + knn16+sampler16 "
+            "may exceed even 80GB cards. Set `LSF_MEM_MB=300000` "
+            "or higher and pick the largest-memory GPU available. "
+            "If this OOMs, drop to bs=2048 (the v15-equivalent of "
+            "this ladder) and look at trends across bs=512 / 1024 "
+            "/ 2048 instead."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+batch_size=4096", "+lr=2e-3",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_sampler_neighbors(
+                        _patch_dual_graph_knn(
+                            _patch_dual_decoder_width(
+                                _patch_dual_encoder_deeper(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                ),
+                                hidden_channels=[32],
+                            ),
+                            n_neighs=16,
+                        ),
+                        num_neighbors=[16],
+                    ),
+                    batch_size=4096, lr=2e-3,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+bs4096+lr2e-3+100ep+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Longer-train sibling of the +bs4096+lr2e-3 winner "
+            "(`+enc-deeper+dec-w32+knn16+sampler16+bs4096+lr2e-3+"
+            "within-sec`). Only delta: `max_epochs=100` (vs the "
+            "base config's 80). Early stopping is still enabled "
+            "(patience=10 val passes ≈ 20 train epochs on val_loss), "
+            "so the run can finish earlier if val_loss plateaus.\n\n"
+            "Rationale: at bs=4096 the dataset's ~340 batches/epoch "
+            "drop to ~85, so each epoch is ~4× fewer gradient steps "
+            "than at bs=256. 80 epochs × 85 steps/epoch = 6,800 "
+            "total steps — about 22% of the bs=256/80-epoch budget "
+            "(31k steps). 100 epochs at bs=4096 gets us to ~8,500 "
+            "steps — closer to (but still below) the historic "
+            "step-count, while keeping per-epoch wall time low.\n\n"
+            "CAVEAT (see `make_train_config_dualvq` max_epochs "
+            "comment): the 2026-05-12 max_epochs=200 sweep on the "
+            "+wide spine regressed niche NMI because val_loss "
+            "drifted past the niche-NMI optimum. 100 is a mild "
+            "bump and the no-batch-int regime is gentler (no "
+            "adversarial CE creep), so this is much less risky — "
+            "but watch the niche-NMI ckpt-selection trade-off "
+            "anyway. Pair with `SQUINT_WITH_PEARSON=1` to also log "
+            "`val_pearson_gene_wise_1hop_nbr_log1p` as a sanity "
+            "monitor.\n\n"
+            "REQUIRES BLOB REBUILD (k=16 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+batch_size=4096", "+lr=2e-3",
+            "+max_epochs=100  (default 80; early stop still ON)",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_max_epochs(
+                    _patch_dual_batch_lr(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        batch_size=4096, lr=2e-3,
+                    ),
+                    max_epochs=100,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+bs8192+lr2.8e-3+200ep+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Double-batch + long-train sibling of the +bs4096+lr2e-3 "
+            "winner. Two deltas:\n"
+            "  1. Batch size 4096 -> 8192 (2× the working config, "
+            "     32× the base bs=256). lr sqrt-scaled to "
+            "     2.83e-3 ≈ 2.8e-3 (5e-4 × sqrt(32)).\n"
+            "  2. max_epochs 80 -> 200. At bs=8192 the dataset has "
+            "     ~43 batches/epoch, so 200 epochs gets us to "
+            "     ~8,500 steps — comparable to the +100ep sibling "
+            "     above at bs=4096.\n\n"
+            "Hypothesis: the +bs4096 setting works well; pushing "
+            "to 2× the batch with the same sqrt-lr scaling tests "
+            "whether the no-batch-int regime tolerates the bigger "
+            "batch (it has no adversarial discriminator to "
+            "saturate, unlike the historic regimes where >8× "
+            "batches collapsed integration). max_epochs=200 keeps "
+            "the total-steps budget honest given the larger batch.\n\n"
+            "MEMORY: bs=8192 + knn16+sampler16 samples "
+            "(1 + 16) × 8192 = 139,264 nodes per training step. "
+            "This is ~2× the bs=4096 memory footprint and is "
+            "**likely** to OOM on standard 40GB cards. Submit with "
+            "`LSF_MEM_MB=400000` AND on the largest-memory GPU "
+            "available; pair with `--gpu mode=exclusive_process:num=1` "
+            "via the bsub flag. If it OOMs, drop bs to 6144 (still "
+            "1.5× the bs=4096 winner) and rerun.\n\n"
+            "CAVEAT (see `make_train_config_dualvq` max_epochs "
+            "comment): max_epochs=200 historically regressed niche "
+            "NMI on the +wide spine. The no-batch-int regime is "
+            "gentler — no adv CE creep — but the val_loss optimum "
+            "may still drift past niche-NMI optimum. Pair with "
+            "`SQUINT_WITH_PEARSON=1` and inspect both ckpts post-"
+            "hoc.\n\n"
+            "REQUIRES BLOB REBUILD (k=16 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+batch_size=8192", "+lr=2.8e-3",
+            "+max_epochs=200  (default 80; early stop still ON)",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_max_epochs(
+                    _patch_dual_batch_lr(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        batch_size=8192, lr=2.8e-3,
+                    ),
+                    max_epochs=200,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn20+sampler20+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Denser-spatial-graph sibling of `+enc-deeper+dec-w32+"
+            "knn16+sampler16+within-sec` (no-batch-int + within-sec "
+            "BCE). The only delta is the spatial graph k: 16 → 20, "
+            "with sampler fanout matched to `[20]` so the GNN sees "
+            "ALL 20 neighbours per cell per step.\n\n"
+            "Tests whether even denser spatial context (vs k=16) "
+            "lifts niche metrics further — diminishing-returns probe "
+            "in the no-batch-int regime where within-section BCE + "
+            "decoder-cov are the only integration pressures.\n\n"
+            "Cost: ~25% more edges than k=16, ~17·bs sampled nodes "
+            "per training step. Should be tolerable at the default "
+            "bs=256 but may need extra GPU memory if you pair this "
+            "with a bigger bs.\n\n"
+            "REQUIRES BLOB REBUILD: `n_neighs_list = [6, 8, 12, 16, "
+            "20, 24]` is now configured in `make_dataset_blob_config"
+            "()` but the existing on-disk blob predates the k=20/24 "
+            "addition. Rebuild with:\n"
+            "    python examples/run_squint.py --build-blob\n"
+            "(one-off, takes ~10-20 min). After rebuild, k=20 and "
+            "k=24 are available."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=20)  (REQUIRES blob rebuild)",
+            "+sampler([20])           (matches graph k)",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_sampler_neighbors(
+                    _patch_dual_graph_knn(
+                        _patch_dual_decoder_width(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                            ),
+                            hidden_channels=[32],
+                        ),
+                        n_neighs=20,
+                    ),
+                    num_neighbors=[20],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn24+sampler24+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Even-denser-spatial-graph sibling of the +knn16+"
+            "sampler16 variant. Spatial graph k=24, sampler [24] — "
+            "DENSEST spatial neighbourhood configured in the blob.\n\n"
+            "Tests the upper end of the spatial-context-density "
+            "axis. If k=24 still lifts niche metrics over k=20, the "
+            "spine isn't yet saturated and the graph could be made "
+            "denser still; if it plateaus or regresses, k=16-20 is "
+            "the right operating point.\n\n"
+            "Cost: 50% more edges than k=16, ~17·bs → ~25·bs "
+            "sampled nodes per training step. Plan on extra GPU "
+            "memory.\n\n"
+            "REQUIRES BLOB REBUILD (same as the +knn20 sibling) — "
+            "rebuild once and both k=20 and k=24 become available."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=24)  (REQUIRES blob rebuild)",
+            "+sampler([24])           (matches graph k)",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_sampler_neighbors(
+                    _patch_dual_graph_knn(
+                        _patch_dual_decoder_width(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                            ),
+                            hidden_channels=[32],
+                        ),
+                        n_neighs=24,
+                    ),
+                    num_neighbors=[24],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn20+sampler20+bs4096+lr2e-3+100ep+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Stacked combo of two recent winners on the no-batch-"
+            "int + enc-deeper + dec-w32 + within-sec spine:\n"
+            "  - knn=20 spatial graph + sampler [20] (denser spatial "
+            "    context than the +knn16 default).\n"
+            "  - bs=4096 + lr=2e-3 (sqrt-scaled 16× the base bs=256/"
+            "    lr=5e-4 — known-good operating point).\n"
+            "  - max_epochs=100 (vs base 80) — compensates for the "
+            "    ~4× fewer batches/epoch at bs=4096 (only ~85 steps/"
+            "    epoch on this dataset), so 100 epochs ≈ 8,500 "
+            "    gradient steps. Early stopping still ON.\n\n"
+            "Pair-wise A/B vs `+knn16+sampler16+bs4096+lr2e-3+100ep`: "
+            "isolates the spatial-density delta (k=16 → k=20) at the "
+            "winning bs/lr/epoch combo.\n\n"
+            "REQUIRES BLOB REBUILD (k=20 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=20)  (REQUIRES blob rebuild)",
+            "+sampler([20])",
+            "+batch_size=4096", "+lr=2e-3",
+            "+max_epochs=100  (default 80; early stop still ON)",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_max_epochs(
+                    _patch_dual_batch_lr(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=20,
+                            ),
+                            num_neighbors=[20],
+                        ),
+                        batch_size=4096, lr=2e-3,
+                    ),
+                    max_epochs=100,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn24+sampler24+bs4096+lr2e-3+100ep+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "knn=24 sibling of `+knn20+sampler20+bs4096+lr2e-3+100ep+"
+            "within-sec`. Spatial graph k=24, sampler [24]. Same "
+            "bs=4096 + lr=2e-3 + max_epochs=100 + within-sec + "
+            "no-batch-int spine.\n\n"
+            "Forms a clean three-point density ladder at the winning "
+            "bs/lr/epoch combo: knn=16 / 20 / 24. Reading the trend "
+            "tells you whether spatial-density gains saturate around "
+            "k=20 or whether k=24 still helps.\n\n"
+            "Memory: ~25% more sampled nodes per training step than "
+            "the k=20 sibling (1 + 24 = 25 nodes per cell vs 1 + 20 "
+            "= 21). At bs=4096 that's `25 × 4096 = 102,400` sampled "
+            "nodes/step. Should fit comfortably with `LSF_MEM_MB=200000` "
+            "but may need more if you pair this with bigger bs.\n\n"
+            "REQUIRES BLOB REBUILD (k=24 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=24)  (REQUIRES blob rebuild)",
+            "+sampler([24])",
+            "+batch_size=4096", "+lr=2e-3",
+            "+max_epochs=100  (default 80; early stop still ON)",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_max_epochs(
+                    _patch_dual_batch_lr(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=24,
+                            ),
+                            num_neighbors=[24],
+                        ),
+                        batch_size=4096, lr=2e-3,
+                    ),
+                    max_epochs=100,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-200-200-128+gnn-h128+dec-w32+knn16+sampler16+cell-w10.0+nbr-w0.5+adj-w2000+bs512+lr7e-4+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "VERY-STRONG-CELL-NB sibling of `s38_v16` (the kitchen-"
+            "sink combo: tighter encoder [200, 200, 128] + gnn-h128 "
+            "+ cell-w=3.0 + nbr-w=0.5 + adj-w=2000 + bs=512 + "
+            "lr=7e-4 + within-sec + no-batch-int). Only delta: "
+            "`wt_attr_reconstr=10.0` (vs s38_v16's 3.0) — nearly 4x "
+            "stronger cell-NB pressure than the s38_v16 base, 10x "
+            "stronger than the default 1.0.\n\n"
+            "Hypothesis: in the no-batch-int regime, the cell branch "
+            "doesn't have to compete with an adversarial / MMD head "
+            "for `z_mlp` gradients — the only competing pulls are "
+            "the cosine-BCE adjacency (already at adj-w=2000 here) "
+            "and the niche-NB (already weakened to 0.5). Pushing "
+            "cell-NB to 10.0 makes per-cell gene-expression "
+            "reconstruction by far the dominant signal on z_mlp / "
+            "z_q_cell — should maximally sharpen cell-type NMI on "
+            "the cell side, potentially at some cost to niche "
+            "metrics if z_gnn (downstream of z_mlp) inherits "
+            "stronger cell-type signal at the expense of spatial.\n\n"
+            "Canonical (sweep-prefix-free) variant name — intended "
+            "for `submit_multi_seed.sh` so multi-seed artifacts land "
+            "in a clean directory alongside the other canonical-name "
+            "comparators.\n\n"
+            "REQUIRES BLOB REBUILD (k=16 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[200, 200, 128])", "+gnn-h=128",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=10.0", "+wt_attr_reconstr_nbr=0.5",
+            "+wt_adj_reconstr=2000",
+            "+batch_size=512", "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_adj_weight(
+                        _patch_dual_attr_recon_nbr_weight(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_gnn_hidden(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[200, 200, 128],
+                                                ),
+                                                hidden=128,
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=10.0,
+                            ),
+                            weight=0.5,
+                        ),
+                        weight=2000.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+bs512+lr7e-4+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "STRONGER-CELL-NB sibling of `s38_v12` (same +enc-deeper "
+            "+dec-w32+knn16+sampler16+bs=512+lr=7e-4 spine, "
+            "no-batch-int, within-sec). Only delta: "
+            "`wt_attr_reconstr=5.0` (vs s38_v12's 2.0). Brackets the "
+            "cell-w axis on the s38_v12 spine between the existing "
+            "cell-w=2.0 / 3.0 / 5.0 / 10 points so the Pareto knee "
+            "is easier to read.\n\n"
+            "Hypothesis: in the no-batch-int regime, cell-NB is the "
+            "main pull on z_mlp / z_q_cell toward per-cell gene-"
+            "expression fidelity. Mid-strong pressure (5.0) may "
+            "give the best cell-NMI without over-fitting / "
+            "compromising niche metrics the way cell-w=10 might.\n\n"
+            "Canonical (sweep-prefix-free) variant name — intended "
+            "for `submit_multi_seed.sh` so multi-seed artifacts land "
+            "in a clean directory alongside the other canonical-name "
+            "comparators.\n\n"
+            "REQUIRES BLOB REBUILD (k=16 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+batch_size=512", "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=5.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+no-batch-int+enc-512+dec-w256+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "No-batch-integration sibling of `+wide+rvq-both+decoder-"
+            "cov+adv+enc-512+dec-w256+within-sec` (the s28_v1 spine "
+            "under within-section BCE). Same architecture as the "
+            "+adv parent (+wide -> 2-layer SAGE GNN h=256, sampler "
+            "[8, 8], 2-hop nbr aggregation; RVQ (30, 90); decoder-"
+            "cov embed=16; shallow encoder [512] -> latent dim 512; "
+            "decoders [256]) — but with EVERY explicit batch-"
+            "integration loss DROPPED (no adv, no mmd-batch, no "
+            "mmd-prior). The within-section BCE adjacency scope "
+            "(`adj_within_section_only=True`) is set explicitly: "
+            "cross-section pairs are dropped from the cosine BCE "
+            "negative pool.\n\n"
+            "Architecturally identical to `s36_v16_...`; this is the "
+            "canonical (sweep-prefix-free) name intended for "
+            "`submit_multi_seed.sh` so multi-seed artifacts land in "
+            "a clean directory at the same level as the other "
+            "canonical-name comparators."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-shallow(mlp=[512])  (latent dim = 512)",
+            "+dec-w=[256]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_shallow(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(
+                                    _patch_dual_wide(_BD()),
+                                    branch="niche", codebook_sizes=(30, 90),
+                                ),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        hidden_channels=[512],
+                    ),
+                    hidden_channels=[256],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+adj-w3000+enc-shallow+dec-w32+within-sec+vq-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "No-adv + no-wide + VQ-warmup sibling of `s36_v13` "
+            "(`+wide+adv+adj-w3000+enc-shallow+dec-w32+within-sec`). "
+            "Three changes from the s36_v13 parent:\n"
+            "  1. Drop the adversarial head + loss (no-batch-int).\n"
+            "  2. Drop `+wide` — reverts the niche side to 1-layer "
+            "     SAGE GNN h=256, sampler [8], 1-hop nbr-NB.\n"
+            "  3. Add VQ warmup (`vq_warmup_epochs=10`): the codebook "
+            "     is frozen at uniform-init for the first 10 epochs "
+            "     (no kmeans init, no EMA, no dead-code expiry; commit "
+            "     losses zeroed). The natural codebook init then runs "
+            "     at epoch 10 on a z_mlp that's been shaped by the "
+            "     spatial-adjacency BCE + cell-NB + nbr-NB rather "
+            "     than the epoch-0 (batch-correlated) distribution.\n\n"
+            "All other knobs match the s36_v13 architecture: RVQ "
+            "(30, 90), decoder-cov embed=16, shallow encoder [256] "
+            "(latent dim 256), cell + niche decoders [32], "
+            "`wt_adj_reconstr=3000` (very tight spatial pressure), "
+            "`adj_within_section_only=True` (cross-section pairs "
+            "dropped from the cosine BCE negative pool).\n\n"
+            "Canonical (sweep-prefix-free) variant name — intended for "
+            "`submit_multi_seed.sh` so multi-seed artifacts land in a "
+            "clean directory alongside the other no-batch-int "
+            "multiseed comparators.\n\n"
+            "Hypothesis: the historic `+wide+adj-w3000+enc-shallow+"
+            "dec-w32` family had very strong cluster-quality metrics "
+            "(NMI / ARI) but historically relied on the adversarial "
+            "head for integration. With cross-section pairs now "
+            "masked out of the BCE AND codebook init deferred past "
+            "epoch 0, the adversarial head may be redundant — and "
+            "the deferred init may avoid the early-epoch lock-in "
+            "that the (now-deprecated) global BCE encouraged. "
+            "Dropping `+wide` further simplifies: 1-layer GNN + "
+            "1-hop nbr-NB stay the historic SQUINT default, so this "
+            "variant tests the no-batch-int + VQ-warmup story on the "
+            "minimal-architecture spine."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+adj(weight=3000)", "+enc-shallow(mlp=[256])",
+            "+dec-w=[32]",
+            "+adj_within_section_only=True",
+            "+vq_warmup_epochs=10",
+        ],
+        "build": lambda: _patch_dual_vq_warmup(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_decoder_width(
+                        _patch_dual_encoder_shallow(
+                            _patch_dual_adj_weight(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                weight=3000.0,
+                            ),
+                            hidden_channels=[256],
+                        ),
+                        hidden_channels=[32],
+                    ),
+                ),
+                enabled=True,
+            ),
+            vq_warmup_epochs=10,
+        ),
+    },
+    "dualvq+wide+rvq-both+decoder-cov+no-batch-int+adj-w3000+enc-shallow+dec-w32+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "No-adv sibling of `s36_v13` "
+            "(`+wide+adv+adj-w3000+enc-shallow+dec-w32+within-sec`). "
+            "Same architecture as the parent (`+wide` -> 2-layer "
+            "SAGE GNN h=256, sampler [8, 8], 2-hop nbr-NB; RVQ "
+            "(30, 90); decoder-cov embed=16; shallow encoder [256] "
+            "(latent dim 256); cell + niche decoders [32]; "
+            "`wt_adj_reconstr=3000`; `adj_within_section_only=True`) "
+            "— but with the adversarial head + loss DROPPED via "
+            "`+no-batch-int`. No mmd-batch / mmd-prior either; the "
+            "ONLY integration pressure left is the (within-section) "
+            "BCE adjacency loss + the decoder covariate.\n\n"
+            "Architecturally identical to `s36_v14_...`; this is the "
+            "canonical (sweep-prefix-free) name intended for "
+            "`submit_multi_seed.sh` so multi-seed artifacts land in "
+            "a clean directory at the same level as the other "
+            "canonical-name comparators.\n\n"
+            "Hypothesis: the `+wide+adj-w3000+enc-shallow+dec-w32` "
+            "family historically had very strong NMI / ARI but "
+            "relied on the adversarial GRL for integration. With "
+            "cross-section pairs now masked out of the BCE negative "
+            "pool, the adversarial head may be redundant — and "
+            "removing it simplifies the optimization (no min-max "
+            "game, no GRL alpha to tune, no classifier head in the "
+            "optimizer state)."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+adj(weight=3000)", "+enc-shallow(mlp=[256])",
+            "+dec-w=[32]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_shallow(
+                        _patch_dual_adj_weight(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(
+                                        _patch_dual_wide(_BD()),
+                                        branch="niche", codebook_sizes=(30, 90),
+                                    ),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            weight=3000.0,
+                        ),
+                        hidden_channels=[256],
+                    ),
+                    hidden_channels=[32],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+adj-w3000+enc-shallow+dec-w32+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "No-adv + no-wide sibling of `s36_v13` "
+            "(`+wide+adv+adj-w3000+enc-shallow+dec-w32+within-sec`). "
+            "Two changes from the s36_v13 parent:\n"
+            "  1. Drop the adversarial head + loss (no-batch-int).\n"
+            "  2. Drop `+wide` — reverts the niche side to 1-layer "
+            "     SAGE GNN h=256, sampler [8], 1-hop nbr-NB.\n\n"
+            "All other knobs match s36_v13: RVQ (30, 90), decoder-"
+            "cov embed=16, shallow encoder [256] (latent dim 256), "
+            "cell + niche decoders [32], `wt_adj_reconstr=3000` "
+            "(very tight spatial pressure), "
+            "`adj_within_section_only=True` (cross-section pairs "
+            "dropped from the cosine BCE negative pool).\n\n"
+            "Canonical (sweep-prefix-free) variant name — intended "
+            "for `submit_multi_seed.sh` so multi-seed artifacts land "
+            "in a clean directory alongside the other no-batch-int "
+            "multiseed comparators.\n\n"
+            "Architectural diff vs the canonical `+wide+...` "
+            "sibling: just the `+wide` removal — both drop adv, "
+            "both keep `adj-w3000` + within-sec BCE. This is the "
+            "minimal-architecture no-batch-int variant on the +adj-"
+            "w3000+enc-shallow+dec-w32 spine.\n\n"
+            "Companion to the existing `+vq-warmup10` sibling of "
+            "the same spine — together they test whether the "
+            "codebook-warmup helps over the naive lazy-init."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+adj(weight=3000)", "+enc-shallow(mlp=[256])",
+            "+dec-w=[32]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_shallow(
+                        _patch_dual_adj_weight(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            weight=3000.0,
+                        ),
+                        hidden_channels=[256],
+                    ),
+                    hidden_channels=[32],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
     "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+knn16+sampler8+mmb0-1b_smb1-1b_1p": {
         "description": (
             "Asymmetric variant: SPATIAL k-NN graph k=16 (densest) "
@@ -4305,6 +5348,144 @@ VARIANTS: dict = {
             num_neighbors=[8],
         ),
     },
+    "dualvq+rvq-both+decoder-cov+adv+enc-256-256-128+gnn-h128+dec-w32+knn16+sampler8+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Within-section-BCE sibling of `+enc-256-256-128+gnn-h128+"
+            "dec-w32+knn16+sampler8`. Architecturally identical to the "
+            "parent (RVQ (30, 90), decoder-cov embed=16, adv α=1 "
+            "wt=150, encoder MLP [256, 256, 128], GNN h=128 — "
+            "symmetric 128-dim cell + niche latents, decoders [32], "
+            "k=16 spatial graph + stochastic 8-of-16 sampler) — the "
+            "only change is `loss_kwargs['adj_within_section_only']="
+            "True`, which restricts the cosine BCE adjacency loss to "
+            "within-section pairs (cross-section pairs are dropped "
+            "from the negative pool, so two biologically-similar "
+            "cells in different sections aren't pushed apart by the "
+            "spatial-adjacency loss).\n\n"
+            "True is now the code default, but the flag is set "
+            "explicitly here so the materialised YAML records the "
+            "choice unambiguously — useful for the multiseed sweep "
+            "(this variant is intended for `submit_multi_seed.sh`).\n\n"
+            "REQUIRES BLOB REBUILD (k=16 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[256, 256, 128])",
+            "+gnn-h=128",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)  (REQUIRES blob rebuild)",
+            "+sampler([8])            (stochastic 8-of-16 per epoch)",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_gnn_hidden(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_adversarial(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                    alpha=1.0, wt_adv_batch=150.0,
+                                ),
+                                hidden_channels=[256, 256, 128],
+                            ),
+                            hidden=128,
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[8],
+            ),
+            enabled=True,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-256-256-128+gnn-h128+dec-w32+knn16+sampler8+within-sec+vq-warmup10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "VQ-warmup sibling of `+enc-256-256-128+gnn-h128+dec-w32+"
+            "knn16+sampler8+within-sec`. Identical to that parent "
+            "except for `vq_warmup_epochs=10`: for the first 10 "
+            "training epochs the VQ codebook is held at its uniform-"
+            "init state (no lazy kmeans-init, no EMA updates, no "
+            "dead-code expiry, commit losses zeroed). The encoder "
+            "still trains under reconstruction + adversarial + the "
+            "newly within-section BCE adjacency loss, so by epoch 10 "
+            "`z_mlp` and `z_gnn` have settled away from epoch-0 batch-"
+            "correlated directions. At epoch 10 the codebook does its "
+            "natural lazy kmeans-init on that much-less-batch-correlated "
+            "z_mlp distribution.\n\n"
+            "Hypothesis (codebook EMA lock-in): early kmeans-init + EMA "
+            "imprints batch-discriminative directions in the codes "
+            "before the integration losses have had time to shape z_mlp. "
+            "Once imprinted, the EMA only ever sees cells already "
+            "routed to those codes, so the lock-in is permanent. "
+            "Deferring init avoids this. Symptom we'd expect to see if "
+            "this is the right knob: per-batch code utilisation looks "
+            "more uniform here than in the no-warmup sibling.\n\n"
+            "Note: balanced kmeans-init (stratified-by-section sample "
+            "for the kmeans data) is NOT applied here. Argument: the "
+            "natural init at epoch 10 already runs on a much-less-"
+            "batch-correlated z_mlp, so stratification on top is "
+            "expected to be marginal. If this variant lifts `nbr_iLISI`"
+            " / `cell_iLISI` materially, we'll layer balanced init on "
+            "top as a v2; if not, the lock-in hypothesis was wrong and "
+            "balanced init wouldn't have helped either.\n\n"
+            "Intended for `submit_multi_seed.sh` — multi-seed run so we "
+            "can read off whether the variance reduction (codebook "
+            "lock-in is a stochastic-init phenomenon) shows up across "
+            "seeds.\n\n"
+            "REQUIRES BLOB REBUILD (k=16 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[256, 256, 128])",
+            "+gnn-h=128",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)  (REQUIRES blob rebuild)",
+            "+sampler([8])            (stochastic 8-of-16 per epoch)",
+            "+adj_within_section_only=True",
+            "+vq_warmup_epochs=10",
+        ],
+        "build": lambda: _patch_dual_vq_warmup(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_sampler_neighbors(
+                    _patch_dual_graph_knn(
+                        _patch_dual_decoder_width(
+                            _patch_dual_gnn_hidden(
+                                _patch_dual_encoder_deeper(
+                                    _patch_dual_adversarial(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                        alpha=1.0, wt_adv_batch=150.0,
+                                    ),
+                                    hidden_channels=[256, 256, 128],
+                                ),
+                                hidden=128,
+                            ),
+                            hidden_channels=[32],
+                        ),
+                        n_neighs=16,
+                    ),
+                    num_neighbors=[8],
+                ),
+                enabled=True,
+            ),
+            vq_warmup_epochs=10,
+        ),
+    },
     "dualvq+rvq-both+decoder-cov+adv+enc-128-128-64+gnn-h128+dec-w32+knn16+sampler8+mmb0-1b_smb1-1b_1p": {
         "description": (
             "ASYMMETRIC encoder/GNN sibling of `+enc-deeper+dec-w32+"
@@ -4360,6 +5541,64 @@ VARIANTS: dict = {
                 n_neighs=16,
             ),
             num_neighbors=[8],
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+adv+enc-128-128-64+gnn-h128+dec-w32+knn16+sampler16+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "All-16-neighbours sibling of `+enc-128-128-64+gnn-h128+"
+            "dec-w32+knn16+sampler8`. Same asymmetric architecture "
+            "(encoder MLP [128, 128, 64] -> cell-branch latent 64, "
+            "GNN h=128 -> niche-branch latent 128, decoders [32], "
+            "k=16 spatial graph, RVQ (30, 90), decoder-cov embed=16, "
+            "adv α=1 wt=150) — the only delta is the sampler fanout: "
+            "`[16]` instead of `[8]`, so the GNN sees ALL 16 spatial "
+            "neighbours per cell per step deterministically (no "
+            "stochastic 8-of-16 subsampling).\n\n"
+            "Pair-wise A/B vs the `+sampler8` sibling: tests whether "
+            "the stochastic neighbour subsampling on the sampler8 "
+            "variant acts as useful per-epoch augmentation, or "
+            "whether deterministic full-16-neighbour aggregation "
+            "(more spatial context per step, no augmentation) is "
+            "better for this asymmetric encoder.\n\n"
+            "Hypothesis: cell-branch tight latent (64) + niche-branch "
+            "wider latent (128) is well-matched to densest spatial "
+            "aggregation — niche-side benefits from full 16-NN "
+            "context, cell-side benefits from the bottleneck.\n\n"
+            "REQUIRES BLOB REBUILD (k=16 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[128, 128, 64])  (cell latent = 64)",
+            "+gnn-h=128                       (niche latent = 128; ASYMMETRIC)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)  (REQUIRES blob rebuild)",
+            "+sampler([16])           (all 16 neighbours per cell)",
+        ],
+        "build": lambda: _patch_dual_sampler_neighbors(
+            _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                    _patch_dual_gnn_hidden(
+                        _patch_dual_encoder_deeper(
+                            _patch_dual_adversarial(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                alpha=1.0, wt_adv_batch=150.0,
+                            ),
+                            hidden_channels=[128, 128, 64],
+                        ),
+                        hidden=128,
+                    ),
+                    hidden_channels=[32],
+                ),
+                n_neighs=16,
+            ),
+            num_neighbors=[16],
         ),
     },
     "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+knn16+sampler16+200ep+mmb0-1b_smb1-1b_1p": {
@@ -12656,6 +13895,2196 @@ VARIANTS: dict = {
             hidden_channels=[32],
         ),
     },
+
+    # ========================================================================
+    # s36 — 8 best-previous-run baselines × {with batch-int, no batch-int}
+    # under the new `adj_within_section_only=True` BCE adjacency scope.
+    # ========================================================================
+    # The BCE adjacency reconstruction loss now (default) drops cross-section
+    # pairs from the negative pool. This sweep re-runs 8 of the strongest
+    # previous configurations under that new default, AND pairs each with a
+    # "no batch-integration" sibling (drops adv / mmd-batch / mmd-prior),
+    # so we can read off:
+    #   (a) "did each previous winner survive the BCE-scope change?" and
+    #   (b) "is the BCE-scope change strong enough to integrate batches
+    #        even WITHOUT an explicit adversarial / MMD loss on z_mlp?"
+    #
+    # Variants (each pair = with-batch-int / no-batch-int):
+    #   v1  / v2  : +enc-deeper+dec-w32                                              (the +adv baseline)
+    #   v3  / v4  : +enc-deeper+dec-w32+knn16+sampler8                               (knn16 stochastic 8-of-16)
+    #   v5  / v6  : +enc-200-200-128+gnn-h128+dec-w32+knn12+sampler12                (s34_v4 spine)
+    #   v7  / v8  : +enc-deeper+dec-w64 + mmd-prior-w50                              (NicheCompass-style integration)
+    #   v9  / v10 : +enc-deeper+dec-w32+knn16+sampler16 + mmd-batch-w200             (s32_v7 spine)
+    #   v11 / v12 : +wide+adj-w3000+enc-shallow+dec-w256                             (wide+adj-w3000 winner)
+    #   v13 / v14 : +wide+adj-w3000+enc-shallow+dec-w32                              (dec-w32 sibling of v11)
+    #   v15 / v16 : +wide+enc-512+dec-w256                                            (s28_v1 spine)
+    #
+    # All 16 set `loss_kwargs['adj_within_section_only']=True` explicitly via
+    # `_patch_dual_adj_within_section_only(enabled=True)` so the materialised
+    # YAML records the choice unambiguously (even though True is now the
+    # code default). The "no-batch-int" siblings additionally apply
+    # `_patch_dual_no_batch_int` after their respective batch-int patch to
+    # strip the integration loss term from `loss_names`.
+    #
+    # Submit via:
+    #   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v36
+    #
+    # Note: variants using +knn12 / +knn16 / +sampler[12 or 16] REQUIRE the
+    # blob to contain those k values. The current `make_dataset_blob_config()`
+    # ships `n_neighs_list = [6, 8, 12, 16]`; if the on-disk blob predates
+    # that, rebuild with `python examples/run_squint.py --build-blob`.
+
+    "s36_v1_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s36 sweep, variant 1: re-run of the `+enc-deeper+dec-w32` "
+            "baseline under the new within-section BCE adjacency scope. "
+            "Identical to the parent variant except for the explicit "
+            "`adj_within_section_only=True` flag (already the code "
+            "default, set explicitly here so the materialised YAML "
+            "records the choice)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                ),
+                hidden_channels=[32],
+            ),
+            enabled=True,
+        ),
+    },
+    "s36_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s36 sweep, variant 2: v1 spine WITHOUT any explicit "
+            "batch-integration loss (no adv, no mmd-batch, no "
+            "mmd-prior). Tests whether the within-section BCE adjacency "
+            "scope + decoder covariate alone are enough for batch "
+            "integration on z_mlp."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            alpha=1.0, wt_adv_batch=150.0,
+                        ),
+                    ),
+                    hidden_channels=[32],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s36_v3_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+knn16+sampler8+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s36 sweep, variant 3: re-run of `+enc-deeper+dec-w32+"
+            "knn16+sampler8` (k=16 spatial graph + stochastic 8-of-16 "
+            "sampler) under the new within-section BCE adjacency scope. "
+            "REQUIRES BLOB REBUILD (k=16 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([8])",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_encoder_deeper(
+                            _patch_dual_adversarial(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                alpha=1.0, wt_adv_batch=150.0,
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[8],
+            ),
+            enabled=True,
+        ),
+    },
+    "s36_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler8+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s36 sweep, variant 4: v3 spine WITHOUT any explicit "
+            "batch-integration loss. Tests within-section BCE + "
+            "decoder-cov alone on the knn16+sampler8 spatial spine."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([8])",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_sampler_neighbors(
+                    _patch_dual_graph_knn(
+                        _patch_dual_decoder_width(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_adversarial(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                    alpha=1.0, wt_adv_batch=150.0,
+                                ),
+                            ),
+                            hidden_channels=[32],
+                        ),
+                        n_neighs=16,
+                    ),
+                    num_neighbors=[8],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s36_v5_dualvq+rvq-both+decoder-cov+adv+enc-200-200-128+gnn-h128+dec-w32+knn12+sampler12+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s36 sweep, variant 5: re-run of s34_v4 (enc [200, 200, "
+            "128] + gnn h=128 + dec-w32 + knn12 + sampler [12]) under "
+            "the new within-section BCE adjacency scope. REQUIRES "
+            "BLOB REBUILD (k=12 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-deeper(mlp=[200, 200, 128])",
+            "+gnn-h=128", "+dec-w=[32]",
+            "+graph_knn(n_neighs=12)", "+sampler([12])",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_gnn_hidden(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_adversarial(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                    alpha=1.0, wt_adv_batch=150.0,
+                                ),
+                                hidden_channels=[200, 200, 128],
+                            ),
+                            hidden=128,
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=12,
+                ),
+                num_neighbors=[12],
+            ),
+            enabled=True,
+        ),
+    },
+    "s36_v6_dualvq+rvq-both+decoder-cov+no-batch-int+enc-200-200-128+gnn-h128+dec-w32+knn12+sampler12+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s36 sweep, variant 6: v5 spine WITHOUT any explicit "
+            "batch-integration loss. Tests within-section BCE + "
+            "decoder-cov alone on the smaller-latent + knn12 spine."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[200, 200, 128])",
+            "+gnn-h=128", "+dec-w=[32]",
+            "+graph_knn(n_neighs=12)", "+sampler([12])",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_sampler_neighbors(
+                    _patch_dual_graph_knn(
+                        _patch_dual_decoder_width(
+                            _patch_dual_gnn_hidden(
+                                _patch_dual_encoder_deeper(
+                                    _patch_dual_adversarial(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                        alpha=1.0, wt_adv_batch=150.0,
+                                    ),
+                                    hidden_channels=[200, 200, 128],
+                                ),
+                                hidden=128,
+                            ),
+                            hidden_channels=[32],
+                        ),
+                        n_neighs=12,
+                    ),
+                    num_neighbors=[12],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s36_v7_dualvq+rvq-both+decoder-cov+mmd-prior-w50+enc-deeper+dec-w64+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s36 sweep, variant 7: re-run of `+mmd-prior-w50+enc-"
+            "deeper+dec-w64` (NicheCompass-style prior matching as the "
+            "integration mechanism, NO +adv) under the new within-"
+            "section BCE adjacency scope."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+mmd-prior(w=50, prior_std=1.0)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[64]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_deeper(
+                    _patch_dual_mmd_prior(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(_BD(),
+                                    branch="niche", codebook_sizes=(30, 90)),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        wt_mmd_prior=50.0, prior_std=1.0,
+                    ),
+                ),
+                hidden_channels=[64],
+            ),
+            enabled=True,
+        ),
+    },
+    "s36_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w64+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s36 sweep, variant 8: v7 spine WITHOUT mmd-prior — "
+            "strips the MMD-to-prior integration loss so it's a clean "
+            "no-batch-int test on the +enc-deeper+dec-w64 architecture."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[64]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_deeper(
+                        _patch_dual_mmd_prior(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            wt_mmd_prior=50.0, prior_std=1.0,
+                        ),
+                    ),
+                    hidden_channels=[64],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s36_v9_dualvq+rvq-both+decoder-cov+mmd-batch-w200+enc-deeper+dec-w32+knn16+sampler16+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s36 sweep, variant 9: re-run of s32_v7 (pairwise per-batch "
+            "MMD wt=200 as the integration mechanism, NO +adv) + "
+            "knn16 + sampler [16] under the new within-section BCE "
+            "adjacency scope. REQUIRES BLOB REBUILD (k=16 in "
+            "`n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+mmd-batch(w=200)",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_encoder_deeper(
+                            _patch_dual_mmd_batch(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                wt_mmd_batch=200.0,
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[16],
+            ),
+            enabled=True,
+        ),
+    },
+    "s36_v10_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s36 sweep, variant 10: v9 spine WITHOUT mmd-batch — "
+            "strips the pairwise-per-batch MMD integration loss so "
+            "it's a clean no-batch-int test on the +enc-deeper+dec-"
+            "w32+knn16+sampler16 architecture."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_sampler_neighbors(
+                    _patch_dual_graph_knn(
+                        _patch_dual_decoder_width(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_mmd_batch(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                    wt_mmd_batch=200.0,
+                                ),
+                            ),
+                            hidden_channels=[32],
+                        ),
+                        n_neighs=16,
+                    ),
+                    num_neighbors=[16],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s36_v11_dualvq+wide+rvq-both+decoder-cov+adv+adj-w3000+enc-shallow+dec-w256+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s36 sweep, variant 11: re-run of `+wide+adj-w3000+enc-"
+            "shallow+dec-w256` (2-layer GNN, very tight adjacency "
+            "weight 3000, shallow encoder [256], decoder [256]) under "
+            "the new within-section BCE adjacency scope."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+adj(weight=3000)", "+enc-shallow(mlp=[256])",
+            "+dec-w=[256]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_shallow(
+                    _patch_dual_adj_weight(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(
+                                        _patch_dual_wide(_BD()),
+                                        branch="niche", codebook_sizes=(30, 90),
+                                    ),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            alpha=1.0, wt_adv_batch=150.0,
+                        ),
+                        weight=3000.0,
+                    ),
+                    hidden_channels=[256],
+                ),
+                hidden_channels=[256],
+            ),
+            enabled=True,
+        ),
+    },
+    "s36_v12_dualvq+wide+rvq-both+decoder-cov+no-batch-int+adj-w3000+enc-shallow+dec-w256+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s36 sweep, variant 12: v11 spine WITHOUT adv. The +wide "
+            "+adj-w3000 winner family relied heavily on adversarial "
+            "integration historically; this tests whether dropping "
+            "adv and falling back to within-section-BCE + decoder-cov "
+            "still works on this geometry."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+adj(weight=3000)", "+enc-shallow(mlp=[256])",
+            "+dec-w=[256]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_shallow(
+                        _patch_dual_adj_weight(
+                            _patch_dual_adversarial(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _patch_dual_wide(_BD()),
+                                            branch="niche", codebook_sizes=(30, 90),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                alpha=1.0, wt_adv_batch=150.0,
+                            ),
+                            weight=3000.0,
+                        ),
+                        hidden_channels=[256],
+                    ),
+                    hidden_channels=[256],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s36_v13_dualvq+wide+rvq-both+decoder-cov+adv+adj-w3000+enc-shallow+dec-w32+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s36 sweep, variant 13: re-run of `+wide+adj-w3000+enc-"
+            "shallow+dec-w32` (same as v11 but with dec-w=[32] for "
+            "the extreme decoder bottleneck) under the new within-"
+            "section BCE adjacency scope."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+adj(weight=3000)", "+enc-shallow(mlp=[256])",
+            "+dec-w=[32]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_shallow(
+                    _patch_dual_adj_weight(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(
+                                        _patch_dual_wide(_BD()),
+                                        branch="niche", codebook_sizes=(30, 90),
+                                    ),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            alpha=1.0, wt_adv_batch=150.0,
+                        ),
+                        weight=3000.0,
+                    ),
+                    hidden_channels=[256],
+                ),
+                hidden_channels=[32],
+            ),
+            enabled=True,
+        ),
+    },
+    "s36_v14_dualvq+wide+rvq-both+decoder-cov+no-batch-int+adj-w3000+enc-shallow+dec-w32+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s36 sweep, variant 14: v13 spine WITHOUT adv. Same test "
+            "as v12 but on the dec-w32 sibling."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+adj(weight=3000)", "+enc-shallow(mlp=[256])",
+            "+dec-w=[32]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_shallow(
+                        _patch_dual_adj_weight(
+                            _patch_dual_adversarial(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _patch_dual_wide(_BD()),
+                                            branch="niche", codebook_sizes=(30, 90),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                alpha=1.0, wt_adv_batch=150.0,
+                            ),
+                            weight=3000.0,
+                        ),
+                        hidden_channels=[256],
+                    ),
+                    hidden_channels=[32],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s36_v15_dualvq+wide+rvq-both+decoder-cov+adv+enc-512+dec-w256+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s36 sweep, variant 15: re-run of s28_v1 (+wide + enc-"
+            "shallow [512] + dec-w256, 2-layer GNN, wide-shallow "
+            "encoder) under the new within-section BCE adjacency "
+            "scope."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+adversarial_batch(alpha=1.0, wt=150.0)",
+            "+enc-shallow(mlp=[512])  (latent dim = 512)",
+            "+dec-w=[256]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_decoder_width(
+                _patch_dual_encoder_shallow(
+                    _patch_dual_adversarial(
+                        _patch_dual_decoder_covariate(
+                            _patch_dual_rvq(
+                                _patch_dual_rvq(
+                                    _patch_dual_wide(_BD()),
+                                    branch="niche", codebook_sizes=(30, 90),
+                                ),
+                                branch="cell", codebook_sizes=(30, 90),
+                            ),
+                        ),
+                        alpha=1.0, wt_adv_batch=150.0,
+                    ),
+                    hidden_channels=[512],
+                ),
+                hidden_channels=[256],
+            ),
+            enabled=True,
+        ),
+    },
+    "s36_v16_dualvq+wide+rvq-both+decoder-cov+no-batch-int+enc-512+dec-w256+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s36 sweep, variant 16: v15 spine WITHOUT adv. Tests "
+            "the wide-shallow-512 encoder geometry under within-"
+            "section-BCE + decoder-cov alone."
+        ),
+        "patches": [
+            "+wide", "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-shallow(mlp=[512])  (latent dim = 512)",
+            "+dec-w=[256]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_decoder_width(
+                    _patch_dual_encoder_shallow(
+                        _patch_dual_adversarial(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(
+                                        _patch_dual_wide(_BD()),
+                                        branch="niche", codebook_sizes=(30, 90),
+                                    ),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            alpha=1.0, wt_adv_batch=150.0,
+                        ),
+                        hidden_channels=[512],
+                    ),
+                    hidden_channels=[256],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+
+    # ========================================================================
+    # s37 — 16 ablations on TWO no-batch-int spines under within-section BCE.
+    # ========================================================================
+    # Now that the adjacency-BCE fix (cross-section pairs excluded from
+    # negatives) makes the +no-batch-int siblings actually train sensibly,
+    # this sweep ablates the remaining knobs the user identified as most
+    # likely to matter:
+    #   (1) adjacency reconstruction weight `wt_adj_reconstr` (default 1000)
+    #   (2) encoder size BEFORE the cell codebook (shared encoder MLP)
+    #   (3) encoder size AFTER the cell codebook (cell + niche decoder MLP)
+    #   (4) cell-level NB weight `wt_attr_reconstr` (default 1.0)
+    #
+    # Two spines × 8 variants each:
+    #
+    # Spine A (v1..v8) — niche-neck decoupled architecture:
+    #   parent = `+enc-shallow+niche-neck-256-256+dec-w32+adv` minus adv,
+    #   plus +no-batch-int + within-sec BCE.
+    #
+    # Spine B (v9..v16) — densest spatial graph, mmd-batch parent minus
+    # mmd-batch:
+    #   parent = `s32_v7 (+enc-deeper+dec-w32+knn16+sampler16+mmd-batch)`
+    #   minus mmd-batch, plus +no-batch-int + within-sec BCE.
+    #
+    # Per-spine variants:
+    #   vN+0: control (no other knob change beyond +no-batch-int + within-sec)
+    #   vN+1: deeper/tighter encoder MLP (axis 2 — "before cell codebook")
+    #   vN+2: wider cell decoder        (axis 3 — "after cell codebook")
+    #   vN+3: narrower cell decoder     (axis 3 — "after cell codebook")
+    #   vN+4: adj weight 500            (axis 1 — weaker spatial pressure)
+    #   vN+5: adj weight 2000           (axis 1 — stronger spatial pressure)
+    #   vN+6: cell-NB weight 2.0        (axis 4 — stronger cell NB)
+    #   vN+7: combo of axes 1+2+4       (Pareto candidate)
+    #
+    # Submit via:
+    #   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v37
+    # Spine B variants v9..v16 REQUIRE the blob to contain k=16.
+
+    # ------------------------------------------------------------------------
+    # Spine A: niche-neck spine, no-batch-int, within-sec
+    # ------------------------------------------------------------------------
+    "s37_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-shallow+niche-neck-256-256+dec-w32+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s37 sweep, variant 1 (Spine A control): niche-neck "
+            "decoupled spine (enc-shallow [256] + niche-neck [256, "
+            "256] + dec-w[32]) with NO batch-integration loss (no "
+            "adv, no mmd-batch, no mmd-prior) under the new within-"
+            "section BCE adjacency scope. Control point for the rest "
+            "of Spine A (v2..v8 vary one knob each)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-shallow(mlp=[256])",
+            "+niche-neck(mlp=[256, 256])",
+            "+dec-w=[32]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_decoder_width(
+                    _patch_dual_niche_neck(
+                        _patch_dual_encoder_shallow(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            hidden_channels=[256],
+                        ),
+                        hidden_channels=[256, 256],
+                    ),
+                    hidden_channels=[32],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s37_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-256+niche-neck-256-256+dec-w32+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s37 sweep, variant 2 (Spine A, axis 2 — encoder BEFORE "
+            "cell codebook): deeper shared encoder MLP `[256, 256]` "
+            "(2 hidden of 256, vs the parent's `[256]`). Tests "
+            "whether more cell-branch encoder capacity BEFORE the "
+            "cell-VQ helps the codebook see a richer pre-quantised "
+            "representation."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-shallow(mlp=[256, 256])",
+            "+niche-neck(mlp=[256, 256])",
+            "+dec-w=[32]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_decoder_width(
+                    _patch_dual_niche_neck(
+                        _patch_dual_encoder_shallow(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            hidden_channels=[256, 256],
+                        ),
+                        hidden_channels=[256, 256],
+                    ),
+                    hidden_channels=[32],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s37_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-shallow+niche-neck-256-256-256+dec-w32+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s37 sweep, variant 3 (Spine A, axis 3 — niche-side "
+            "encoder AFTER cell codebook): DEEPER niche-neck "
+            "`[256, 256, 256]` (3 hidden of 256, vs the parent's "
+            "`[256, 256]` = 2 hidden). Adds a layer of capacity to "
+            "the niche-only path AFTER the z_mlp tap into the cell "
+            "VQ — gives the GNN richer input without changing the "
+            "shared encoder or the cell-side path. Output dim stays "
+            "256 so the GNN's input dim is unchanged."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-shallow(mlp=[256])",
+            "+niche-neck(mlp=[256, 256, 256])",
+            "+dec-w=[32]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_decoder_width(
+                    _patch_dual_niche_neck(
+                        _patch_dual_encoder_shallow(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            hidden_channels=[256],
+                        ),
+                        hidden_channels=[256, 256, 256],
+                    ),
+                    hidden_channels=[32],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s37_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-shallow+niche-neck-256+dec-w32+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s37 sweep, variant 4 (Spine A, axis 3 — niche-side "
+            "encoder AFTER cell codebook): SHALLOWER niche-neck "
+            "`[256]` (1 hidden of 256, vs the parent's `[256, 256]` "
+            "= 2 hidden). Drops a layer of capacity from the niche-"
+            "only path. Tests whether less niche-side post-tap "
+            "capacity hurts niche metrics — also a cheaper baseline "
+            "to compare against v3."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-shallow(mlp=[256])",
+            "+niche-neck(mlp=[256])",
+            "+dec-w=[32]",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_decoder_width(
+                    _patch_dual_niche_neck(
+                        _patch_dual_encoder_shallow(
+                            _patch_dual_decoder_covariate(
+                                _patch_dual_rvq(
+                                    _patch_dual_rvq(_BD(),
+                                        branch="niche", codebook_sizes=(30, 90)),
+                                    branch="cell", codebook_sizes=(30, 90),
+                                ),
+                            ),
+                            hidden_channels=[256],
+                        ),
+                        hidden_channels=[256],
+                    ),
+                    hidden_channels=[32],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s37_v5_dualvq+rvq-both+decoder-cov+no-batch-int+enc-shallow+niche-neck-256-256+dec-w32+adj-w500+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s37 sweep, variant 5 (Spine A, axis 1 — adjacency "
+            "weight): WEAKER cosine BCE adjacency loss "
+            "`wt_adj_reconstr=500` (vs default 1000). Tests whether "
+            "the previous default was too strong now that "
+            "cross-section pairs are masked out."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-shallow(mlp=[256])",
+            "+niche-neck(mlp=[256, 256])",
+            "+dec-w=[32]",
+            "+wt_adj_reconstr=500",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_adj_weight(
+                    _patch_dual_decoder_width(
+                        _patch_dual_niche_neck(
+                            _patch_dual_encoder_shallow(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                hidden_channels=[256],
+                            ),
+                            hidden_channels=[256, 256],
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    weight=500.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s37_v6_dualvq+rvq-both+decoder-cov+no-batch-int+enc-shallow+niche-neck-256-256+dec-w32+adj-w2000+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s37 sweep, variant 6 (Spine A, axis 1 — adjacency "
+            "weight): STRONGER cosine BCE adjacency loss "
+            "`wt_adj_reconstr=2000` (vs default 1000). With cross-"
+            "section pairs now masked, stronger spatial pressure may "
+            "be safe / beneficial."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-shallow(mlp=[256])",
+            "+niche-neck(mlp=[256, 256])",
+            "+dec-w=[32]",
+            "+wt_adj_reconstr=2000",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_adj_weight(
+                    _patch_dual_decoder_width(
+                        _patch_dual_niche_neck(
+                            _patch_dual_encoder_shallow(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                hidden_channels=[256],
+                            ),
+                            hidden_channels=[256, 256],
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    weight=2000.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s37_v7_dualvq+rvq-both+decoder-cov+no-batch-int+enc-shallow+niche-neck-256-256+dec-w32+cell-w2.0+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s37 sweep, variant 7 (Spine A, axis 4 — cell-NB "
+            "weight): STRONGER cell-level NB recon "
+            "`wt_attr_reconstr=2.0` (vs default 1.0). Sharpens the "
+            "cell-branch reconstruction pressure — expected to lift "
+            "cell-type NMI."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-shallow(mlp=[256])",
+            "+niche-neck(mlp=[256, 256])",
+            "+dec-w=[32]",
+            "+wt_attr_reconstr=2.0",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_attr_recon_weight(
+                    _patch_dual_decoder_width(
+                        _patch_dual_niche_neck(
+                            _patch_dual_encoder_shallow(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                hidden_channels=[256],
+                            ),
+                            hidden_channels=[256, 256],
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    weight=2.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s37_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-256+niche-neck-256-256+dec-w32+cell-w2.0+adj-w2000+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s37 sweep, variant 8 (Spine A combo): stacks v2 (deeper "
+            "encoder `[256, 256]`), v7 (cell-w=2.0), and v6 (adj-"
+            "w=2000) on the niche-neck no-batch-int spine. Tests "
+            "whether the individually-promising axes are additive."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-shallow(mlp=[256, 256])",
+            "+niche-neck(mlp=[256, 256])",
+            "+dec-w=[32]",
+            "+wt_attr_reconstr=2.0", "+wt_adj_reconstr=2000",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_adj_weight(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_decoder_width(
+                            _patch_dual_niche_neck(
+                                _patch_dual_encoder_shallow(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                    hidden_channels=[256, 256],
+                                ),
+                                hidden_channels=[256, 256],
+                            ),
+                            hidden_channels=[32],
+                        ),
+                        weight=2.0,
+                    ),
+                    weight=2000.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+
+    # ------------------------------------------------------------------------
+    # Spine B: enc-deeper + knn16 + sampler16, no-batch-int, within-sec
+    # ------------------------------------------------------------------------
+    "s37_v9_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s37 sweep, variant 9 (Spine B control): s32_v7 spine "
+            "(`+enc-deeper+dec-w32+knn16+sampler16`) with NO batch-"
+            "integration loss (mmd-batch stripped) under the new "
+            "within-section BCE adjacency scope. Control point for "
+            "the rest of Spine B (v10..v16 vary one knob each).\n\n"
+            "REQUIRES BLOB REBUILD (k=16 in `n_neighs_list`)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_sampler_neighbors(
+                    _patch_dual_graph_knn(
+                        _patch_dual_decoder_width(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(_BD(),
+                                            branch="niche", codebook_sizes=(30, 90)),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                            ),
+                            hidden_channels=[32],
+                        ),
+                        n_neighs=16,
+                    ),
+                    num_neighbors=[16],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s37_v10_dualvq+rvq-both+decoder-cov+no-batch-int+enc-200-200-128+gnn-h128+dec-w32+knn16+sampler16+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s37 sweep, variant 10 (Spine B, axis 2 — encoder "
+            "BEFORE cell codebook): TIGHTER shared encoder "
+            "`[200, 200, 128]` + GNN h=128 (vs the parent's "
+            "`[400, 400, 256]` + h=256). Halves the latent dim — "
+            "tests whether a smaller pre-cell-VQ representation is "
+            "enough now that within-section BCE handles integration."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[200, 200, 128])",
+            "+gnn-h=128",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_sampler_neighbors(
+                    _patch_dual_graph_knn(
+                        _patch_dual_decoder_width(
+                            _patch_dual_gnn_hidden(
+                                _patch_dual_encoder_deeper(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                    hidden_channels=[200, 200, 128],
+                                ),
+                                hidden=128,
+                            ),
+                            hidden_channels=[32],
+                        ),
+                        n_neighs=16,
+                    ),
+                    num_neighbors=[16],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s37_v11_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+niche-neck-256+dec-w32+knn16+sampler16+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s37 sweep, variant 11 (Spine B, axis 3 — niche-side "
+            "encoder AFTER cell codebook): ADD a niche-neck `[256]` "
+            "(1 hidden of 256). Spine B has no niche-neck by "
+            "default; introducing one decouples the niche-side "
+            "path from the cell-VQ input. Tests whether decoupling "
+            "alone (a mild form of the Spine A architecture) lifts "
+            "niche / cell metrics on this spine."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+niche-neck(mlp=[256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_sampler_neighbors(
+                    _patch_dual_graph_knn(
+                        _patch_dual_decoder_width(
+                            _patch_dual_niche_neck(
+                                _patch_dual_encoder_deeper(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                ),
+                                hidden_channels=[256],
+                            ),
+                            hidden_channels=[32],
+                        ),
+                        n_neighs=16,
+                    ),
+                    num_neighbors=[16],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s37_v12_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+niche-neck-256-256+dec-w32+knn16+sampler16+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s37 sweep, variant 12 (Spine B, axis 3 — niche-side "
+            "encoder AFTER cell codebook): ADD a DEEPER niche-neck "
+            "`[256, 256]` (2 hidden of 256). Matches Spine A's "
+            "default niche-neck depth on the Spine B knn16+sampler16 "
+            "spatial setup."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+niche-neck(mlp=[256, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_sampler_neighbors(
+                    _patch_dual_graph_knn(
+                        _patch_dual_decoder_width(
+                            _patch_dual_niche_neck(
+                                _patch_dual_encoder_deeper(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                ),
+                                hidden_channels=[256, 256],
+                            ),
+                            hidden_channels=[32],
+                        ),
+                        n_neighs=16,
+                    ),
+                    num_neighbors=[16],
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s37_v13_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+adj-w500+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s37 sweep, variant 13 (Spine B, axis 1 — adjacency "
+            "weight): WEAKER cosine BCE adjacency loss "
+            "`wt_adj_reconstr=500`."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_adj_reconstr=500",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_adj_weight(
+                    _patch_dual_sampler_neighbors(
+                        _patch_dual_graph_knn(
+                            _patch_dual_decoder_width(
+                                _patch_dual_encoder_deeper(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                ),
+                                hidden_channels=[32],
+                            ),
+                            n_neighs=16,
+                        ),
+                        num_neighbors=[16],
+                    ),
+                    weight=500.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s37_v14_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+adj-w2000+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s37 sweep, variant 14 (Spine B, axis 1 — adjacency "
+            "weight): STRONGER cosine BCE adjacency loss "
+            "`wt_adj_reconstr=2000`."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_adj_reconstr=2000",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_adj_weight(
+                    _patch_dual_sampler_neighbors(
+                        _patch_dual_graph_knn(
+                            _patch_dual_decoder_width(
+                                _patch_dual_encoder_deeper(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                ),
+                                hidden_channels=[32],
+                            ),
+                            n_neighs=16,
+                        ),
+                        num_neighbors=[16],
+                    ),
+                    weight=2000.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s37_v15_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w2.0+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s37 sweep, variant 15 (Spine B, axis 4 — cell-NB "
+            "weight): STRONGER cell-level NB recon "
+            "`wt_attr_reconstr=2.0`."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=2.0",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_attr_recon_weight(
+                    _patch_dual_sampler_neighbors(
+                        _patch_dual_graph_knn(
+                            _patch_dual_decoder_width(
+                                _patch_dual_encoder_deeper(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                ),
+                                hidden_channels=[32],
+                            ),
+                            n_neighs=16,
+                        ),
+                        num_neighbors=[16],
+                    ),
+                    weight=2.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s37_v16_dualvq+rvq-both+decoder-cov+no-batch-int+enc-200-200-128+gnn-h128+dec-w32+knn16+sampler16+cell-w2.0+adj-w2000+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s37 sweep, variant 16 (Spine B combo): stacks v10 "
+            "(tighter encoder `[200, 200, 128]` + gnn-h=128), v15 "
+            "(cell-w=2.0), and v14 (adj-w=2000) on the +knn16+"
+            "sampler16 no-batch-int spine."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[200, 200, 128])",
+            "+gnn-h=128",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=2.0", "+wt_adj_reconstr=2000",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_adj_weight(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_gnn_hidden(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[200, 200, 128],
+                                        ),
+                                        hidden=128,
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=2.0,
+                    ),
+                    weight=2000.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+
+    # ========================================================================
+    # s38 — 16 ablations around the s37_v15 base (no-batch-int + cell-w2.0
+    # on the +enc-deeper+dec-w32+knn16+sampler16 spine, under within-section
+    # BCE).
+    # ========================================================================
+    # Base architecture (= s37_v15):
+    #   RVQ (30, 90) on both branches, decoder-cov embed=16,
+    #   NO batch-integration loss (no adv / mmd-batch / mmd-prior),
+    #   encoder MLP [400, 400, 256], 1-layer SAGE GNN h=256,
+    #   decoders [32], k=16 spatial graph + sampler [16],
+    #   wt_attr_reconstr = 2.0, adj_within_section_only = True.
+    #
+    # Axes (each variant changes ONE knob — combos at v15/v16):
+    #   v1-v5  : encoder dimensions & sizes (axis 1)
+    #   v6-v11 : loss weights — adjacency / cell-NB / nbr-NB (axis 2)
+    #   v12-v14: batch_size + learning rate (sqrt-scaled pairs)   (axis 3)
+    #   v15-v16: Pareto combos
+    #
+    # Submit via:
+    #   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v38
+    # REQUIRES BLOB REBUILD if the on-disk blob is missing k=16
+    # (`make_dataset_blob_config()` ships `n_neighs_list = [6, 8, 12, 16]`).
+
+    # ------------------------------------------------------------------------
+    # Axis 1 — encoder dimensions & sizes
+    # ------------------------------------------------------------------------
+    "s38_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-256-64+gnn-h64+dec-w32+knn16+sampler16+cell-w2.0+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s38 sweep, variant 1 (axis 1 — encoder, latent 64): "
+            "encoder MLP `[256, 256, 64]` (3 hidden, funnels to "
+            "latent 64) + GNN h=64. TIGHTEST latent in the sweep — "
+            "quarters the codebook embedding dim vs the base's 256. "
+            "Tests how far we can shrink before reconstruction or "
+            "niche metrics degrade."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[256, 256, 64])", "+gnn-h=64",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=2.0",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_attr_recon_weight(
+                    _patch_dual_sampler_neighbors(
+                        _patch_dual_graph_knn(
+                            _patch_dual_decoder_width(
+                                _patch_dual_gnn_hidden(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                        hidden_channels=[256, 256, 64],
+                                    ),
+                                    hidden=64,
+                                ),
+                                hidden_channels=[32],
+                            ),
+                            n_neighs=16,
+                        ),
+                        num_neighbors=[16],
+                    ),
+                    weight=2.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s38_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-256-128+gnn-h128+dec-w32+knn16+sampler16+cell-w2.0+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s38 sweep, variant 2 (axis 1 — encoder, latent 128): "
+            "encoder MLP `[256, 256, 128]` (3 hidden, funnels to "
+            "latent 128) + GNN h=128. Halves the codebook embedding "
+            "dim vs the base's 256."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[256, 256, 128])", "+gnn-h=128",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=2.0",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_attr_recon_weight(
+                    _patch_dual_sampler_neighbors(
+                        _patch_dual_graph_knn(
+                            _patch_dual_decoder_width(
+                                _patch_dual_gnn_hidden(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                        hidden_channels=[256, 256, 128],
+                                    ),
+                                    hidden=128,
+                                ),
+                                hidden_channels=[32],
+                            ),
+                            n_neighs=16,
+                        ),
+                        num_neighbors=[16],
+                    ),
+                    weight=2.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s38_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-256-256+dec-w32+knn16+sampler16+cell-w2.0+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s38 sweep, variant 3 (axis 1 — encoder, latent 256): "
+            "encoder MLP `[256, 256, 256]` (uniform-width 3-layer "
+            "trunk at 256, vs the base's `[400, 400, 256]` whose "
+            "first two layers are 400-wide). GNN h=256 (default) "
+            "matches latent. Tests whether the 400-wide intermediate "
+            "layers are necessary or a uniform 256-wide trunk works."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[256, 256, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=2.0",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_attr_recon_weight(
+                    _patch_dual_sampler_neighbors(
+                        _patch_dual_graph_knn(
+                            _patch_dual_decoder_width(
+                                _patch_dual_encoder_deeper(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                    hidden_channels=[256, 256, 256],
+                                ),
+                                hidden_channels=[32],
+                            ),
+                            n_neighs=16,
+                        ),
+                        num_neighbors=[16],
+                    ),
+                    weight=2.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s38_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-512-512-512+gnn-h512+dec-w32+knn16+sampler16+cell-w2.0+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s38 sweep, variant 4 (axis 1 — encoder, latent 512): "
+            "encoder MLP `[512, 512, 512]` (uniform-width 3-layer "
+            "at 512) + GNN h=512. WIDEST latent in this sweep — "
+            "doubles the codebook embedding dim vs the base's 256. "
+            "Tests whether more representational room helps cell-"
+            "type / niche separation."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[512, 512, 512])", "+gnn-h=512",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=2.0",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_attr_recon_weight(
+                    _patch_dual_sampler_neighbors(
+                        _patch_dual_graph_knn(
+                            _patch_dual_decoder_width(
+                                _patch_dual_gnn_hidden(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                        hidden_channels=[512, 512, 512],
+                                    ),
+                                    hidden=512,
+                                ),
+                                hidden_channels=[32],
+                            ),
+                            n_neighs=16,
+                        ),
+                        num_neighbors=[16],
+                    ),
+                    weight=2.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s38_v5_dualvq+rvq-both+decoder-cov+no-batch-int+enc-shallow+dec-w32+knn16+sampler16+cell-w2.0+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s38 sweep, variant 5 (axis 1 — encoder, depth = 1): "
+            "SHALLOW encoder `[256]` (1 hidden layer of 256, latent "
+            "dim 256). Depth comparison vs v3 (`[256, 256, 256]`, "
+            "3 layers at the same latent): does the 3-layer trunk "
+            "carry information the 1-layer trunk loses?"
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-shallow(mlp=[256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=2.0",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_attr_recon_weight(
+                    _patch_dual_sampler_neighbors(
+                        _patch_dual_graph_knn(
+                            _patch_dual_decoder_width(
+                                _patch_dual_encoder_shallow(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                    hidden_channels=[256],
+                                ),
+                                hidden_channels=[32],
+                            ),
+                            n_neighs=16,
+                        ),
+                        num_neighbors=[16],
+                    ),
+                    weight=2.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+
+    # ------------------------------------------------------------------------
+    # Axis 2 — loss weights (adjacency / cell-NB / nbr-NB)
+    # ------------------------------------------------------------------------
+    "s38_v6_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w2.0+adj-w500+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s38 sweep, variant 6 (axis 2 — adjacency weight): "
+            "WEAKER cosine BCE adjacency `wt_adj_reconstr=500` "
+            "(vs default 1000). Tests whether 1000 is too strong "
+            "on the no-batch-int spine."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=2.0", "+wt_adj_reconstr=500",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_adj_weight(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=2.0,
+                    ),
+                    weight=500.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s38_v7_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w2.0+adj-w2000+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s38 sweep, variant 7 (axis 2 — adjacency weight): "
+            "STRONGER cosine BCE adjacency `wt_adj_reconstr=2000` "
+            "(vs default 1000). With cross-section pairs masked, "
+            "stronger spatial pressure may be safe / beneficial."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=2.0", "+wt_adj_reconstr=2000",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_adj_weight(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=2.0,
+                    ),
+                    weight=2000.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s38_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w3.0+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s38 sweep, variant 8 (axis 2 — cell-NB weight): "
+            "STRONGER cell NB recon `wt_attr_reconstr=3.0` (vs the "
+            "base's 2.0). Pushes the cell-level reconstruction "
+            "harder — should sharpen cell-type NMI."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=3.0",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_attr_recon_weight(
+                    _patch_dual_sampler_neighbors(
+                        _patch_dual_graph_knn(
+                            _patch_dual_decoder_width(
+                                _patch_dual_encoder_deeper(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                ),
+                                hidden_channels=[32],
+                            ),
+                            n_neighs=16,
+                        ),
+                        num_neighbors=[16],
+                    ),
+                    weight=3.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s38_v9_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s38 sweep, variant 9 (axis 2 — cell-NB weight): "
+            "VERY STRONG cell NB recon `wt_attr_reconstr=5.0` (vs "
+            "the base's 2.0). Aggressive bump — expect cell-NMI to "
+            "improve at the possible cost of niche metrics."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=5.0",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_attr_recon_weight(
+                    _patch_dual_sampler_neighbors(
+                        _patch_dual_graph_knn(
+                            _patch_dual_decoder_width(
+                                _patch_dual_encoder_deeper(
+                                    _patch_dual_decoder_covariate(
+                                        _patch_dual_rvq(
+                                            _patch_dual_rvq(_BD(),
+                                                branch="niche", codebook_sizes=(30, 90)),
+                                            branch="cell", codebook_sizes=(30, 90),
+                                        ),
+                                    ),
+                                ),
+                                hidden_channels=[32],
+                            ),
+                            n_neighs=16,
+                        ),
+                        num_neighbors=[16],
+                    ),
+                    weight=5.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s38_v10_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w2.0+nbr-w0.5+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s38 sweep, variant 10 (axis 2 — niche NB weight): "
+            "WEAKER niche NB recon `wt_attr_reconstr_nbr=0.5` (vs "
+            "default 1.0). Cell-w stays at 2.0. Freeing the niche "
+            "embedding from per-batch nbr-gene means tends to lift "
+            "niche-side iLISI."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=2.0", "+wt_attr_reconstr_nbr=0.5",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_attr_recon_nbr_weight(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=2.0,
+                    ),
+                    weight=0.5,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s38_v11_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w2.0+nbr-w2.0+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s38 sweep, variant 11 (axis 2 — niche NB weight): "
+            "STRONGER niche NB recon `wt_attr_reconstr_nbr=2.0` "
+            "(vs default 1.0). Symmetric with cell-w=2.0 — matched "
+            "pressure on cell and niche branches."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=2.0", "+wt_attr_reconstr_nbr=2.0",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_attr_recon_nbr_weight(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=2.0,
+                    ),
+                    weight=2.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+
+    # ------------------------------------------------------------------------
+    # Axis 3 — batch size + learning rate (sqrt-scaled pairs)
+    # ------------------------------------------------------------------------
+    "s38_v12_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w2.0+bs512+lr7e-4+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s38 sweep, variant 12 (axis 3 — bs+lr): batch_size=512, "
+            "lr=7e-4 (sqrt-scaled 2× the base's bs=256/lr=5e-4). "
+            "Larger batch = smoother per-step gradient; sqrt-lr keeps "
+            "the per-sample gradient roughly constant."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=2.0",
+            "+batch_size=512", "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=2.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s38_v13_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w2.0+bs1024+lr1e-3+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s38 sweep, variant 13 (axis 3 — bs+lr): batch_size=1024, "
+            "lr=1e-3 (sqrt-scaled 4× the base's bs=256/lr=5e-4). "
+            "Per s22 sweep history, sqrt scaling at this level worked "
+            "on the +wide spine; this re-tests on the no-batch-int "
+            "spine."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=2.0",
+            "+batch_size=1024", "+lr=1e-3",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=2.0,
+                    ),
+                    batch_size=1024, lr=1e-3,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s38_v14_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w2.0+bs128+lr3.5e-4+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s38 sweep, variant 14 (axis 3 — bs+lr): batch_size=128, "
+            "lr=3.5e-4 (sqrt-scaled 0.5× the base's bs=256/lr=5e-4). "
+            "Smaller batch + smaller lr — slower / noisier gradient "
+            "but more update steps per epoch. Useful if the base's "
+            "batch=256 is too smooth for the codebook to settle into "
+            "the right partition."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=2.0",
+            "+batch_size=128", "+lr=3.5e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_encoder_deeper(
+                                        _patch_dual_decoder_covariate(
+                                            _patch_dual_rvq(
+                                                _patch_dual_rvq(_BD(),
+                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                branch="cell", codebook_sizes=(30, 90),
+                                            ),
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=2.0,
+                    ),
+                    batch_size=128, lr=3.5e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+
+    # ------------------------------------------------------------------------
+    # Pareto combos
+    # ------------------------------------------------------------------------
+    "s38_v15_dualvq+rvq-both+decoder-cov+no-batch-int+enc-200-200-128+gnn-h128+dec-w32+knn16+sampler16+cell-w3.0+adj-w2000+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s38 sweep, variant 15 (combo): stacks v3 (tighter "
+            "encoder [200, 200, 128] + gnn-h128) + v7 (adj-w=2000) "
+            "+ v8 (cell-w=3.0) on the base spine. Pareto candidate "
+            "combining the most-promising single-knob bumps."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[200, 200, 128])", "+gnn-h=128",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=3.0", "+wt_adj_reconstr=2000",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_adj_weight(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_gnn_hidden(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(_BD(),
+                                                        branch="niche", codebook_sizes=(30, 90)),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[200, 200, 128],
+                                        ),
+                                        hidden=128,
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=3.0,
+                    ),
+                    weight=2000.0,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
+    "s38_v16_dualvq+rvq-both+decoder-cov+no-batch-int+enc-200-200-128+gnn-h128+dec-w32+knn16+sampler16+cell-w3.0+nbr-w0.5+adj-w2000+bs512+lr7e-4+within-sec+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s38 sweep, variant 16 (kitchen-sink combo): tighter "
+            "encoder [200, 200, 128] + gnn-h128 + cell-w=3.0 + "
+            "nbr-w=0.5 + adj-w=2000 + bs=512 + lr=7e-4. Stacks all "
+            "of v3, v7, v8, v10, v12 — if these axes are mostly "
+            "additive, this should be the Pareto winner of the "
+            "sweep."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[200, 200, 128])", "+gnn-h=128",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=3.0", "+wt_attr_reconstr_nbr=0.5",
+            "+wt_adj_reconstr=2000",
+            "+batch_size=512", "+lr=7e-4",
+            "+adj_within_section_only=True",
+        ],
+        "build": lambda: _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_adj_weight(
+                        _patch_dual_attr_recon_nbr_weight(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_gnn_hidden(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[200, 200, 128],
+                                                ),
+                                                hidden=128,
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=3.0,
+                            ),
+                            weight=0.5,
+                        ),
+                        weight=2000.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+    },
 }
 
 
@@ -16056,6 +19485,132 @@ DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v35"] = [
     "s35_v6_dualvq+cvq-both-30-60-60+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
     "s35_v7_dualvq+cvq-both-30-60-90+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
     "s35_v8_dualvq+cvq-both-30-90-90+decoder-cov+adv+enc-deeper+dec-w32+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 36 — 8 best-previous-run baselines × {with batch-int, no batch-int}
+# under the new `adj_within_section_only=True` BCE adjacency scope.
+#
+# Reads off:
+#   (a) "Did each previous winner survive the BCE-scope change?"
+#       (compare odd v_i to its pre-s36 sibling run.)
+#   (b) "Is the within-section BCE scope alone enough to integrate
+#        batches WITHOUT an explicit adv / mmd-batch / mmd-prior loss?"
+#       (compare even v_i to its odd partner.)
+#
+# Pairs (with-batch-int / no-batch-int):
+#   v1  / v2   — enc-deeper+dec-w32                      (mmb-smb best baseline)
+#   v3  / v4   — enc-deeper+dec-w32+knn16+sampler8       (densest spatial graph)
+#   v5  / v6   — enc-200-200-128+gnn-h128+dec-w32+knn12+sampler12  (s34_v4 spine)
+#   v7  / v8   — enc-deeper+dec-w64 + mmd-prior          (NicheCompass-style)
+#   v9  / v10  — enc-deeper+dec-w32+knn16+sampler16 + mmd-batch    (s32_v7 spine)
+#   v11 / v12  — wide+adj-w3000+enc-shallow+dec-w256
+#   v13 / v14  — wide+adj-w3000+enc-shallow+dec-w32
+#   v15 / v16  — wide+enc-512+dec-w256                   (s28_v1 spine)
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v36
+#
+# Note: v3-v10 use +knn12 or +knn16 + matching sampler — they REQUIRE the
+# blob to contain those k values. `make_dataset_blob_config()` ships
+# `n_neighs_list = [6, 8, 12, 16]`; rebuild the blob if needed.
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v36"] = [
+    "s36_v1_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+within-sec+mmb0-1b_smb1-1b_1p",
+    "s36_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+within-sec+mmb0-1b_smb1-1b_1p",
+    "s36_v3_dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+knn16+sampler8+within-sec+mmb0-1b_smb1-1b_1p",
+    "s36_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler8+within-sec+mmb0-1b_smb1-1b_1p",
+    "s36_v5_dualvq+rvq-both+decoder-cov+adv+enc-200-200-128+gnn-h128+dec-w32+knn12+sampler12+within-sec+mmb0-1b_smb1-1b_1p",
+    "s36_v6_dualvq+rvq-both+decoder-cov+no-batch-int+enc-200-200-128+gnn-h128+dec-w32+knn12+sampler12+within-sec+mmb0-1b_smb1-1b_1p",
+    "s36_v7_dualvq+rvq-both+decoder-cov+mmd-prior-w50+enc-deeper+dec-w64+within-sec+mmb0-1b_smb1-1b_1p",
+    "s36_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w64+within-sec+mmb0-1b_smb1-1b_1p",
+    "s36_v9_dualvq+rvq-both+decoder-cov+mmd-batch-w200+enc-deeper+dec-w32+knn16+sampler16+within-sec+mmb0-1b_smb1-1b_1p",
+    "s36_v10_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+within-sec+mmb0-1b_smb1-1b_1p",
+    "s36_v11_dualvq+wide+rvq-both+decoder-cov+adv+adj-w3000+enc-shallow+dec-w256+within-sec+mmb0-1b_smb1-1b_1p",
+    "s36_v12_dualvq+wide+rvq-both+decoder-cov+no-batch-int+adj-w3000+enc-shallow+dec-w256+within-sec+mmb0-1b_smb1-1b_1p",
+    "s36_v13_dualvq+wide+rvq-both+decoder-cov+adv+adj-w3000+enc-shallow+dec-w32+within-sec+mmb0-1b_smb1-1b_1p",
+    "s36_v14_dualvq+wide+rvq-both+decoder-cov+no-batch-int+adj-w3000+enc-shallow+dec-w32+within-sec+mmb0-1b_smb1-1b_1p",
+    "s36_v15_dualvq+wide+rvq-both+decoder-cov+adv+enc-512+dec-w256+within-sec+mmb0-1b_smb1-1b_1p",
+    "s36_v16_dualvq+wide+rvq-both+decoder-cov+no-batch-int+enc-512+dec-w256+within-sec+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 37 — 16 ablations on TWO no-batch-int spines under within-section BCE.
+#
+# Now that the adjacency-BCE fix (cross-section pairs excluded from
+# negatives) means +no-batch-int variants train sensibly, ablate the four
+# knobs the user identified as most likely to matter:
+#   axis 1: adjacency reconstruction weight (`wt_adj_reconstr`)
+#   axis 2: encoder size BEFORE the cell codebook (shared encoder MLP)
+#   axis 3: encoder size AFTER the cell codebook (cell + niche decoder MLP)
+#   axis 4: cell-level NB weight (`wt_attr_reconstr`)
+#
+# Spine A (v1..v8): niche-neck decoupled spine, no batch-int.
+# Spine B (v9..v16): +enc-deeper+dec-w32+knn16+sampler16 spine, no batch-int.
+#
+# Per-spine layout:
+#   v0 control   |  v1 deeper-encoder   |  v2 wider-dec   |  v3 narrower-dec
+#   v4 adj-w500  |  v5 adj-w2000        |  v6 cell-w2.0   |  v7 combo
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v37
+#
+# Spine B variants (v9..v16) REQUIRE the blob to contain k=16. Rebuild with
+# `python examples/run_squint.py --build-blob` if needed.
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v37"] = [
+    # Spine A: niche-neck spine
+    "s37_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-shallow+niche-neck-256-256+dec-w32+within-sec+mmb0-1b_smb1-1b_1p",
+    "s37_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-256+niche-neck-256-256+dec-w32+within-sec+mmb0-1b_smb1-1b_1p",
+    "s37_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-shallow+niche-neck-256-256-256+dec-w32+within-sec+mmb0-1b_smb1-1b_1p",
+    "s37_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-shallow+niche-neck-256+dec-w32+within-sec+mmb0-1b_smb1-1b_1p",
+    "s37_v5_dualvq+rvq-both+decoder-cov+no-batch-int+enc-shallow+niche-neck-256-256+dec-w32+adj-w500+within-sec+mmb0-1b_smb1-1b_1p",
+    "s37_v6_dualvq+rvq-both+decoder-cov+no-batch-int+enc-shallow+niche-neck-256-256+dec-w32+adj-w2000+within-sec+mmb0-1b_smb1-1b_1p",
+    "s37_v7_dualvq+rvq-both+decoder-cov+no-batch-int+enc-shallow+niche-neck-256-256+dec-w32+cell-w2.0+within-sec+mmb0-1b_smb1-1b_1p",
+    "s37_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-256+niche-neck-256-256+dec-w32+cell-w2.0+adj-w2000+within-sec+mmb0-1b_smb1-1b_1p",
+    # Spine B: enc-deeper + knn16 + sampler16 spine
+    "s37_v9_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+within-sec+mmb0-1b_smb1-1b_1p",
+    "s37_v10_dualvq+rvq-both+decoder-cov+no-batch-int+enc-200-200-128+gnn-h128+dec-w32+knn16+sampler16+within-sec+mmb0-1b_smb1-1b_1p",
+    "s37_v11_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+niche-neck-256+dec-w32+knn16+sampler16+within-sec+mmb0-1b_smb1-1b_1p",
+    "s37_v12_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+niche-neck-256-256+dec-w32+knn16+sampler16+within-sec+mmb0-1b_smb1-1b_1p",
+    "s37_v13_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+adj-w500+within-sec+mmb0-1b_smb1-1b_1p",
+    "s37_v14_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+adj-w2000+within-sec+mmb0-1b_smb1-1b_1p",
+    "s37_v15_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w2.0+within-sec+mmb0-1b_smb1-1b_1p",
+    "s37_v16_dualvq+rvq-both+decoder-cov+no-batch-int+enc-200-200-128+gnn-h128+dec-w32+knn16+sampler16+cell-w2.0+adj-w2000+within-sec+mmb0-1b_smb1-1b_1p",
+]
+
+# Sweep 38 — 16 ablations around the s37_v15 base:
+#   base = no-batch-int + enc-deeper [400, 400, 256] + dec-w[32] + knn16 +
+#          sampler [16] + cell-w=2.0 + within-sec BCE.
+#
+# Axes:
+#   v1-v5  : encoder dimensions & sizes (axis 1)
+#   v6-v11 : loss weights (axis 2 — adj / cell-NB / nbr-NB)
+#   v12-v14: batch_size + learning rate (axis 3, sqrt-scaled)
+#   v15-v16: Pareto combos
+#
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v38
+#
+# REQUIRES BLOB REBUILD if k=16 isn't already in the on-disk blob
+# (`make_dataset_blob_config()` ships `n_neighs_list = [6, 8, 12, 16]`).
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v38"] = [
+    # Axis 1: encoder dimensions (latent 64 / 128 / 256 / 512) + depth control
+    "s38_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-256-64+gnn-h64+dec-w32+knn16+sampler16+cell-w2.0+within-sec+mmb0-1b_smb1-1b_1p",
+    "s38_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-256-128+gnn-h128+dec-w32+knn16+sampler16+cell-w2.0+within-sec+mmb0-1b_smb1-1b_1p",
+    "s38_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-256-256-256+dec-w32+knn16+sampler16+cell-w2.0+within-sec+mmb0-1b_smb1-1b_1p",
+    "s38_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-512-512-512+gnn-h512+dec-w32+knn16+sampler16+cell-w2.0+within-sec+mmb0-1b_smb1-1b_1p",
+    "s38_v5_dualvq+rvq-both+decoder-cov+no-batch-int+enc-shallow+dec-w32+knn16+sampler16+cell-w2.0+within-sec+mmb0-1b_smb1-1b_1p",
+    # Axis 2: loss weights
+    "s38_v6_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w2.0+adj-w500+within-sec+mmb0-1b_smb1-1b_1p",
+    "s38_v7_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w2.0+adj-w2000+within-sec+mmb0-1b_smb1-1b_1p",
+    "s38_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w3.0+within-sec+mmb0-1b_smb1-1b_1p",
+    "s38_v9_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w5.0+within-sec+mmb0-1b_smb1-1b_1p",
+    "s38_v10_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w2.0+nbr-w0.5+within-sec+mmb0-1b_smb1-1b_1p",
+    "s38_v11_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w2.0+nbr-w2.0+within-sec+mmb0-1b_smb1-1b_1p",
+    # Axis 3: batch_size + learning rate (sqrt-scaled)
+    "s38_v12_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w2.0+bs512+lr7e-4+within-sec+mmb0-1b_smb1-1b_1p",
+    "s38_v13_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w2.0+bs1024+lr1e-3+within-sec+mmb0-1b_smb1-1b_1p",
+    "s38_v14_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w2.0+bs128+lr3.5e-4+within-sec+mmb0-1b_smb1-1b_1p",
+    # Combos
+    "s38_v15_dualvq+rvq-both+decoder-cov+no-batch-int+enc-200-200-128+gnn-h128+dec-w32+knn16+sampler16+cell-w3.0+adj-w2000+within-sec+mmb0-1b_smb1-1b_1p",
+    "s38_v16_dualvq+rvq-both+decoder-cov+no-batch-int+enc-200-200-128+gnn-h128+dec-w32+knn16+sampler16+cell-w3.0+nbr-w0.5+adj-w2000+bs512+lr7e-4+within-sec+mmb0-1b_smb1-1b_1p",
 ]
 
 

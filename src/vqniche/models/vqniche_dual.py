@@ -102,6 +102,7 @@ class VQNiche_Dual(BaseModel):
             adversarial_schedule: Literal["constant", "cosine"] = "constant",
             adversarial_total_epochs: int = 100,
             adversarial_apply_to: Literal["full", "cell"] = "full",
+            vq_warmup_epochs: int = 0,
         ):
         # BaseModel.__init__ stores names + builds the loss-fn dispatcher.
         # We pass placeholder values for adjacency_decoder_name (unused)
@@ -293,7 +294,72 @@ class VQNiche_Dual(BaseModel):
         # gradient conflict.
         self.dispersion_niche = torch.nn.Parameter(torch.randn(in_channels))
 
+        # ---- VQ warmup (defer codebook init + EMA) ------------------------
+        # Hypothesis (codebook EMA lock-in to early z_mlp): when the
+        # codebook does its lazy kmeans-init on the FIRST training step's
+        # data, the cells flowing through are heavily batch-correlated
+        # (encoder hasn't yet been pulled by the adversarial / MMD
+        # integration loss), so the initial code centroids are biased
+        # toward batch-discriminative directions. Subsequent EMA updates
+        # reinforce the assignment, leaving some codes near-exclusive to
+        # one section for the rest of training.
+        #
+        # The warmup: for the first `vq_warmup_epochs` epochs, the
+        # codebook stays at its uniform-init (l2-normed random) state —
+        # both lazy kmeans-init AND EMA updates are skipped on every
+        # CosineSimCodebook / EuclideanCodebook in this model (toggled
+        # via the `freeze_updates` buffer added in vqgraph/vq.py). The
+        # encoder still trains: STE makes the codebook transparent to
+        # gradients, so reconstruction + adversarial + MMD pressures all
+        # reach the encoder. Commit losses ARE zeroed during warmup
+        # (see `_step`) to avoid pulling z_mlp toward arbitrary uniform-
+        # random codes.
+        #
+        # At epoch `vq_warmup_epochs`: the next forward pass triggers
+        # natural kmeans-init on a z_mlp distribution that has been
+        # shaped by the integration losses, so the initial centroids
+        # are far more batch-invariant. Default 0 = legacy behaviour.
+        self.vq_warmup_epochs = int(vq_warmup_epochs)
+        if self.vq_warmup_epochs > 0:
+            print(
+                f"7. VQ warmup: codebook init + EMA frozen for the "
+                f"first {self.vq_warmup_epochs} epoch(s). Commit losses "
+                f"are zeroed during this window."
+            )
+
         self._init_inference_data_caches()
+
+    # ------------------------------------------------------------------
+    # VQ warmup hook
+    # ------------------------------------------------------------------
+
+    def _set_codebook_freeze_updates(self, freeze: bool) -> None:
+        """
+        Walk every codebook in the model and set its `freeze_updates`
+        buffer. When True, the codebook's lazy kmeans-init and EMA
+        update + dead-code expiry are all suppressed inside its
+        `forward`. Used by the VQ-warmup window.
+        """
+        # Import here to avoid a top-of-file circular: vq.py is the
+        # codebook leaf module, used by everything else.
+        from vqniche.vqgraph.vq import CosineSimCodebook, EuclideanCodebook
+        flag = bool(freeze)
+        for m in self.modules():
+            if isinstance(m, (CosineSimCodebook, EuclideanCodebook)):
+                m.freeze_updates.fill_(flag)
+
+    def on_train_epoch_start(self) -> None:
+        """
+        Lightning hook: fired BEFORE the first batch of each training
+        epoch. We use it to toggle the VQ codebook's `freeze_updates`
+        buffer based on whether we're still inside the warmup window.
+        """
+        super_hook = getattr(super(), "on_train_epoch_start", None)
+        if super_hook is not None:
+            super_hook()
+        if self.vq_warmup_epochs > 0:
+            freeze = self.current_epoch < self.vq_warmup_epochs
+            self._set_codebook_freeze_updates(freeze)
 
     # ------------------------------------------------------------------
     # Inference cache
@@ -626,6 +692,39 @@ class VQNiche_Dual(BaseModel):
             'logits':          logits[:batch_size],
             'labels':          getattr(batch, 'y', torch.zeros(batch_size, dtype=torch.long, device=batch.x.device))[:batch_size],
         }
+
+        # VQ warmup: during the first `vq_warmup_epochs` epochs the
+        # codebook is frozen at its uniform-init state; the commit loss
+        # (which pulls z_mlp toward the codebook centroids) would
+        # therefore drag the encoder toward arbitrary random codes —
+        # exactly the opposite of what we want. Zero both branches'
+        # commit losses by passing identical (input == output) tensors:
+        # mse(x, x) = 0. The dispatcher still computes the term but it
+        # contributes 0 to total_loss. After warmup the original tensors
+        # are restored on the next step.
+        if (mode == 'train'
+            and self.vq_warmup_epochs > 0
+            and self.current_epoch < self.vq_warmup_epochs):
+            _no_commit_cell  = loss_data['quantizer_input_cell'].detach()
+            _no_commit_niche = loss_data['quantizer_input_niche'].detach()
+            loss_data['quantizer_input_cell']  = _no_commit_cell
+            loss_data['quantizer_output_cell'] = _no_commit_cell
+            loss_data['quantizer_input_niche']  = _no_commit_niche
+            loss_data['quantizer_output_niche'] = _no_commit_niche
+
+        # Per-node section / adata_batch IDs. Consumed by the cosine
+        # adjacency BCE (and the inner-product BCE) when
+        # `loss_kwargs['adj_within_section_only']=True` (the default)
+        # to drop cross-section pairs from the negative set, so two
+        # biologically-similar cells in different sections aren't pulled
+        # apart by the spatial-adjacency loss. We populate the key
+        # unconditionally (with None when adata_batch_ids is missing) so
+        # the dispatcher's `loss_data[key]` lookup never KeyErrors when
+        # the flag is on; the BCE loss treats None as "fall back to
+        # legacy global-pair behaviour".
+        loss_data['node_adata_batch_ids'] = (
+            adata_batch_ids.long() if adata_batch_ids is not None else None
+        )
 
         # Adversarial batch loss data (only when the adversary is built).
         # Loss dispatcher reads `batch_logits` and `batch_labels` keys.
