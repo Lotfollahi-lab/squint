@@ -323,6 +323,54 @@ def make_dataset_blob_config_chl59() -> dict:
     }
 
 
+def make_dataset_blob_config_chl59_2b() -> dict:
+    """
+    Dataset-blob build config for the 2-sample CosMx Lung subset
+    (`/lustre/scratch126/cellgen/lotfollahi/DATASETS/silver/chl59-2b_1p`).
+
+    Same structure as `make_dataset_blob_config_chl59` (the 8-sample
+    version), with two differences:
+      - root data path -> /lustre/scratch126/cellgen/lotfollahi/DATASETS
+      - dataset name   -> chl59-2b_1p
+
+    Intended use: lightweight ablation runs (faster to train than the
+    8-sample dataset, useful for ablating the s49_v23 spine when the
+    full chl59-8b_1p compute budget is unavailable).
+    """
+    return {
+        "experiment": {
+            "name": "in_memory_dataset_blob",
+            "description": "CosMx Lung — 2-sample subset",
+        },
+        "dataset": {
+            "name": "chl59-2b_1p",
+            "feature_names": ["cell_gene_counts"],
+            "label_names": [],   # set to ["cell_types=<your_obs_key>"] if available
+            "graph_kwargs": {
+                "coord_type":         "generic",
+                "spatial_key":        "spatial",
+                # 8 = SQUINT default, 16 = knn16 variants (s49_v23 spine),
+                # 24 = knn24 ablation in the v51 neighbors-axis sweep.
+                "n_neighs_list":      [8, 16, 24],
+                "radius_list":        None,
+                "include_self_loop":  True,
+                "batch_key":          "batch",
+                "k": {
+                    "lm_eigvecs": 128,
+                },
+            },
+            "data_directory_path": "/lustre/scratch126/cellgen/lotfollahi/DATASETS",
+            "pre_transform": None,
+            "pre_filter":    None,
+            "overwrite":     True,
+        },
+        "software_paths": {
+            "deepwalk": "",
+            "gosh":     "",
+        },
+    }
+
+
 def make_dataset_blob_config_mmb20() -> dict:
     """
     Dataset-blob build config for the cross-platform retrieval dataset
@@ -2958,6 +3006,37 @@ def _patch_dual_gnn_hidden(
     return cfg
 
 
+def _patch_dual_gnn_layers(
+        cfg: dict,
+        num_layers: int = 2,
+    ) -> dict:
+    """
+    Override the niche-branch GNN depth (`gnn_params.num_layers`). Base
+    default is 1 layer (= 1-hop aggregation). Setting `num_layers=2`
+    gives 2-hop aggregation — the niche encoder sees neighbours of
+    neighbours.
+
+    IMPORTANT: the sampler depth MUST match the GNN depth, otherwise
+    the second GNN layer sees incomplete neighbour sets and the
+    aggregation is silently wrong. For `num_layers=2` on a knn=16
+    graph, set the sampler to `[16, 16]` via
+    `_patch_dual_sampler_neighbors(num_neighbors=[16, 16])`.
+
+    This helper is a surgical "GNN-only" knob — it does NOT touch
+    `nbr_aggregation_hops` (the niche-side reconstruction TARGET k-hop
+    radius) or codebook sizes; for the coupled "everything wide"
+    sweep see `_patch_dual_wide`. Keeping these orthogonal lets you
+    ablate GNN depth without confounding it with target-aggregation
+    radius or codebook capacity.
+
+    Memory: each extra GNN layer adds ~D^2 params (default D=256 → 65k
+    params/layer). Activation memory scales with the deeper sampler
+    fan-out — `[16, 16]` is ~16x the per-step memory of `[16]`.
+    """
+    cfg["model"]["encoder_params"]["gnn_params"]["num_layers"] = int(num_layers)
+    return cfg
+
+
 def _patch_dual_sampler_neighbors(
         cfg: dict,
         num_neighbors: Optional[List[int]] = None,
@@ -3630,6 +3709,65 @@ def _patch_dual_chl59_lung5(
 
     # Validation runs on the held-out replicate(s); name the monitor
     # accordingly so checkpoints are saved on test-set Pearson.
+    cfg["trainer"]["monitor"] = "val_loss"
+    return cfg
+
+
+def _patch_dual_chl59_2b_1p(
+        cfg: dict,
+        train_batch_idx: Optional[List[int]] = None,
+        test_batch_idx: Optional[List[int]] = None,
+        batch_size: int = 512,
+        edge_sampling_ratio: float = 1.0,
+    ) -> dict:
+    """
+    Swap the dataset to /lustre/scratch126/cellgen/lotfollahi/DATASETS/silver/chl59-2b_1p
+    (2-sample CosMx Lung subset). Sibling of `_patch_dual_chl59_lung5`
+    but pointing at the 2-sample silver directory and defaulting to
+    bs=512 (no per-section memory bottleneck at 2 samples vs 8).
+
+    Parameters
+    ----------
+    train_batch_idx, test_batch_idx:
+        Same semantics as in `_patch_dual_chl59_lung5` — `adata_batch_id`
+        values, NOT positions. Empty lists default to "every blob
+        section used for training, none held out". With only 2 sections
+        in this dataset, leaving both empty trains on both.
+    batch_size:
+        Default 512 (matches the s49_v23 spine). The chl59-8b helper
+        defaults to 128 due to the larger gene panel + denser sampling
+        at 8 sections; with only 2 sections the per-step autograd memory
+        is much lower, so 512 is fine on the standard 44 GiB cards.
+    edge_sampling_ratio:
+        Default 1.0 (matches chl59-8b setting).
+    """
+    test_batch_idx = list(test_batch_idx) if test_batch_idx else []
+    train_batch_idx = list(train_batch_idx) if train_batch_idx else []
+
+    cfg["dataset"]["dataset_name"]   = "chl59-2b_1p"
+    cfg["dataset"]["dataset_tag"]    = "chl59-2b_1p"
+    cfg["dataset"]["root_data_dir"]  = "/lustre/scratch126/cellgen/lotfollahi/DATASETS"
+    cfg["dataset"]["adata_batch_idx"] = []
+
+    cfg["dataset"]["train_transform_params"] = {
+        "region":         None,
+        "train_batches":  list(train_batch_idx),
+        "val_batches":    [],
+        "test_batches":   test_batch_idx,
+        "xy_key":         "xy_coordinates",
+        "train_val_cell_split":
+            cfg["dataset"]["train_transform_params"].get("train_val_cell_split", 0.10),
+        "cell_split_seed":
+            cfg["dataset"]["train_transform_params"].get("cell_split_seed", 0),
+    }
+
+    cfg["dataset"]["graph_params"]["batch_key"] = "batch"
+
+    cfg["datamodule"]["loader_params"]["batch_size"] = int(batch_size)
+    cfg["model"]["loss_params"]["loss_kwargs"]["edge_sampling_ratio"] = float(
+        edge_sampling_ratio
+    )
+
     cfg["trainer"]["monitor"] = "val_loss"
     return cfg
 
@@ -24154,6 +24292,1686 @@ VARIANTS: dict = {
             weight=100.0, temperature=100.0, branch="cell",
         ),
     },
+    # -----------------------------------------------------------------------
+    # s49_v23 ports — region-holdout (mmb) + chl59-8b_1p + spatch_1p
+    # -----------------------------------------------------------------------
+    # Three standalone variants that take the s49_v23 multiseed default
+    # (decoupled-enc + diversity-w10 + contrastWB-w10-k5 on s48_v2 spine)
+    # and apply ONE extra outer wrapper each:
+    #   - +region-holdout  -> +_patch_holdout_regions (mmb dataset)
+    #   - +chl59-8b_1p     -> +_patch_dual_chl59_lung5(test=[2,3])
+    #   - +spatch_1p       -> +_patch_dual_spatch(train=[2], test='rest')
+    #
+    # Used as comparators for the s49_v23 multiseed default in:
+    #   - plot_pearson_benchmark (region-holdout variant)
+    #   - plot_*_benchmark cross-dataset comparisons
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+region-holdout+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Region-holdout port of the s49_v23 multiseed default variant. Spine: decoupled-enc + within-batch contrastive (wt=10, k=5) + cell-VQ codebook-diversity (wt=10) on the s48_v2 spine (cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Adds 25%x25% spatial holdout patches (batch15 upper-left + batch82 lower-right) matching the existing region-holdout reference. Held-out cells get the test data-split tag so post-inference Pearson reports only on unseen cells. Default max_epochs=80."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders(niche trunk = independent deep copy)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+region_holdout(test_regions={15: upper-left 25%x25%, 82: lower-right 25%x25%})",
+        ],
+        "build": lambda: _patch_holdout_regions(
+            _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[400, 400, 256],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=10.0, temperature=100.0, branch="cell",
+        ),
+            
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w128-256+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+region-holdout+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Region-holdout port of s49_v23, with WIDER decoder: MLP [128, 256] (2-layer, growing) instead of [32] (1-layer, narrow). All other knobs identical to the standard region-holdout port: decoupled-enc + within-batch contrastive (wt=10, k=5) + cell-VQ codebook-diversity (wt=10) on the s48_v2 spine (cell-w=1, no-batch-int, enc-deeper [400, 400, 256], knn16, sampler[16], bs=512, lr=7e-4, within-sec) + 25%x25% spatial holdout patches (batch15 upper-left + batch82 lower-right). The wider decoder gives the NB-rate head ~14x more capacity (272 -> 32 -> 431 = 22k -> 272 -> 128 -> 256 -> 431 = 174k params per decoder), useful for measuring how much per-cell reconstruction quality is decoder-capacity-bound on this dataset. Default max_epochs=80."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders(niche trunk = independent deep copy)",
+            "+dec-w=[128, 256]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+region_holdout(test_regions={15: upper-left 25%x25%, 82: lower-right 25%x25%})",
+        ],
+        "build": lambda: _patch_holdout_regions(
+            _patch_dual_codebook_diversity(
+                _patch_dual_contrastive_cell_within_batch(
+                    _patch_dual_adj_within_section_only(
+                        _patch_dual_no_batch_int(
+                            _patch_dual_batch_lr(
+                                _patch_dual_attr_recon_weight(
+                                    _patch_dual_sampler_neighbors(
+                                        _patch_dual_graph_knn(
+                                            _patch_dual_decoder_width(
+                                                _patch_dual_decoupled_encoders(
+                                                    _patch_dual_encoder_deeper(
+                                                        _patch_dual_decoder_covariate(
+                                                            _patch_dual_rvq(
+                                                                _patch_dual_rvq(_BD(),
+                                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                                branch="cell", codebook_sizes=(30, 90),
+                                                            ),
+                                                        ),
+                                                        hidden_channels=[400, 400, 256],
+                                                    ),
+                                                ),
+                                                hidden_channels=[128, 256],
+                                            ),
+                                            n_neighs=16,
+                                        ),
+                                        num_neighbors=[16],
+                                    ),
+                                    weight=1.0,
+                                ),
+                                batch_size=512, lr=7e-4,
+                            ),
+                        ),
+                        enabled=True,
+                    ),
+                    wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+                ),
+                weight=10.0, temperature=100.0, branch="cell",
+            ),
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-8b_1p": {
+        "description": (
+            "Port of the s49_v23 multiseed default variant to chl59-8b_1p (CosMx Lung, 8 sections). Spine: decoupled-enc + within-batch contrastive (wt=10, k=5) + cell-VQ codebook-diversity (wt=10) on the s48_v2 spine (cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Train: chl59 adata_batch_id 0+1+4+5+6+7. Test: 2+3 (held-out replicates). Default max_epochs=80. REQUIRES BLOB REBUILD for chl59-8b_1p (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders(niche trunk = independent deep copy)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+chl59-8b_1p(test=[2, 3])",
+        ],
+        "build": lambda: _patch_dual_chl59_lung5(
+            _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[400, 400, 256],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=10.0, temperature=100.0, branch="cell",
+        ),
+            test_batch_idx=[2, 3], batch_size=512,
+        ),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+spatch_1p": {
+        "description": (
+            "Port of the s49_v23 multiseed default variant to spatch_1p. Spine: decoupled-enc + within-batch contrastive (wt=10, k=5) + cell-VQ codebook-diversity (wt=10) on the s48_v2 spine (cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Train: spatch_1p adata_batch_id=2 only. Test: every other section. Default max_epochs=80. REQUIRES BLOB REBUILD for spatch_1p (k=16 in n_neighs_list)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders(niche trunk = independent deep copy)",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+spatch_1p(test=rest)",
+        ],
+        "build": lambda: _patch_dual_spatch(
+            _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[400, 400, 256],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=10.0, temperature=100.0, branch="cell",
+        ),
+            train_batch_idx=[2], test_batch_idx="rest", batch_size=512,
+        ),
+    },
+    # -----------------------------------------------------------------------
+    # s49_v23 ablations (canonical-name) — 7 ablations x 2 datasets
+    # -----------------------------------------------------------------------
+    # Ablations of the s49_v23 spine (decoupled-enc + diversity-w10 +
+    # contrastWB-w10-k5):
+    #   - base                                  (control)
+    #   - no-contrastive                        (drops within-batch contrastive)
+    #   - no-adj                                (drops adjacency BCE)
+    #   - no-decoder-cov                        (drops learned batch covariate)
+    #   - rvq-cell (30, 30) / (30, 10) / (30, 300)   (vary L2 codebook size)
+    #
+    # Two datasets: mmb0-1b_smb1-1b_1p + chl59-2b_1p (new 2-sample subset at
+    # /lustre/scratch126/cellgen/lotfollahi/DATASETS/silver/chl59-2b_1p).
+    #
+    # Submit via:
+    #   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v51
+    #   bash examples/submit_dataset_sweep.sh chl59-2b_1p-ablations-v51
+    # ---- mmb0-1b_smb1-1b_1p ----
+    "s51_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49_v23 ablation on mmb0-1b_smb1-1b_1p: BASE — s49_v23 spine unchanged (control). Built on the s49_v23 spine (decoupled-enc + within-batch contrastive wt=10, k=5 + codebook-diversity on cell-VQ wt=10 + cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Cell RVQ = (30, 90), niche RVQ = (30, 90). REQUIRES BLOB REBUILD (k=16 in n_neighs_list) ."
+        ),
+        "patches": [
+            "+rvq-both(levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+_patch_dual_contrastive_cell_within_batch(
+_patch_dual_adj_within_section_only(
+_patch_dual_no_batch_int(
+    _patch_dual_batch_lr(
+        _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _BD(),
+                                            branch="niche", codebook_sizes=(30, 90),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                hidden_channels=[400, 400, 256],
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[16],
+            ),
+            weight=1.0,
+        ),
+        batch_size=512, lr=7e-4,
+    ),
+),
+enabled=True,
+),
+wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+),
+weight=10.0, temperature=100.0, branch="cell",
+),
+    },
+    "s51_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49_v23 ablation on mmb0-1b_smb1-1b_1p: Drops the within-batch contrastive cell loss. Built on the s49_v23 spine (decoupled-enc + within-batch contrastive wt=10, k=5 + codebook-diversity on cell-VQ wt=10 + cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Cell RVQ = (30, 90), niche RVQ = (30, 90). REQUIRES BLOB REBUILD (k=16 in n_neighs_list) ."
+        ),
+        "patches": [
+            "+rvq-both(levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "-contrastive-cell-within-batch (ablated)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+_patch_dual_adj_within_section_only(
+_patch_dual_no_batch_int(
+    _patch_dual_batch_lr(
+        _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _BD(),
+                                            branch="niche", codebook_sizes=(30, 90),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                hidden_channels=[400, 400, 256],
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[16],
+            ),
+            weight=1.0,
+        ),
+        batch_size=512, lr=7e-4,
+    ),
+),
+enabled=True,
+),
+weight=10.0, temperature=100.0, branch="cell",
+),
+    },
+    "s51_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+no-adj+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49_v23 ablation on mmb0-1b_smb1-1b_1p: Drops the adjacency BCE loss. Built on the s49_v23 spine (decoupled-enc + within-batch contrastive wt=10, k=5 + codebook-diversity on cell-VQ wt=10 + cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Cell RVQ = (30, 90), niche RVQ = (30, 90). REQUIRES BLOB REBUILD (k=16 in n_neighs_list) ."
+        ),
+        "patches": [
+            "+rvq-both(levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+no-adj (drops bce_cosine_adjacency_reconstruction_loss)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+        ],
+        "build": lambda: _patch_dual_no_adj(
+_patch_dual_codebook_diversity(
+_patch_dual_contrastive_cell_within_batch(
+_patch_dual_adj_within_section_only(
+_patch_dual_no_batch_int(
+    _patch_dual_batch_lr(
+        _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _BD(),
+                                            branch="niche", codebook_sizes=(30, 90),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                hidden_channels=[400, 400, 256],
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[16],
+            ),
+            weight=1.0,
+        ),
+        batch_size=512, lr=7e-4,
+    ),
+),
+enabled=True,
+),
+wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+),
+weight=10.0, temperature=100.0, branch="cell",
+),
+),
+    },
+    "s51_v4_dualvq+rvq-both+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49_v23 ablation on mmb0-1b_smb1-1b_1p: Drops the learned decoder batch covariate. Built on the s49_v23 spine (decoupled-enc + within-batch contrastive wt=10, k=5 + codebook-diversity on cell-VQ wt=10 + cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Cell RVQ = (30, 90), niche RVQ = (30, 90). REQUIRES BLOB REBUILD (k=16 in n_neighs_list) ."
+        ),
+        "patches": [
+            "+rvq-both(levels=[30, 90])",
+            "-decoder_covariate (ablated)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+_patch_dual_contrastive_cell_within_batch(
+_patch_dual_adj_within_section_only(
+_patch_dual_no_batch_int(
+    _patch_dual_batch_lr(
+        _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _BD(),
+                                            branch="niche", codebook_sizes=(30, 90),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                hidden_channels=[400, 400, 256],
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[16],
+            ),
+            weight=1.0,
+        ),
+        batch_size=512, lr=7e-4,
+    ),
+),
+enabled=True,
+),
+wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+),
+weight=10.0, temperature=100.0, branch="cell",
+),
+    },
+    "s51_v5_dualvq+rvq-cell-30-30+rvq-niche-30-90+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49_v23 ablation on mmb0-1b_smb1-1b_1p: Cell RVQ L2 = 30 (vs default 90). Built on the s49_v23 spine (decoupled-enc + within-batch contrastive wt=10, k=5 + codebook-diversity on cell-VQ wt=10 + cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Cell RVQ = (30, 30), niche RVQ = (30, 90). REQUIRES BLOB REBUILD (k=16 in n_neighs_list) ."
+        ),
+        "patches": [
+            "+rvq-cell=[30, 30], rvq-niche=[30, 90]",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+_patch_dual_contrastive_cell_within_batch(
+_patch_dual_adj_within_section_only(
+_patch_dual_no_batch_int(
+    _patch_dual_batch_lr(
+        _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _BD(),
+                                            branch="niche", codebook_sizes=(30, 90),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 30),
+                                    ),
+                                ),
+                                hidden_channels=[400, 400, 256],
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[16],
+            ),
+            weight=1.0,
+        ),
+        batch_size=512, lr=7e-4,
+    ),
+),
+enabled=True,
+),
+wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+),
+weight=10.0, temperature=100.0, branch="cell",
+),
+    },
+    "s51_v6_dualvq+rvq-cell-30-10+rvq-niche-30-90+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49_v23 ablation on mmb0-1b_smb1-1b_1p: Cell RVQ L2 = 10 (smallest tested). Built on the s49_v23 spine (decoupled-enc + within-batch contrastive wt=10, k=5 + codebook-diversity on cell-VQ wt=10 + cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Cell RVQ = (30, 10), niche RVQ = (30, 90). REQUIRES BLOB REBUILD (k=16 in n_neighs_list) ."
+        ),
+        "patches": [
+            "+rvq-cell=[30, 10], rvq-niche=[30, 90]",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+_patch_dual_contrastive_cell_within_batch(
+_patch_dual_adj_within_section_only(
+_patch_dual_no_batch_int(
+    _patch_dual_batch_lr(
+        _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _BD(),
+                                            branch="niche", codebook_sizes=(30, 90),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 10),
+                                    ),
+                                ),
+                                hidden_channels=[400, 400, 256],
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[16],
+            ),
+            weight=1.0,
+        ),
+        batch_size=512, lr=7e-4,
+    ),
+),
+enabled=True,
+),
+wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+),
+weight=10.0, temperature=100.0, branch="cell",
+),
+    },
+    "s51_v7_dualvq+rvq-cell-30-300+rvq-niche-30-90+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49_v23 ablation on mmb0-1b_smb1-1b_1p: Cell RVQ L2 = 300 (largest tested). Built on the s49_v23 spine (decoupled-enc + within-batch contrastive wt=10, k=5 + codebook-diversity on cell-VQ wt=10 + cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Cell RVQ = (30, 300), niche RVQ = (30, 90). REQUIRES BLOB REBUILD (k=16 in n_neighs_list) ."
+        ),
+        "patches": [
+            "+rvq-cell=[30, 300], rvq-niche=[30, 90]",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+_patch_dual_contrastive_cell_within_batch(
+_patch_dual_adj_within_section_only(
+_patch_dual_no_batch_int(
+    _patch_dual_batch_lr(
+        _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _BD(),
+                                            branch="niche", codebook_sizes=(30, 90),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 300),
+                                    ),
+                                ),
+                                hidden_channels=[400, 400, 256],
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[16],
+            ),
+            weight=1.0,
+        ),
+        batch_size=512, lr=7e-4,
+    ),
+),
+enabled=True,
+),
+wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+),
+weight=10.0, temperature=100.0, branch="cell",
+),
+    },
+    # ---- chl59-2b_1p ----
+    "s51_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p": {
+        "description": (
+            "s49_v23 ablation on chl59-2b_1p: BASE — s49_v23 spine unchanged (control). Built on the s49_v23 spine (decoupled-enc + within-batch contrastive wt=10, k=5 + codebook-diversity on cell-VQ wt=10 + cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Cell RVQ = (30, 90), niche RVQ = (30, 90). REQUIRES BLOB REBUILD (k=16 in n_neighs_list) for the chl59-2b_1p dataset."
+        ),
+        "patches": [
+            "+rvq-both(levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+chl59-2b_1p(dataset switch)",
+        ],
+        "build": lambda: _patch_dual_chl59_2b_1p(
+_patch_dual_codebook_diversity(
+_patch_dual_contrastive_cell_within_batch(
+_patch_dual_adj_within_section_only(
+_patch_dual_no_batch_int(
+    _patch_dual_batch_lr(
+        _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _BD(),
+                                            branch="niche", codebook_sizes=(30, 90),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                hidden_channels=[400, 400, 256],
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[16],
+            ),
+            weight=1.0,
+        ),
+        batch_size=512, lr=7e-4,
+    ),
+),
+enabled=True,
+),
+wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+),
+weight=10.0, temperature=100.0, branch="cell",
+),
+batch_size=512,
+),
+    },
+    "s51_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+chl59-2b_1p": {
+        "description": (
+            "s49_v23 ablation on chl59-2b_1p: Drops the within-batch contrastive cell loss. Built on the s49_v23 spine (decoupled-enc + within-batch contrastive wt=10, k=5 + codebook-diversity on cell-VQ wt=10 + cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Cell RVQ = (30, 90), niche RVQ = (30, 90). REQUIRES BLOB REBUILD (k=16 in n_neighs_list) for the chl59-2b_1p dataset."
+        ),
+        "patches": [
+            "+rvq-both(levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "-contrastive-cell-within-batch (ablated)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+chl59-2b_1p(dataset switch)",
+        ],
+        "build": lambda: _patch_dual_chl59_2b_1p(
+_patch_dual_codebook_diversity(
+_patch_dual_adj_within_section_only(
+_patch_dual_no_batch_int(
+    _patch_dual_batch_lr(
+        _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _BD(),
+                                            branch="niche", codebook_sizes=(30, 90),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                hidden_channels=[400, 400, 256],
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[16],
+            ),
+            weight=1.0,
+        ),
+        batch_size=512, lr=7e-4,
+    ),
+),
+enabled=True,
+),
+weight=10.0, temperature=100.0, branch="cell",
+),
+batch_size=512,
+),
+    },
+    "s51_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+no-adj+chl59-2b_1p": {
+        "description": (
+            "s49_v23 ablation on chl59-2b_1p: Drops the adjacency BCE loss. Built on the s49_v23 spine (decoupled-enc + within-batch contrastive wt=10, k=5 + codebook-diversity on cell-VQ wt=10 + cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Cell RVQ = (30, 90), niche RVQ = (30, 90). REQUIRES BLOB REBUILD (k=16 in n_neighs_list) for the chl59-2b_1p dataset."
+        ),
+        "patches": [
+            "+rvq-both(levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+no-adj (drops bce_cosine_adjacency_reconstruction_loss)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+chl59-2b_1p(dataset switch)",
+        ],
+        "build": lambda: _patch_dual_chl59_2b_1p(
+_patch_dual_no_adj(
+_patch_dual_codebook_diversity(
+_patch_dual_contrastive_cell_within_batch(
+_patch_dual_adj_within_section_only(
+_patch_dual_no_batch_int(
+    _patch_dual_batch_lr(
+        _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _BD(),
+                                            branch="niche", codebook_sizes=(30, 90),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                ),
+                                hidden_channels=[400, 400, 256],
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[16],
+            ),
+            weight=1.0,
+        ),
+        batch_size=512, lr=7e-4,
+    ),
+),
+enabled=True,
+),
+wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+),
+weight=10.0, temperature=100.0, branch="cell",
+),
+),
+batch_size=512,
+),
+    },
+    "s51_v4_dualvq+rvq-both+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p": {
+        "description": (
+            "s49_v23 ablation on chl59-2b_1p: Drops the learned decoder batch covariate. Built on the s49_v23 spine (decoupled-enc + within-batch contrastive wt=10, k=5 + codebook-diversity on cell-VQ wt=10 + cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Cell RVQ = (30, 90), niche RVQ = (30, 90). REQUIRES BLOB REBUILD (k=16 in n_neighs_list) for the chl59-2b_1p dataset."
+        ),
+        "patches": [
+            "+rvq-both(levels=[30, 90])",
+            "-decoder_covariate (ablated)",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+chl59-2b_1p(dataset switch)",
+        ],
+        "build": lambda: _patch_dual_chl59_2b_1p(
+_patch_dual_codebook_diversity(
+_patch_dual_contrastive_cell_within_batch(
+_patch_dual_adj_within_section_only(
+_patch_dual_no_batch_int(
+    _patch_dual_batch_lr(
+        _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _BD(),
+                                            branch="niche", codebook_sizes=(30, 90),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 90),
+                                    ),
+                                hidden_channels=[400, 400, 256],
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[16],
+            ),
+            weight=1.0,
+        ),
+        batch_size=512, lr=7e-4,
+    ),
+),
+enabled=True,
+),
+wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+),
+weight=10.0, temperature=100.0, branch="cell",
+),
+batch_size=512,
+),
+    },
+    "s51_v5_dualvq+rvq-cell-30-30+rvq-niche-30-90+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p": {
+        "description": (
+            "s49_v23 ablation on chl59-2b_1p: Cell RVQ L2 = 30 (vs default 90). Built on the s49_v23 spine (decoupled-enc + within-batch contrastive wt=10, k=5 + codebook-diversity on cell-VQ wt=10 + cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Cell RVQ = (30, 30), niche RVQ = (30, 90). REQUIRES BLOB REBUILD (k=16 in n_neighs_list) for the chl59-2b_1p dataset."
+        ),
+        "patches": [
+            "+rvq-cell=[30, 30], rvq-niche=[30, 90]",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+chl59-2b_1p(dataset switch)",
+        ],
+        "build": lambda: _patch_dual_chl59_2b_1p(
+_patch_dual_codebook_diversity(
+_patch_dual_contrastive_cell_within_batch(
+_patch_dual_adj_within_section_only(
+_patch_dual_no_batch_int(
+    _patch_dual_batch_lr(
+        _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _BD(),
+                                            branch="niche", codebook_sizes=(30, 90),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 30),
+                                    ),
+                                ),
+                                hidden_channels=[400, 400, 256],
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[16],
+            ),
+            weight=1.0,
+        ),
+        batch_size=512, lr=7e-4,
+    ),
+),
+enabled=True,
+),
+wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+),
+weight=10.0, temperature=100.0, branch="cell",
+),
+batch_size=512,
+),
+    },
+    "s51_v6_dualvq+rvq-cell-30-10+rvq-niche-30-90+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p": {
+        "description": (
+            "s49_v23 ablation on chl59-2b_1p: Cell RVQ L2 = 10 (smallest tested). Built on the s49_v23 spine (decoupled-enc + within-batch contrastive wt=10, k=5 + codebook-diversity on cell-VQ wt=10 + cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Cell RVQ = (30, 10), niche RVQ = (30, 90). REQUIRES BLOB REBUILD (k=16 in n_neighs_list) for the chl59-2b_1p dataset."
+        ),
+        "patches": [
+            "+rvq-cell=[30, 10], rvq-niche=[30, 90]",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+chl59-2b_1p(dataset switch)",
+        ],
+        "build": lambda: _patch_dual_chl59_2b_1p(
+_patch_dual_codebook_diversity(
+_patch_dual_contrastive_cell_within_batch(
+_patch_dual_adj_within_section_only(
+_patch_dual_no_batch_int(
+    _patch_dual_batch_lr(
+        _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _BD(),
+                                            branch="niche", codebook_sizes=(30, 90),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 10),
+                                    ),
+                                ),
+                                hidden_channels=[400, 400, 256],
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[16],
+            ),
+            weight=1.0,
+        ),
+        batch_size=512, lr=7e-4,
+    ),
+),
+enabled=True,
+),
+wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+),
+weight=10.0, temperature=100.0, branch="cell",
+),
+batch_size=512,
+),
+    },
+    "s51_v7_dualvq+rvq-cell-30-300+rvq-niche-30-90+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p": {
+        "description": (
+            "s49_v23 ablation on chl59-2b_1p: Cell RVQ L2 = 300 (largest tested). Built on the s49_v23 spine (decoupled-enc + within-batch contrastive wt=10, k=5 + codebook-diversity on cell-VQ wt=10 + cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Cell RVQ = (30, 300), niche RVQ = (30, 90). REQUIRES BLOB REBUILD (k=16 in n_neighs_list) for the chl59-2b_1p dataset."
+        ),
+        "patches": [
+            "+rvq-cell=[30, 300], rvq-niche=[30, 90]",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+chl59-2b_1p(dataset switch)",
+        ],
+        "build": lambda: _patch_dual_chl59_2b_1p(
+_patch_dual_codebook_diversity(
+_patch_dual_contrastive_cell_within_batch(
+_patch_dual_adj_within_section_only(
+_patch_dual_no_batch_int(
+    _patch_dual_batch_lr(
+        _patch_dual_attr_recon_weight(
+            _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                    _patch_dual_decoder_width(
+                        _patch_dual_decoupled_encoders(
+                            _patch_dual_encoder_deeper(
+                                _patch_dual_decoder_covariate(
+                                    _patch_dual_rvq(
+                                        _patch_dual_rvq(
+                                            _BD(),
+                                            branch="niche", codebook_sizes=(30, 90),
+                                        ),
+                                        branch="cell", codebook_sizes=(30, 300),
+                                    ),
+                                ),
+                                hidden_channels=[400, 400, 256],
+                            ),
+                        ),
+                        hidden_channels=[32],
+                    ),
+                    n_neighs=16,
+                ),
+                num_neighbors=[16],
+            ),
+            weight=1.0,
+        ),
+        batch_size=512, lr=7e-4,
+    ),
+),
+enabled=True,
+),
+wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+),
+weight=10.0, temperature=100.0, branch="cell",
+),
+batch_size=512,
+),
+    },
+    # -----------------------------------------------------------------------
+    # s49_v23 ablations — neighbors-axis extension (v51, knn=8 + knn=24)
+    # -----------------------------------------------------------------------
+    # Two more variants per dataset: knn=8 + sampler=8 (small matched) and
+    # knn=24 + sampler=24 (large matched). The knn=16 axis center IS the
+    # v51 base variant — listed a second time in the DATASET_VARIANTS sweep
+    # below so the neighbors axis has all 3 levels visible in the results.
+    # ---- mmb0-1b_smb1-1b_1p ----
+    "s51_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn8+sampler8+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49_v23 ablation on mmb0-1b_smb1-1b_1p: neighbors axis — graph k=8, sampler=8 (vs base knn=16+sampler=16). Same spine as the v51 base: decoupled-enc + within-batch contrastive (wt=10, k=5) + cell-VQ codebook-diversity (wt=10) + cell-w=1 + no-batch-int + enc-deeper [400, 400, 256] + dec-w[32] + bs=512 + lr=7e-4 + within-sec. Cell RVQ = (30, 90), niche RVQ = (30, 90). REQUIRES BLOB REBUILD with k=8 in n_neighs_list ."
+        ),
+        "patches": [
+            "+rvq-both(levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=8)",
+            "+sampler([8])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[400, 400, 256],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=8,
+                                    ),
+                                    num_neighbors=[8],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=10.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s51_v10_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn24+sampler24+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49_v23 ablation on mmb0-1b_smb1-1b_1p: neighbors axis — graph k=24, sampler=24 (vs base knn=16+sampler=16). Same spine as the v51 base: decoupled-enc + within-batch contrastive (wt=10, k=5) + cell-VQ codebook-diversity (wt=10) + cell-w=1 + no-batch-int + enc-deeper [400, 400, 256] + dec-w[32] + bs=512 + lr=7e-4 + within-sec. Cell RVQ = (30, 90), niche RVQ = (30, 90). REQUIRES BLOB REBUILD with k=24 in n_neighs_list ."
+        ),
+        "patches": [
+            "+rvq-both(levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=24)",
+            "+sampler([24])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[400, 400, 256],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=24,
+                                    ),
+                                    num_neighbors=[24],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=10.0, temperature=100.0, branch="cell",
+        ),
+    },
+    # ---- chl59-2b_1p ----
+    "s51_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn8+sampler8+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p": {
+        "description": (
+            "s49_v23 ablation on chl59-2b_1p: neighbors axis — graph k=8, sampler=8 (vs base knn=16+sampler=16). Same spine as the v51 base: decoupled-enc + within-batch contrastive (wt=10, k=5) + cell-VQ codebook-diversity (wt=10) + cell-w=1 + no-batch-int + enc-deeper [400, 400, 256] + dec-w[32] + bs=512 + lr=7e-4 + within-sec. Cell RVQ = (30, 90), niche RVQ = (30, 90). REQUIRES BLOB REBUILD with k=8 in n_neighs_list for the chl59-2b_1p dataset."
+        ),
+        "patches": [
+            "+rvq-both(levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=8)",
+            "+sampler([8])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+chl59-2b_1p(dataset switch)",
+        ],
+        "build": lambda: _patch_dual_chl59_2b_1p(
+            _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[400, 400, 256],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=8,
+                                    ),
+                                    num_neighbors=[8],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=10.0, temperature=100.0, branch="cell",
+        ),
+            batch_size=512,
+        ),
+    },
+    "s51_v10_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn24+sampler24+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p": {
+        "description": (
+            "s49_v23 ablation on chl59-2b_1p: neighbors axis — graph k=24, sampler=24 (vs base knn=16+sampler=16). Same spine as the v51 base: decoupled-enc + within-batch contrastive (wt=10, k=5) + cell-VQ codebook-diversity (wt=10) + cell-w=1 + no-batch-int + enc-deeper [400, 400, 256] + dec-w[32] + bs=512 + lr=7e-4 + within-sec. Cell RVQ = (30, 90), niche RVQ = (30, 90). REQUIRES BLOB REBUILD with k=24 in n_neighs_list for the chl59-2b_1p dataset."
+        ),
+        "patches": [
+            "+rvq-both(levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=24)",
+            "+sampler([24])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+chl59-2b_1p(dataset switch)",
+        ],
+        "build": lambda: _patch_dual_chl59_2b_1p(
+            _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[400, 400, 256],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=24,
+                                    ),
+                                    num_neighbors=[24],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=10.0, temperature=100.0, branch="cell",
+        ),
+            batch_size=512,
+        ),
+    },
+    # -----------------------------------------------------------------------
+    # s49_v23 ablation — knn=16 graph + sampler=8 (v51 slot 9 replacement)
+    # -----------------------------------------------------------------------
+    # Replaces the duplicate-base entry at slot 9. Isolates 'graph density'
+    # from 'per-step sampler size': v8 (knn=8+s=8, matched-small) and this
+    # variant (knn=16+s=8, dense-graph-sparse-sampler) both sample 8 nbrs
+    # per cell per step but operate on DIFFERENT spatial graph densities.
+    "s51_v9_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler8+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49_v23 ablation on mmb0-1b_smb1-1b_1p: knn=16 graph but sampler=8 — keep the default GRAPH density but limit the sampler to draw only 8 neighbors per training step. Direct comparator vs base (knn=16+sampler=16) and vs the matched knn=8+sampler=8 variant: isolates 'graph density' from 'per-step sampler size'. Same spine as the v51 base — only the sampler num_neighbors changes."
+        ),
+        "patches": [
+            "+rvq-both(levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([8])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[400, 400, 256],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[8],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=10.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s51_v9_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler8+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p": {
+        "description": (
+            "s49_v23 ablation on chl59-2b_1p: knn=16 graph but sampler=8 — keep the default GRAPH density but limit the sampler to draw only 8 neighbors per training step. Direct comparator vs base (knn=16+sampler=16) and vs the matched knn=8+sampler=8 variant: isolates 'graph density' from 'per-step sampler size'. Same spine as the v51 base — only the sampler num_neighbors changes."
+        ),
+        "patches": [
+            "+rvq-both(levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([8])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+chl59-2b_1p(dataset switch)",
+        ],
+        "build": lambda: _patch_dual_chl59_2b_1p(
+            _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_graph_knn(
+                                        _patch_dual_decoder_width(
+                                            _patch_dual_decoupled_encoders(
+                                                _patch_dual_encoder_deeper(
+                                                    _patch_dual_decoder_covariate(
+                                                        _patch_dual_rvq(
+                                                            _patch_dual_rvq(_BD(),
+                                                                branch="niche", codebook_sizes=(30, 90)),
+                                                            branch="cell", codebook_sizes=(30, 90),
+                                                        ),
+                                                    ),
+                                                    hidden_channels=[400, 400, 256],
+                                                ),
+                                            ),
+                                            hidden_channels=[32],
+                                        ),
+                                        n_neighs=16,
+                                    ),
+                                    num_neighbors=[8],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=10.0, temperature=100.0, branch="cell",
+        ),
+            batch_size=512,
+        ),
+    },
+    # -----------------------------------------------------------------------
+    # s49_v23 ablation — 2-layer GNN (v51 slot 11)
+    # -----------------------------------------------------------------------
+    # Bumps GNN num_layers from 1 to 2 with matched sampler [16, 16].
+    # `nbr_aggregation_hops` stays at 1 so this isolates 'GNN sees 2
+    # hops' from the target-aggregation radius (which `_patch_dual_wide`
+    # couples together).
+    "s51_v11_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16-16+gnn-l2+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s49_v23 ablation on mmb0-1b_smb1-1b_1p: GNN depth 1 -> 2 layers (2-hop spatial aggregation), with matched 2-hop sampler [16, 16]. The niche encoder now sees neighbours-of-neighbours per training step. All other knobs identical to the v51 base: decoupled-enc + within-batch contrastive (wt=10, k=5) + cell-VQ codebook-diversity (wt=10) on the s48_v2 spine. `nbr_aggregation_hops` STAYS at 1 (the niche-side reconstruction target is the 1-hop neighbourhood mean, NOT the 2-hop) — so this isolates the 'GNN sees 2 hops' effect from the 'target is 2-hop mean' effect that `_patch_dual_wide` couples them with. Memory: 2-hop sampler increases per-step activation memory by ~16x relative to 1-hop on knn=16 graph; bs=512 should still fit but the run is slower."
+        ),
+        "patches": [
+            "+rvq-both(levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16, 16])  (2-hop, matches gnn-l2)",
+            "+gnn-l2 (num_layers: 1 -> 2)",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+        ],
+        "build": lambda: _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_gnn_layers(
+                                        _patch_dual_graph_knn(
+                                            _patch_dual_decoder_width(
+                                                _patch_dual_decoupled_encoders(
+                                                    _patch_dual_encoder_deeper(
+                                                        _patch_dual_decoder_covariate(
+                                                            _patch_dual_rvq(
+                                                                _patch_dual_rvq(_BD(),
+                                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                                branch="cell", codebook_sizes=(30, 90),
+                                                            ),
+                                                        ),
+                                                        hidden_channels=[400, 400, 256],
+                                                    ),
+                                                ),
+                                                hidden_channels=[32],
+                                            ),
+                                            n_neighs=16,
+                                        ),
+                                        num_layers=2,
+                                    ),
+                                    num_neighbors=[16, 16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=10.0, temperature=100.0, branch="cell",
+        ),
+    },
+    "s51_v11_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16-16+gnn-l2+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p": {
+        "description": (
+            "s49_v23 ablation on chl59-2b_1p: GNN depth 1 -> 2 layers (2-hop spatial aggregation), with matched 2-hop sampler [16, 16]. The niche encoder now sees neighbours-of-neighbours per training step. All other knobs identical to the v51 base: decoupled-enc + within-batch contrastive (wt=10, k=5) + cell-VQ codebook-diversity (wt=10) on the s48_v2 spine. `nbr_aggregation_hops` STAYS at 1 (the niche-side reconstruction target is the 1-hop neighbourhood mean, NOT the 2-hop) — so this isolates the 'GNN sees 2 hops' effect from the 'target is 2-hop mean' effect that `_patch_dual_wide` couples them with. Memory: 2-hop sampler increases per-step activation memory by ~16x relative to 1-hop on knn=16 graph; bs=512 should still fit but the run is slower."
+        ),
+        "patches": [
+            "+rvq-both(levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16, 16])  (2-hop, matches gnn-l2)",
+            "+gnn-l2 (num_layers: 1 -> 2)",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+chl59-2b_1p(dataset switch)",
+        ],
+        "build": lambda: _patch_dual_chl59_2b_1p(
+            _patch_dual_codebook_diversity(
+            _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                    _patch_dual_no_batch_int(
+                        _patch_dual_batch_lr(
+                            _patch_dual_attr_recon_weight(
+                                _patch_dual_sampler_neighbors(
+                                    _patch_dual_gnn_layers(
+                                        _patch_dual_graph_knn(
+                                            _patch_dual_decoder_width(
+                                                _patch_dual_decoupled_encoders(
+                                                    _patch_dual_encoder_deeper(
+                                                        _patch_dual_decoder_covariate(
+                                                            _patch_dual_rvq(
+                                                                _patch_dual_rvq(_BD(),
+                                                                    branch="niche", codebook_sizes=(30, 90)),
+                                                                branch="cell", codebook_sizes=(30, 90),
+                                                            ),
+                                                        ),
+                                                        hidden_channels=[400, 400, 256],
+                                                    ),
+                                                ),
+                                                hidden_channels=[32],
+                                            ),
+                                            n_neighs=16,
+                                        ),
+                                        num_layers=2,
+                                    ),
+                                    num_neighbors=[16, 16],
+                                ),
+                                weight=1.0,
+                            ),
+                            batch_size=512, lr=7e-4,
+                        ),
+                    ),
+                    enabled=True,
+                ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+            weight=10.0, temperature=100.0, branch="cell",
+        ),
+            batch_size=512,
+        ),
+    },
 }
 
 
@@ -27924,6 +29742,44 @@ DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v50"] = [
 ]
 
 
+# -----------------------------------------------------------------------
+# s49_v23 ablation sweeps — 7 variants each on 2 datasets.
+# Submit via:
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-ablations-v51
+#   bash examples/submit_dataset_sweep.sh chl59-2b_1p-ablations-v51
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-ablations-v51"] = [
+    # 7 original ablations
+    "s51_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",  # 1. base (control)
+    "s51_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+mmb0-1b_smb1-1b_1p",  # 2. -contrastive
+    "s51_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+no-adj+mmb0-1b_smb1-1b_1p",  # 3. -adjacency
+    "s51_v4_dualvq+rvq-both+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",  # 4. -decoder-cov
+    "s51_v5_dualvq+rvq-cell-30-30+rvq-niche-30-90+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",  # 5. rvq-cell (30, 30)
+    "s51_v6_dualvq+rvq-cell-30-10+rvq-niche-30-90+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",  # 6. rvq-cell (30, 10)
+    "s51_v7_dualvq+rvq-cell-30-300+rvq-niche-30-90+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",  # 7. rvq-cell (30, 300)
+    # neighbors-axis extension
+    "s51_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn8+sampler8+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",  # 8. knn=8 + sampler=8  (NEW)
+    "s51_v9_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler8+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",  # 9. knn=16 + sampler=8 (dense graph + sparse sampler — NEW, replaces dup)
+    "s51_v10_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn24+sampler24+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",  # 10. knn=24 + sampler=24 (NEW)
+    "s51_v11_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16-16+gnn-l2+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",  # 11. 2-layer GNN + sampler [16, 16]  (NEW)
+]
+
+DATASET_VARIANTS["chl59-2b_1p-ablations-v51"] = [
+    # 7 original ablations
+    "s51_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p",  # 1. base (control)
+    "s51_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+chl59-2b_1p",  # 2. -contrastive
+    "s51_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+no-adj+chl59-2b_1p",  # 3. -adjacency
+    "s51_v4_dualvq+rvq-both+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p",  # 4. -decoder-cov
+    "s51_v5_dualvq+rvq-cell-30-30+rvq-niche-30-90+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p",  # 5. rvq-cell (30, 30)
+    "s51_v6_dualvq+rvq-cell-30-10+rvq-niche-30-90+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p",  # 6. rvq-cell (30, 10)
+    "s51_v7_dualvq+rvq-cell-30-300+rvq-niche-30-90+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p",  # 7. rvq-cell (30, 300)
+    # neighbors-axis extension
+    "s51_v8_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn8+sampler8+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p",  # 8. knn=8 + sampler=8  (NEW)
+    "s51_v9_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler8+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p",  # 9. knn=16 + sampler=8 (dense graph + sparse sampler — NEW, replaces dup)
+    "s51_v10_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn24+sampler24+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p",  # 10. knn=24 + sampler=24 (NEW)
+    "s51_v11_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16-16+gnn-l2+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p",  # 11. 2-layer GNN + sampler [16, 16]  (NEW)
+]
+
+
 def _ablation_summary(variant: str) -> dict:
     """A small, human-readable record of what this run is. Saved next to the
     full materialised config so you can grep / cat the summary without
@@ -28063,6 +29919,9 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
     if dataset == "chl59-8b_1p":
         cfg = make_dataset_blob_config_chl59()
         cfg_path = CONFIG_OUT_DIR / "build_blob_chl59-8b_1p.yaml"
+    elif dataset == "chl59-2b_1p":
+        cfg = make_dataset_blob_config_chl59_2b()
+        cfg_path = CONFIG_OUT_DIR / "build_blob_chl59-2b_1p.yaml"
     elif dataset == "mmb0-1b_smb1-20b_1p":
         cfg = make_dataset_blob_config_mmb20()
         cfg_path = CONFIG_OUT_DIR / "build_blob_mmb0-1b_smb1-20b_1p.yaml"
@@ -28075,7 +29934,7 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
     else:
         raise ValueError(
             f"Unknown --build-blob-dataset {dataset!r}. Choices: "
-            f"'mmb0-1b_smb1-1b_1p', 'chl59-8b_1p', "
+            f"'mmb0-1b_smb1-1b_1p', 'chl59-8b_1p', 'chl59-2b_1p', "
             f"'mmb0-1b_smb1-20b_1p', 'spatch_1p'."
         )
     with open(cfg_path, "w") as f:
@@ -30249,6 +32108,7 @@ def main():
                    choices=[
                        "mmb0-1b_smb1-1b_1p",
                        "chl59-8b_1p",
+                       "chl59-2b_1p",
                        "mmb0-1b_smb1-20b_1p",
                        "spatch_1p",
                    ],
@@ -30257,6 +32117,9 @@ def main():
                         "brain, 1+1 sections). "
                         "'chl59-8b_1p' = /nfs/team361/sb75/DATASETS/"
                         "silver/chl59-8b_1p (CosMx Lung, 8 samples). "
+                        "'chl59-2b_1p' = /lustre/scratch126/cellgen/"
+                        "lotfollahi/DATASETS/silver/chl59-2b_1p (CosMx "
+                        "Lung, 2-sample subset for ablations). "
                         "'mmb0-1b_smb1-20b_1p' = /lustre/.../silver/"
                         "mmb0-1b_smb1-20b_1p_shared_genes (MERFISH + 20 "
                         "STARmap, harmonised by "
