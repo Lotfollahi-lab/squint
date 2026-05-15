@@ -337,9 +337,14 @@ def main():
                     help="If given, comma-separated category labels in sorted "
                          "order to remap the batch values. Example: "
                          "'MERFISH,STARmap PLUS' for two-batch datasets.")
-    ap.add_argument("--label-keys", type=str, default="cell_type",
+    ap.add_argument("--label-keys", type=str,
+                    default="cell_type,annotation,niche,spatial_cluster",
                     help="Comma-separated obs columns to color UMAP by, in "
-                         "addition to the batch panel.")
+                         "addition to the batch panel. Defaults cover "
+                         "multiple datasets — missing columns are silently "
+                         "skipped: cell_type (mmb / chl59), annotation "
+                         "(spatch_{ov,hcc,coad}_1p), niche (chl59), "
+                         "spatial_cluster (spatch_*_1p).")
     ap.add_argument("--n-neighbors", type=int, default=15,
                     help="kNN size for sc.pp.neighbors (default 15).")
     ap.add_argument("--n-pcs", type=int, default=None,

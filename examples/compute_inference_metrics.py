@@ -153,8 +153,17 @@ DEFAULT_EMB_KEYS = [
     "X_squint_quantized",
 ]
 
-DEFAULT_CELL_LABEL_KEYS  = ["cell_type", "cell_types"]
-DEFAULT_NICHE_LABEL_KEYS = ["niche", "Sub_molecular_tissue_region", "ccf_region_name"]
+# Cell-type label columns to score cell codes against. Tried in order;
+# missing columns are silently skipped per-(seed, label) so the defaults
+# can safely list keys from MULTIPLE datasets:
+#   - "cell_type" / "cell_types": mmb (mouse brain), chl59 (CosMx Lung)
+#   - "annotation":               spatch_{ov, hcc, coad}_1p tissue subsets
+DEFAULT_CELL_LABEL_KEYS  = ["cell_type", "cell_types", "annotation"]
+# Niche / spatial-region label columns. Same per-dataset rationale:
+#   - "niche":                                   chl59 (CosMx Lung)
+#   - "Sub_molecular_tissue_region", "ccf_region_name": mmb mouse brain
+#   - "spatial_cluster":                         spatch_{ov, hcc, coad}_1p
+DEFAULT_NICHE_LABEL_KEYS = ["niche", "Sub_molecular_tissue_region", "ccf_region_name", "spatial_cluster"]
 
 
 # ---------------------------------------------------------------------------
