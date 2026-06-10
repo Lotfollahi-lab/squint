@@ -438,6 +438,69 @@ def make_dataset_blob_config_mmb20() -> dict:
     }
 
 
+def make_dataset_blob_config_mmb239() -> dict:
+    """
+    Dataset-blob build config for the 239-section MERFISH mouse-brain
+    dataset (`/lustre/.../silver/mmb0-239b_1p`, 239 AnnDatas:
+    harmonised_merfish_mouse_brain_239-batch_batch{1..239}.h5ad).
+
+    Unlike `make_dataset_blob_config_mmb20` (which mixes MERFISH + STARmap
+    and therefore needs panel harmonization -> a `_shared_genes` dir), ALL
+    239 sections here are MERFISH mouse brain on the SAME gene panel, so NO
+    harmonization step is required: we read the silver dir directly and the
+    dataset name has no `_shared_genes` suffix.
+
+    Run order (one-time):
+        python examples/run_squint.py --build-blob --build-blob-dataset mmb0-239b_1p
+        -> reads /lustre/.../silver/mmb0-239b_1p, builds dataset_blob.pt
+
+    Notes:
+      - root data path -> /lustre/scratch126/cellgen/lotfollahi/DATASETS
+        (same DATA_ROOT as mmb20; silver/mmb0-239b_1p lives under it).
+      - n_neighs_list [8, 16]: 8 = SQUINT default / smoke; 16 = the
+        s49_v23 spine (graph_knn(n_neighs=16)). Both precomputed so no
+        rebuild per sampler depth.
+      - batch_key 'batch': the silver AnnDatas carry obs['batch'] = the
+        per-section id, so `build_batch_one_hot_from_obs` densifies cleanly
+        across all 239 sections.
+      - label_names empty: no supervised heads; per-cell obs is carried to
+        inference via `obs_per_batch_id`.
+    """
+    return {
+        "experiment": {
+            "name": "in_memory_dataset_blob",
+            "description": (
+                "MERFISH mouse-brain, 239 sections, single shared gene "
+                "panel (no harmonization needed)."
+            ),
+        },
+        "dataset": {
+            "name": "mmb0-239b_1p",
+            "feature_names": ["cell_gene_counts"],
+            "label_names": [],
+            "graph_kwargs": {
+                "coord_type":         "generic",
+                "spatial_key":        "spatial",
+                "n_neighs_list":      [8, 16],
+                "radius_list":        None,
+                "include_self_loop":  True,
+                "batch_key":          "batch",
+                "k": {
+                    "lm_eigvecs": 128,
+                },
+            },
+            "data_directory_path": str(DATA_ROOT),
+            "pre_transform": None,
+            "pre_filter":    None,
+            "overwrite":     True,
+        },
+        "software_paths": {
+            "deepwalk": "",
+            "gosh":     "",
+        },
+    }
+
+
 def _make_spatch_blob_config(name: str, description: str) -> dict:
     """
     Shared body for all `spatch_*_1p` blob configs. Differs from
@@ -4204,6 +4267,54 @@ def _patch_dual_spatch(
     # training section; the held-out test sections are evaluated by
     # `predict()` post-hoc.
     cfg["trainer"]["monitor"] = "val_loss"
+    return cfg
+
+
+def _patch_dual_mmb239(
+        cfg: dict,
+        train_adata_ids: Optional[List[int]] = None,
+        test_adata_ids: Optional[List[int]] = None,
+        batch_size: int = 512,
+        edge_sampling_ratio: float = 2.0,
+        gnn_layers: int = 1,
+        sampler_neighbors: List[int] = [16],
+        nbr_aggregation_hops: int = 1,
+    ) -> dict:
+    """
+    Swap the dataset to /lustre/.../silver/mmb0-239b_1p (239 MERFISH
+    mouse-brain sections, single shared gene panel). Reuses
+    `_patch_dual_mmb20`'s whole-section split + memory + niche-depth wiring,
+    then overrides the dataset identity (no `_shared_genes` suffix — these
+    are all MERFISH, so no panel harmonization is needed).
+
+    Defaults reproduce the s49_v23 config faithfully (bs=512, edge_sampling
+    2.0, gnn=1, sampler=[16], nbr_hops=1). With `train_adata_ids=None` and
+    `test_adata_ids=None`, train() trains on EVERY section in the blob and
+    the base config's 10% cell-level split provides the val signal (no
+    whole-section test holdout).
+
+    !! SCALE WARNING: 239 sections is ~12x the mmb20 run, whose static graph
+    (x + edge_index for all training sections) already sat resident on the
+    GPU. At bs=512 this WILL be extremely memory-heavy and is likely to OOM
+    except on the largest GPUs. If it OOMs, dial down (in this order):
+    `batch_size` (256 -> 128 -> 64), `edge_sampling_ratio` (-> 1.0/0.5),
+    `sampler_neighbors` ([16] -> [8]). All are exposed as parameters here.
+    """
+    cfg = _patch_dual_mmb20(
+        cfg,
+        train_adata_ids=train_adata_ids,
+        test_adata_ids=test_adata_ids,
+        batch_size=batch_size,
+        edge_sampling_ratio=edge_sampling_ratio,
+        gnn_layers=gnn_layers,
+        sampler_neighbors=sampler_neighbors,
+        nbr_aggregation_hops=nbr_aggregation_hops,
+    )
+    # Override the dataset identity set by _patch_dual_mmb20 (which targets
+    # the harmonized mmb20 dir). mmb0-239b_1p is read directly from the
+    # silver dir of the same name under root_data_dir.
+    cfg["dataset"]["dataset_name"] = "mmb0-239b_1p"
+    cfg["dataset"]["dataset_tag"]  = "mmb0-239b_1p"
     return cfg
 
 
@@ -23394,6 +23505,75 @@ VARIANTS: dict = {
             nbr_aggregation_hops=1,
         ),
     },
+    "s49_v23_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-239b_1p": {
+        "description": (
+            "s49_v23 ported to mmb0-239b_1p (239 MERFISH mouse-brain sections, single shared gene panel — NO harmonization needed, unlike mmb20). IDENTICAL model/loss config to the mmb0-1b_smb1-1b_1p s49_v23 benchmarking variant (decoupled-enc + within-batch contrastive wt=10/k=5 + cell-VQ codebook-diversity wt=10 on the s48_v2 spine: cell-w=1, no-batch-int, enc-deeper [400,400,256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec; cell RVQ = (30,90), niche RVQ = (30,90); gnn=1, nbr_hops=1, edge_sampling_ratio=2.0). Dataset swapped via _patch_dual_mmb239: TRAIN ON ALL 239 sections (test_adata_ids omitted), val = 10% in-section cell split — no whole-section test holdout (intended for producing SQUINT codes across all sections for the downstream tissue-scale JEPA). bs kept at 512 (faithful to s49_v23). !! SCALE WARNING: 239 sections is ~12x mmb20 (already memory-heavy at 19 sections); bs=512 over a 239-section resident graph WILL be very memory-heavy and likely OOMs except on the largest GPUs — if so, lower batch_size (256/128/64) then edge_sampling_ratio then sampler. REQUIRES a BLOB BUILD: --build-blob --build-blob-dataset mmb0-239b_1p (k=[8,16] pre-populated)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10.0, k_pos=5, T=0.1)",
+            "+decoupled-enc(independent niche MLP)",
+            "+codebook-diversity(branch=cell, wt=10.0, T=100.0)",
+            "+mmb239(train=ALL-239, test=none, bs512, sampler[16], gnn1, nbr1, edge_sampling=2.0)",
+        ],
+        "build": lambda: _patch_dual_mmb239(
+    _patch_dual_codebook_diversity(
+                _patch_dual_contrastive_cell_within_batch(
+                _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                _patch_dual_attr_recon_weight(
+                _patch_dual_sampler_neighbors(
+                _patch_dual_graph_knn(
+                _patch_dual_decoder_width(
+                _patch_dual_decoupled_encoders(
+                _patch_dual_encoder_deeper(
+                _patch_dual_decoder_covariate(
+                _patch_dual_rvq(
+                _patch_dual_rvq(
+                _BD(),
+                branch="niche", codebook_sizes=(30, 90),
+            ),
+                branch="cell", codebook_sizes=(30, 90),
+            ),
+            ),
+                hidden_channels=[400, 400, 256],
+            ),
+            ),
+                hidden_channels=[32],
+            ),
+                n_neighs=16,
+            ),
+                num_neighbors=[16],
+            ),
+                weight=1.0,
+            ),
+                batch_size=512, lr=7e-4,
+            ),
+            ),
+                enabled=True,
+            ),
+                wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+            ),
+                weight=10.0, temperature=100.0, branch="cell",
+            ),
+            batch_size=512,
+            edge_sampling_ratio=2.0,
+            gnn_layers=1,
+            sampler_neighbors=[16],
+            nbr_aggregation_hops=1,
+        ),
+    },
     "s49_v24_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+rvq-cell-30-200+contrastWB-w200-k5+mmb0-1b_smb1-1b_1p": {
         "description": (
             "s49 sweep, variant 24: L2=200 codebook + contrastive wt=200 (size + stronger contrastive combo). Built on the s48_v2 spine (s42 winner + cell-w=1.0 + within-batch contrastive cell loss at wt=10, k=5, T=0.1), which already lifts cell-NMI without hurting niche metrics. This variant changes only the axes called out in the summary; all other knobs match the spine. REQUIRES BLOB REBUILD (k=16 in n_neighs_list)."
@@ -34130,6 +34310,9 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
     elif dataset == "mmb0-1b_smb1-20b_1p":
         cfg = make_dataset_blob_config_mmb20()
         cfg_path = CONFIG_OUT_DIR / "build_blob_mmb0-1b_smb1-20b_1p.yaml"
+    elif dataset == "mmb0-239b_1p":
+        cfg = make_dataset_blob_config_mmb239()
+        cfg_path = CONFIG_OUT_DIR / "build_blob_mmb0-239b_1p.yaml"
     elif dataset == "mmb0-1b_smb1-1b_1p":
         cfg = make_dataset_blob_config()
         cfg_path = CONFIG_OUT_DIR / "build_blob_mmb0-1b_smb1-1b_1p.yaml"
@@ -34149,7 +34332,7 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
         raise ValueError(
             f"Unknown --build-blob-dataset {dataset!r}. Choices: "
             f"'mmb0-1b_smb1-1b_1p', 'chl59-8b_1p', 'chl59-2b_1p', "
-            f"'mmb0-1b_smb1-20b_1p', 'spatch_1p', "
+            f"'mmb0-1b_smb1-20b_1p', 'mmb0-239b_1p', 'spatch_1p', "
             f"'spatch_ov_1p', 'spatch_hcc_1p', 'spatch_coad_1p'."
         )
     with open(cfg_path, "w") as f:
@@ -36325,6 +36508,7 @@ def main():
                        "chl59-8b_1p",
                        "chl59-2b_1p",
                        "mmb0-1b_smb1-20b_1p",
+                       "mmb0-239b_1p",
                        "spatch_1p",
                        "spatch_ov_1p",
                        "spatch_hcc_1p",
