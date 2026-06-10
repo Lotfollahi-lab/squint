@@ -127,3 +127,47 @@ def nb_nbr_attribute_reconstruction_loss(
         k_hop_nb_loss=k_hop_nb_loss,
         wt_attr_reconstr=wt_attr_reconstr,
     )
+
+
+def nb_nbr_attribute_reconstruction_loss_dual(
+        pred_attr_nbr: torch.Tensor,
+        target_attr_nbr: torch.Tensor,
+        edge_index: torch.Tensor,
+        batch_size: int,
+        dispersion_niche: torch.Tensor,
+        k_hop_nb_loss: int = 0,
+        wt_attr_reconstr: float = 0.1,
+    ) -> torch.Tensor:
+    """
+    Same as `nb_nbr_attribute_reconstruction_loss` but reads its NB-
+    dispersion parameter from a *separate* tensor named `dispersion_niche`,
+    so the niche branch in VQNiche_Dual can have its own learnable
+    per-gene dispersion that is decoupled from the cell-branch dispersion.
+
+    Why a separate dispersion is essential for the dual model
+    ---------------------------------------------------------
+    The two NB likelihoods in VQNiche_Dual see targets with very
+    different variance structure:
+
+      - Cell-branch target  = per-cell raw counts
+                              (high variance, lots of zeros)
+                              -> optimal theta is SMALL (high overdispersion)
+      - Niche-branch target = 1-hop neighbourhood-mean of raw counts
+                              (smoother by ~8-9x via averaging)
+                              -> optimal theta is LARGE (low overdispersion)
+
+    With a *shared* dispersion the niche branch's gradient on theta is
+    cleaner (smooth target, easier to fit) so it dominates: theta drifts
+    up over training and the cell-branch NB likelihood degrades even
+    when the cell decoder predictions are static. Decoupling the two
+    dispersion parameters removes this gradient conflict entirely.
+    """
+    return nb_attribute_reconstruction_loss(
+        pred_attr=pred_attr_nbr,
+        target_attr=target_attr_nbr,
+        edge_index=edge_index,
+        batch_size=batch_size,
+        dispersion=dispersion_niche,
+        k_hop_nb_loss=k_hop_nb_loss,
+        wt_attr_reconstr=wt_attr_reconstr,
+    )

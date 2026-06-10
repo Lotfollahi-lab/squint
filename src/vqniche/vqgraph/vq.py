@@ -228,6 +228,9 @@ class EuclideanCodebook(nn.Module):
         self.register_buffer("initted", torch.Tensor([not kmeans_init]))
         self.register_buffer("cluster_size", torch.zeros(num_codebooks, codebook_size))
         self.register_buffer("embed_avg", embed.clone())
+        # Match CosineSimCodebook: external control for the VQ-warmup
+        # feature. When set, lazy init AND EMA updates are deferred.
+        self.register_buffer("freeze_updates", torch.tensor([False]))
 
         self.learnable_codebook = learnable_codebook
         if learnable_codebook:
@@ -239,6 +242,8 @@ class EuclideanCodebook(nn.Module):
     @torch.jit.ignore
     def init_embed_(self, data):
         if self.initted:
+            return
+        if bool(self.freeze_updates):
             return
 
         embed, cluster_size = kmeans(
@@ -302,7 +307,8 @@ class EuclideanCodebook(nn.Module):
         # print(embed_ind.shape)
         quantize = batched_embedding(embed_ind, self.embed)
         # print(embed_onehot.shape)
-        if self.training:
+        # `freeze_updates` skip: see CosineSimCodebook for rationale.
+        if self.training and not bool(self.freeze_updates):
             cluster_size = embed_onehot.sum(dim=1)
             # print(cluster_size.shape)
             self.all_reduce_fn(cluster_size)
@@ -362,6 +368,17 @@ class CosineSimCodebook(nn.Module):
 
         self.register_buffer("initted", torch.Tensor([not kmeans_init]))
         self.register_buffer("cluster_size", torch.zeros(num_codebooks, codebook_size))
+        # `freeze_updates` lets an external caller (e.g. VQNiche_Dual's
+        # `on_train_epoch_start`) suppress BOTH the lazy kmeans init AND
+        # the EMA update + dead-code expiry inside `forward`. Used by
+        # the VQ-warmup feature: during the first N epochs the codebook
+        # stays at its uniform-init values and the encoder gets to
+        # settle under reconstruction + adversarial gradients before
+        # the codes lock in to whatever distribution z_mlp happens to
+        # have at epoch 0 (which is heavily batch-correlated). Default
+        # False = legacy behaviour. Registered as a buffer so the flag
+        # is part of `state_dict()` and survives DDP.
+        self.register_buffer("freeze_updates", torch.tensor([False]))
 
         self.learnable_codebook = learnable_codebook
         if learnable_codebook:
@@ -372,6 +389,11 @@ class CosineSimCodebook(nn.Module):
     @torch.jit.ignore
     def init_embed_(self, data):
         if self.initted:
+            return
+        # `freeze_updates`-controlled deferral: when set (typically
+        # during a VQ warmup window), the lazy kmeans-init is held off
+        # so the encoder can settle before the codes lock in.
+        if bool(self.freeze_updates):
             return
 
         embed, cluster_size = kmeans(
@@ -437,7 +459,12 @@ class CosineSimCodebook(nn.Module):
 
         quantize = batched_embedding(embed_ind, self.embed)
 
-        if self.training:
+        # Skip EMA + dead-code expiry when `freeze_updates` is set
+        # (VQ warmup window). The codebook stays at its uniform-init
+        # values; the forward still produces a quantized output (so the
+        # downstream graph + STE remain unchanged), but the codes don't
+        # drift toward the early-epoch z_mlp distribution.
+        if self.training and not bool(self.freeze_updates):
             bins = embed_onehot.sum(dim=1)
             self.all_reduce_fn(bins)
 

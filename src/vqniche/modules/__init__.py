@@ -5,6 +5,7 @@ from .cosine_codebook import CosineSimCodebook
 from .vq import get_vq_class, get_valid_params
 from .hierarchical_vq import ResidualVQ_Squint, ConditionalVQ
 from .dispersion_head import DispersionHead
+from .adversary import BatchAdversaryHead, grad_reverse
 from .film import FiLM
 from .temperature_annealer import TemperatureAnnealer
 
@@ -27,6 +28,10 @@ __all__ = [
 
     # NB likelihood
     'DispersionHead',
+
+    # Adversarial batch invariance (Ganin et al. 2015 GRL)
+    'BatchAdversaryHead',
+    'grad_reverse',
 
     # Conditioning modules
     'FiLM',

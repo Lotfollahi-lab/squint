@@ -37,6 +37,7 @@ import concurrent.futures
 from typing import Optional, Callable, List, Tuple
 
 import numpy as np
+import pandas as pd
 import scanpy as sc
 import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
@@ -128,6 +129,72 @@ class InMemoryDatasetBlob(InMemoryDataset):
         # This index is set to 0 because there is only one processed data file.
         self.load(self.processed_paths[0])
 
+        # Best-effort load of the per-AnnData obs DataFrames written by
+        # `process()`. Pre-existing blobs that were built before this field
+        # was introduced won't have the file — fall back to an empty dict
+        # (downstream code treats "no obs_per_batch_id" as "don't write
+        # extra obs columns to the inference adata").
+        obs_pkl = Path(self.processed_dir) / "obs_per_batch_id.pkl"
+        if obs_pkl.exists():
+            with open(obs_pkl, "rb") as f:
+                self.obs_per_batch_id = pickle.load(f)
+        else:
+            self.obs_per_batch_id = {}
+
+
+    def _derive_adata_batch_id(self, adata_batch, adata_batch_file) -> int:
+        """
+        Derive the integer `adata_batch_id` from `adata.uns['batch']`.
+
+        Accepted shapes for `uns['batch']`:
+          - integer (`6`, `np.int64(6)`, ...)              -> 6
+          - integer string (`'6'`)                         -> 6
+          - 'batchN' string (`'batch6'`)                   -> 6
+
+        Anything else is a hard error — `uns['batch']` is the canonical
+        and only source of section-level batch identity. The previous
+        file-alphabetical-position fallback was removed because it could
+        silently mis-attribute sections when files were added / removed /
+        renamed between blob builds.
+        """
+        uns_batch = adata_batch.uns.get('batch', None)
+        if uns_batch is None:
+            raise ValueError(
+                f"adata.uns['batch'] is missing for "
+                f"{Path(adata_batch_file).name}. Every input AnnData must "
+                f"carry uns['batch'] (an int, int-string, or 'batchN' "
+                f"string) — that's the canonical source of section-level "
+                f"batch identity."
+            )
+        # int or numpy int-like — already done.
+        try:
+            import numpy as _np
+            if isinstance(uns_batch, (int, _np.integer)):
+                return int(uns_batch)
+        except ImportError:
+            if isinstance(uns_batch, int):
+                return int(uns_batch)
+        # 'batchN' string.
+        if isinstance(uns_batch, str):
+            if uns_batch.startswith('batch'):
+                tail = uns_batch[5:]
+                try:
+                    return int(tail)
+                except ValueError:
+                    pass
+            # Plain integer string ('6').
+            try:
+                return int(uns_batch)
+            except ValueError:
+                pass
+        raise ValueError(
+            f"adata.uns['batch']={uns_batch!r} for "
+            f"{Path(adata_batch_file).name} is not parseable as an int. "
+            f"Accepted shapes: integer, integer-string ('6'), or 'batchN' "
+            f"string ('batch6'). Re-stamp uns['batch'] on every silver "
+            f"file in the dataset before rebuilding the blob."
+        )
+
 
     def process(self) -> None:
         """
@@ -151,8 +218,27 @@ class InMemoryDatasetBlob(InMemoryDataset):
             for label_name in self.label_names
         }
 
+        # Collect each input AnnData's full `.obs` DataFrame, keyed by the
+        # same integer `adata_batch_id` that `process_anndata_batch` will
+        # stamp on the per-cell PyG Data objects. Pickled to disk and
+        # used by `inference_data_dict_to_adata` to write *every* obs
+        # column of every input AnnData onto the inference output AnnData,
+        # NaN-filling columns that are present only in some batches.
+        # Done in pass 1 (sequential, single-process) because pass 2 runs
+        # in a process pool — accumulating shared state from inside that
+        # pool would not propagate back to the parent.
+        self.obs_per_batch_id: dict = {}
+
         for adata_batch_file in self.raw_paths:
             adata_batch = sc.read(adata_batch_file)
+
+            # Capture full `.obs` for this AnnData (copy so subsequent
+            # reads / mutations don't affect what we save).
+            adata_batch_id = self._derive_adata_batch_id(
+                adata_batch=adata_batch,
+                adata_batch_file=adata_batch_file,
+            )
+            self.obs_per_batch_id[adata_batch_id] = adata_batch.obs.copy()
 
             if self.gene_panel is None:
                 # adata_batch.var is a pandas dataframe
@@ -181,7 +267,27 @@ class InMemoryDatasetBlob(InMemoryDataset):
                     )
 
             for label_name, label_key in zip(self.label_names, self.label_keys):
-                self.label_categories[label_name].update(adata_batch.obs[label_key].unique())
+                if label_key not in adata_batch.obs.columns:
+                    print(
+                        f"WARNING: obs column '{label_key}' missing from "
+                        f"{Path(adata_batch_file).name}; skipping y_{label_name} "
+                        "for this batch."
+                    )
+                    continue
+                # Drop NaN / None / pd.NA from the unique-values list before
+                # adding to the category set. Real-world AnnDatas often have
+                # unlabeled cells (NaN in obs[label_key]); they shouldn't
+                # become a category (and the mixed-type set would also fail
+                # the `sorted()` below with
+                # `'<' not supported between instances of 'float' and 'str'`).
+                # Cells with NaN/None labels still load — `pandas_to_torch_one_hot`
+                # encodes them as an all-zero row (no category matches),
+                # which downstream code treats as "unlabeled".
+                _vals = adata_batch.obs[label_key].unique()
+                # pandas' `.dropna()` on an Index also strips pd.NA; cast to
+                # Series first since np.ndarray doesn't have .dropna().
+                _vals = pd.Series(_vals).dropna().tolist()
+                self.label_categories[label_name].update(_vals)
 
         print("All batches have the same gene panel.")
 
@@ -197,6 +303,11 @@ class InMemoryDatasetBlob(InMemoryDataset):
         # save the gene panel to disk
         with open(Path(self.processed_dir) / "gene_panel.pkl", "wb") as f:
             pickle.dump(self.gene_panel, f)
+
+        # save the per-AnnData `.obs` DataFrames to disk for inference-time
+        # propagation to the output AnnData (see __init__ load below).
+        with open(Path(self.processed_dir) / "obs_per_batch_id.pkl", "wb") as f:
+            pickle.dump(self.obs_per_batch_id, f)
 
         # ----------------- Second Pass over AnnData Batches -----------------
         # This pass is used to process each batch of AnnData into a PyG Data object.
@@ -334,6 +445,12 @@ class InMemoryDatasetBlob(InMemoryDataset):
             # ----------------- Build Torch One-Hot Labels -----------------
         # build for node labels (categorical pandas series to one hot tensor)
         for label_name, label_key in zip(self.label_names, self.label_keys):
+            if label_key not in adata_batch.obs.columns:
+                # Already warned during pre-scan; just skip writing
+                # the y_<label> tensor for this batch. Downstream code
+                # that consumes y_<label> already tolerates missing keys
+                # (it iterates over `batch.keys()` looking for 'y_*').
+                continue
             batch_dict[f"y_{label_name}"] = pandas_to_torch_one_hot(
                                                 adata_batch.obs[label_key],
                                                 categories=self.label_categories[label_name]
@@ -403,11 +520,56 @@ class InMemoryDatasetBlob(InMemoryDataset):
         # ----------------- Add Metadata -----------------
         batch_dict['xy_coordinates'] = Tensor(adata_batch.obsm['spatial'])
         batch_dict['cell_id'] = adata_batch.obs['cell_id'].to_list()
-        batch_dict['dataset_id'] = adata_batch.uns['dataset_id']
-        batch_dict['tissue'] = adata_batch.uns['tissue']
-        batch_dict['species'] = adata_batch.uns['species']
-        batch_dict['adata_batch_id'] = int(adata_batch.uns['batch'][5:])
-        print(f"{batch_dict['adata_batch_id']=}, {adata_batch.uns['batch']=}")
+        # `dataset_id` / `tissue` / `species` are pure metadata —
+        # round-tripped through training so they end up on the
+        # `predicted_adata.uns` at inference time for traceability, but
+        # NO downstream computation reads them. Default to safe values
+        # when missing so new datasets (e.g. spatch_1p) can build their
+        # blob without a curator pre-stamping every metadata key first.
+        # If you DO stamp them on the silver AnnDatas, those values win.
+        batch_dict['dataset_id'] = adata_batch.uns.get('dataset_id', self.name)
+        batch_dict['tissue']     = adata_batch.uns.get('tissue',     'unknown')
+        batch_dict['species']    = adata_batch.uns.get('species',    'unknown')
+
+        # Per-cell row index INTO this AnnData's `.obs` DataFrame. Combined
+        # with `adata_batch_ids` it forms a unique per-cell key that
+        # survives PyG concat + NeighborLoader sub-sampling, used at
+        # inference time to look up arbitrary obs columns from the
+        # dataset_blob's stored `obs_per_batch_id` and write them onto
+        # the output AnnData (with NaN-fill for columns missing in this
+        # AnnData but present in another).
+        batch_dict['obs_row_index'] = torch.arange(
+            len(adata_batch), dtype=torch.long
+        )
+
+        # Per-cell batch label for FiLM / decoder-covariate / adversarial
+        # batch correction. Sourced from `adata.uns['batch']` (per-section
+        # value) and broadcast to every cell in the section. Earlier
+        # versions read `adata.obs[batch_key]` (per-cell) and fell back to
+        # parsing 'batchN' out of `obs['cell_id']`; both are now
+        # superseded — `uns['batch']` is the single canonical source for
+        # the section's batch identity. If `uns['batch']` is missing the
+        # field is left unset, and `initialize_databatch` will raise a
+        # clear error pointing at the dataset blob build.
+        uns_batch_value = adata_batch.uns.get('batch', None)
+        if uns_batch_value is not None:
+            batch_dict['obs_batch'] = (
+                [str(uns_batch_value)] * len(adata_batch)
+            )
+
+        # `adata_batch_id` is a small integer key used by the in-memory
+        # dataloader to label each cell with which AnnData it came from.
+        # Historically derived from `uns['batch'][5:]` ("batchN" -> N).
+        # Be defensive: fall back to a sequential index if `uns['batch']`
+        # is missing or doesn't follow the "batchN" convention.
+        batch_dict['adata_batch_id'] = self._derive_adata_batch_id(
+            adata_batch=adata_batch,
+            adata_batch_file=adata_batch_file,
+        )
+        print(
+            f"{batch_dict['adata_batch_id']=}, "
+            f"uns['batch']={adata_batch.uns.get('batch', None)!r}"
+        )
 
         # ----------------- Convert Data Dict to PyG Data Object -----------------
         data_batch = Data(**batch_dict)

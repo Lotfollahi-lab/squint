@@ -30,7 +30,7 @@ so the encoder and downstream metric code can branch on `num_quantizers`
 without further plumbing.
 """
 
-from typing import Sequence, Union, List
+from typing import Sequence, Union, List, Optional
 
 import torch
 import torch.nn as nn
@@ -101,6 +101,22 @@ class ResidualVQ_Squint(nn.Module):
             sync_kmeans: bool = True,
             commitment_weight: float = 0.0,   # external commit loss is used
             sample_codebook_temp: float = 0.0,
+            # ----- codebook-diversity loss (lucidrains feature) ---------------
+            # When > 0, the inner VectorQuantize adds a softmax-similarity
+            # penalty that pushes codes APART in the embedding sphere on
+            # every forward pass. This is the SwAV/DINO-style "prototype
+            # repulsion" signal — it directly penalises code collapse and
+            # tends to produce more distinct, well-separated centroids.
+            #
+            # Default 0.0 = legacy behaviour (lucidrains' VectorQuantize
+            # doesn't add the term unless weight > 0).
+            #
+            # `codebook_diversity_temperature` softens the within-codebook
+            # similarity histogram before the softmax. Larger T = softer
+            # repulsion across many codes; smaller T = sharper, focuses
+            # on the few most similar pairs.
+            codebook_diversity_loss_weight: float = 0.0,
+            codebook_diversity_temperature: float = 100.0,
         ):
         super().__init__()
         codebook_sizes = _normalize_codebook_sizes(codebook_size, num_quantizers)
@@ -127,6 +143,11 @@ class ResidualVQ_Squint(nn.Module):
                 threshold_ema_dead_code=(threshold_ema_dead_code if i == 0 else 0),
                 commitment_weight=commitment_weight,
                 sample_codebook_temp=sample_codebook_temp,
+                # Diversity loss applies per-codebook; identical weight +
+                # temperature for every level. Per-level tuning isn't worth
+                # the complexity given a 2-level RVQ.
+                codebook_diversity_loss_weight=codebook_diversity_loss_weight,
+                codebook_diversity_temperature=codebook_diversity_temperature,
             )
             for i, k in enumerate(codebook_sizes)
         ])
@@ -167,23 +188,38 @@ class ResidualVQ_Squint(nn.Module):
 
 class ConditionalVQ(nn.Module):
     """
-    Two-level tree-structured VQ.
+    Tree-structured VQ with 2 or 3 levels.
 
     Level 1: a single VectorQuantize of size K1 (coarse niche).
     Level 2: K1 separate VectorQuantize modules, each of size K2 (one
-             refinement codebook per level-1 niche). Cells routed to the same
-             level-1 code share one level-2 codebook.
+             refinement codebook per level-1 code). Cells routed to the
+             same level-1 code share one level-2 codebook.
+    Level 3 (optional): K1 * K2 separate VectorQuantize modules, each
+             of size K3 (one per (level-1, level-2) leaf). Activated by
+             passing `codebook_size_l3` (else the module is 2-level and
+             behaves exactly as before).
 
-    Forward:
+    Forward (3-level case):
       z_q1, idx_l1 = vq_l1(z)
-      r1 = z - z_q1.detach()                 # detach for STE on level 2
+      r1 = z - z_q1.detach()
       for c in 0..K1-1:
           mask = (idx_l1 == c)
-          if any(mask):
-              z_q2[mask], idx_l2[mask] = vq_l2[c](r1[mask])
-      z_q = z_q1 + z_q2
+          if any: z_q2[mask], idx_l2[mask] = vq_l2[c](r1[mask])
+      r2 = r1 - z_q2.detach()
+      for c in 0..K1-1, b in 0..K2-1:
+          mask = (idx_l1 == c) & (idx_l2 == b)
+          if any: z_q3[mask], idx_l3[mask] = vq_l3[c*K2 + b](r2[mask])
+      z_q = z_q1 + z_q2 + z_q3
 
-    Total expressivity: K1 × K2 distinct quantized representations.
+    Total expressivity: K1 × K2 (2-level) or K1 × K2 × K3 (3-level)
+    distinct quantized representations.
+
+    Per-bucket data sparsity grows with depth (a typical (l1, l2) leaf
+    holds far fewer cells than an l1 bucket). Same defensive defaults
+    as level 2 are reused for level 3:
+      - kmeans_init=False (cannot reliably cluster a sparse leaf)
+      - threshold_ema_dead_code=0 (don't revive dead codes when the
+        leaf itself is small).
     """
 
     def __init__(
@@ -191,6 +227,7 @@ class ConditionalVQ(nn.Module):
             dim: int,
             codebook_size_l1: int = 30,
             codebook_size_l2: int = 10,
+            codebook_size_l3: Optional[int] = None,
             use_cosine_sim: bool = True,
             ema_update: bool = True,
             decay: float = 0.8,
@@ -206,9 +243,20 @@ class ConditionalVQ(nn.Module):
         self.dim = dim
         self.codebook_size_l1 = int(codebook_size_l1)
         self.codebook_size_l2 = int(codebook_size_l2)
-        self.codebook_sizes = [self.codebook_size_l1, self.codebook_size_l2]
+        self.codebook_size_l3 = (
+            int(codebook_size_l3) if codebook_size_l3 is not None else None
+        )
+        if self.codebook_size_l3 is not None:
+            self.codebook_sizes = [
+                self.codebook_size_l1,
+                self.codebook_size_l2,
+                self.codebook_size_l3,
+            ]
+            self.num_quantizers = 3
+        else:
+            self.codebook_sizes = [self.codebook_size_l1, self.codebook_size_l2]
+            self.num_quantizers = 2
         self.codebook_size = self.codebook_size_l1   # primary (level 1)
-        self.num_quantizers = 2
         self.heads = 1
         self.separate_codebook_per_head = False
 
@@ -247,16 +295,41 @@ class ConditionalVQ(nn.Module):
             )
             for _ in range(self.codebook_size_l1)
         ])
+        # Level 3: K1*K2 leaf codebooks, indexed flat as
+        #   idx = l1 * K2 + l2
+        # Stored as a single ModuleList (faster + simpler iteration than
+        # nesting). Built only when 3-level is requested.
+        if self.codebook_size_l3 is not None:
+            self.vq_l3 = nn.ModuleList([
+                VectorQuantize(
+                    dim=dim,
+                    codebook_size=self.codebook_size_l3,
+                    use_cosine_sim=use_cosine_sim,
+                    ema_update=ema_update,
+                    decay=decay,
+                    eps=eps,
+                    kmeans_init=False,
+                    threshold_ema_dead_code=0,
+                    commitment_weight=commitment_weight,
+                    sample_codebook_temp=sample_codebook_temp,
+                )
+                for _ in range(self.codebook_size_l1 * self.codebook_size_l2)
+            ])
+        else:
+            self.vq_l3 = None
 
     def forward(self, z: torch.Tensor):
         """
         z: (B, D)
         Returns:
-            z_q: (B, D)              z_q1 + z_q2
-            indices: (B, 2)          [level-1 idx, level-2 idx]
-            commit_loss: scalar      level-1 loss + mean over active level-2
-                                     buckets (empty buckets are skipped, not
-                                     counted, to keep the magnitude stable).
+            z_q: (B, D)              sum_l z_q_l
+            indices: (B, num_quantizers)
+                                     [l1, l2]            (2-level)
+                                     [l1, l2, l3]        (3-level)
+            commit_loss: scalar      sum of per-level losses
+                                     (mean across active buckets per
+                                     level so empty buckets don't tilt
+                                     the magnitude).
         """
         B, D = z.shape
         # Level 1
@@ -288,7 +361,49 @@ class ConditionalVQ(nn.Module):
         else:
             loss_l2 = torch.zeros((), device=z.device, dtype=z.dtype)
 
-        z_q = z_q1 + z_q2
-        indices = torch.stack([idx_l1, idx_l2], dim=-1)     # (B, 2)
-        commit_loss = loss_l1 + loss_l2
+        # ---- 2-level shortcut --------------------------------------------
+        if self.vq_l3 is None:
+            z_q = z_q1 + z_q2
+            indices = torch.stack([idx_l1, idx_l2], dim=-1)     # (B, 2)
+            commit_loss = loss_l1 + loss_l2
+            return z_q, indices, commit_loss
+
+        # ---- 3-level pass ------------------------------------------------
+        # Detach for level-3 STE on the running residual.
+        r2 = r1 - z_q2.detach()
+
+        z_q3 = torch.zeros_like(z_q1)
+        idx_l3 = torch.zeros(B, dtype=idx_l1.dtype, device=z.device)
+        loss_l3_terms: List[torch.Tensor] = []
+        K2 = self.codebook_size_l2
+        # Iterate over (l1, l2) leaves. There are K1*K2 of them; we skip
+        # any leaf with no cells (typical — most leaves are empty in any
+        # given batch). The combined-key trick (`leaf_id = l1*K2 + l2`)
+        # lets us hold all leaf VQs in a single ModuleList and avoids a
+        # second nested module.
+        for c in range(self.codebook_size_l1):
+            mask_l1 = (idx_l1 == c)
+            if not mask_l1.any():
+                continue
+            for b in range(K2):
+                mask = mask_l1 & (idx_l2 == b)
+                n_in_leaf = int(mask.sum().item())
+                if n_in_leaf == 0:
+                    continue
+                leaf_id = c * K2 + b
+                r2_cb = r2[mask]                            # (n_leaf, D)
+                z_q3_cb, idx_l3_cb, loss_l3_cb = self.vq_l3[leaf_id](r2_cb)
+                z_q3[mask] = z_q3_cb
+                idx_l3[mask] = idx_l3_cb
+                if isinstance(loss_l3_cb, torch.Tensor):
+                    loss_l3_terms.append(loss_l3_cb)
+
+        if len(loss_l3_terms) > 0:
+            loss_l3 = torch.stack(loss_l3_terms).mean()
+        else:
+            loss_l3 = torch.zeros((), device=z.device, dtype=z.dtype)
+
+        z_q = z_q1 + z_q2 + z_q3
+        indices = torch.stack([idx_l1, idx_l2, idx_l3], dim=-1)  # (B, 3)
+        commit_loss = loss_l1 + loss_l2 + loss_l3
         return z_q, indices, commit_loss

@@ -145,6 +145,23 @@ class VQNiche(BaseModel):
                         )
         print(f"4. Predictor: {predictor_name} that transforms {self.encoder.dim} hidden features to {out_channels} dimensional logits.")
 
+        # ---- Adjacency-loss input mode (optional) --------------------------
+        # By default, the BCE adjacency loss is computed on `h_adj`, which is
+        # the output of the adjacency_decoder MLP fed with the quantized
+        # latent. When `bypass_adj_decoder=True`, the BCE loss is computed
+        # directly on the quantized latent z_q, matching the NicheCompass /
+        # standard graph-VAE formulation:
+        #     edge_logit_ij = z_q_i^T z_q_j      (no extra non-linearity)
+        # This removes one MLP and forces the codebook embeddings themselves
+        # to encode pairwise spatial proximity, which is exactly the bias
+        # we want when the goal is for codes to capture spatial niches.
+        # Read here so it is set BEFORE the forward path is exercised.
+        loss_kwargs_for_flags = (loss_params.get('loss_kwargs', {})
+                                 if loss_params else {})
+        self.bypass_adj_decoder = bool(
+            loss_kwargs_for_flags.get('bypass_adj_decoder', False)
+        )
+
         # ---- Code-conditional dispersion (optional) ------------------------
         # When enabled, replace the global per-gene `dispersion` parameter
         # (kept on BaseModel as a fallback) with a small MLP that maps the
@@ -323,8 +340,16 @@ class VQNiche(BaseModel):
                     conditions=batch_attr_decoder_conditions,
                 )
 
-        # decode the VQ-encoded edge embeddings to recover the adjacency matrix
-        h_adj = self.adjacency_decoder(h_quantized)
+        # decode the VQ-encoded edge embeddings to recover the adjacency matrix.
+        # When `bypass_adj_decoder` is set, we feed the quantized latent z_q
+        # *directly* into the BCE adjacency loss so the edge logits are raw
+        # inner products z_q_i^T z_q_j — matching NicheCompass / standard
+        # graph-VAE formulation. This is a strong inductive bias toward codes
+        # whose embeddings cluster spatially.
+        if self.bypass_adj_decoder:
+            h_adj = h_quantized
+        else:
+            h_adj = self.adjacency_decoder(h_quantized)
 
         unnormalized_logits_batch = self.predictor(h_latent)
 
@@ -596,6 +621,13 @@ class VQNiche(BaseModel):
                         'dispersion': self._resolve_dispersion(h_quantized[:batch_size]), # attribute reconstruction loss
                         'h_adj': h_adj_batch, # adjacency reconstruction loss
                         'batch_edge_index': train_batch.edge_index, # adjacency reconstruction loss
+                        # Per-node section ids — consumed by the BCE adjacency
+                        # losses when `adj_within_section_only=True` (default)
+                        # to drop cross-section pairs from the negative set.
+                        # Set unconditionally; the dispatcher only reads it
+                        # when the flag is on, so legacy variants are
+                        # unaffected if no flag is set.
+                        'node_adata_batch_ids': getattr(train_batch, 'adata_batch_ids', None),
                         'logits': unnormalized_logits_batch[:batch_size], # label prediction loss
                         'labels': train_batch.y[:batch_size], # label prediction loss
                         'h_spatial_prior': h_spatial_prior, # spatial prior loss
@@ -883,7 +915,28 @@ class VQNiche(BaseModel):
         """
         if cache_dict is None:
             cache_dict = {key: [] for key in self.cache_keys}
-            
+
+        # Skip the appends if the caller is one of the persistent
+        # train/val/test caches AND nobody is going to consume it.
+        # `BaseModel.compute_metrics` only drains those caches at
+        # epoch boundaries; with `train_metrics_list = []` (the
+        # SQUINT_WITH_PEARSON=0 default) the consumer short-circuits
+        # AND the per-step appends pile up GPU tensors until OOM.
+        # Symptom: linear upward slope in the wandb GPU memory panel,
+        # ending in `torch.cuda.OutOfMemoryError` inside the adjacency
+        # BCE loss after ~75 s on a 140 GiB H100 at batch_size=1024.
+        # `predict()` passes `cache_dict=None` and gets a fresh local
+        # dict back — we always populate that (skip only fires for
+        # the persistent caches).
+        train_metrics_empty = not getattr(self, 'train_metrics_list', None)
+        test_metrics_empty  = not getattr(self, 'test_metrics_list',  None)
+        if cache_dict is getattr(self, 'train_inference_data_cache', None) and train_metrics_empty:
+            return cache_dict
+        if cache_dict is getattr(self, 'val_inference_data_cache',   None) and train_metrics_empty:
+            return cache_dict
+        if cache_dict is getattr(self, 'test_inference_data_cache',  None) and test_metrics_empty:
+            return cache_dict
+
         cache_dict['X'].append(batch.x[:batch_size])
         cache_dict['X_nbr'].append(
             aggregate_1hop_neighbor_features(
@@ -905,6 +958,17 @@ class VQNiche(BaseModel):
 
         cache_dict['XY_coordinates'].append(batch.xy_coordinates[:batch_size])
         cache_dict['adata_batch_ids'].append(batch.adata_batch_ids[:batch_size])
+
+        # Optional per-cell row index INTO the source AnnData's `.obs` —
+        # used together with `adata_batch_ids` to look up arbitrary obs
+        # columns from `dataset_blob.obs_per_batch_id` when building the
+        # inference output AnnData. Same dynamic-cache pattern as `y_*`.
+        if getattr(batch, 'obs_row_index', None) is not None:
+            if 'obs_row_index' not in cache_dict:
+                cache_dict['obs_row_index'] = []
+                if 'obs_row_index' not in self.cache_keys:
+                    self.cache_keys.append('obs_row_index')
+            cache_dict['obs_row_index'].append(batch.obs_row_index[:batch_size])
 
         # Cache model outputs
         cache_dict['H_latent'].append(h_latent[:batch_size])

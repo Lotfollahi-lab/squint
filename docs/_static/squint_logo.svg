@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!--
+  SQUINT logo. VQ-VAE for spatial transcriptomics with dual + residual
+  codebooks.
+
+  Concept: a stylised, half-closed ("squinting") eye whose iris is a
+  small grid of coloured tiles. The eye nods to the project name
+  (squinting = focused, narrow, deliberate look); the tile grid stands
+  for the discrete codebook (every cell's encoding is just one of K
+  tokens per branch, like cells viewed through a quantised lens).
+
+  All colours are explicit hex (no gradients), all text is rendered as
+  <text> elements (no font outlines). Edit freely in Illustrator /
+  Inkscape / any text editor.
+
+  Note: XML comments cannot contain double-hyphen sequences, so this
+  block uses prose paragraphs instead of dashed section dividers.
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 720 240"
+     width="720" height="240"
+     role="img" aria-label="SQUINT logo">
+  <title>SQUINT</title>
+  <desc>Stylised squinting eye with a quantised codebook iris, paired with the SQUINT wordmark.</desc>
+
+  <!-- Mark: stylised squinting eye, vertically centred at y=120.
+       The eye is a horizontal lens (two arcs meeting at sharp
+       corners), visually narrower than tall = "squinted". The iris
+       is a 3x3 grid of distinct token colours. -->
+  <g id="mark" transform="translate(20 0)" fill="none" stroke-linejoin="round">
+
+    <!-- Upper eyelid (arc bowing UP from left corner to right corner) -->
+    <path d="M 20 120 Q 130 28 240 120"
+          stroke="#1f3a5f" stroke-width="10" stroke-linecap="round"/>
+
+    <!-- Lower eyelid (arc bowing DOWN, mirror of the upper) -->
+    <path d="M 20 120 Q 130 212 240 120"
+          stroke="#1f3a5f" stroke-width="10" stroke-linecap="round"/>
+
+    <!-- Tear-duct accent dots at the corners — gives the "narrow,
+         focused gaze" feel without committing to a full eyelash motif. -->
+    <circle cx="20"  cy="120" r="6" fill="#1f3a5f" stroke="none"/>
+    <circle cx="240" cy="120" r="6" fill="#1f3a5f" stroke="none"/>
+
+    <!-- Iris: white disc, slightly clipped feeling because the lids
+         arc inward at top + bottom (no actual clipping path so the
+         disc still shows through; this is the squint convention). -->
+    <circle cx="130" cy="120" r="58" fill="#ffffff" stroke="#1f3a5f" stroke-width="3"/>
+
+    <!-- Quantised codebook iris: 3x3 grid of distinct tile colours.
+         Tiles are slightly rounded (rx=2) to read as discrete tokens
+         rather than a heatmap pixel grid. Palette = matplotlib tab10
+         (the same palette the niche-integration plots use elsewhere
+         in the project), so the logo's colours match the figures. -->
+    <g transform="translate(105 95)">
+      <rect x="0"  y="0"  width="14" height="14" rx="2" fill="#1f77b4"/>
+      <rect x="18" y="0"  width="14" height="14" rx="2" fill="#ff7f0e"/>
+      <rect x="36" y="0"  width="14" height="14" rx="2" fill="#2ca02c"/>
+      <rect x="0"  y="18" width="14" height="14" rx="2" fill="#d62728"/>
+      <rect x="18" y="18" width="14" height="14" rx="2" fill="#9467bd"/>
+      <rect x="36" y="18" width="14" height="14" rx="2" fill="#8c564b"/>
+      <rect x="0"  y="36" width="14" height="14" rx="2" fill="#e377c2"/>
+      <rect x="18" y="36" width="14" height="14" rx="2" fill="#bcbd22"/>
+      <rect x="36" y="36" width="14" height="14" rx="2" fill="#17becf"/>
+    </g>
+
+  </g>
+
+  <!-- Wordmark: "SQUINT" in tracked-out bold sans-serif. We use
+       the SVG `font-family` cascade so the rendering machine picks
+       a sane installed font (Inter / Helvetica / Arial in that
+       order). Text is real <text>, not outlined paths, so it
+       remains editable. -->
+  <text x="320" y="148"
+        font-family="Inter, Helvetica, Arial, sans-serif"
+        font-size="86" font-weight="800" letter-spacing="10"
+        fill="#1f3a5f">SQUINT</text>
+
+  <!-- Tagline (small, sub-wordmark). Optional — strip this <text>
+       block if you only want the standalone mark + name. -->
+  <text x="324" y="186"
+        font-family="Inter, Helvetica, Arial, sans-serif"
+        font-size="16" font-weight="400" letter-spacing="3"
+        fill="#5a6d85">spatial transcriptomics tokens</text>
+</svg>

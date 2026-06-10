@@ -17,12 +17,21 @@ from vqniche.loss import (
     mse_attribute_reconstruction_loss,
     nb_attribute_reconstruction_loss,
     nb_nbr_attribute_reconstruction_loss,
+    nb_nbr_attribute_reconstruction_loss_dual,
+    contrastive_cell_attribute_loss,
+    contrastive_cell_attribute_within_batch_loss,
     mse_adjacency_reconstruction_loss,
     bce_adjacency_reconstruction_loss,
+    bce_cosine_adjacency_reconstruction_loss,
+    adversarial_batch_loss,
+    mmd_batch_loss,
+    mmd_prior_loss,
     mse_joint_code_commit_loss,
     ce_spatial_prior_loss,
     mse_commit_loss,
     mse_code_loss,
+    mse_commit_loss_cell,
+    mse_commit_loss_niche,
     l2_codebook_orthogonal_regularization_loss,
     mask_token_regularization
 )
@@ -46,6 +55,7 @@ class BaseModel(pl.LightningModule):
             lr: float = 0.01,
             weight_decay: float = 0.0,
             mask_lr_scale: float = 1.0,
+            fused: bool = False,
             loss_names: List[str] = ['cross_entropy'],
             loss_kwargs: dict = {'reduction': 'mean'},
         ) -> None:
@@ -113,6 +123,14 @@ class BaseModel(pl.LightningModule):
         self.lr = lr
         self.weight_decay = weight_decay
         self.mask_lr_scale = mask_lr_scale
+        # `fused=True` on Adam coalesces all parameter updates into a
+        # single CUDA kernel (vs per-tensor launches). 5-15% speedup on
+        # the optimizer step for SQUINT's many-small-tensor regime.
+        # Requires all params on GPU + bf16-mixed master weights stay
+        # fp32, both of which we satisfy. Default False to preserve
+        # legacy behaviour for any caller that builds a cfg without
+        # the new key; set via `cfg["model"]["optimizer_params"]["fused"]`.
+        self.fused = bool(fused)
 
         # Loss parameters
         self.loss_kwargs = loss_kwargs
@@ -243,7 +261,18 @@ class BaseModel(pl.LightningModule):
                 loss_fn = bce_adjacency_reconstruction_loss
 
                 loss_fn_data_keys = ['batch_size', 'h_adj', 'batch_edge_index']
-                
+
+                # Within-section pair scope. Default True: cross-section
+                # pairs are dropped from the BCE so two biologically-
+                # similar cells from different AnnData sections aren't
+                # pushed apart by the spatial-adjacency loss (which was
+                # the legacy global-pair behaviour). Set
+                # `loss_kwargs['adj_within_section_only'] = False` to
+                # revert to legacy. Requires the model's `_step` to put a
+                # per-node `node_adata_batch_ids` tensor in the loss data.
+                if loss_kwargs.get('adj_within_section_only', True):
+                    loss_fn_data_keys.append('node_adata_batch_ids')
+
                 edge_sampling_ratio = loss_kwargs.get('edge_sampling_ratio')
                 if edge_sampling_ratio is not None:
                     loss_fn_params['edge_sampling_ratio'] = edge_sampling_ratio
@@ -259,6 +288,192 @@ class BaseModel(pl.LightningModule):
                 wt_adj_reconstr = loss_kwargs.get('wt_adj_reconstr')
                 if wt_adj_reconstr is not None:
                     loss_fn_params['wt_adj_reconstr'] = wt_adj_reconstr
+
+            elif loss_fn_name == 'nb_attribute_reconstruction_loss_nbr_dual':
+                # Niche-branch NB for VQNiche_Dual with a SEPARATE dispersion
+                # parameter (`dispersion_niche`) decoupled from the cell-branch
+                # dispersion. See `nb_nbr_attribute_reconstruction_loss_dual`
+                # for the rationale (variance structure differs between
+                # per-cell and neighbourhood-mean targets).
+                loss_fn = nb_nbr_attribute_reconstruction_loss_dual
+                loss_fn_data_keys = ['pred_attr_nbr', 'target_attr_nbr',
+                                     'edge_index', 'batch_size', 'dispersion_niche']
+                loss_fn_params['k_hop_nb_loss'] = 0
+                wt_attr_reconstr_nbr = loss_kwargs.get('wt_attr_reconstr_nbr')
+                if wt_attr_reconstr_nbr is not None:
+                    loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr_nbr
+                else:
+                    wt_attr_reconstr = loss_kwargs.get('wt_attr_reconstr')
+                    if wt_attr_reconstr is not None:
+                        loss_fn_params['wt_attr_reconstr'] = wt_attr_reconstr
+
+            elif loss_fn_name == 'contrastive_cell_attribute_loss':
+                # NT-Xent contrastive auxiliary loss on the pre-quantization
+                # cell-branch latent (`quantizer_input_cell` = z_mlp_cell of
+                # the seed cells). Positive pairs are the top-k cells with
+                # the most similar log1p gene-expression profile in the
+                # FULL mini-batch (any section); negatives are the rest.
+                # Pulls same-type cells together in `z_mlp_cell` space and
+                # pushes different-type apart — a between-cell objective
+                # that complements NB's within-cell objective. Tunables
+                # come from loss_kwargs; all are optional with sensible
+                # defaults in the loss fn.
+                loss_fn = contrastive_cell_attribute_loss
+                loss_fn_data_keys = ['quantizer_input_cell', 'target_attr']
+                for k in (
+                    'k_pos',
+                    'temperature',
+                    'log_transform_gene_space',
+                    'wt_contrastive_cell',
+                ):
+                    v = loss_kwargs.get(k)
+                    if v is not None:
+                        loss_fn_params[k] = v
+
+            elif loss_fn_name == 'contrastive_cell_attribute_within_batch_loss':
+                # Within-section variant of the contrastive cell loss. Both
+                # positive-pair candidates AND the NT-Xent denominator are
+                # restricted to cells sharing the anchor's adata_batch_id.
+                # Same architectural reasoning as
+                # `adj_within_section_only=True` on the cosine adjacency
+                # BCE: without the restriction, cross-section pairs leak
+                # into the gradient and push biologically-similar cells
+                # from different MERFISH/STARmap sections apart — counter
+                # to the batch-integration objective.
+                loss_fn = contrastive_cell_attribute_within_batch_loss
+                loss_fn_data_keys = [
+                    'quantizer_input_cell', 'target_attr',
+                    'node_adata_batch_ids', 'batch_size',
+                ]
+                for k in (
+                    'k_pos',
+                    'temperature',
+                    'log_transform_gene_space',
+                    'wt_contrastive_cell',
+                ):
+                    v = loss_kwargs.get(k)
+                    if v is not None:
+                        loss_fn_params[k] = v
+
+            elif loss_fn_name == 'bce_cosine_adjacency_reconstruction_loss':
+                # NicheCompass-style adjacency reconstruction via cosine
+                # similarity. Operates on either:
+                #   - 'z_gnn' (continuous, default; NicheCompass-faithful)
+                #   - 'z_q_niche' (quantized, opt-in)
+                # Selected by `loss_kwargs['adj_loss_input']`.
+                loss_fn = bce_cosine_adjacency_reconstruction_loss
+
+                adj_input = loss_kwargs.get('adj_loss_input', 'z_gnn')
+                if adj_input not in ('z_gnn', 'z_q_niche'):
+                    raise ValueError(
+                        f"loss_kwargs['adj_loss_input'] must be one of "
+                        f"{{'z_gnn', 'z_q_niche'}}, got {adj_input!r}."
+                    )
+                loss_fn_data_keys = ['batch_size', 'batch_edge_index', adj_input]
+
+                # Within-section pair scope (default True). See the
+                # `bce_adjacency_reconstruction_loss` branch above for
+                # rationale + opt-out flag.
+                if loss_kwargs.get('adj_within_section_only', True):
+                    loss_fn_data_keys.append('node_adata_batch_ids')
+
+                edge_sampling_ratio = loss_kwargs.get('edge_sampling_ratio')
+                if edge_sampling_ratio is not None:
+                    loss_fn_params['edge_sampling_ratio'] = edge_sampling_ratio
+                use_pos_weight = loss_kwargs.get('use_pos_weight')
+                if use_pos_weight is not None:
+                    loss_fn_params['use_pos_weight'] = use_pos_weight
+                cosine_temperature = loss_kwargs.get('cosine_temperature')
+                if cosine_temperature is not None:
+                    loss_fn_params['cosine_temperature'] = cosine_temperature
+                wt_adj_reconstr = loss_kwargs.get('wt_adj_reconstr')
+                if wt_adj_reconstr is not None:
+                    loss_fn_params['wt_adj_reconstr'] = wt_adj_reconstr
+
+            elif loss_fn_name == 'adversarial_batch_loss':
+                # Domain-adversarial batch invariance for VQNiche_Dual.
+                # CE on the BatchAdversaryHead's logits against per-cell
+                # batch IDs. The head's GRL flips the gradient sign so
+                # the encoder is pushed toward batch-invariance while the
+                # classifier itself trains normally.
+                loss_fn = adversarial_batch_loss
+                loss_fn_data_keys = ['batch_logits', 'batch_labels']
+                wt_adv_batch = loss_kwargs.get('wt_adv_batch')
+                if wt_adv_batch is not None:
+                    loss_fn_params['wt_adv_batch'] = wt_adv_batch
+
+            elif loss_fn_name == 'mmd_batch_loss':
+                # Non-adversarial batch-invariance loss. Computes
+                # differentiable MMD between the per-batch distributions
+                # of `mmd_target` (typically z_mlp[:batch_size], the
+                # cell-token input pre-VQ) and adds it to the total
+                # loss. Unlike the adversarial CE, MMD has no min-max
+                # game — backprop directly minimises the kernel-based
+                # distribution distance, so it doesn't suffer the
+                # warmup pathology where the cell token learns
+                # batch-correlated features early and the late-arriving
+                # adversary can't remove them.
+                #
+                # We read `mmd_target_labels` (NOT `batch_labels`)
+                # because the adversarial CE may also be active and
+                # populate `batch_labels` with the FULL-tensor variant
+                # (seeds + sampled neighbours), whereas MMD always
+                # operates on the seed prefix only — so it needs the
+                # seed-only label slice.
+                loss_fn = mmd_batch_loss
+                loss_fn_data_keys = ['mmd_target', 'mmd_target_labels']
+                wt_mmd_batch = loss_kwargs.get('wt_mmd_batch')
+                if wt_mmd_batch is not None:
+                    loss_fn_params['wt_mmd_batch'] = wt_mmd_batch
+                mmd_n_sub = loss_kwargs.get('mmd_n_sub')
+                if mmd_n_sub is not None:
+                    loss_fn_params['n_sub'] = int(mmd_n_sub)
+
+            elif loss_fn_name == 'mmd_prior_loss':
+                # MMD between mmd_target and samples from the
+                # isotropic Gaussian prior N(0, prior_std² * I).
+                # Parameterless analogue of a VAE's KL(q || N(0, I))
+                # — pulls the empirical distribution of the embedding
+                # toward a batch-agnostic prior, providing
+                # NicheCompass-style integration pressure without
+                # making the encoder probabilistic. Consumes the
+                # same `mmd_target` tensor as `mmd_batch_loss` (the
+                # two can coexist; they consume the same tensor but
+                # compute different distances). No batch labels
+                # needed.
+                loss_fn = mmd_prior_loss
+                loss_fn_data_keys = ['mmd_target']
+                wt_mmd_prior = loss_kwargs.get('wt_mmd_prior')
+                if wt_mmd_prior is not None:
+                    loss_fn_params['wt_mmd_prior'] = wt_mmd_prior
+                mmd_n_sub = loss_kwargs.get('mmd_n_sub')
+                if mmd_n_sub is not None:
+                    loss_fn_params['n_sub'] = int(mmd_n_sub)
+                mmd_prior_std = loss_kwargs.get('mmd_prior_std')
+                if mmd_prior_std is not None:
+                    loss_fn_params['prior_std'] = float(mmd_prior_std)
+
+            elif loss_fn_name == 'mse_commit_loss_cell':
+                # Commit loss for the CELL branch of VQNiche_Dual. Pulls
+                # z_mlp toward z_q_cell. Disjoint from the niche branch.
+                loss_fn = mse_commit_loss_cell
+                loss_fn_data_keys = ['quantizer_input_cell', 'quantizer_output_cell']
+                wt_commit_cell = loss_kwargs.get('wt_commit_cell')
+                if wt_commit_cell is None:
+                    wt_commit_cell = loss_kwargs.get('wt_commit')
+                if wt_commit_cell is not None:
+                    loss_fn_params['wt_commit'] = wt_commit_cell
+
+            elif loss_fn_name == 'mse_commit_loss_niche':
+                # Commit loss for the NICHE branch of VQNiche_Dual. Pulls
+                # z_gnn toward z_q_niche. Disjoint from the cell branch.
+                loss_fn = mse_commit_loss_niche
+                loss_fn_data_keys = ['quantizer_input_niche', 'quantizer_output_niche']
+                wt_commit_niche = loss_kwargs.get('wt_commit_niche')
+                if wt_commit_niche is None:
+                    wt_commit_niche = loss_kwargs.get('wt_commit')
+                if wt_commit_niche is not None:
+                    loss_fn_params['wt_commit'] = wt_commit_niche
 
             elif loss_fn_name == 'mse_joint_code_commit_loss':
                 loss_fn = mse_joint_code_commit_loss
@@ -512,11 +727,30 @@ class BaseModel(pl.LightningModule):
             #         {"params": mask_params, "lr": self.lr * self.mask_lr_scale, "weight_decay": 0.0},
             #     ]
             # )
-            return torch.optim.Adam(
-                self.parameters(),
-                lr=self.lr,
-                weight_decay=self.weight_decay,
-            )
+            # `fused=True` (when configured) coalesces parameter updates
+            # into a single CUDA kernel. Best-effort: if PyTorch refuses
+            # the request (CPU params, exotic dtype, older PyTorch
+            # version, ...), fall back to the unfused path with a
+            # warning rather than crashing training.
+            try:
+                return torch.optim.Adam(
+                    self.parameters(),
+                    lr=self.lr,
+                    weight_decay=self.weight_decay,
+                    fused=self.fused,
+                )
+            except (RuntimeError, TypeError, ValueError) as e:
+                if self.fused:
+                    print(
+                        f"WARNING: torch.optim.Adam(fused=True) failed "
+                        f"({type(e).__name__}: {e}); falling back to "
+                        f"fused=False."
+                    )
+                return torch.optim.Adam(
+                    self.parameters(),
+                    lr=self.lr,
+                    weight_decay=self.weight_decay,
+                )
         else:
             raise NotImplementedError(f'Optimizer {self.optimizer_name} not implemented')
 
@@ -648,9 +882,17 @@ class BaseModel(pl.LightningModule):
     def compute_metrics(
         self,
         mode: Literal['train', 'val', 'test'] = 'val',
-    ) -> None:
+    ) -> dict:
         """
         Compute metrics for a given mode. The mode determines the dataloader and inference data cache used to compute the metrics.
+
+        Returns
+        -------
+        dict
+            Metric-name -> value. Returns `{}` when the relevant
+            `*_metrics_list` is empty (e.g. losses-only training mode
+            where Pearson computation is turned off) — callers can
+            iterate the dict unconditionally.
 
         Parameters
         ----------
@@ -674,22 +916,45 @@ class BaseModel(pl.LightningModule):
             metrics_list = self.test_metrics_list
 
         if len(metrics_list) > 0:
+            # Guard: if the dataloader for this mode produced no batches
+            # (e.g. val_dataloader is empty because `val_batches=[]` AND
+            # `train_val_cell_split=0`), the cache lists are empty and
+            # `torch.cat([])` would raise. Return an empty metrics dict
+            # so the caller's logging loop is a no-op for this mode.
+            if any(len(inference_data_cache[k]) == 0 for k in self.cache_keys):
+                # Reset the cache for the next epoch and bail out.
+                for key in self.cache_keys:
+                    inference_data_cache[key] = []
+                return {}
+
             # 3) Concatenate the inference data cache
             for key in self.cache_keys:
                 inference_data_cache[key] = torch.cat(inference_data_cache[key], dim=0)
             inference_data_cache['edge_index'] = dataloader.data.edge_index
 
-            # 4) Convert the inference data to an AnnData object
+            # 4) Convert the inference data to an AnnData object. Pass
+            # the per-AnnData `obs` DataFrames (collected at blob-build
+            # time and stashed on the datamodule) so every column from
+            # every input AnnData ends up on the inference output adata,
+            # NaN-filled for cells from sources that don't carry the column.
             adata = inference_data_dict_to_adata(
                 inference_data=inference_data_cache,
                 label_categories_dict=None,
+                obs_per_batch_id=getattr(
+                    self.trainer.datamodule, 'obs_per_batch_id', None,
+                ),
             )
 
-            # 5) Compute the benchmarking metrics
+            # 5) Compute the benchmarking metrics.
+            # `estimate_adj_kwargs` is only meaningful for the legacy MLP
+            # adjacency-decoder path; the dual model and any other variant
+            # without that decoder doesn't carry it. Default to {} so we
+            # don't crash here; metrics that genuinely need it will skip
+            # themselves on missing inputs.
             metrics_dict = compute_benchmarking_metrics(
                 adata=adata,
                 metrics=metrics_list,
-                **self.loss_kwargs['estimate_adj_kwargs'],
+                **self.loss_kwargs.get('estimate_adj_kwargs', {}),
             )
             
             # 6) Clear the inference data cache
@@ -697,6 +962,27 @@ class BaseModel(pl.LightningModule):
                 inference_data_cache[key] = []
 
             return metrics_dict
+
+        # `metrics_list` was empty (e.g. losses-only training mode set
+        # via the SQUINT_WITH_PEARSON=0 default, where `train_metrics_list`
+        # / `test_metrics_list` are both `[]`). Skip the AnnData
+        # reconstruction + Pearson loop entirely and return an empty
+        # dict so callers can keep iterating unconditionally — earlier
+        # the implicit `None` return crashed `on_validation_epoch_end`'s
+        # `for key, value in metrics_dict.items():` loop.
+        #
+        # CRITICAL: even though we're skipping the metrics computation,
+        # we MUST still drain the inference cache. `_step` appends to
+        # this cache on every training/val step (cell_emb, X_hat, etc. —
+        # GPU tensors), and the metrics path was the only consumer that
+        # cleared it. Without this clear, GPU memory grows linearly
+        # until OOM (~75 s on a ~140 GiB H100 at batch_size=1024). The
+        # symptom is a steady upward slope in the wandb GPU memory
+        # panel, ending in `torch.cuda.OutOfMemoryError` deep inside
+        # the adjacency-BCE loss (the largest per-step allocation).
+        for key in self.cache_keys:
+            inference_data_cache[key] = []
+        return {}
 
 
     def on_train_epoch_start(self) -> None:

@@ -18,7 +18,8 @@ def bce_adjacency_reconstruction_loss(
         edge_sampling_ratio: Optional[float] = None,
         use_pos_weight: bool = False,
         estimate_adj_kwargs: dict = {},
-        wt_adj_reconstr: float = 0.1
+        wt_adj_reconstr: float = 0.1,
+        node_adata_batch_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
     """
     Compute the binary cross entropy (BCE) between the estimated adjacency from the decoder module and the original adjacency.
@@ -42,6 +43,13 @@ def bce_adjacency_reconstruction_loss(
         The keyword arguments for the adjacency estimation method.
     wt_adj_reconstr: float
         The scaling factor for the adjacency reconstruction loss.
+    node_adata_batch_ids: Optional[torch.Tensor]
+        Per-node adata_batch_id (section id), shape `(B+S,)` long. When
+        given, restrict the BCE to within-section pairs — cross-section
+        pairs are dropped from both the candidate-negative pool and the
+        positive-weight accounting. Spatial edges are intra-section by
+        construction (the graph is built per-AnnData), so this only ever
+        drops negatives. Default `None` keeps the legacy global behaviour.
 
     Returns
     -------
@@ -70,6 +78,12 @@ def bce_adjacency_reconstruction_loss(
     # for the loss path; it remains relevant for the inference-time adjacency
     # reconstruction in `reconstruct_adjacency_matrix`.
 
+    # Pre-compute per-node section ids cast to long if we'll need them.
+    if node_adata_batch_ids is not None:
+        section_ids = node_adata_batch_ids.long()
+    else:
+        section_ids = None
+
     # if no sampling is performed, we build and compare original and reconstructed adjacency matrices of the seed nodes in the batch with the nodes in the induced subgraph
     if edge_sampling_ratio is None:
         # Raw inner-product logits between every seed node and every node in
@@ -83,34 +97,75 @@ def bce_adjacency_reconstruction_loss(
                                     edge_index=batch_edge_index,
                                 )[:batch_size]
 
-        # compute the positive weight for the BCE loss
-        if use_pos_weight:
-            n_pos_edges = adj_batch.sum()
-            n_neg_edges = adj_batch.numel() - n_pos_edges
-            pos_weight = n_neg_edges / n_pos_edges.clamp(min=1)
-        else:
-            pos_weight = None
+        if section_ids is None:
+            # Legacy: BCE over ALL (seed, induced-subgraph-node) pairs.
+            if use_pos_weight:
+                n_pos_edges = adj_batch.sum()
+                n_neg_edges = adj_batch.numel() - n_pos_edges
+                pos_weight = n_neg_edges / n_pos_edges.clamp(min=1)
+            else:
+                pos_weight = None
 
-        bce_adj_reconstr_loss = F.binary_cross_entropy_with_logits(
-                                        input=adj_logits,
-                                        target=adj_batch.detach().to(adj_logits.dtype),
-                                        reduction='mean',
-                                        pos_weight=pos_weight,
-                                )
+            bce_adj_reconstr_loss = F.binary_cross_entropy_with_logits(
+                                            input=adj_logits,
+                                            target=adj_batch.detach().to(adj_logits.dtype),
+                                            reduction='mean',
+                                            pos_weight=pos_weight,
+                                    )
+        else:
+            # Within-section: drop every cross-section pair from the BCE.
+            seed_ids = section_ids[:batch_size]
+            same_section = seed_ids.unsqueeze(1) == section_ids.unsqueeze(0)
+            n_pairs_kept = same_section.sum().clamp(min=1)
+
+            if use_pos_weight:
+                pos_mask = adj_batch.bool() & same_section
+                n_pos = pos_mask.sum()
+                n_neg = n_pairs_kept - n_pos
+                pos_weight = n_neg / n_pos.clamp(min=1)
+            else:
+                pos_weight = None
+
+            bce_unreduced = F.binary_cross_entropy_with_logits(
+                                            input=adj_logits,
+                                            target=adj_batch.detach().to(adj_logits.dtype),
+                                            reduction='none',
+                                            pos_weight=pos_weight,
+                                    )
+            weight = same_section.to(bce_unreduced.dtype)
+            bce_adj_reconstr_loss = (bce_unreduced * weight).sum() / n_pairs_kept
 
     else:
         # number of positive edges in the total number of edges in the induced subgraph of the batch
         # batch_edge_index is a tensor of shape (2, num_edges_in_batch)
         n_pos_edges = batch_edge_index.shape[1]
 
+        # When restricting to within-section, oversample then filter
+        # cross-section negatives out. Same logic as in the cosine BCE.
+        if section_ids is not None:
+            n_sections = int(section_ids.max().item()) + 1 if section_ids.numel() > 0 else 1
+            oversample_factor = min(max(n_sections, 2), 8)
+        else:
+            oversample_factor = 1
+
         # sample negative edges
         # batch_non_edge_index is a tensor of shape approximately (2, n_pos_edges * edge_sampling_ratio)
         batch_non_edge_index = negative_sampling(
             edge_index=batch_edge_index,
-            num_neg_samples=int(n_pos_edges * edge_sampling_ratio),
+            num_neg_samples=int(n_pos_edges * edge_sampling_ratio * oversample_factor),
             method='sparse',
             force_undirected=True,
         )
+
+        if section_ids is not None:
+            src_ids = section_ids[batch_non_edge_index[0]]
+            dst_ids = section_ids[batch_non_edge_index[1]]
+            within = src_ids == dst_ids
+            batch_non_edge_index = batch_non_edge_index[:, within]
+            target_n_neg = int(n_pos_edges * edge_sampling_ratio)
+            if batch_non_edge_index.shape[1] > target_n_neg:
+                batch_non_edge_index = batch_non_edge_index[:, :target_n_neg]
+
         # this sets the exact number of sampled negative edges
         n_neg_edges = batch_non_edge_index.shape[1]
 
