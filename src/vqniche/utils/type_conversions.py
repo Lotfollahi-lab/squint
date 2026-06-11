@@ -61,12 +61,19 @@ def sparse_mx_to_float_tensor(
     --------
     torch.Tensor
         A dense PyTorch float tensor with dtype float32.
-    """
-    # Ensure the data is in float32 format directly
-    sparse_mx = sparse_mx.astype(np.float32)
 
-    # Convert directly to dense format as a PyTorch tensor
-    dense_tensor = torch.tensor(sparse_mx.toarray(), dtype=torch.float32)
+    Accepts either a scipy sparse matrix or an already-dense numpy array:
+    some silver datasets (e.g. the harmonised mmb0-239b_1p MERFISH brains)
+    store ``adata.X`` as a dense ``numpy.ndarray``, which has no
+    ``.toarray()`` — densify only when the input is actually sparse.
+    """
+    if sp.issparse(sparse_mx):
+        dense = sparse_mx.astype(np.float32).toarray()
+    else:
+        dense = np.asarray(sparse_mx, dtype=np.float32)
+
+    # Convert to a dense PyTorch float tensor
+    dense_tensor = torch.tensor(dense, dtype=torch.float32)
     return dense_tensor
 
 
