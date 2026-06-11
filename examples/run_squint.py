@@ -34895,6 +34895,21 @@ def train(
         # crash long-running ablations. `WANDB_INIT_TIMEOUT=300` is also
         # set in main() so children inherit it; this kwarg makes the
         # value self-documenting at the construction site.
+        # wandb caps group names at 128 chars. `adata_batch_idx` can be a
+        # long list (e.g. all 239 sections trained at once -> [0,1,...,238]),
+        # which overflows the limit. Keep the detailed `dataset:batch=[...]`
+        # group for short lists (so existing runs don't re-group), fall back
+        # to a batch COUNT for long ones, and hard-cap at 128 either way.
+        _group = (f"{cfg['dataset']['dataset_name']}:"
+                  f"batch={cfg['dataset']['adata_batch_idx']}")
+        if len(_group) > 128:
+            try:
+                _n_batch = len(cfg['dataset']['adata_batch_idx'])
+            except TypeError:
+                _n_batch = cfg['dataset']['adata_batch_idx']
+            _group = (f"{cfg['dataset']['dataset_name']}:"
+                      f"n_batch={_n_batch}")
+        _group = _group[:128]
         logger = WandbLogger(
             save_dir=str(run_dir),                    # local cache -> <run_dir>/wandb/
             project=WANDB_PROJECT,
@@ -34902,7 +34917,7 @@ def train(
             # Group by dataset+batches so all ablations of one dataset cluster
             # together. The variant goes in `tags` so we can filter the wandb
             # UI to e.g. all "poc+nbr" runs across timestamps.
-            group=f"{cfg['dataset']['dataset_name']}:batch={cfg['dataset']['adata_batch_idx']}",
+            group=_group,
             job_type="train",
             tags=[
                 _wandb_tag("variant:",   variant),
