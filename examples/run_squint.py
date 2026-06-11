@@ -485,9 +485,14 @@ def make_dataset_blob_config_mmb239() -> dict:
                 "radius_list":        None,
                 "include_self_loop":  True,
                 "batch_key":          "batch",
-                "k": {
-                    "lm_eigvecs": 128,
-                },
+                # NO Laplacian spectral embeddings. The s49_v23 model uses
+                # feature_names=["cell_gene_counts"] and never consumes
+                # U_lm_eigvecs (0 references in run_squint.py), so computing
+                # 128 eigvecs (eigsh, k=128) per graph per section is the
+                # dominant, wasted build cost over 239 sections. Skipping it
+                # is the single biggest speedup. Re-add {"lm_eigvecs": N} and
+                # rebuild only if a future variant needs spectral features.
+                "k": {},
             },
             "data_directory_path": str(DATA_ROOT),
             "pre_transform": None,
