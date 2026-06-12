@@ -28021,6 +28021,136 @@ _patch_dual_codebook_diversity(
 batch_size=512,
 ),
     },
+    "s51_v12_dualvq+rvq-cell-17-159+rvq-niche-6-450+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+spatch_hcc_1p": {
+        "description": (
+            "s51 v12 on spatch_hcc_1p: ground-truth L0 codebook sizes at ~constant total capacity (was 30*90=2700 per branch). cell RVQ = (17, 159) [L0=17 = #cell types; 17*159=2703 ~ 2700], niche RVQ = (6, 450) [L0=6 = #niches; 6*450=2700]. Everything else IDENTICAL to the s51_v1 s49_v23 spine (decoder-cov, no-batch-int, enc-deeper [400,400,256], dec-w[32], knn16, sampler[16], gnn1, cell-w1, bs512, lr7e-4, within-sec, decoupled-enc, diversity-w10, contrastWB-w10-k5). Trains on all hcc sections, 10% cell-level val. REQUIRES the spatch_hcc_1p blob (k=16)."
+        ),
+        "patches": [
+            "+rvq(cell levels=[17, 159], niche levels=[6, 450])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+spatch_hcc_1p(dataset switch)",
+        ],
+        "build": lambda: _patch_dual_spatch_hcc(
+_patch_dual_codebook_diversity(
+    _patch_dual_contrastive_cell_within_batch(
+        _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_decoupled_encoders(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(
+                                                        _BD(),
+                                                        branch="niche", codebook_sizes=(6, 450),
+                                                    ),
+                                                    branch="cell", codebook_sizes=(17, 159),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=1.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+        wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+    ),
+    weight=10.0, temperature=100.0, branch="cell",
+),
+batch_size=512,
+),
+    },
+    "s51_v13_dualvq+rvq-cell-17-12-13+rvq-niche-6-21-21+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+spatch_hcc_1p": {
+        "description": (
+            "s51 v13 on spatch_hcc_1p: 3-LEVEL RVQ with ground-truth L0 sizes, total ~constant (~2700 per branch). cell RVQ = (17, 12, 13) [L0=17 = #cell types; 17*12*13=2652], niche RVQ = (6, 21, 21) [L0=6 = #niches; 6*21*21=2646]. Higher levels split the residual capacity into two balanced levels. Everything else IDENTICAL to the s51_v1 s49_v23 spine. Trains on all hcc sections, 10% cell-level val. REQUIRES the spatch_hcc_1p blob (k=16)."
+        ),
+        "patches": [
+            "+rvq(cell levels=[17, 12, 13], niche levels=[6, 21, 21])",
+            "+decoder_covariate",
+            "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])",
+            "+decoupled-encoders",
+            "+dec-w=[32]",
+            "+graph_knn(n_neighs=16)",
+            "+sampler([16])",
+            "+wt_attr_reconstr=1.0",
+            "+batch_size=512",
+            "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+spatch_hcc_1p(dataset switch)",
+        ],
+        "build": lambda: _patch_dual_spatch_hcc(
+_patch_dual_codebook_diversity(
+    _patch_dual_contrastive_cell_within_batch(
+        _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_decoupled_encoders(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(
+                                                        _BD(),
+                                                        branch="niche", codebook_sizes=(6, 21, 21),
+                                                    ),
+                                                    branch="cell", codebook_sizes=(17, 12, 13),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=1.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+        wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+    ),
+    weight=10.0, temperature=100.0, branch="cell",
+),
+batch_size=512,
+),
+    },
     "s51_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+spatch_hcc_1p": {
         "description": (
             "s51 ablation v2 on spatch_hcc_1p (hepatocellular carcinoma): Drops the within-batch contrastive cell loss. Built on the s49_v23 spine (decoupled-enc + within-batch contrastive wt=10, k=5 + cell-VQ codebook-diversity wt=10 + cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], bs=512, lr=7e-4, within-sec). Cell RVQ = (30, 90), niche RVQ = (30, 90), knn=16, sampler=[16], gnn_layers=1. REQUIRES BLOB REBUILD for spatch_hcc_1p (--build-blob-dataset spatch_hcc_1p, k=[8, 16, 24] pre-populated)."
