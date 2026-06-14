@@ -4223,19 +4223,26 @@ def _patch_dual_squint_hln(
         test_batch_idx=None,
         batch_size: int = 512,
         edge_sampling_ratio: float = 1.0,
+        max_epochs: int = 400,
     ) -> dict:
     """Thin wrapper: squint_hln (CosMx human lymph node, manual niches from
     the spatial-niche-benchmark study; SINGLE section). Defaults train on all
     sections in the blob (here, the one section) with a 10% cell-level val
     split and no whole-section holdout. Labels are read from the original obs
-    columns via the blob's label_names (cell_type_annotation / niche_annotation)."""
-    return _patch_dual_spatch_subset(
+    columns via the blob's label_names (cell_type_annotation / niche_annotation).
+
+    max_epochs defaults to 400 (vs the base config's 80) — the single small
+    section gives few gradient steps/epoch, so a larger budget is warranted.
+    NOTE: early stopping (patience=10 val passes) can still stop earlier;
+    disable it (trainer.early_stopping_params.enabled=False) to force all 400."""
+    cfg = _patch_dual_spatch_subset(
         cfg, dataset_name="squint_hln",
         train_batch_idx=train_batch_idx,
         test_batch_idx=test_batch_idx,
         batch_size=batch_size,
         edge_sampling_ratio=edge_sampling_ratio,
     )
+    return _patch_dual_max_epochs(cfg, max_epochs=max_epochs)
 
 
 def _patch_dual_spatch(
@@ -25967,6 +25974,124 @@ _patch_dual_codebook_diversity(
                                 n_neighs=16,
                             ),
                             num_neighbors=[16],
+                        ),
+                        weight=1.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+        wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+    ),
+    weight=10.0, temperature=100.0, branch="cell",
+),
+batch_size=512,
+),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn8+sampler8+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+squint_hln": {
+        "description": (
+            "squint_hln (CosMx human lymph node) s49_v23 spine with knn=8, sampler=[8] (vs the knn16 default) and DEFAULT codebooks (cell RVQ=(30,90), niche RVQ=(30,90); 30 L0/branch). max_epochs=400 (via _patch_dual_squint_hln). Trains on all sections (single CosMx section), 10% cell-level val. Uses the k=8 spatial graph already in the squint_hln blob (n_neighs_list=[8,16,24]). REQUIRES the squint_hln blob."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])", "+decoupled-encoders",
+            "+dec-w=[32]", "+graph_knn(n_neighs=8)", "+sampler([8])",
+            "+wt_attr_reconstr=1.0", "+batch_size=512", "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+squint_hln(dataset switch, train=ALL, max_epochs=400)",
+        ],
+        "build": lambda: _patch_dual_squint_hln(
+_patch_dual_codebook_diversity(
+    _patch_dual_contrastive_cell_within_batch(
+        _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_decoupled_encoders(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(
+                                                        _BD(),
+                                                        branch="niche", codebook_sizes=(30, 90),
+                                                    ),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=8,
+                            ),
+                            num_neighbors=[8],
+                        ),
+                        weight=1.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+        wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+    ),
+    weight=10.0, temperature=100.0, branch="cell",
+),
+batch_size=512,
+),
+    },
+    "dualvq+rvq-cell-16-169+rvq-niche-4-675+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn8+sampler8+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+squint_hln": {
+        "description": (
+            "squint_hln (CosMx human lymph node) s49_v23 spine with knn=8, sampler=[8] and GROUND-TRUTH L0 codebooks: cell RVQ=(16,169) [16*169=2704], niche RVQ=(4,675) [L0=4 manual niches; 4*675=2700]. max_epochs=400. Trains on all sections (single CosMx section), 10% cell-level val. Uses the k=8 graph in the squint_hln blob. REQUIRES the squint_hln blob."
+        ),
+        "patches": [
+            "+rvq(cell levels=[16, 169], niche levels=[4, 675])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])", "+decoupled-encoders",
+            "+dec-w=[32]", "+graph_knn(n_neighs=8)", "+sampler([8])",
+            "+wt_attr_reconstr=1.0", "+batch_size=512", "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+squint_hln(dataset switch, train=ALL, max_epochs=400)",
+        ],
+        "build": lambda: _patch_dual_squint_hln(
+_patch_dual_codebook_diversity(
+    _patch_dual_contrastive_cell_within_batch(
+        _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_decoupled_encoders(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(
+                                                        _BD(),
+                                                        branch="niche", codebook_sizes=(4, 675),
+                                                    ),
+                                                    branch="cell", codebook_sizes=(16, 169),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=8,
+                            ),
+                            num_neighbors=[8],
                         ),
                         weight=1.0,
                     ),
