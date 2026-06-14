@@ -506,9 +506,11 @@ def make_dataset_blob_config_mmb239() -> dict:
     }
 
 
-def _make_spatch_blob_config(name: str, description: str) -> dict:
+def _make_spatch_blob_config(name: str, description: str,
+                             label_names: Optional[List[str]] = None) -> dict:
     """
-    Shared body for all `spatch_*_1p` blob configs. Differs from
+    Shared body for all `spatch_*_1p` blob configs (and reusable for other
+    silver datasets with the same shape). Differs from
     `make_dataset_blob_config_spatch` (the original smoke-test variant)
     in two ways:
       - parameterised by `name` so the same config shape works for
@@ -517,10 +519,16 @@ def _make_spatch_blob_config(name: str, description: str) -> dict:
         sweep (which uses all three k values) doesn't require a
         rebuild per knn ablation.
 
-    Used by the spatch_{ov,hcc,coad}_1p builders below. The original
-    smoke-test `make_dataset_blob_config_spatch` is kept as-is for
-    backward compatibility.
+    `label_names` maps SQUINT label tensors to the per-cell obs columns in
+    the silver AnnDatas, as "<name>=<obs_column>" (the builder splits on
+    '='). Defaults to the spatch convention
+    (cell_types=annotation, niche_types=spatial_cluster); pass a custom list
+    to register a dataset that keeps its labels under different column names
+    (e.g. the tonsil / lymph-node atlases:
+    ["cell_types=cell_type_annotation", "niche_types=niche_annotation"]).
     """
+    if label_names is None:
+        label_names = ["cell_types=annotation", "niche_types=spatial_cluster"]
     return {
         "experiment": {
             "name": "in_memory_dataset_blob",
@@ -529,10 +537,7 @@ def _make_spatch_blob_config(name: str, description: str) -> dict:
         "dataset": {
             "name": name,
             "feature_names": ["cell_gene_counts"],
-            "label_names": [
-                "cell_types=annotation",
-                "niche_types=spatial_cluster",
-            ],
+            "label_names": list(label_names),
             "graph_kwargs": {
                 "coord_type":         "generic",
                 "spatial_key":        "spatial",
@@ -580,6 +585,38 @@ def make_dataset_blob_config_spatch_coad() -> dict:
     return _make_spatch_blob_config(
         name="spatch_coad_1p",
         description="spatch_coad_1p — colon adenocarcinoma subset (silver/spatch_coad_1p).",
+    )
+
+
+def make_dataset_blob_config_squint_hln() -> dict:
+    """CosMx human lymph node with MANUAL niche annotations from the
+    spatial-niche-benchmark study (silver/squint_hln). Single section.
+    Labels are kept under their original obs columns and registered here:
+    cell types -> obs['cell_type_annotation'] (NanoString),
+    niches     -> obs['niche_annotation'] (4 manual niches: B cell Zone,
+                  T cell Zone, Medulla, Germinal Center)."""
+    return _make_spatch_blob_config(
+        name="squint_hln",
+        description="squint_hln — CosMx human lymph node, manual niches "
+                    "(spatial-niche-benchmark).",
+        label_names=["cell_types=cell_type_annotation",
+                     "niche_types=niche_annotation"],
+    )
+
+
+def make_dataset_blob_config_squint_vht() -> dict:
+    """Human Tonsil Cell Atlas Visium (silver/squint_vht). Labels kept under
+    their original obs columns and registered here:
+    cell types -> obs['annotation_20230508'] (121 cell types/states),
+    niches     -> obs['area'] (expert-annotated histological areas).
+    NOTE: confirm these exact column names from the fetch script's printout
+    (zellkonverter export); adjust here if they differ."""
+    return _make_spatch_blob_config(
+        name="squint_vht",
+        description="squint_vht — Human Tonsil Cell Atlas Visium, expert "
+                    "histological areas.",
+        label_names=["cell_types=annotation_20230508",
+                     "niche_types=area"],
     )
 
 
@@ -4173,6 +4210,27 @@ def _patch_dual_spatch_coad(
     """Thin wrapper: spatch_coad_1p (colon adenocarcinoma subset)."""
     return _patch_dual_spatch_subset(
         cfg, dataset_name="spatch_coad_1p",
+        train_batch_idx=train_batch_idx,
+        test_batch_idx=test_batch_idx,
+        batch_size=batch_size,
+        edge_sampling_ratio=edge_sampling_ratio,
+    )
+
+
+def _patch_dual_squint_hln(
+        cfg: dict,
+        train_batch_idx: Optional[List[int]] = None,
+        test_batch_idx=None,
+        batch_size: int = 512,
+        edge_sampling_ratio: float = 1.0,
+    ) -> dict:
+    """Thin wrapper: squint_hln (CosMx human lymph node, manual niches from
+    the spatial-niche-benchmark study; SINGLE section). Defaults train on all
+    sections in the blob (here, the one section) with a 10% cell-level val
+    split and no whole-section holdout. Labels are read from the original obs
+    columns via the blob's label_names (cell_type_annotation / niche_annotation)."""
+    return _patch_dual_spatch_subset(
+        cfg, dataset_name="squint_hln",
         train_batch_idx=train_batch_idx,
         test_batch_idx=test_batch_idx,
         batch_size=batch_size,
@@ -25806,6 +25864,124 @@ VARIANTS: dict = {
             train_batch_idx=[], test_batch_idx=[], batch_size=512,
         ),
     },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+squint_hln": {
+        "description": (
+            "s49_v23 spine on squint_hln (CosMx human lymph node, manual niches from spatial-niche-benchmark). DEFAULT codebooks: cell RVQ = (30, 90), niche RVQ = (30, 90) (30 L0 codes per branch, 2700 total). Spine: decoupled-enc + within-batch contrastive (wt=10, k=5) + cell-VQ codebook-diversity (wt=10) on the s48_v2 spine (cell-w=1, no-batch-int, enc-deeper [400,400,256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Trains on all sections in the blob (this dataset is a SINGLE CosMx section), 10% cell-level val. Labels read via the squint_hln blob's label_names (cell_type_annotation / niche_annotation). REQUIRES the squint_hln blob (--build-blob-dataset squint_hln)."
+        ),
+        "patches": [
+            "+rvq(branch=both, levels=[30, 90])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])", "+decoupled-encoders",
+            "+dec-w=[32]", "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=1.0", "+batch_size=512", "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+squint_hln(dataset switch, train=ALL)",
+        ],
+        "build": lambda: _patch_dual_squint_hln(
+_patch_dual_codebook_diversity(
+    _patch_dual_contrastive_cell_within_batch(
+        _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_decoupled_encoders(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(
+                                                        _BD(),
+                                                        branch="niche", codebook_sizes=(30, 90),
+                                                    ),
+                                                    branch="cell", codebook_sizes=(30, 90),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=1.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+        wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+    ),
+    weight=10.0, temperature=100.0, branch="cell",
+),
+batch_size=512,
+),
+    },
+    "dualvq+rvq-cell-16-169+rvq-niche-4-675+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+squint_hln": {
+        "description": (
+            "s49_v23 spine on squint_hln with GROUND-TRUTH L0 codebook sizes at ~constant total capacity. cell RVQ = (16, 169) [L0=16 cell codes; 16*169=2704 ~ 2700], niche RVQ = (4, 675) [L0=4 = #manual niches (B cell Zone, T cell Zone, Medulla, Germinal Center); 4*675=2700]. Everything else IDENTICAL to the squint_hln s49_v23 spine above; trains on all sections (single CosMx section), 10% cell-level val. REQUIRES the squint_hln blob."
+        ),
+        "patches": [
+            "+rvq(cell levels=[16, 169], niche levels=[4, 675])",
+            "+decoder_covariate", "+no-batch-int",
+            "+enc-deeper(mlp=[400, 400, 256])", "+decoupled-encoders",
+            "+dec-w=[32]", "+graph_knn(n_neighs=16)", "+sampler([16])",
+            "+wt_attr_reconstr=1.0", "+batch_size=512", "+lr=7e-4",
+            "+adj_within_section_only=True",
+            "+contrastive-cell-within-batch(wt=10, k_pos=5, T=0.1)",
+            "+codebook-diversity(branch=cell, wt=10, T=100)",
+            "+squint_hln(dataset switch, train=ALL)",
+        ],
+        "build": lambda: _patch_dual_squint_hln(
+_patch_dual_codebook_diversity(
+    _patch_dual_contrastive_cell_within_batch(
+        _patch_dual_adj_within_section_only(
+            _patch_dual_no_batch_int(
+                _patch_dual_batch_lr(
+                    _patch_dual_attr_recon_weight(
+                        _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(
+                                _patch_dual_decoder_width(
+                                    _patch_dual_decoupled_encoders(
+                                        _patch_dual_encoder_deeper(
+                                            _patch_dual_decoder_covariate(
+                                                _patch_dual_rvq(
+                                                    _patch_dual_rvq(
+                                                        _BD(),
+                                                        branch="niche", codebook_sizes=(4, 675),
+                                                    ),
+                                                    branch="cell", codebook_sizes=(16, 169),
+                                                ),
+                                            ),
+                                            hidden_channels=[400, 400, 256],
+                                        ),
+                                    ),
+                                    hidden_channels=[32],
+                                ),
+                                n_neighs=16,
+                            ),
+                            num_neighbors=[16],
+                        ),
+                        weight=1.0,
+                    ),
+                    batch_size=512, lr=7e-4,
+                ),
+            ),
+            enabled=True,
+        ),
+        wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+    ),
+    weight=10.0, temperature=100.0, branch="cell",
+),
+batch_size=512,
+),
+    },
     # -----------------------------------------------------------------------
     # s49_v23 ablations (canonical-name) — 7 ablations x 2 datasets
     # -----------------------------------------------------------------------
@@ -34656,12 +34832,19 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
     elif dataset == "spatch_coad_1p":
         cfg = make_dataset_blob_config_spatch_coad()
         cfg_path = CONFIG_OUT_DIR / "build_blob_spatch_coad_1p.yaml"
+    elif dataset == "squint_hln":
+        cfg = make_dataset_blob_config_squint_hln()
+        cfg_path = CONFIG_OUT_DIR / "build_blob_squint_hln.yaml"
+    elif dataset == "squint_vht":
+        cfg = make_dataset_blob_config_squint_vht()
+        cfg_path = CONFIG_OUT_DIR / "build_blob_squint_vht.yaml"
     else:
         raise ValueError(
             f"Unknown --build-blob-dataset {dataset!r}. Choices: "
             f"'mmb0-1b_smb1-1b_1p', 'chl59-8b_1p', 'chl59-2b_1p', "
             f"'mmb0-1b_smb1-20b_1p', 'mmb0-239b_1p', 'spatch_1p', "
-            f"'spatch_ov_1p', 'spatch_hcc_1p', 'spatch_coad_1p'."
+            f"'spatch_ov_1p', 'spatch_hcc_1p', 'spatch_coad_1p', "
+            f"'squint_hln', 'squint_vht'."
         )
     with open(cfg_path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
@@ -36856,6 +37039,8 @@ def main():
                        "spatch_ov_1p",
                        "spatch_hcc_1p",
                        "spatch_coad_1p",
+                       "squint_hln",
+                       "squint_vht",
                    ],
                    help="Which dataset to build (default: "
                         "mmb0-1b_smb1-1b_1p — MERFISH + STARmap mouse "
