@@ -52,6 +52,7 @@ from vqniche.modules import MLP as MLP_Module
 from vqniche.modules import init_gnn_module
 from vqniche.modules import FiLM
 from vqniche.modules import CrossStitch
+from vqniche.modules import BranchAdapter
 from vqniche.modules import get_vq_class, get_valid_params
 
 
@@ -71,6 +72,7 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             cross_stitch_params: Optional[dict] = None,
             detach_gnn_input: bool = False,
             cell_to_niche: Optional[dict] = None,
+            branch_adapter: Optional[dict] = None,
         ):
         """
         Parameters
@@ -145,6 +147,15 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             gradients), `project_dim` (int or None — optionally project
             the cell signal before concat). Default `None` -> no
             cell->niche injection.
+        branch_adapter: dict, optional
+            Parameter-efficient coupling: a small dim-preserving adapter
+            per branch (cell adapter before VQ_cell, niche adapter before
+            the GNN), so ONE shared trunk plus tiny per-branch
+            specializers replace two full trunks. Each adapter inits to
+            identity. Keys forwarded to `BranchAdapter`: `kind`
+            ('affine' | 'lora' | 'mlp'), `rank` (lora), `hidden` (mlp).
+            Typically used with the coupled trunk. Default `None` -> no
+            adapters.
         """
         super().__init__()
 
@@ -356,6 +367,26 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             self.cell_to_niche_source = None
             self.cell_to_niche_detach = True
             self.cell_to_niche_proj = None
+
+        # ---- Optional per-branch ADAPTER (parameter-efficient coupling) -----
+        # A small dim-preserving specializer applied per branch on top of the
+        # (typically COUPLED / shared) trunk: cell adapter before VQ_cell, niche
+        # adapter before the GNN. Lets one shared trunk carry the expensive
+        # input layers while each branch keeps a tiny specializer — far fewer
+        # params than two full trunks. Each adapter is init to identity so the
+        # model starts exactly as the coupled shared-trunk model. Dim-preserving
+        # so codebook / decoder shapes are unchanged. `branch_adapter` keys are
+        # forwarded to `BranchAdapter` (`kind`, `rank`, `hidden`).
+        if branch_adapter is not None:
+            self.cell_adapter = BranchAdapter(
+                dim=vq_cell_in_channels, **branch_adapter,
+            )
+            self.niche_adapter = BranchAdapter(
+                dim=gnn_pre_neck_in_channels, **branch_adapter,
+            )
+        else:
+            self.cell_adapter = None
+            self.niche_adapter = None
 
         # ---- Optional NICHE NECK MLP (between z_mlp_niche and the GNN) ------
         # When `niche_neck_params` is provided, an additional MLP is
@@ -583,6 +614,14 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         else:
             z_mlp_niche = z_mlp_niche_path
 
+        # ---- per-branch CELL adapter (parameter-efficient coupling) ---------
+        # Small identity-initialized specializer on the (shared) trunk output,
+        # applied to the cell-VQ input. Re-binds `z_mlp` so the commit /
+        # contrastive losses and the returned latent all see the adapted cell
+        # representation. Dim-preserving.
+        if self.cell_adapter is not None:
+            z_mlp = self.cell_adapter(z_mlp)
+
         # ---- compositional cell->niche coupling -----------------------------
         # Inject the cell branch's representation as extra GNN node features so
         # the GNN aggregates neighbours' cell identity (= local cell-type
@@ -597,6 +636,13 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             if self.cell_to_niche_proj is not None:
                 cell_sig = self.cell_to_niche_proj(cell_sig)
             z_mlp_niche = torch.cat([z_mlp_niche, cell_sig], dim=-1)
+
+        # ---- per-branch NICHE adapter (parameter-efficient coupling) --------
+        # Small identity-initialized specializer on the (shared) trunk output,
+        # applied to the niche-side GNN input. Dim-preserving (matches
+        # gnn_pre_neck_in_channels).
+        if self.niche_adapter is not None:
+            z_mlp_niche = self.niche_adapter(z_mlp_niche)
 
         # ---- niche-side pipeline: [niche_neck] -> GNN -> VQ_niche -----------
         # Stop-gradient coupling: when `detach_gnn_input` is set, the

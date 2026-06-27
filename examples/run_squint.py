@@ -3013,6 +3013,41 @@ def _patch_dual_disentangle(cfg: dict, wt: float = 100.0) -> dict:
     return cfg
 
 
+def _patch_dual_branch_adapter(
+        cfg: dict,
+        kind: str = "lora",
+        rank: Optional[int] = None,
+        hidden: Optional[int] = None,
+    ) -> dict:
+    """
+    Parameter-efficient coupling: force the COUPLED (shared) trunk and add a
+    small identity-initialized per-branch adapter (cell adapter before VQ_cell,
+    niche adapter before the GNN). One shared trunk carries the expensive input
+    layers; the tiny adapters give each branch its specialization — far fewer
+    params than the two full trunks of the decoupled encoder.
+
+    `kind`   : 'affine' (~2*dim params/branch), 'lora' (rank-r residual,
+               ~2*r*dim), or 'mlp' (small residual head, ~2*dim*hidden).
+    `rank`   : LoRA rank (lora only).
+    `hidden` : hidden width (mlp only; defaults to dim).
+
+    Apply OUTERMOST on a spine (e.g. s55_v3) — it removes any decoupled / Y-shape
+    / cross-stitch / cell->niche encoder config so the trunk is genuinely shared.
+    """
+    enc = cfg["model"]["encoder_params"]
+    enc.pop("niche_mlp_params", None)
+    enc.pop("shared_mlp_params", None)
+    enc.pop("cross_stitch_params", None)
+    enc.pop("cell_to_niche", None)
+    ad = {"kind": kind}
+    if rank is not None:
+        ad["rank"] = int(rank)
+    if hidden is not None:
+        ad["hidden"] = int(hidden)
+    enc["branch_adapter"] = ad
+    return cfg
+
+
 def _build_s51_spine_codebook(cell_sizes, niche_sizes):
     """Build the s51_v1 / s49_v23 spine with the given per-branch RVQ codebook
     sizes. This is BYTE-IDENTICAL to the s52_v1 build chain (decoupled-enc +
@@ -34289,6 +34324,53 @@ VARIANTS["s58_v7_compose-zqcell+disentangle-w100+crossmnn-wt10-k1+mmb0-1b_smb1-1
             _s56_spine(), source="z_q_cell", detach=True),
         wt=100.0),
 }
+
+
+# ===========================================================================
+# s59 — follow-ups to the s56 coupling table (Soft L2 was the only variant with
+# no significant degradation + a slight integration trend). Two threads:
+#   A. SOFT-L2 weight sweep — chase that integration signal (1e-3 == s56_v8).
+#   B. PARAMETER-EFFICIENT coupling: one shared trunk + a tiny identity-init
+#      per-branch adapter (affine / lora / mlp). Targets the "fewer params,
+#      same performance" argument — coupled halves the encoder MLP params but
+#      lost resolution; the adapter restores per-branch specialization cheaply.
+# All on the s55_v3 cross-batch-MNN spine (_s56_spine()). Reference = s55_v3.
+# ===========================================================================
+# A. Soft-L2 weight sweep (decoupled architecture + weight-distance penalty).
+_S59_SOFTL2 = [("v1", "1e-4", 1e-4), ("v2", "1e-2", 1e-2), ("v3", "1e-1", 1e-1)]
+for _v, _wtag, _wt in _S59_SOFTL2:
+    VARIANTS[f"s59_{_v}_softL2-w{_wtag}+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+        "description": (
+            f"s59 soft-L2 coupling weight sweep (cross-batch MNN spine): two "
+            f"decoupled trunks + L2 penalty between matched weights, "
+            f"wt_encoder_coupling={_wtag} (1e-3 = s56_v8 was the promising point). "
+            f"Tests whether the slight integration gain becomes significant at a "
+            f"different strength. Reference = s55_v3."
+        ),
+        "patches": [f"= s55_v3 spine + soft-L2 coupling (wt={_wtag})"],
+        "build": (lambda wt=_wt: _patch_dual_soft_coupling(_s56_spine(), wt=wt)),
+    }
+
+# B. Parameter-efficient coupling: shared trunk + per-branch adapter.
+#    (tag, BranchAdapter kwargs, ~% of decoupled encoder-MLP params)
+_S59_ADAPTERS = [
+    ("v4", "coupled-affine-adapter", dict(kind="affine"),            "~50%"),
+    ("v5", "coupled-lora-r16",       dict(kind="lora", rank=16),     "~52%"),
+    ("v6", "coupled-mlp-adapter",    dict(kind="mlp", hidden=256),   "~80%"),
+]
+for _v, _tag, _adk, _pct in _S59_ADAPTERS:
+    VARIANTS[f"s59_{_v}_{_tag}+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+        "description": (
+            f"s59 parameter-efficient coupling (cross-batch MNN spine): ONE shared "
+            f"MLP trunk + identity-init per-branch {_adk['kind']} adapter (cell "
+            f"adapter before VQ_cell, niche adapter before the GNN). Restores the "
+            f"per-branch specialization that pure coupled lost, at {_pct} of the "
+            f"decoupled encoder-MLP params. Reference = s55_v3 (decoupled); "
+            f"contrast vs s56_v1 (coupled, no adapter)."
+        ),
+        "patches": [f"= s55_v3 spine -> COUPLED trunk + {_adk['kind']} branch adapter"],
+        "build": (lambda adk=_adk: _patch_dual_branch_adapter(_s56_spine(), **adk)),
+    }
 
 
 # Map short dataset tag -> ordered list of sweep variant names. The CLI's

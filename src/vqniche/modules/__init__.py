@@ -8,6 +8,7 @@ from .dispersion_head import DispersionHead
 from .adversary import BatchAdversaryHead, grad_reverse
 from .film import FiLM
 from .cross_stitch import CrossStitch
+from .branch_adapter import BranchAdapter
 from .temperature_annealer import TemperatureAnnealer
 
 
@@ -39,6 +40,9 @@ __all__ = [
 
     # Multi-task coupling (Misra et al. 2016 cross-stitch)
     'CrossStitch',
+
+    # Parameter-efficient per-branch adapter (shared trunk + tiny specializer)
+    'BranchAdapter',
 
     # Annealing modules
     'TemperatureAnnealer',
