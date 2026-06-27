@@ -2786,7 +2786,7 @@ def _patch_dual_continuous_vq(cfg: dict, branch: str = "both") -> dict:
     Replace the discrete VQ bottleneck with a CONTINUOUS passthrough
     (`ContinuousVQ`) on the cell and/or niche branch.
 
-    This is the discretization ABLATION for the WABI rebuttal (reviewer #1:
+    This is the discretization ABLATION (addresses the reviewer comment that
     "the rationale for using discrete codebooks over continuous latents is
     not sufficiently supported"). It isolates whether the *discreteness* of
     the codebook — not the encoder/decoder capacity, depth, or any other
@@ -26237,13 +26237,14 @@ weight=10.0, temperature=100.0, branch="cell",
     },
     # =======================================================================
     # s53 — CONTINUOUS-LATENT (discretization) ablation family
-    #       [WABI rebuttal, reviewer #1]. A NEW, self-contained family —
-    #       SEPARATE from the s51/s52 ablations; nothing existing is re-run.
+    #       (addresses the discrete-vs-continuous-latent reviewer comment).
+    #       A NEW, self-contained family — SEPARATE from the s51/s52
+    #       ablations; nothing existing is re-run.
     # =======================================================================
     "s53_v1_continuous-latent+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
         "description": (
-            "CONTINUOUS-LATENT ABLATION of the mouse-brain winner (WABI reviewer #1: "
-            "'rationale for discrete codebooks over continuous latents not sufficiently "
+            "CONTINUOUS-LATENT ABLATION of the mouse-brain winner (addresses the reviewer "
+            "comment: 'rationale for discrete codebooks over continuous latents not sufficiently "
             "supported'). This is EXACTLY the variant "
             "'s49_v23_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+"
             "sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+"
@@ -34891,7 +34892,8 @@ DATASET_VARIANTS["spatch_coad_1p-ablations-v52"] = [
 
 # -----------------------------------------------------------------------
 # s53 — CONTINUOUS-LATENT (discretization) ablation family
-#       [WABI rebuttal, reviewer #1]. A NEW, self-contained sweep — ONLY the
+#       (addresses the discrete-vs-continuous-latent reviewer comment).
+#       A NEW, self-contained sweep — ONLY the
 #       continuous variant; the discrete s49_v23 control is NOT listed, so
 #       running this re-trains nothing that already exists. Compare its
 #       metrics against the already-computed s49_v23 run.
