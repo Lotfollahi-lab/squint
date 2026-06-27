@@ -2781,6 +2781,55 @@ def _patch_dual_codebook_diversity(
     return cfg
 
 
+def _patch_dual_continuous_vq(cfg: dict, branch: str = "both") -> dict:
+    """
+    Replace the discrete VQ bottleneck with a CONTINUOUS passthrough
+    (`ContinuousVQ`) on the cell and/or niche branch.
+
+    This is the discretization ABLATION for the WABI rebuttal (reviewer #1:
+    "the rationale for using discrete codebooks over continuous latents is
+    not sufficiently supported"). It isolates whether the *discreteness* of
+    the codebook — not the encoder/decoder capacity, depth, or any other
+    architectural choice — drives SQUINT's benchmark gain.
+
+    The encoder/decoder architecture, latent dimensionality, graph, sampler,
+    and every non-VQ loss are left EXACTLY as-is; only the quantizer module
+    is swapped for an identity map. Concretely, with `branch="both"`:
+      - z_q = z  (the continuous encoder latent flows straight to the decoder,
+        no nearest-codebook snap);
+      - the commitment loss `mse_commit_loss = MSE(z, z_q) == 0`;
+      - the codebook-diversity term is dropped (there is no codebook).
+
+    "Comparable capacity": the continuous latent has the SAME dimensionality
+    as the VQ embedding dim (the VQ quantizes in-place, so swapping it for an
+    identity map changes neither the latent dim nor the decoder input shape).
+    The continuous variant therefore has >= the representational capacity of
+    the discrete one — the fair, conservative comparison the reviewer asks
+    for (if discrete still matches/wins despite the continuous model having
+    strictly more capacity, discretization is doing real work).
+
+    Apply this OUTERMOST in a build chain so it owns the final
+    `vq_*_params`, overriding any RVQ / codebook-diversity settings set by
+    inner patches. That way the continuous build can be written as the exact
+    discrete build wrapped in one call — self-evidently "same architecture,
+    continuous bottleneck".
+
+    Parameters
+    ----------
+    branch : 'cell' | 'niche' | 'both'
+        Which VQ slot(s) to make continuous. The full "no VQ-VAE" ablation
+        uses 'both'.
+    """
+    if branch not in ("cell", "niche", "both"):
+        raise ValueError(f"branch must be 'cell'/'niche'/'both', got {branch!r}")
+    enc = cfg["model"]["encoder_params"]
+    if branch in ("cell", "both"):
+        enc["vq_cell_params"] = {"vq_name": "ContinuousVQ"}
+    if branch in ("niche", "both"):
+        enc["vq_niche_params"] = {"vq_name": "ContinuousVQ"}
+    return cfg
+
+
 def _patch_dual_vq_warmup(cfg: dict, vq_warmup_epochs: int = 10) -> dict:
     """
     Defer codebook init + EMA updates for the first `vq_warmup_epochs`
@@ -26186,6 +26235,53 @@ wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
 weight=10.0, temperature=100.0, branch="cell",
 ),
     },
+    # =======================================================================
+    # s53 — CONTINUOUS-LATENT (discretization) ablation family
+    #       [WABI rebuttal, reviewer #1]. A NEW, self-contained family —
+    #       SEPARATE from the s51/s52 ablations; nothing existing is re-run.
+    # =======================================================================
+    "s53_v1_continuous-latent+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "CONTINUOUS-LATENT ABLATION of the mouse-brain winner (WABI reviewer #1: "
+            "'rationale for discrete codebooks over continuous latents not sufficiently "
+            "supported'). This is EXACTLY the variant "
+            "'s49_v23_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+"
+            "sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+"
+            "contrastWB-w10-k5+mmb0-1b_smb1-1b_1p' WITH THE VQ COMPONENT REMOVED. Its build "
+            "calls that variant's OWN build() and then applies _patch_dual_continuous_vq("
+            "branch='both'), so the encoder/decoder architecture, latent dimensionality, "
+            "graph, sampler, batch size, lr, and every non-VQ loss are byte-for-byte "
+            "identical — ONLY the two ResidualVQ bottlenecks become continuous passthroughs "
+            "(ContinuousVQ). Effects: z_q = z (continuous encoder latent goes straight to the "
+            "decoder, no codebook snap), the commitment loss mse_commit = MSE(z, z_q) == 0, "
+            "and the cell-VQ codebook-diversity term is inert (no codebook). The continuous "
+            "latent has the SAME dim as the VQ embedding, so it carries >= the discrete "
+            "model's capacity — the conservative 'comparable capacity' comparison requested. "
+            "Isolates whether DISCRETIZATION (not capacity/depth) drives the gain. SCORING: "
+            "emits no meaningful codes (idx are placeholder zeros) — compare to the discrete "
+            "s49_v23 via the EMBEDDING metrics in benchmarking.py (cnmi/cari/casw/nasw/gcs on "
+            "obsm[latent_key]); do NOT use the code->label path for it. Reuses the s49_v23 "
+            "blob (mmb0-1b_smb1-1b_1p, k=16) — NO blob rebuild needed; existing runs untouched."
+        ),
+        "patches": [
+            "= s49_v23_dualvq+rvq-both+...+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
+            "+continuous-latent(branch=both)  [ResidualVQ -> ContinuousVQ on cell AND niche:",
+            "                                  removes quantization, commit loss is 0,",
+            "                                  codebook-diversity inert]",
+        ],
+        # Build = the EXACT s49_v23 mmb-smb config, then swap both VQ bottlenecks
+        # for a continuous passthrough. Referencing the s49_v23 build() directly
+        # (rather than re-copying its patch chain) guarantees this stays literally
+        # "s49_v23 minus VQ" even if that variant is ever edited. s49_v23's build()
+        # returns a fresh deep-copied cfg (via _BD), so mutating it here is safe and
+        # does not affect the s49_v23 variant itself.
+        "build": lambda: _patch_dual_continuous_vq(
+            VARIANTS[
+                "s49_v23_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p"
+            ]["build"](),
+            branch="both",
+        ),
+    },
     "s51_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+mmb0-1b_smb1-1b_1p": {
         "description": (
             "s49_v23 ablation on mmb0-1b_smb1-1b_1p: Drops the within-batch contrastive cell loss. Built on the s49_v23 spine (decoupled-enc + within-batch contrastive wt=10, k=5 + codebook-diversity on cell-VQ wt=10 + cell-w=1, no-batch-int, enc-deeper [400, 400, 256], dec-w[32], knn16, sampler[16], bs=512, lr=7e-4, within-sec). Cell RVQ = (30, 90), niche RVQ = (30, 90). REQUIRES BLOB REBUILD (k=16 in n_neighs_list) ."
@@ -34791,6 +34887,23 @@ DATASET_VARIANTS["spatch_coad_1p-ablations-v52"] = [
     "s52_v1_dualvq+rvq-cell-30-90+rvq-niche-30-10+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+spatch_coad_1p",  # niche RVQ (30, 10)
     "s52_v2_dualvq+rvq-cell-30-90+rvq-niche-30-30+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+spatch_coad_1p",  # niche RVQ (30, 30)
     "s52_v3_dualvq+rvq-cell-30-90+rvq-niche-30-300+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+spatch_coad_1p",  # niche RVQ (30, 300)
+]
+
+# -----------------------------------------------------------------------
+# s53 — CONTINUOUS-LATENT (discretization) ablation family
+#       [WABI rebuttal, reviewer #1]. A NEW, self-contained sweep — ONLY the
+#       continuous variant; the discrete s49_v23 control is NOT listed, so
+#       running this re-trains nothing that already exists. Compare its
+#       metrics against the already-computed s49_v23 run.
+# Runner (single-seed, metrics-only, matching how s49_v23 was evaluated):
+#   bash examples/submit_dataset_sweep.sh mmb0-1b_smb1-1b_1p-continuous-ablation
+# SCORING: the continuous model emits no meaningful codes, so compare it to
+# s49_v23 via the EMBEDDING metrics in benchmarking.py (cnmi/cari/casw/nasw/
+# gcs on obsm[latent_key]); do NOT use the code->label path for it — that
+# path stays a "free clustering" bonus the discrete model gets and this can't.
+# -----------------------------------------------------------------------
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-continuous-ablation"] = [
+    "s53_v1_continuous-latent+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p",
 ]
 
 

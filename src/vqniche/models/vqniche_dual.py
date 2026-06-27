@@ -794,11 +794,18 @@ class VQNiche_Dual(BaseModel):
         # take the LEVEL-1 codebook (`vq_cell.layers[0]._codebook.embed`)
         # since cell-NMI is computed against level-1 indices.
         # For non-residual VQ (no `.layers` attribute) we fall back to
-        # the single `_codebook` slot.
+        # the single `_codebook` slot. For a continuous / no-codebook VQ
+        # (e.g. ContinuousVQ in the discretization ablation) neither path
+        # exists, so we fall back to None — the codebook-only losses
+        # (orthogonality / diversity) simply don't apply to a continuous
+        # model and are never in its `loss_names`.
         try:
             _cell_cb_embed = self.encoder.vq_cell.layers[0]._codebook.embed
         except AttributeError:
-            _cell_cb_embed = self.encoder.vq_cell._codebook.embed
+            try:
+                _cell_cb_embed = self.encoder.vq_cell._codebook.embed
+            except AttributeError:
+                _cell_cb_embed = None
         loss_data['codebook_embeddings'] = _cell_cb_embed
 
         # Adversarial batch loss data (only when the adversary is built).

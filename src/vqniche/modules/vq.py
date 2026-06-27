@@ -17,6 +17,8 @@ from vector_quantize_pytorch import (
 
 # Local hierarchical / tree-structured VQ variants
 from .hierarchical_vq import ResidualVQ_Squint, ConditionalVQ
+# Continuous (identity) passthrough — discretization ablation
+from .continuous_vq import ContinuousVQ
 
 
 def get_vq_class(
@@ -54,6 +56,7 @@ def get_vq_class(
         # Local hierarchical variants (in-tree, built atop VectorQuantize):
         'ResidualVQ_Squint': ResidualVQ_Squint,   # RQ-VAE with per-level sizing
         'ConditionalVQ':    ConditionalVQ,         # tree (level-1 routes to level-2)
+        'ContinuousVQ':     ContinuousVQ,          # identity passthrough (no quantization)
     }
 
     if vq_name not in vq_classes:
@@ -92,6 +95,7 @@ def get_valid_params(
         # Local hierarchical variants — required params match their __init__:
         'ResidualVQ_Squint': ['dim', 'num_quantizers', 'codebook_size'],
         'ConditionalVQ':    ['dim', 'codebook_size_l1', 'codebook_size_l2'],
+        'ContinuousVQ':     ['dim'],  # identity passthrough — only needs the latent dim
     }
     class_name = cls.__name__
     init_signature = inspect.signature(cls.__init__)
