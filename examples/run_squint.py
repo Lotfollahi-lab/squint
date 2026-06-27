@@ -2296,6 +2296,21 @@ def _patch_dual_decoupled_encoders(
     return cfg
 
 
+def _patch_dual_coupled_encoders(cfg: dict) -> dict:
+    """Force the COUPLED (shared-trunk) encoder — the INVERSE of
+    `_patch_dual_decoupled_encoders` / `_patch_dual_shared_specific_encoders`.
+    Removes the separate niche-side MLP (`niche_mlp_params`) and any Y-shape
+    shared trunk (`shared_mlp_params`) so the cell and niche branches share a
+    single MLP trunk (the legacy default). Spatial-loss gradients then flow back
+    into the cell-VQ input — the coupling this ablation tests. Apply OUTERMOST on
+    a build that has decoupled / shared-specific encoders (e.g. the s55_v3 spine).
+    """
+    enc = cfg["model"]["encoder_params"]
+    enc.pop("niche_mlp_params", None)
+    enc.pop("shared_mlp_params", None)
+    return cfg
+
+
 def _patch_dual_shared_specific_encoders(
         cfg: dict,
         shared_mlp_params: Optional[dict] = None,
@@ -2861,6 +2876,91 @@ def _patch_dual_contrastive_cross_batch(
     lk["k_cross"] = int(k_cross)
     lk["mnn_floor"] = float(mnn_floor)
     lk["mutual"] = bool(mutual)
+    return cfg
+
+
+def _patch_dual_cross_stitch(
+        cfg: dict,
+        per_channel: bool = False,
+        init_diag: float = 0.9,
+        init_off: float = 0.1,
+    ) -> dict:
+    """
+    Cross-stitch coupling (Misra et al., CVPR 2016): learn a 2x2 mix of
+    the cell- and niche-branch post-MLP latents before the cell-VQ / GNN
+    split. The "soft sharing" middle ground between the coupled shared
+    trunk and the fully decoupled encoders — one cross-stitch unit spans
+    the whole shared-to-split spectrum and learns the optimal mix from
+    data, so there is no hand-picked split point.
+
+    Operates on the DECOUPLED architecture: this patch ensures a
+    separate niche MLP exists (adds one, a copy of the cell MLP, if the
+    cfg doesn't already have it) and removes any Y-shape shared trunk,
+    then attaches `cross_stitch_params` for the encoder to build a
+    `CrossStitch` unit. `per_channel=False` -> one 2x2 (4 scalars);
+    `per_channel=True` -> an independent 2x2 per feature channel.
+
+    Apply OUTERMOST on a decoupled spine (e.g. s55_v3).
+    """
+    enc = cfg["model"]["encoder_params"]
+    # Require / ensure the decoupled architecture (independent niche MLP).
+    if enc.get("niche_mlp_params") is None:
+        enc["niche_mlp_params"] = _copy(enc.get("mlp_params", {})) or {}
+    enc.pop("shared_mlp_params", None)   # cross-stitch is incompatible with Y-shape
+    enc["cross_stitch_params"] = {
+        "per_channel": bool(per_channel),
+        "init_diag": float(init_diag),
+        "init_off": float(init_off),
+    }
+    return cfg
+
+
+def _patch_dual_stopgrad_coupled(cfg: dict) -> dict:
+    """
+    Gradient-level coupling (stop-gradient; cf. Yu et al. 2020 family):
+    keep ONE shared MLP trunk (coupled), but DETACH the niche-path input
+    so spatial-loss gradients (adjacency BCE, nbr-NB, niche-commit) never
+    flow back into the trunk that also produces the cell-VQ input. The
+    trunk is then trained purely by the cell objective; the GNN, niche VQ
+    and niche decoder still train on top of the detached trunk features.
+
+    This is the cheapest way to protect the cell-intrinsic codes from
+    spatial corruption while physically sharing the encoder — near-zero
+    parameter overhead (a single `.detach()` in the forward pass).
+
+    Forces the coupled trunk (removes any separate niche/shared MLP) and
+    sets `detach_gnn_input=True`. Apply OUTERMOST on a spine.
+    """
+    enc = cfg["model"]["encoder_params"]
+    enc.pop("niche_mlp_params", None)
+    enc.pop("shared_mlp_params", None)
+    enc.pop("cross_stitch_params", None)
+    enc["detach_gnn_input"] = True
+    return cfg
+
+
+def _patch_dual_soft_coupling(cfg: dict, wt: float = 1e-3) -> dict:
+    """
+    Soft parameter sharing (Duong et al. 2015; Yang & Hospedales 2017):
+    keep the two encoders fully DECOUPLED (independent cell + niche MLP
+    trunks) but add an L2 penalty on the distance between their matched
+    weight tensors, so the two trunks are encouraged to stay similar
+    without physically sharing parameters. The lightest-touch coupling
+    of the decoupled architecture.
+
+    Ensures the decoupled architecture (adds a niche MLP copy if absent)
+    and sets `loss_kwargs['wt_encoder_coupling'] = wt`; the dual model
+    adds `wt * sum_l ||W_cell[l] - W_niche[l]||_F^2` to the total loss.
+    `wt` is small by default because the penalty sums over all MLP
+    weights (large absolute magnitude). Apply OUTERMOST on a decoupled
+    spine (e.g. s55_v3).
+    """
+    enc = cfg["model"]["encoder_params"]
+    if enc.get("niche_mlp_params") is None:
+        enc["niche_mlp_params"] = _copy(enc.get("mlp_params", {})) or {}
+    enc.pop("shared_mlp_params", None)
+    enc.pop("cross_stitch_params", None)
+    cfg["model"]["loss_params"]["loss_kwargs"]["wt_encoder_coupling"] = float(wt)
     return cfg
 
 
@@ -33837,6 +33937,216 @@ def _register_dataset_sweep(
             }
         names.append(name)
     return names
+
+
+# ===========================================================================
+# s56 — ENCODER CELL/NICHE COUPLING-METHOD ablation (on the cross-batch MNN
+# spine). How should the cell-intrinsic and spatial-niche encoders SHARE
+# parameters so they "work well together" without spatial losses corrupting
+# the cell codes? We sweep a spectrum from full sharing to full decoupling,
+# plus three learned/elegant coupling methods drawn from the multi-task
+# literature (Misra 2016 cross-stitch; Duong 2015 / Yang & Hospedales 2017
+# soft sharing; Yu 2020-style stop-gradient). All built on the s55_v3
+# cross-batch-MNN spine, so they're directly comparable to the rest.
+#
+# Endpoints already defined/run:
+#   * DECOUPLED (reference) = s55_v3   (two independent MLP trunks)
+#   * COUPLED               = s56_v1   (one shared MLP trunk)
+# Partial sharing (Y-shape: shared trunk + per-branch heads, concat back to
+# 256-d so codebook/decoder shapes are unchanged):
+#   * s56_v2  shared 192 / path 64  (mostly shared)
+#   * s56_v3  shared 128 / path 128 (balanced)
+#   * s56_v4  shared 64  / path 192 (mostly specialised)
+# Learned / elegant coupling:
+#   * s56_v5  cross-stitch, one 2x2 mix (4 scalars; Misra 2016)
+#   * s56_v6  cross-stitch, per-channel 2x2 (Misra 2016)
+#   * s56_v7  stop-gradient on a coupled trunk (gradient-level coupling)
+#   * s56_v8  soft parameter-sharing L2 penalty between decoupled trunks
+# ===========================================================================
+_S56_SPINE_KEY = ("s55_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper"
+                  "+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec"
+                  "+decoupled-enc+diversity-w10+contrastWB-w10-k5"
+                  "+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p")
+
+
+def _s56_spine():
+    """Fresh build of the s55_v3 cross-batch-MNN spine (decoupled encoders),
+    rebuilt each call so the coupling patches mutate an independent cfg."""
+    return VARIANTS[_S56_SPINE_KEY]["build"]()
+
+
+VARIANTS["s56_v1_coupled-enc+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s56 coupling ablation on the CROSS-BATCH MNN spine: COUPLED encoder "
+        "(cell + niche share ONE MLP trunk; hard parameter sharing) vs the "
+        "decoupled default (s55_v3). Built by wrapping the s55_v3 build with "
+        "_patch_dual_coupled_encoders, which removes the separate niche-side MLP "
+        "(niche_mlp_params) so spatial-loss gradients flow back into the cell-VQ "
+        "input. Everything else (cross-batch MNN wt_cross=10/k_cross=1, codebooks, "
+        "graph, losses) is identical to s55_v3. Reference (decoupled) = s55_v3. "
+        "Reuses the mmb0-1b_smb1-1b_1p blob (k=16)."
+    ),
+    "patches": ["= s55_v3 (cross-batch spine) + decoupled -> COUPLED encoder"],
+    "build": lambda: _patch_dual_coupled_encoders(_s56_spine()),
+}
+
+# ---- Partial sharing: Y-shape (shared trunk + per-branch heads) ------------
+# `_patch_dual_shared_specific_encoders` builds 3 MLPs (shared + cell-path +
+# niche-path) and concatenates [shared, path] for each branch. We vary the
+# split point via shared_last_dim / path_last_dim so the concatenated dim
+# stays 256 (= the s55_v3 trunk output), keeping codebook + decoder shapes
+# unchanged. Higher shared_last_dim = more sharing (closer to s56_v1 coupled);
+# higher path_last_dim = more specialisation (closer to s55_v3 decoupled).
+_S56_YSHAPE = [
+    ("v2", "yshape-shared192-path64",  192, 64,  "mostly shared"),
+    ("v3", "yshape-shared128-path128", 128, 128, "balanced"),
+    ("v4", "yshape-shared64-path192",  64,  192, "mostly specialised"),
+]
+for _v, _tag, _sd, _pd, _desc in _S56_YSHAPE:
+    VARIANTS[f"s56_{_v}_{_tag}+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+        "description": (
+            f"s56 coupling ablation (cross-batch MNN spine): partial sharing via "
+            f"the Y-shape encoder ({_desc}) — a shared MLP trunk (last dim {_sd}) "
+            f"plus per-branch path MLPs (last dim {_pd}), concatenated to "
+            f"{_sd + _pd}-d for each branch (= the s55_v3 trunk width, so codebook "
+            f"and decoder shapes are unchanged). The shared trunk sees gradients "
+            f"from BOTH branches; each path MLP sees only its own branch. "
+            f"wt_cross=10/k_cross=1 cross-batch MNN as default. Reference = s55_v3."
+        ),
+        "patches": [
+            f"= s55_v3 spine + Y-shape encoder (shared_last={_sd}, path_last={_pd})",
+        ],
+        "build": (lambda sd=_sd, pd=_pd: _patch_dual_shared_specific_encoders(
+            _s56_spine(), shared_last_dim=sd, path_last_dim=pd)),
+    }
+
+# ---- Learned coupling: cross-stitch (Misra et al., CVPR 2016) --------------
+VARIANTS["s56_v5_crossstitch-scalar+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s56 coupling ablation (cross-batch MNN spine): CROSS-STITCH coupling "
+        "(Misra et al. 2016) with ONE learnable 2x2 mixing matrix (4 scalars) "
+        "shared across all channels, mixing the cell- and niche-branch post-MLP "
+        "latents before the cell-VQ / GNN split. Spans the shared-to-decoupled "
+        "spectrum and learns the optimal mix from data; near-identity init "
+        "(0.9 / 0.1). Built on the decoupled s55_v3 spine. Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + cross-stitch (per_channel=False)"],
+    "build": lambda: _patch_dual_cross_stitch(_s56_spine(), per_channel=False),
+}
+VARIANTS["s56_v6_crossstitch-perchannel+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s56 coupling ablation (cross-batch MNN spine): CROSS-STITCH coupling "
+        "(Misra et al. 2016) with an INDEPENDENT 2x2 mix per feature channel "
+        "(4 x dim scalars) — the per-unit form closest to the original paper. "
+        "More expressive than the scalar variant (s56_v5). Built on the decoupled "
+        "s55_v3 spine. Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + cross-stitch (per_channel=True)"],
+    "build": lambda: _patch_dual_cross_stitch(_s56_spine(), per_channel=True),
+}
+
+# ---- Gradient-level coupling: stop-gradient on a coupled trunk -------------
+VARIANTS["s56_v7_stopgrad-coupled+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s56 coupling ablation (cross-batch MNN spine): STOP-GRADIENT coupling. "
+        "One physical shared MLP trunk (coupled), but the niche-path input is "
+        "detached so spatial-loss gradients never reach the trunk that produces "
+        "the cell-VQ input — the trunk is trained purely by the cell objective, "
+        "while the GNN / niche VQ / niche decoder learn on top of the detached "
+        "features. Cheapest cell-code protection while physically sharing the "
+        "encoder (one .detach()). Reference = s55_v3 (decoupled), contrast vs "
+        "s56_v1 (coupled, no detach)."
+    ),
+    "patches": ["= s55_v3 spine + COUPLED trunk + detach_gnn_input=True"],
+    "build": lambda: _patch_dual_stopgrad_coupled(_s56_spine()),
+}
+
+# ---- Soft parameter sharing: L2 penalty between decoupled trunks -----------
+VARIANTS["s56_v8_softcouple-w1e-3+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s56 coupling ablation (cross-batch MNN spine): SOFT parameter sharing "
+        "(Duong 2015 / Yang & Hospedales 2017). Two fully decoupled cell + niche "
+        "MLP trunks (as in s55_v3) PLUS an L2 penalty on the distance between "
+        "their matched weights (wt_encoder_coupling=1e-3), encouraging the trunks "
+        "to stay similar without physically sharing parameters — the lightest-touch "
+        "coupling. NOTE: the penalty sums over all MLP weights, so the 1e-3 weight "
+        "is a starting point that may need tuning. Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine (decoupled) + wt_encoder_coupling=1e-3"],
+    "build": lambda: _patch_dual_soft_coupling(_s56_spine(), wt=1e-3),
+}
+
+
+# ===========================================================================
+# s57 — ALL ablations re-run on the CROSS-BATCH MNN contrastive spine.
+# The s57 "default" contrastive loss is the cross-batch MNN variant
+# (wt_cross=10, k_cross=1 == the s55_v3 config), replacing the within-batch
+# contrastive used by the s51/s52/s54 ablations. Each s57 variant is generated
+# by wrapping the corresponding within-batch ablation variant's build with
+# _patch_dual_contrastive_cross_batch (swaps within-batch -> cross-batch MNN),
+# so it stays in sync with the source variants.
+#
+# NOT generated (reused as-is):
+#   * cross-batch reference (s49_v23 + cross)  = s55_v3 (already defined)
+#   * contrastive-axis comparators             = s51_v1 (within) + s51_v2 (none)
+#   * coupled/decoupled axis                   = s55_v3 (decoupled) + s56_v1 (coupled)
+# ===========================================================================
+_S57_CROSS = dict(wt_cross=10.0, k_cross=1)
+# (s57 key tag, source-variant key PREFIX) — source resolved to its full mmb key.
+_S57_SPEC = [
+    ("no-adj",           "s51_v3_"),    # adjacency reconstruction: drop
+    ("no-dec-cov",       "s51_v4_"),    # decoder covariate: drop
+    ("gnn-l2",           "s51_v11_"),   # GNN depth: 2 layers
+    ("knn8",             "s51_v8_"),    # neighbours: knn8 / sampler8
+    ("knn16-sampler8",   "s51_v9_"),    # neighbours: knn16 / sampler8
+    ("knn24",            "s51_v10_"),   # neighbours: knn24
+    ("rvq-cell-30-10",   "s51_v6_"),    # cell codebook L1=10
+    ("rvq-cell-30-30",   "s51_v5_"),    # cell codebook L1=30
+    ("rvq-cell-30-300",  "s51_v7_"),    # cell codebook L1=300
+    ("rvq-niche-30-10",  "s52_v1_"),    # niche codebook L1=10
+    ("rvq-niche-30-30",  "s52_v2_"),    # niche codebook L1=30
+    ("rvq-niche-30-300", "s52_v3_"),    # niche codebook L1=300
+    ("rvq-cell-10-30",   "s54_v1_"),    # cell codebook L0=10
+    ("rvq-cell-90-30",   "s54_v2_"),    # cell codebook L0=90
+    ("rvq-cell-300-30",  "s54_v3_"),    # cell codebook L0=300
+    ("rvq-niche-10-30",  "s54_v4_"),    # niche codebook L0=10
+    ("rvq-niche-90-30",  "s54_v5_"),    # niche codebook L0=90
+    ("rvq-niche-300-30", "s54_v6_"),    # niche codebook L0=300
+]
+
+
+def _s57_resolve_source(prefix):
+    cands = [k for k in VARIANTS
+             if k.startswith(prefix) and k.endswith("+mmb0-1b_smb1-1b_1p")]
+    if len(cands) != 1:
+        print(f"[s57] WARNING: prefix {prefix!r} matched {len(cands)} variant(s) "
+              f"{cands}; skipping that s57 entry.")
+        return None
+    return cands[0]
+
+
+for _i, (_tag, _pref) in enumerate(_S57_SPEC, start=1):
+    _src = _s57_resolve_source(_pref)
+    if _src is None:
+        continue
+    _key = f"s57_v{_i}_crossmnn-wt10-k1+{_tag}+mmb0-1b_smb1-1b_1p"
+    VARIANTS[_key] = {
+        "description": (
+            f"s57 ablation on the CROSS-BATCH MNN contrastive spine (default = "
+            f"cross-batch MNN wt_cross=10, k_cross=1, == s55_v3). This variant = "
+            f"source '{_src}' with the within-batch contrastive loss swapped for "
+            f"the cross-batch MNN loss (wraps the source build with "
+            f"_patch_dual_contrastive_cross_batch). Reuses the mmb0-1b_smb1-1b_1p "
+            f"blob (k=16). s57 reference = s55_v3; contrastive axis reuses "
+            f"s51_v1 (within) / s51_v2 (none)."
+        ),
+        "patches": [
+            f"= {_pref}<src> + within-batch contrastive -> cross-batch MNN "
+            f"(wt_cross=10, k_cross=1)",
+        ],
+        "build": (lambda src=_src: _patch_dual_contrastive_cross_batch(
+            VARIANTS[src]["build"](), **_S57_CROSS)),
+    }
 
 
 # Map short dataset tag -> ordered list of sweep variant names. The CLI's

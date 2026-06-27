@@ -51,6 +51,7 @@ import pytorch_lightning as pl
 from vqniche.modules import MLP as MLP_Module
 from vqniche.modules import init_gnn_module
 from vqniche.modules import FiLM
+from vqniche.modules import CrossStitch
 from vqniche.modules import get_vq_class, get_valid_params
 
 
@@ -67,6 +68,8 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             niche_neck_params: Optional[dict] = None,
             niche_mlp_params: Optional[dict] = None,
             shared_mlp_params: Optional[dict] = None,
+            cross_stitch_params: Optional[dict] = None,
+            detach_gnn_input: bool = False,
         ):
         """
         Parameters
@@ -112,6 +115,25 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             class (default 'VectorQuantize'). Quantises `z_mlp`.
         vq_niche_params: dict
             VQ class + args for the *niche* branch. Quantises `z_gnn`.
+        cross_stitch_params: dict, optional
+            When provided, inserts a cross-stitch unit (Misra et al.
+            2016) that learns a 2x2 mix of the cell- and niche-branch
+            post-MLP latents before the cell-VQ / GNN split — the
+            "soft sharing" coupling that spans shared-to-decoupled.
+            Requires the DECOUPLED architecture (`niche_mlp_params`
+            set) and is mutually exclusive with the Y-shape shared
+            trunk (`shared_mlp_params`). Keys are forwarded to
+            `CrossStitch` (`per_channel`, `init_diag`, `init_off`).
+            Default `None` -> no cross-stitch.
+        detach_gnn_input: bool, default False
+            When True, stop-gradient on the niche path input: the
+            tensor fed into the (optional) niche_neck + GNN is detached
+            so spatial-loss gradients never reach the MLP trunk that
+            also produces the cell-VQ input. On the COUPLED (shared-
+            trunk) architecture this is the gradient-level coupling
+            variant — one physical trunk, trained only by the cell
+            objective, with the niche modules learning on top of the
+            detached features. Works with any trunk mode.
         """
         super().__init__()
 
@@ -213,6 +235,70 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         # when shared is disabled).
         vq_cell_in_channels  = cell_in_channels  + shared_out_dim
         gnn_pre_neck_in_channels = niche_post_mlp_dim + shared_out_dim
+
+        # ---- Optional CROSS-STITCH coupling (Misra et al. 2016) -------------
+        # A learned 2x2 mixing of the cell- and niche-branch post-MLP
+        # latents BEFORE the cell-VQ / GNN split:
+        #
+        #   z_mlp_cell'  = a_cc * z_mlp_cell + a_cn * z_mlp_niche
+        #   z_mlp_niche' = a_nc * z_mlp_cell + a_nn * z_mlp_niche
+        #
+        # This is the "soft sharing" middle ground between the legacy
+        # shared trunk (full coupling) and the decoupled encoders (no
+        # coupling): a single cross-stitch unit spans the whole
+        # shared-to-split spectrum and learns the optimal mix from data
+        # (Misra et al., CVPR 2016), so the split point is not a
+        # hand-tuned hyperparameter.
+        #
+        # Requirements (validated here):
+        #   - DECOUPLED architecture: a separate `niche_mlp_module`
+        #     must exist (so the two streams have independent params
+        #     to mix). Cross-stitch on a single shared trunk is a
+        #     no-op (both streams would be identical).
+        #   - Mutually exclusive with the Y-shape shared trunk
+        #     (`shared_mlp_params`) — mixing already-concatenated
+        #     shared features is ill-defined here.
+        #   - Equal cell / niche post-MLP dims (the 2x2 mixes matched
+        #     channels). The decoupled patch makes the niche MLP a
+        #     copy of the cell MLP, so this holds by default.
+        if cross_stitch_params is not None:
+            if self.niche_mlp_module is None:
+                raise ValueError(
+                    "cross_stitch_params requires the DECOUPLED encoder "
+                    "(a separate niche_mlp_params); cross-stitch on a "
+                    "single shared trunk is a no-op."
+                )
+            if self.shared_mlp_module is not None:
+                raise ValueError(
+                    "cross_stitch_params is mutually exclusive with the "
+                    "Y-shape shared trunk (shared_mlp_params)."
+                )
+            if cell_in_channels != niche_post_mlp_dim:
+                raise ValueError(
+                    "cross_stitch requires equal cell/niche post-MLP "
+                    f"dims, got cell={cell_in_channels} vs "
+                    f"niche={niche_post_mlp_dim}. Match the niche MLP's "
+                    "final hidden dim to the cell MLP's."
+                )
+            self.cross_stitch = CrossStitch(
+                dim=cell_in_channels, **cross_stitch_params,
+            )
+        else:
+            self.cross_stitch = None
+
+        # ---- Optional STOP-GRADIENT on the niche (GNN) input ----------------
+        # When True, the tensor fed into the niche path (GNN, via the
+        # optional niche_neck) is `.detach()`-ed, so spatial-loss
+        # gradients (adjacency BCE, nbr-NB, niche-commit) do NOT flow
+        # back into the MLP trunk that also produces the cell-VQ input.
+        # On the COUPLED (shared-trunk) architecture this is the
+        # "gradient-level coupling" variant: one physical trunk shared
+        # by both branches, but trained ONLY by the cell objective —
+        # the GNN, niche VQ and niche decoder still train on top of the
+        # detached features. Cheap (one detach), near-zero param
+        # overhead. Independent of the architecture knobs above (works
+        # with coupled, decoupled, or Y-shape trunks).
+        self.detach_gnn_input = bool(detach_gnn_input)
 
         # ---- Optional NICHE NECK MLP (between z_mlp_niche and the GNN) ------
         # When `niche_neck_params` is provided, an additional MLP is
@@ -419,6 +505,20 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             # niche-specific MLP by default so this is rare).
             z_mlp_niche_path = z_mlp_cell_path
 
+        # ---- cross-stitch mixing (Misra et al. 2016) ------------------------
+        # Learned 2x2 combination of the two post-MLP (post-FiLM) path
+        # latents. Only active in the decoupled architecture (validated
+        # in __init__: cross_stitch requires a separate niche MLP and
+        # forbids the Y-shape shared trunk), so `z_shared is None` here
+        # and the cell-VQ input is exactly `z_mlp_cell_path`. We mix
+        # both streams and re-bind `z_mlp` (the cell-VQ input, assembled
+        # above from the un-mixed cell path) and the niche path.
+        if self.cross_stitch is not None:
+            z_mlp_cell_path, z_mlp_niche_path = self.cross_stitch(
+                z_mlp_cell_path, z_mlp_niche_path,
+            )
+            z_mlp = z_mlp_cell_path        # z_shared is None in cross-stitch mode
+
         # Niche-pre-neck input: concat of [shared, niche-path] in
         # Y-shape mode; niche-path only otherwise.
         if z_shared is not None:
@@ -427,9 +527,17 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             z_mlp_niche = z_mlp_niche_path
 
         # ---- niche-side pipeline: [niche_neck] -> GNN -> VQ_niche -----------
+        # Stop-gradient coupling: when `detach_gnn_input` is set, the
+        # niche path consumes a detached copy of `z_mlp_niche`, so
+        # spatial-loss gradients never reach the (possibly shared) MLP
+        # trunk that produces the cell-VQ input. The niche_neck / GNN /
+        # niche VQ still train normally on the detached features.
+        niche_path_input = (
+            z_mlp_niche.detach() if self.detach_gnn_input else z_mlp_niche
+        )
         gnn_input = (
-            self.niche_neck(z_mlp_niche) if self.niche_neck is not None
-            else z_mlp_niche
+            self.niche_neck(niche_path_input) if self.niche_neck is not None
+            else niche_path_input
         )
         z_gnn = self.gnn_module(gnn_input, batch_edge_index)
 
@@ -443,3 +551,49 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         z_q_niche, idx_niche, _ = self.vq_niche(z_gnn)
 
         return z_mlp, z_gnn, z_q_cell, z_q_niche, idx_cell, idx_niche
+
+    def encoder_coupling_penalty(self) -> torch.Tensor:
+        """
+        Soft parameter-sharing penalty (Duong et al. 2015; Yang &
+        Hospedales 2017) between the DECOUPLED cell- and niche-branch
+        MLP trunks: the sum of squared differences between matched
+        weight tensors,
+
+            sum_l || W_cell[l] - W_niche[l] ||_F^2 .
+
+        Minimising it (with a small weight, added to the total loss by
+        the model) keeps the two independent trunks *similar* without
+        physically sharing them — the lightest-touch coupling of the
+        decoupled architecture. Requires both MLPs to exist with
+        identical shapes (the decoupled patch makes the niche MLP a
+        deep-copy of the cell MLP, so this holds by construction).
+
+        Returns a scalar tensor on the module's device with grad to
+        both trunks. Raises if the encoder is not decoupled.
+        """
+        if self.mlp_module is None or self.niche_mlp_module is None:
+            raise RuntimeError(
+                "encoder_coupling_penalty requires the DECOUPLED encoder "
+                "(both a cell MLP `mlp_params` and a niche MLP "
+                "`niche_mlp_params`). Got "
+                f"mlp_module={self.mlp_module is not None}, "
+                f"niche_mlp_module={self.niche_mlp_module is not None}."
+            )
+        cell_params = list(self.mlp_module.parameters())
+        niche_params = list(self.niche_mlp_module.parameters())
+        if len(cell_params) != len(niche_params):
+            raise RuntimeError(
+                "encoder_coupling_penalty requires matched cell/niche MLP "
+                f"shapes; got {len(cell_params)} vs {len(niche_params)} "
+                "parameter tensors."
+            )
+        pen = None
+        for p_cell, p_niche in zip(cell_params, niche_params):
+            if p_cell.shape != p_niche.shape:
+                raise RuntimeError(
+                    "encoder_coupling_penalty: mismatched parameter shapes "
+                    f"{tuple(p_cell.shape)} vs {tuple(p_niche.shape)}."
+                )
+            term = ((p_cell - p_niche) ** 2).sum()
+            pen = term if pen is None else pen + term
+        return pen

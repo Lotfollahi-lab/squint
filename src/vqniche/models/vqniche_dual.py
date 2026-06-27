@@ -835,6 +835,29 @@ class VQNiche_Dual(BaseModel):
             mode=mode,
         )
 
+        # ---- soft encoder-coupling penalty (Duong 2015 / Yang &
+        # Hospedales 2017) ----------------------------------------------------
+        # Optional L2 distance between the DECOUPLED cell- and niche-MLP
+        # weight tensors, encouraging the two independent trunks to stay
+        # similar (soft parameter sharing) without physically sharing
+        # parameters. Off by default; enabled by setting
+        # `loss_kwargs['wt_encoder_coupling'] > 0` on a decoupled
+        # variant. Added to total_loss here (not via the loss dispatcher)
+        # because it reads encoder weights, not batch tensors.
+        wt_couple = float(self.loss_kwargs.get('wt_encoder_coupling', 0.0) or 0.0)
+        if wt_couple > 0.0:
+            coupling_penalty = self.encoder.encoder_coupling_penalty()
+            loss_value = loss_value + wt_couple * coupling_penalty
+            self.log(
+                name=f"{mode}_encoder_coupling_penalty",
+                value=coupling_penalty,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                batch_size=batch_size,
+                sync_dist=True,
+            )
+
         # Cache inference data for this split.
         cache_dict = getattr(self, f"{mode}_inference_data_cache", None)
         if cache_dict is not None:

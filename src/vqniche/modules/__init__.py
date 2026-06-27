@@ -7,6 +7,7 @@ from .hierarchical_vq import ResidualVQ_Squint, ConditionalVQ
 from .dispersion_head import DispersionHead
 from .adversary import BatchAdversaryHead, grad_reverse
 from .film import FiLM
+from .cross_stitch import CrossStitch
 from .temperature_annealer import TemperatureAnnealer
 
 
@@ -35,6 +36,9 @@ __all__ = [
 
     # Conditioning modules
     'FiLM',
+
+    # Multi-task coupling (Misra et al. 2016 cross-stitch)
+    'CrossStitch',
 
     # Annealing modules
     'TemperatureAnnealer',
