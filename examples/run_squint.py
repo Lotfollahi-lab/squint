@@ -2964,6 +2964,55 @@ def _patch_dual_soft_coupling(cfg: dict, wt: float = 1e-3) -> dict:
     return cfg
 
 
+def _patch_dual_compositional_cell_to_niche(
+        cfg: dict,
+        source: str = "z_q_cell",
+        detach: bool = True,
+        project_dim: Optional[int] = None,
+    ) -> dict:
+    """
+    Compositional cell->niche coupling (idea #1): inject the cell branch's
+    representation as extra node features for the niche GNN, so the GNN
+    aggregates neighbours' cell identity (= local cell-type composition,
+    CellCharter/Banksy-style). Directional, asymmetric: with `detach=True`
+    (default) the injected signal carries NO gradient back to the cell branch,
+    so the cell codes stay protected while the niche branch gets strictly more
+    (biologically-relevant) information.
+
+    `source`     : 'z_q_cell' (quantized = denoised identity, default) or
+                   'z_mlp_cell' (continuous pre-VQ).
+    `detach`     : protect the cell branch (default True).
+    `project_dim`: optionally project the cell signal before concatenation
+                   (None = full concat).
+
+    Apply OUTERMOST on a decoupled spine (e.g. s55_v3).
+    """
+    enc = cfg["model"]["encoder_params"]
+    enc["cell_to_niche"] = {
+        "source": source,
+        "detach": bool(detach),
+        "project_dim": (int(project_dim) if project_dim else None),
+    }
+    return cfg
+
+
+def _patch_dual_disentangle(cfg: dict, wt: float = 100.0) -> dict:
+    """
+    Disentanglement penalty (idea #2): add a Barlow-Twins-style
+    cross-correlation decorrelation loss between the cell and niche latents,
+    pushing the niche code to carry only signal complementary to the cell
+    code. Adds `disentangle_cell_niche_loss` to loss_names and sets
+    `loss_kwargs['wt_disentangle']`. The penalty is the mean squared
+    cross-correlation (in [0, 1]), so `wt` plays the same upweighting role as
+    the adjacency BCE weight. Apply OUTERMOST on any dual spine.
+    """
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    if "disentangle_cell_niche_loss" not in losses:
+        losses.append("disentangle_cell_niche_loss")
+    cfg["model"]["loss_params"]["loss_kwargs"]["wt_disentangle"] = float(wt)
+    return cfg
+
+
 def _build_s51_spine_codebook(cell_sizes, niche_sizes):
     """Build the s51_v1 / s49_v23 spine with the given per-branch RVQ codebook
     sizes. This is BYTE-IDENTICAL to the s52_v1 build chain (decoupled-enc +
@@ -34147,6 +34196,99 @@ for _i, (_tag, _pref) in enumerate(_S57_SPEC, start=1):
         "build": (lambda src=_src: _patch_dual_contrastive_cross_batch(
             VARIANTS[src]["build"](), **_S57_CROSS)),
     }
+
+
+# ===========================================================================
+# s58 — INFORMATION-FLOW / COMPLEMENTARITY coupling (beyond trunk-sharing).
+# The s56 trunk-sharing sweep tied with the decoupled baseline -> sharing the
+# trunk is not the lever. s58 instead changes WHAT flows between the branches:
+#   #1 COMPOSITIONAL cell->niche coupling: the niche GNN consumes neighbours'
+#      cell codes (detached) so the niche code is built on local cell-type
+#      composition — directional, asymmetric (cell stays protected).
+#   #2 DISENTANGLEMENT penalty: decorrelate the cell & niche latents so the
+#      niche code captures only complementary signal.
+#   plus #1+#2 combined.
+# All on the s55_v3 cross-batch-MNN decoupled spine (_s56_spine()).
+# Reference = s55_v3.
+# ===========================================================================
+VARIANTS["s58_v1_compose-cell2niche-zqcell+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s58 #1 compositional cell->niche coupling (cross-batch MNN spine): the "
+        "niche GNN consumes neighbours' QUANTIZED cell codes (z_q_cell, detached) "
+        "as extra node features, so the niche representation is built on local "
+        "cell-type composition while the cell branch stays gradient-protected. "
+        "Full concat (no projection). Reference = s55_v3 (decoupled)."
+    ),
+    "patches": ["= s55_v3 spine + cell_to_niche(source=z_q_cell, detach=True)"],
+    "build": lambda: _patch_dual_compositional_cell_to_niche(
+        _s56_spine(), source="z_q_cell", detach=True),
+}
+VARIANTS["s58_v2_compose-cell2niche-zqcell-proj64+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s58 #1 compositional cell->niche coupling, PROJECTED: neighbours' "
+        "z_q_cell (detached) projected to 64-d before concatenation onto the "
+        "niche GNN input, so the cell signal doesn't dominate the niche features. "
+        "Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + cell_to_niche(z_q_cell, detach, project_dim=64)"],
+    "build": lambda: _patch_dual_compositional_cell_to_niche(
+        _s56_spine(), source="z_q_cell", detach=True, project_dim=64),
+}
+VARIANTS["s58_v3_compose-cell2niche-zmlp+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s58 #1 compositional cell->niche coupling with the CONTINUOUS cell "
+        "latent (z_mlp_cell, detached) instead of the quantized code — ablation "
+        "of discrete vs continuous injected cell signal. Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + cell_to_niche(source=z_mlp_cell, detach=True)"],
+    "build": lambda: _patch_dual_compositional_cell_to_niche(
+        _s56_spine(), source="z_mlp_cell", detach=True),
+}
+VARIANTS["s58_v4_compose-cell2niche-zqcell-nodetach+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s58 #1 compositional cell->niche coupling WITHOUT detach — niche "
+        "gradients flow back into the cell branch through the injected z_q_cell. "
+        "Tests whether protecting the cell branch (the asymmetry) matters. "
+        "Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + cell_to_niche(z_q_cell, detach=False)"],
+    "build": lambda: _patch_dual_compositional_cell_to_niche(
+        _s56_spine(), source="z_q_cell", detach=False),
+}
+VARIANTS["s58_v5_disentangle-w100+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s58 #2 disentanglement penalty (cross-batch MNN spine): "
+        "Barlow-Twins-style cross-correlation decorrelation between the cell and "
+        "niche latents (wt_disentangle=100) so the niche code captures only "
+        "complementary signal. Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + disentangle_cell_niche_loss (wt=100)"],
+    "build": lambda: _patch_dual_disentangle(_s56_spine(), wt=100.0),
+}
+VARIANTS["s58_v6_disentangle-w1000+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s58 #2 disentanglement penalty, STRONGER (wt_disentangle=1000). The "
+        "penalty is mean squared cross-correlation (in [0,1]); 100 vs 1000 "
+        "brackets the upweighting. Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + disentangle_cell_niche_loss (wt=1000)"],
+    "build": lambda: _patch_dual_disentangle(_s56_spine(), wt=1000.0),
+}
+VARIANTS["s58_v7_compose-zqcell+disentangle-w100+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s58 #1+#2 COMBINED (cross-batch MNN spine): compositional cell->niche "
+        "coupling (z_q_cell, detached) PLUS the disentanglement penalty "
+        "(wt=100). Tests whether injecting cell composition and decorrelating "
+        "the codes are complementary. Reference = s55_v3."
+    ),
+    "patches": [
+        "= s55_v3 spine + cell_to_niche(z_q_cell, detach) + disentangle (wt=100)",
+    ],
+    "build": lambda: _patch_dual_disentangle(
+        _patch_dual_compositional_cell_to_niche(
+            _s56_spine(), source="z_q_cell", detach=True),
+        wt=100.0),
+}
 
 
 # Map short dataset tag -> ordered list of sweep variant names. The CLI's

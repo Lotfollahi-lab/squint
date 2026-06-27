@@ -21,6 +21,7 @@ from vqniche.loss import (
     contrastive_cell_attribute_loss,
     contrastive_cell_attribute_within_batch_loss,
     contrastive_cell_attribute_cross_batch_mnn_loss,
+    disentangle_cell_niche_loss,
     mse_adjacency_reconstruction_loss,
     bce_adjacency_reconstruction_loss,
     bce_cosine_adjacency_reconstruction_loss,
@@ -375,6 +376,21 @@ class BaseModel(pl.LightningModule):
                     'mnn_floor',
                     'mutual',
                 ):
+                    v = loss_kwargs.get(k)
+                    if v is not None:
+                        loss_fn_params[k] = v
+
+            elif loss_fn_name == 'disentangle_cell_niche_loss':
+                # Decorrelation penalty between the cell and niche latents
+                # (Barlow-Twins-style cross-correlation). Pushes the niche
+                # code to carry only signal complementary to the cell code.
+                # Reads the two pre-VQ branch latents already sliced to the
+                # seed cells (z_mlp[:bs] / z_gnn[:bs]).
+                loss_fn = disentangle_cell_niche_loss
+                loss_fn_data_keys = [
+                    'quantizer_input_cell', 'quantizer_input_niche',
+                ]
+                for k in ('wt_disentangle',):
                     v = loss_kwargs.get(k)
                     if v is not None:
                         loss_fn_params[k] = v

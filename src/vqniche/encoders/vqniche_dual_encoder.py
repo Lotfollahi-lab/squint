@@ -70,6 +70,7 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             shared_mlp_params: Optional[dict] = None,
             cross_stitch_params: Optional[dict] = None,
             detach_gnn_input: bool = False,
+            cell_to_niche: Optional[dict] = None,
         ):
         """
         Parameters
@@ -134,6 +135,16 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             variant — one physical trunk, trained only by the cell
             objective, with the niche modules learning on top of the
             detached features. Works with any trunk mode.
+        cell_to_niche: dict, optional
+            Compositional cell->niche coupling. When set, the cell
+            branch's representation is concatenated onto the niche GNN's
+            node features, so the GNN aggregates neighbours' cell
+            identity (local cell-type composition). Keys: `source`
+            ('z_q_cell' [default] or 'z_mlp_cell'), `detach` (bool,
+            default True — protect the cell branch from niche
+            gradients), `project_dim` (int or None — optionally project
+            the cell signal before concat). Default `None` -> no
+            cell->niche injection.
         """
         super().__init__()
 
@@ -299,6 +310,52 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         # overhead. Independent of the architecture knobs above (works
         # with coupled, decoupled, or Y-shape trunks).
         self.detach_gnn_input = bool(detach_gnn_input)
+
+        # ---- Optional COMPOSITIONAL cell->niche coupling -------------------
+        # Inject the cell branch's representation as EXTRA node features for
+        # the niche GNN. Because the GNN aggregates over spatial neighbours,
+        # the niche representation then pools neighbours' cell identity — i.e.
+        # the local CELL-TYPE COMPOSITION, which is biologically what a niche
+        # is (CellCharter / Banksy style). Directional, asymmetric coupling:
+        # by default the injected signal is DETACHED, so niche gradients never
+        # corrupt the cell branch (cell stays protected) while the niche
+        # branch gets strictly more relevant information.
+        #
+        #   cfg keys (all optional):
+        #     source      : 'z_q_cell' (default, quantized = denoised cell
+        #                   identity) or 'z_mlp_cell' (continuous pre-VQ).
+        #     detach      : bool (default True) — protect the cell branch.
+        #     project_dim : int or None (default None) — when set, the cell
+        #                   signal is linearly projected to this dim before
+        #                   concatenation (controls how much it can dominate
+        #                   the niche features); None = concat the full
+        #                   `vq_cell_in_channels`-dim signal.
+        #
+        # The injected signal has dim `vq_cell_in_channels` (= z_q_cell /
+        # z_mlp dim), optionally projected, and is concatenated onto the
+        # niche-side GNN input — so `gnn_pre_neck_in_channels` grows here.
+        if cell_to_niche is not None:
+            self.cell_to_niche_source = cell_to_niche.get("source", "z_q_cell")
+            if self.cell_to_niche_source not in ("z_q_cell", "z_mlp_cell"):
+                raise ValueError(
+                    "cell_to_niche['source'] must be 'z_q_cell' or "
+                    f"'z_mlp_cell', got {self.cell_to_niche_source!r}."
+                )
+            self.cell_to_niche_detach = bool(cell_to_niche.get("detach", True))
+            _proj_dim = cell_to_niche.get("project_dim")
+            if _proj_dim:
+                self.cell_to_niche_proj = torch.nn.Linear(
+                    vq_cell_in_channels, int(_proj_dim),
+                )
+                cell_to_niche_dim = int(_proj_dim)
+            else:
+                self.cell_to_niche_proj = None
+                cell_to_niche_dim = vq_cell_in_channels
+            gnn_pre_neck_in_channels = gnn_pre_neck_in_channels + cell_to_niche_dim
+        else:
+            self.cell_to_niche_source = None
+            self.cell_to_niche_detach = True
+            self.cell_to_niche_proj = None
 
         # ---- Optional NICHE NECK MLP (between z_mlp_niche and the GNN) ------
         # When `niche_neck_params` is provided, an additional MLP is
@@ -526,6 +583,21 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         else:
             z_mlp_niche = z_mlp_niche_path
 
+        # ---- compositional cell->niche coupling -----------------------------
+        # Inject the cell branch's representation as extra GNN node features so
+        # the GNN aggregates neighbours' cell identity (= local cell-type
+        # composition). Requires the cell VQ output, so quantize the cell
+        # branch HERE (once); the tail then reuses z_q_cell / idx_cell.
+        z_q_cell = idx_cell = None
+        if self.cell_to_niche_source is not None:
+            z_q_cell, idx_cell, _ = self.vq_cell(z_mlp)
+            cell_sig = z_q_cell if self.cell_to_niche_source == "z_q_cell" else z_mlp
+            if self.cell_to_niche_detach:
+                cell_sig = cell_sig.detach()
+            if self.cell_to_niche_proj is not None:
+                cell_sig = self.cell_to_niche_proj(cell_sig)
+            z_mlp_niche = torch.cat([z_mlp_niche, cell_sig], dim=-1)
+
         # ---- niche-side pipeline: [niche_neck] -> GNN -> VQ_niche -----------
         # Stop-gradient coupling: when `detach_gnn_input` is set, the
         # niche path consumes a detached copy of `z_mlp_niche`, so
@@ -541,13 +613,11 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         )
         z_gnn = self.gnn_module(gnn_input, batch_edge_index)
 
-        # Two independent quantizations. NOTE: cell-VQ takes
-        # `z_mlp` (which is `concat(z_shared, z_mlp_cell_path)` in
-        # Y-shape mode, or just `z_mlp_cell_path` otherwise) — never
-        # the niche-side output. The whole point of decoupled / Y-
-        # shape encoders is to keep the cell-VQ input free of niche-
-        # branch gradient flow.
-        z_q_cell,  idx_cell,  _ = self.vq_cell(z_mlp)
+        # Cell quantization (skip if already done above for cell->niche).
+        # cell-VQ takes `z_mlp` (concat(z_shared, z_mlp_cell_path) in Y-shape
+        # mode, else z_mlp_cell_path) — never the niche-side output.
+        if z_q_cell is None:
+            z_q_cell, idx_cell, _ = self.vq_cell(z_mlp)
         z_q_niche, idx_niche, _ = self.vq_niche(z_gnn)
 
         return z_mlp, z_gnn, z_q_cell, z_q_niche, idx_cell, idx_niche
