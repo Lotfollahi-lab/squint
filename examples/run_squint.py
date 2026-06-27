@@ -2830,6 +2830,56 @@ def _patch_dual_continuous_vq(cfg: dict, branch: str = "both") -> dict:
     return cfg
 
 
+def _build_s51_spine_codebook(cell_sizes, niche_sizes):
+    """Build the s51_v1 / s49_v23 spine with the given per-branch RVQ codebook
+    sizes. This is BYTE-IDENTICAL to the s52_v1 build chain (decoupled-enc +
+    within-batch contrastive wt=10/k=5 + cell-VQ codebook-diversity wt=10 +
+    decoder-cov + no-batch-int + enc-deeper [400,400,256] + dec-w[32] + knn16 +
+    sampler[16] + gnn=1 + bs=512 + lr=7e-4 + within-sec), parametrised only by
+    `cell_sizes` / `niche_sizes` (e.g. (10, 30)). Used for the L0 codebook-size
+    ablation (s54_*) so every such variant is correct-by-construction and
+    differs from the s51_v1 reference ONLY in the codebook size."""
+    return _patch_dual_codebook_diversity(
+        _patch_dual_contrastive_cell_within_batch(
+            _patch_dual_adj_within_section_only(
+                _patch_dual_no_batch_int(
+                    _patch_dual_batch_lr(
+                        _patch_dual_attr_recon_weight(
+                            _patch_dual_sampler_neighbors(
+                                _patch_dual_graph_knn(
+                                    _patch_dual_decoder_width(
+                                        _patch_dual_decoupled_encoders(
+                                            _patch_dual_encoder_deeper(
+                                                _patch_dual_decoder_covariate(
+                                                    _patch_dual_rvq(
+                                                        _patch_dual_rvq(_BD(),
+                                                            branch="niche", codebook_sizes=niche_sizes,
+                                                        ),
+                                                        branch="cell", codebook_sizes=cell_sizes,
+                                                    ),
+                                                ),
+                                                hidden_channels=[400, 400, 256],
+                                            ),
+                                        ),
+                                        hidden_channels=[32],
+                                    ),
+                                    n_neighs=16,
+                                ),
+                                num_neighbors=[16],
+                            ),
+                            weight=1.0,
+                        ),
+                        batch_size=512, lr=7e-4,
+                    ),
+                ),
+                enabled=True,
+            ),
+            wt_contrastive_cell=10.0, k_pos=5, temperature=0.1,
+        ),
+        weight=10.0, temperature=100.0, branch="cell",
+    )
+
+
 def _patch_dual_vq_warmup(cfg: dict, vq_warmup_epochs: int = 10) -> dict:
     """
     Defer codebook init + EMA updates for the first `vq_warmup_epochs`
@@ -30240,6 +30290,57 @@ batch_size=512,
             ),
             weight=10.0, temperature=100.0, branch="cell",
         ),
+    },
+    # =======================================================================
+    # s54 — L0 codebook-size ablation (Fig S3 extension). Complements the
+    #       existing L1 sweeps (s51 = cell L1, s52 = niche L1) by varying the
+    #       FIRST RVQ level L0 in {10, 90, 300} while holding L1 = 30. Built on
+    #       the s51_v1 / s49_v23 spine (WITH contrastive) via
+    #       _build_s51_spine_codebook, so each variant differs from the s51_v1
+    #       reference ONLY in the codebook size. Axis centres (L0=30 -> (30,30))
+    #       reuse existing variants: cell-L0 centre = s51_v5; niche-L0 = s52_v2.
+    # =======================================================================
+    "s54_v1_dualvq+rvq-cell-10-30+rvq-niche-30-90+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s54 L0 codebook ablation on mmb0-1b_smb1-1b_1p: CELL L0 = 10 (vs default 30); cell L1 held at 30 -> cell RVQ = (10, 30). Niche RVQ unchanged at default (30, 90). Built on the s51_v1/s49_v23 spine (WITH within-batch contrastive wt=10/k=5 + cell-VQ diversity wt=10 + dec-cov + no-batch-int + enc-deeper + dec-w[32] + knn16 + sampler[16] + gnn=1 + bs=512 + lr=7e-4 + within-sec) — identical to s51_v5 except cell L0. Cell-L0 axis centre (L0=30, cell (30,30)) = existing s51_v5. Reuses the mmb0-1b_smb1-1b_1p blob (k=16)."
+        ),
+        "patches": ["= s51_v1 spine (WITH contrastive); rvq-cell(10, 30), rvq-niche(30, 90)"],
+        "build": lambda: _build_s51_spine_codebook(cell_sizes=(10, 30), niche_sizes=(30, 90)),
+    },
+    "s54_v2_dualvq+rvq-cell-90-30+rvq-niche-30-90+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s54 L0 codebook ablation on mmb0-1b_smb1-1b_1p: CELL L0 = 90 (vs default 30); cell L1 held at 30 -> cell RVQ = (90, 30). Niche RVQ unchanged at default (30, 90). Built on the s51_v1/s49_v23 spine (WITH contrastive). Cell-L0 axis centre (L0=30) = existing s51_v5. Reuses the mmb0-1b_smb1-1b_1p blob (k=16)."
+        ),
+        "patches": ["= s51_v1 spine (WITH contrastive); rvq-cell(90, 30), rvq-niche(30, 90)"],
+        "build": lambda: _build_s51_spine_codebook(cell_sizes=(90, 30), niche_sizes=(30, 90)),
+    },
+    "s54_v3_dualvq+rvq-cell-300-30+rvq-niche-30-90+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s54 L0 codebook ablation on mmb0-1b_smb1-1b_1p: CELL L0 = 300 (vs default 30); cell L1 held at 30 -> cell RVQ = (300, 30). Niche RVQ unchanged at default (30, 90). Built on the s51_v1/s49_v23 spine (WITH contrastive). Cell-L0 axis centre (L0=30) = existing s51_v5. Reuses the mmb0-1b_smb1-1b_1p blob (k=16)."
+        ),
+        "patches": ["= s51_v1 spine (WITH contrastive); rvq-cell(300, 30), rvq-niche(30, 90)"],
+        "build": lambda: _build_s51_spine_codebook(cell_sizes=(300, 30), niche_sizes=(30, 90)),
+    },
+    "s54_v4_dualvq+rvq-cell-30-90+rvq-niche-10-30+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s54 L0 codebook ablation on mmb0-1b_smb1-1b_1p: NICHE L0 = 10 (vs default 30); niche L1 held at 30 -> niche RVQ = (10, 30). Cell RVQ unchanged at default (30, 90). Built on the s51_v1/s49_v23 spine (WITH contrastive) — identical to s52_v2 except niche L0. Niche-L0 axis centre (L0=30, niche (30,30)) = existing s52_v2. Reuses the mmb0-1b_smb1-1b_1p blob (k=16)."
+        ),
+        "patches": ["= s51_v1 spine (WITH contrastive); rvq-cell(30, 90), rvq-niche(10, 30)"],
+        "build": lambda: _build_s51_spine_codebook(cell_sizes=(30, 90), niche_sizes=(10, 30)),
+    },
+    "s54_v5_dualvq+rvq-cell-30-90+rvq-niche-90-30+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s54 L0 codebook ablation on mmb0-1b_smb1-1b_1p: NICHE L0 = 90 (vs default 30); niche L1 held at 30 -> niche RVQ = (90, 30). Cell RVQ unchanged at default (30, 90). Built on the s51_v1/s49_v23 spine (WITH contrastive). Niche-L0 axis centre (L0=30) = existing s52_v2. Reuses the mmb0-1b_smb1-1b_1p blob (k=16)."
+        ),
+        "patches": ["= s51_v1 spine (WITH contrastive); rvq-cell(30, 90), rvq-niche(90, 30)"],
+        "build": lambda: _build_s51_spine_codebook(cell_sizes=(30, 90), niche_sizes=(90, 30)),
+    },
+    "s54_v6_dualvq+rvq-cell-30-90+rvq-niche-300-30+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s54 L0 codebook ablation on mmb0-1b_smb1-1b_1p: NICHE L0 = 300 (vs default 30); niche L1 held at 30 -> niche RVQ = (300, 30). Cell RVQ unchanged at default (30, 90). Built on the s51_v1/s49_v23 spine (WITH contrastive). Niche-L0 axis centre (L0=30) = existing s52_v2. Reuses the mmb0-1b_smb1-1b_1p blob (k=16)."
+        ),
+        "patches": ["= s51_v1 spine (WITH contrastive); rvq-cell(30, 90), rvq-niche(300, 30)"],
+        "build": lambda: _build_s51_spine_codebook(cell_sizes=(30, 90), niche_sizes=(300, 30)),
     },
     "s52_v1_dualvq+rvq-cell-30-90+rvq-niche-30-10+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p": {
         "description": (

@@ -340,6 +340,30 @@ def main() -> int:
             f"{seed_runs_dir} and the run_dir paths they point at."
         )
 
+    # GUARD: detect seeds that resolved to the SAME run dir. This happens
+    # when parallel seed jobs collide on a seconds-granularity timestamp
+    # (fixed in train() by appending `_seed<N>`; older sweeps or any
+    # regression surface here). Such seeds are NOT independent — the
+    # per_seed_*.csv would carry duplicate rows and the benchmark figures
+    # would show falsely tight error bars.
+    _by_dir: Dict[str, List[int]] = {}
+    for _seed, _rd in seed_to_run_dir.items():
+        _by_dir.setdefault(str(_rd), []).append(_seed)
+    _collisions = {d: sorted(ss) for d, ss in _by_dir.items() if len(ss) > 1}
+    if _collisions:
+        print("\n" + "!" * 78)
+        print("WARNING: multiple seeds resolved to the SAME run dir — they are "
+              "NOT independent runs:")
+        for _d, _ss in sorted(_collisions.items()):
+            print(f"  seeds {_ss} -> {_d}")
+        print(f"  => {len(seed_to_run_dir)} seed stamps map to only "
+              f"{len(_by_dir)} distinct run dir(s); per_seed_*.csv will contain "
+              f"DUPLICATE rows and any mean/SEM over seeds will be biased "
+              f"(falsely tight error bars).")
+        print("  Fix: rerun the multi-seed sweep with the train() seed-suffix "
+              "fix so each seed gets its own `<TS>_seed<N>` dir.")
+        print("!" * 78 + "\n")
+
     _aggregate(
         seed_to_run_dir=seed_to_run_dir,
         seed_to_runtime=seed_to_runtime,
