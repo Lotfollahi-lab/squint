@@ -20,6 +20,7 @@ from vqniche.loss import (
     nb_nbr_attribute_reconstruction_loss_dual,
     contrastive_cell_attribute_loss,
     contrastive_cell_attribute_within_batch_loss,
+    contrastive_cell_attribute_cross_batch_mnn_loss,
     mse_adjacency_reconstruction_loss,
     bce_adjacency_reconstruction_loss,
     bce_cosine_adjacency_reconstruction_loss,
@@ -350,6 +351,29 @@ class BaseModel(pl.LightningModule):
                     'temperature',
                     'log_transform_gene_space',
                     'wt_contrastive_cell',
+                ):
+                    v = loss_kwargs.get(k)
+                    if v is not None:
+                        loss_fn_params[k] = v
+
+            elif loss_fn_name == 'contrastive_cell_attribute_cross_batch_mnn_loss':
+                # Within-batch NT-Xent (resolution) + cross-batch mutual-NN
+                # pure-attraction term (integration). wt_cross=0 reduces to the
+                # within-batch loss. Needs the same per-node section ids.
+                loss_fn = contrastive_cell_attribute_cross_batch_mnn_loss
+                loss_fn_data_keys = [
+                    'quantizer_input_cell', 'target_attr',
+                    'node_adata_batch_ids', 'batch_size',
+                ]
+                for k in (
+                    'k_pos',
+                    'k_cross',
+                    'temperature',
+                    'log_transform_gene_space',
+                    'wt_contrastive_cell',
+                    'wt_cross',
+                    'mnn_floor',
+                    'mutual',
                 ):
                     v = loss_kwargs.get(k)
                     if v is not None:

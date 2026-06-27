@@ -306,3 +306,138 @@ def contrastive_cell_attribute_within_batch_loss(
     loss = loss_per_anchor.sum() / n_active
 
     return float(wt_contrastive_cell) * loss
+
+
+def contrastive_cell_attribute_cross_batch_mnn_loss(
+        quantizer_input_cell: torch.Tensor,
+        target_attr: torch.Tensor,
+        node_adata_batch_ids: torch.Tensor,
+        batch_size: int,
+        k_pos: int = 5,
+        k_cross: int = 1,
+        temperature: float = 0.1,
+        log_transform_gene_space: bool = True,
+        wt_contrastive_cell: float = 1.0,
+        wt_cross: float = 1.0,
+        mnn_floor: float = 0.0,
+        mutual: bool = True,
+    ) -> torch.Tensor:
+    """
+    Cross-batch MNN-augmented contrastive cell loss (integration-friendly).
+
+    Sum of two terms:
+
+      L_within : the EXACT within-batch NT-Xent
+                 (`contrastive_cell_attribute_within_batch_loss`). Pulls
+                 same-section same-type cells together and pushes same-section
+                 different-type cells apart — provides cell-type resolution
+                 and the repulsion that keeps the latent from collapsing.
+
+      L_cross  : a PURE-ATTRACTION term over cross-batch mutual-nearest-
+                 neighbour (MNN) pairs mined in raw-gene-expression space.
+                 It pulls each matched cell pair together ACROSS sections.
+                 There are NO negatives in this term, so it never pushes any
+                 cross-section cell apart — avoiding the exact failure mode
+                 that makes the within-batch loss hurt iLISI / MMD. Aligning
+                 matched cell types across batches directly improves
+                 integration.
+
+        total = wt_contrastive_cell * L_within  +  wt_cross * L_cross
+
+    With `wt_cross == 0` this is IDENTICAL to
+    `contrastive_cell_attribute_within_batch_loss` (useful as a control).
+
+    Cross-batch MNN mining (per mini-batch, no grad)
+    ------------------------------------------------
+    On the seed cells:
+      1. sim_x = cosine similarity of log1p raw counts.
+      2. For each anchor i, take its top-`k_cross` most-similar cells in
+         OTHER sections (different `adata_batch_id`).
+      3. `mutual=True` (default): keep (i, j) only if i is ALSO in j's
+         top-`k_cross` — reciprocity filters out batch-effect-driven false
+         matches. `mutual=False`: keep the (symmetrised) union.
+      4. `mnn_floor`: optionally require sim_x[i, j] >= mnn_floor.
+    L_cross = mean over MNN pairs of (1 - cos(z_i, z_j)).
+
+    Caveats
+    -------
+    - The MNN graph is MINI-BATCH-LOCAL (only co-sampled cells are
+      candidates) -> an APPROXIMATE MNN; noisier than a global graph but
+      cheap (O(B^2), reuses the within-batch similarity machinery). Larger
+      `batch_size` -> better matches.
+    - A mini-batch with a single section has no cross-batch pairs ->
+      L_cross == 0 -> reduces to the within-batch loss.
+
+    Parameters mirror `contrastive_cell_attribute_within_batch_loss`, plus
+    `k_cross`, `wt_cross`, `mnn_floor`, `mutual`.
+    """
+    if node_adata_batch_ids is None:
+        raise ValueError(
+            "contrastive_cell_attribute_cross_batch_mnn_loss requires "
+            "node_adata_batch_ids."
+        )
+
+    # --- within-batch term (identical to the within-batch loss) ----------
+    within = contrastive_cell_attribute_within_batch_loss(
+        quantizer_input_cell=quantizer_input_cell,
+        target_attr=target_attr,
+        node_adata_batch_ids=node_adata_batch_ids,
+        batch_size=batch_size,
+        k_pos=k_pos,
+        temperature=temperature,
+        log_transform_gene_space=log_transform_gene_space,
+        wt_contrastive_cell=wt_contrastive_cell,
+    )
+
+    if float(wt_cross) == 0.0 or quantizer_input_cell.numel() == 0:
+        return within
+
+    z = quantizer_input_cell
+    x = target_attr
+    B = z.shape[0]
+    if B < 2:
+        return within
+
+    batch_ids = node_adata_batch_ids
+    if batch_ids.shape[0] > B:
+        batch_ids = batch_ids[:B]
+    elif batch_ids.shape[0] < B:
+        raise ValueError(
+            f"node_adata_batch_ids has fewer entries ({batch_ids.shape[0]}) "
+            f"than batch_size ({B})."
+        )
+
+    cross = batch_ids.unsqueeze(0) != batch_ids.unsqueeze(1)              # (B, B)
+    if not bool(cross.any()):
+        return within  # single section in this mini-batch — no cross pairs
+
+    # --- cross-batch MNN mining in gene-expression space (no grad) --------
+    with torch.no_grad():
+        if log_transform_gene_space:
+            x_for_sim = torch.log1p(torch.clamp(x, min=0.0))
+        else:
+            x_for_sim = x
+        x_normed = F.normalize(x_for_sim, dim=-1, eps=1e-8)
+        sim_x = x_normed @ x_normed.t()                                  # (B, B)
+        sim_x_cross = sim_x.masked_fill(~cross, float('-inf'))
+        kc = max(1, min(int(k_cross), B - 1))
+        _, idx = sim_x_cross.topk(kc, dim=-1)                            # (B, kc)
+        topk_mask = torch.zeros(B, B, dtype=torch.bool, device=z.device)
+        topk_mask.scatter_(1, idx, True)
+        # Drop fills picked from all-(-inf) rows by re-imposing the cross mask.
+        topk_mask = topk_mask & cross
+        if mutual:
+            mnn = topk_mask & topk_mask.t()
+        else:
+            mnn = topk_mask | topk_mask.t()
+        if mnn_floor > 0.0:
+            mnn = mnn & (sim_x >= float(mnn_floor))
+        n_pairs = mnn.sum()
+
+    # --- pure attraction on MNN pairs (with grad) ------------------------
+    # n_pairs == 0 -> masked sum is 0 -> l_cross == 0 (no special-case sync).
+    z_normed = F.normalize(z, dim=-1, eps=1e-8)
+    sim_z = z_normed @ z_normed.t()                                      # cosine (B, B)
+    l_cross = ((1.0 - sim_z) * mnn.to(sim_z.dtype)).sum() / n_pairs.clamp(min=1)
+
+    return within + float(wt_cross) * l_cross

@@ -2830,6 +2830,40 @@ def _patch_dual_continuous_vq(cfg: dict, branch: str = "both") -> dict:
     return cfg
 
 
+def _patch_dual_contrastive_cross_batch(
+        cfg: dict,
+        wt_cross: float = 1.0,
+        k_cross: int = 1,
+        mnn_floor: float = 0.0,
+        mutual: bool = True,
+    ) -> dict:
+    """
+    Swap the within-batch contrastive cell loss for its CROSS-BATCH MNN
+    variant (`contrastive_cell_attribute_cross_batch_mnn_loss`): the
+    within-batch NT-Xent is kept UNCHANGED (resolution) and a cross-batch
+    mutual-nearest-neighbour PURE-ATTRACTION term is added (integration) —
+    it pulls the most-similar cells across sections together with NO
+    negatives, so it never repels cross-section cells (the failure mode that
+    makes the within-batch loss hurt iLISI/MMD).
+
+    Apply OUTERMOST on a build that already carries the within-batch
+    contrastive loss (e.g. the s49_v23 spine): the within-batch kwargs
+    (wt_contrastive_cell, k_pos, temperature) are inherited and the cross
+    kwargs are added. `wt_cross=0` behaves exactly like the within-batch loss.
+    """
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    if "contrastive_cell_attribute_within_batch_loss" in losses:
+        losses.remove("contrastive_cell_attribute_within_batch_loss")
+    if "contrastive_cell_attribute_cross_batch_mnn_loss" not in losses:
+        losses.append("contrastive_cell_attribute_cross_batch_mnn_loss")
+    lk = cfg["model"]["loss_params"]["loss_kwargs"]
+    lk["wt_cross"] = float(wt_cross)
+    lk["k_cross"] = int(k_cross)
+    lk["mnn_floor"] = float(mnn_floor)
+    lk["mutual"] = bool(mutual)
+    return cfg
+
+
 def _build_s51_spine_codebook(cell_sizes, niche_sizes):
     """Build the s51_v1 / s49_v23 spine with the given per-branch RVQ codebook
     sizes. This is BYTE-IDENTICAL to the s52_v1 build chain (decoupled-enc +
@@ -30341,6 +30375,68 @@ batch_size=512,
         ),
         "patches": ["= s51_v1 spine (WITH contrastive); rvq-cell(30, 90), rvq-niche(300, 30)"],
         "build": lambda: _build_s51_spine_codebook(cell_sizes=(30, 90), niche_sizes=(300, 30)),
+    },
+    # =======================================================================
+    # s55 — CROSS-BATCH MNN contrastive sweep. The s49_v23 spine with the
+    #       within-batch contrastive loss replaced by
+    #       contrastive_cell_attribute_cross_batch_mnn_loss: within-batch
+    #       NT-Xent (unchanged) + cross-batch mutual-NN pure-attraction term.
+    #       Goal: keep cell-type resolution while IMPROVING batch integration
+    #       (iLISI/MMD). Sweeps the cross-batch weight (wt_cross), k_cross, and
+    #       an MNN similarity floor. Each build wraps the s49_v23 build, so it
+    #       is byte-identical to s49_v23 except the contrastive swap. Reference
+    #       = s49_v23 (== within-batch only, wt_cross=0). Reuses the s49_v23
+    #       blob (mmb0-1b_smb1-1b_1p, k=16) — no rebuild.
+    # =======================================================================
+    "s55_v1_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+crossmnn-wt1-k1+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s55 cross-batch MNN contrastive: s49_v23 spine, within-batch contrastive REPLACED by within-batch NT-Xent (unchanged: wt=10, k_pos=5, T=0.1) + cross-batch mutual-NN pure-attraction (wt_cross=1.0, k_cross=1, mutual). Conservative cross weight. Reference = s49_v23 (wt_cross=0)."
+        ),
+        "patches": ["= s49_v23 spine; within-batch contrastive -> cross-batch MNN (wt_cross=1.0, k_cross=1)"],
+        "build": lambda: _patch_dual_contrastive_cross_batch(
+            VARIANTS["s49_v23_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p"]["build"](),
+            wt_cross=1.0, k_cross=1,
+        ),
+    },
+    "s55_v2_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+crossmnn-wt5-k1+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s55 cross-batch MNN contrastive: s49_v23 spine + cross-batch mutual-NN attraction at wt_cross=5.0, k_cross=1. Mid cross weight."
+        ),
+        "patches": ["= s49_v23 spine; cross-batch MNN (wt_cross=5.0, k_cross=1)"],
+        "build": lambda: _patch_dual_contrastive_cross_batch(
+            VARIANTS["s49_v23_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p"]["build"](),
+            wt_cross=5.0, k_cross=1,
+        ),
+    },
+    "s55_v3_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s55 cross-batch MNN contrastive: s49_v23 spine + cross-batch mutual-NN attraction at wt_cross=10.0, k_cross=1 (cross weight = within weight). Strong alignment."
+        ),
+        "patches": ["= s49_v23 spine; cross-batch MNN (wt_cross=10.0, k_cross=1)"],
+        "build": lambda: _patch_dual_contrastive_cross_batch(
+            VARIANTS["s49_v23_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p"]["build"](),
+            wt_cross=10.0, k_cross=1,
+        ),
+    },
+    "s55_v4_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+crossmnn-wt5-k2+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s55 cross-batch MNN contrastive: s49_v23 spine + cross-batch mutual-NN attraction at wt_cross=5.0, k_cross=2 (more cross matches per anchor)."
+        ),
+        "patches": ["= s49_v23 spine; cross-batch MNN (wt_cross=5.0, k_cross=2)"],
+        "build": lambda: _patch_dual_contrastive_cross_batch(
+            VARIANTS["s49_v23_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p"]["build"](),
+            wt_cross=5.0, k_cross=2,
+        ),
+    },
+    "s55_v5_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+crossmnn-wt2-k1-floor0.5+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "s55 cross-batch MNN contrastive: s49_v23 spine + cross-batch mutual-NN attraction at wt_cross=2.0, k_cross=1, mnn_floor=0.5 (only accept high-confidence cross matches, cosine >= 0.5). Safer matching."
+        ),
+        "patches": ["= s49_v23 spine; cross-batch MNN (wt_cross=2.0, k_cross=1, mnn_floor=0.5)"],
+        "build": lambda: _patch_dual_contrastive_cross_batch(
+            VARIANTS["s49_v23_dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+mmb0-1b_smb1-1b_1p"]["build"](),
+            wt_cross=2.0, k_cross=1, mnn_floor=0.5,
+        ),
     },
     "s52_v1_dualvq+rvq-cell-30-90+rvq-niche-30-10+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+chl59-2b_1p": {
         "description": (

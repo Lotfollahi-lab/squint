@@ -15,6 +15,7 @@ from .nb_attribute_reconstruction import (
 from .contrastive_cell_attribute import (
     contrastive_cell_attribute_loss,
     contrastive_cell_attribute_within_batch_loss,
+    contrastive_cell_attribute_cross_batch_mnn_loss,
 )
 from .mse_adjacency_reconstruction import mse_adjacency_reconstruction_loss
 from .bce_adjacency_reconstruction import bce_adjacency_reconstruction_loss
@@ -44,6 +45,7 @@ __all__ = [
     "nb_nbr_attribute_reconstruction_loss_dual",
     "contrastive_cell_attribute_loss",
     "contrastive_cell_attribute_within_batch_loss",
+    "contrastive_cell_attribute_cross_batch_mnn_loss",
     "mse_adjacency_reconstruction_loss",
     "bce_adjacency_reconstruction_loss",
     "bce_cosine_adjacency_reconstruction_loss",
