@@ -35322,6 +35322,15 @@ def train(
     # play it safe and keep '+' (no spaces, no slashes).
     variant_slug = variant.replace("/", "_").replace(" ", "_")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Append the seed so PARALLEL multi-seed jobs that start in the same
+    # wall-clock second get DISTINCT run dirs. Without this, the seconds-
+    # granularity timestamp + `mkdir(exist_ok=True)` below let two seed jobs
+    # silently share one dir and clobber each other's predicted_adata.h5ad /
+    # checkpoints — the cause of duplicate run_dirs in seed_run_index.csv.
+    # Matches the `<TS>_seed_<N>` layout the multi-seed runner assumes.
+    _run_seed = cfg.get("experiment", {}).get("seed", None)
+    if _run_seed is not None:
+        timestamp = f"{timestamp}_seed{_run_seed}"
     # Route artifacts under the variant's CHOSEN dataset, using the
     # short `dataset_tag` (e.g. `mmb0-1b_smb1-1b_1p`) rather than the
     # full `dataset_name` (e.g. `mmb0-1b_smb1-1b_1p_coord_aligned`). The
