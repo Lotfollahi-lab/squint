@@ -34345,6 +34345,21 @@ _S57_EXTRA = [
     (27, "twomodel-niche-only",   lambda: _s57_src_build("s61_v2_")),
     (28, "continuous-latent",     lambda: _s57_src_build("s53_v1_")),
     (29, "discrete-vq-ref",       lambda: _s57_src_build("s49_v23_")),
+    # Residual-VQ depth ablation (reviewer: "no validation of RVQ, L=1 vs L=2").
+    # Default = L=2 residual (30,90) == the s57_v19 reference. These are L=1
+    # single-level VQ at 3 sizes (on the FiLM-scale default spine):
+    #   v30 capacity-matched K=2700 (=30x90 effective)
+    #   v31 parameter-matched K=120 (=30+90 codebook vectors)
+    #   v32 drop-the-level    K=30  (just the coarse L0)
+    (30, "vq1level-k2700", lambda: _patch_dual_vq(
+        _patch_dual_squint_default(_s57_src_build("s51_v1_")),
+        branch="both", codebook_size=2700)),
+    (31, "vq1level-k120", lambda: _patch_dual_vq(
+        _patch_dual_squint_default(_s57_src_build("s51_v1_")),
+        branch="both", codebook_size=120)),
+    (32, "vq1level-k30", lambda: _patch_dual_vq(
+        _patch_dual_squint_default(_s57_src_build("s51_v1_")),
+        branch="both", codebook_size=30)),
 ]
 for _v, _tag, _bld in _S57_EXTRA:
     VARIANTS[f"s57_v{_v}_{_tag}+mmb0-1b_smb1-1b_1p"] = {
