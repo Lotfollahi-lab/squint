@@ -34288,23 +34288,113 @@ for _i, (_tag, _pref) in enumerate(_S57_SPEC, start=1):
     _src = _s57_resolve_source(_pref)
     if _src is None:
         continue
-    _key = f"s57_v{_i}_crossmnn-wt10-k1+{_tag}+mmb0-1b_smb1-1b_1p"
+    _key = f"s57_v{_i}_filmscale+{_tag}+mmb0-1b_smb1-1b_1p"
     VARIANTS[_key] = {
         "description": (
-            f"s57 ablation on the CROSS-BATCH MNN contrastive spine (default = "
-            f"cross-batch MNN wt_cross=10, k_cross=1, == s55_v3). This variant = "
-            f"source '{_src}' with the within-batch contrastive loss swapped for "
-            f"the cross-batch MNN loss (wraps the source build with "
-            f"_patch_dual_contrastive_cross_batch). Reuses the mmb0-1b_smb1-1b_1p "
-            f"blob (k=16). s57 reference = s55_v3; contrastive axis reuses "
-            f"s51_v1 (within) / s51_v2 (none)."
+            f"s57 ablation on the NEW DEFAULT spine (cross-batch MNN + cell-cond "
+            f"niche FiLM scale-only, == the s57_v19 reference / s62_v5). This "
+            f"variant = source '{_src}' rebuilt on the FiLM-scale default (wraps "
+            f"the source build with _patch_dual_squint_default), so it ABLATES the "
+            f"FiLM model (no decoupled confound). Reuses the mmb0-1b_smb1-1b_1p "
+            f"blob (k=16). s57 reference = s57_v19 (un-ablated FiLM)."
         ),
         "patches": [
-            f"= {_pref}<src> + within-batch contrastive -> cross-batch MNN "
-            f"(wt_cross=10, k_cross=1)",
+            f"= {_pref}<src> + cross-batch MNN + cell-cond FiLM scale-only",
         ],
-        "build": (lambda src=_src: _patch_dual_contrastive_cross_batch(
-            VARIANTS[src]["build"](), **_S57_CROSS)),
+        "build": (lambda src=_src: _patch_dual_squint_default(
+            VARIANTS[src]["build"]())),
+    }
+
+
+# ---------------------------------------------------------------------------
+# s57 SELF-CONTAINED PAPER SET (FiLM-scale DEFAULT) — fold the reference, the
+# contrastive axis, the coupling-mechanism comparison, the two-separate-models
+# baseline, and the continuous-vs-VQ ablation into the s57 namespace, so running
+# ONLY `s57_v*` yields the complete paper set. The DEFAULT / reference model is
+# now cell-cond FiLM scale-only (NOT decoupled): the component ablations (v1-v18)
+# are rebuilt on the FiLM spine, so they ablate the FiLM model. Builds resolve
+# sources LAZILY at submit time. Keep the source *definitions* in this file
+# (building blocks); only RUN `s57_v*`.
+#   v19 REFERENCE = FiLM scale-only (cross-MNN + cell-cond FiLM scale; == s62_v5)
+#   v20 contrastive within-batch + FiLM ;  v21 contrastive none + FiLM
+#   v22 coupled ; v23 cross-stitch ; v24 coupled+affine ; v25 decoupled
+#       (coupling-axis comparators vs the FiLM reference)
+#   v26/v27 two separate models: cell-only / niche-only (reviewer baseline)
+#   v28 continuous-latent ; v29 plain discrete VQ ref (the continuous-vs-VQ pair;
+#       both within-batch, no FiLM — discretization is a VQ-vs-no-VQ question)
+# ---------------------------------------------------------------------------
+def _s57_src_build(prefix):
+    """Lazy: build the unique mmb0-1b_smb1-1b_1p variant matching `prefix`."""
+    return VARIANTS[_s57_resolve_source(prefix)]["build"]()
+
+_S57_EXTRA = [
+    # (vN, tag, build-thunk)
+    (19, "reference-filmscale",
+         lambda: _patch_dual_squint_default(_s57_src_build("s51_v1_"))),
+    (20, "contrast-within-batch+film",
+         lambda: _patch_dual_cell_conditioned_niche(
+             _s57_src_build("s51_v1_"), mode="film_scale")),
+    (21, "contrast-none+film",
+         lambda: _patch_dual_cell_conditioned_niche(
+             _s57_src_build("s51_v2_"), mode="film_scale")),
+    (22, "coupling-coupled",      lambda: _s57_src_build("s56_v1_")),
+    (23, "coupling-crossstitch",  lambda: _s57_src_build("s56_v5_")),
+    (24, "coupling-affine",       lambda: _s57_src_build("s59_v4_")),
+    (25, "coupling-decoupled",    lambda: _s57_src_build("s55_v3_")),
+    (26, "twomodel-cell-only",    lambda: _s57_src_build("s61_v1_")),
+    (27, "twomodel-niche-only",   lambda: _s57_src_build("s61_v2_")),
+    (28, "continuous-latent",     lambda: _s57_src_build("s53_v1_")),
+    (29, "discrete-vq-ref",       lambda: _s57_src_build("s49_v23_")),
+]
+for _v, _tag, _bld in _S57_EXTRA:
+    VARIANTS[f"s57_v{_v}_{_tag}+mmb0-1b_smb1-1b_1p"] = {
+        "description": (
+            f"s57 self-contained paper set ({_tag}) — FiLM-scale default; "
+            f"reference = s57_v19 (cell-cond FiLM scale-only)."
+        ),
+        "patches": [f"= s57 extra: {_tag}"],
+        "build": _bld,
+    }
+
+
+# ===========================================================================
+# s63 — ALL ablations on the NEW DEFAULT spine = cross-batch-MNN + cell-cond
+# niche FiLM scale-only (the coupling that improved spatial-domain integration,
+# = s62_v5). Mirrors s57 but adds `_patch_dual_cell_conditioned_niche(mode=
+# 'film_scale')` on top. Lets us show every ablation still holds once FiLM
+# scale-only is adopted as the default cell/niche coupling. Reuses _S57_SPEC.
+# s63 reference (un-ablated default) = s62_v5.
+# NOTE: large re-run (18 x 5 = 90 jobs). RECOMMENDED to first replicate the
+# FiLM scale-only integration gain on a 2nd dataset before committing this.
+# ===========================================================================
+def _patch_dual_squint_default(cfg: dict) -> dict:
+    """The NEW SQUINT default coupling = cross-batch MNN contrastive + cell-cond
+    niche FiLM scale-only, applied on a within-batch decoupled source."""
+    return _patch_dual_cell_conditioned_niche(
+        _patch_dual_contrastive_cross_batch(cfg, **_S57_CROSS),
+        mode="film_scale",
+    )
+
+
+for _i, (_tag, _pref) in enumerate(_S57_SPEC, start=1):
+    _src = _s57_resolve_source(_pref)
+    if _src is None:
+        continue
+    _key = f"s63_v{_i}_filmscale+crossmnn-wt10-k1+{_tag}+mmb0-1b_smb1-1b_1p"
+    VARIANTS[_key] = {
+        "description": (
+            f"s63 ablation on the NEW DEFAULT spine (cross-batch MNN + cell-cond "
+            f"niche FiLM scale-only, == s62_v5). This variant = source '{_src}' "
+            f"with the within-batch contrastive swapped for cross-batch MNN AND "
+            f"cell-cond FiLM scale-only added (wraps the source build with "
+            f"_patch_dual_squint_default). Reuses the mmb0-1b_smb1-1b_1p blob. "
+            f"s63 reference = s62_v5."
+        ),
+        "patches": [
+            f"= {_pref}<src> + cross-batch MNN + cell-cond FiLM scale-only",
+        ],
+        "build": (lambda src=_src: _patch_dual_squint_default(
+            VARIANTS[src]["build"]())),
     }
 
 

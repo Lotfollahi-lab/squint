@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # submit_s57_crossbatch_ablations_multiseed.sh
 # -----------------------------------------------------------------------------
-# Run ALL s57 ablations (the CROSS-BATCH MNN contrastive spine) multi-seed.
+# Run the COMPLETE SELF-CONTAINED s57 paper set multi-seed (29 variants).
 #
-# s57 = every s51/s52/s54 ablation re-run with the within-batch contrastive loss
-# swapped for the cross-batch MNN loss (wt_cross=10, k_cross=1 == s55_v3). 18 NEW
-# variants (generated programmatically in run_squint.py). Each -> 5 seed jobs +
-# 1 aggregator via submit_multi_seed.sh.
-#
-# NOT relaunched (already run / run separately):
-#   * cross-batch reference (s49_v23 + cross) = s55_v3
-#   * contrastive-axis comparators            = s51_v1 (within) + s51_v2 (none)
-#   * encoder cell/niche coupling axis        = s56 (8 variants; reference s55_v3),
-#       run via:  bash examples/submit_s56_coupling_ablations_multiseed.sh
+# DEFAULT / reference model = cell-cond niche FiLM scale-only (+ cross-batch MNN),
+# == s57_v19. Everything the paper needs lives under s57_v*:
+#   v19         reference (FiLM scale-only)
+#   v1-v18      component ablations, REBUILT on the FiLM spine (ablate the FiLM
+#               model: adjacency / decoder-cov / GNN depth / neighbours /
+#               cell+niche codebook L1 & L0)
+#   v20/v21     contrastive axis (within-batch+FiLM / none+FiLM)
+#   v22-v25     coupling-mechanism comparison vs FiLM (coupled / cross-stitch /
+#               affine / decoupled)
+#   v26/v27     two-separate-models baseline (cell-only / niche-only)
+#   v28/v29     continuous-vs-VQ (continuous / discrete VQ ref)
+# Each -> 5 seed jobs + 1 aggregator via submit_multi_seed.sh (29 x 5 = 145).
+# NOTE: s57 now subsumes the old s63 (FiLM-spine ablations) — don't also run s63.
 #
 # Usage:
 #   bash examples/submit_s57_crossbatch_ablations_multiseed.sh [SEEDS]
