@@ -26693,6 +26693,51 @@ batch_size=512,
         "build": lambda: _patch_dual_smb1_20b(
             _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90)))),
     },
+    # FiLM-scale REFERENCE (the FULL s57_v19 config) on the three spatch
+    # tissue subsets (spatch_ov_1p / spatch_hcc_1p / spatch_coad_1p). Each is
+    # MULTI-section (dataset_id_*.h5ad), so all use the complete s57_v19
+    # coupling = cross-batch MNN (wt=10,k=1) + cell-cond niche FiLM scale-only
+    # on the s49_v23 spine (decoupled RVQ (30,90) + cell-VQ diversity). Train
+    # on ALL sections in the subset (10% cell-level val, no whole-section
+    # holdout). spatch labels: cell=annotation, niche=spatial_cluster (from
+    # the blob). bs=512, edge_sampling=1.0 (spatch s51 convention). REQUIRE
+    # the per-subset blobs (--build-blob-dataset spatch_{ov,hcc,coad}_1p).
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+spatch_ov_1p": {
+        "description": (
+            "FiLM-scale reference (FULL s57_v19 config) on spatch_ov_1p "
+            "(ovarian cancer subset). = s49_v23 spine (decoupled RVQ (30,90) "
+            "+ cell-VQ diversity) + cross-batch MNN (wt=10,k=1) + cell-cond "
+            "niche FiLM scale-only, switched to spatch_ov_1p (train ALL "
+            "sections, 10% cell-level val). REQUIRES the spatch_ov_1p blob."
+        ),
+        "patches": ["= s57_v19 reference (cross-MNN + FiLM scale) + spatch_ov_1p (train=ALL)"],
+        "build": lambda: _patch_dual_spatch_ov(
+            _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90)))),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+spatch_hcc_1p": {
+        "description": (
+            "FiLM-scale reference (FULL s57_v19 config) on spatch_hcc_1p "
+            "(hepatocellular carcinoma subset). = s49_v23 spine (decoupled "
+            "RVQ (30,90) + cell-VQ diversity) + cross-batch MNN (wt=10,k=1) + "
+            "cell-cond niche FiLM scale-only, switched to spatch_hcc_1p (train "
+            "ALL sections, 10% cell-level val). REQUIRES the spatch_hcc_1p blob."
+        ),
+        "patches": ["= s57_v19 reference (cross-MNN + FiLM scale) + spatch_hcc_1p (train=ALL)"],
+        "build": lambda: _patch_dual_spatch_hcc(
+            _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90)))),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+spatch_coad_1p": {
+        "description": (
+            "FiLM-scale reference (FULL s57_v19 config) on spatch_coad_1p "
+            "(colon adenocarcinoma subset). = s49_v23 spine (decoupled RVQ "
+            "(30,90) + cell-VQ diversity) + cross-batch MNN (wt=10,k=1) + "
+            "cell-cond niche FiLM scale-only, switched to spatch_coad_1p (train "
+            "ALL sections, 10% cell-level val). REQUIRES the spatch_coad_1p blob."
+        ),
+        "patches": ["= s57_v19 reference (cross-MNN + FiLM scale) + spatch_coad_1p (train=ALL)"],
+        "build": lambda: _patch_dual_spatch_coad(
+            _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90)))),
+    },
     # -----------------------------------------------------------------------
     # s49_v23 ablations (canonical-name) — 7 ablations x 2 datasets
     # -----------------------------------------------------------------------
