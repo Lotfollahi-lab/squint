@@ -506,6 +506,71 @@ def make_dataset_blob_config_mmb239() -> dict:
     }
 
 
+def make_dataset_blob_config_smb1_20b() -> dict:
+    """
+    Dataset-blob build config for the STARmap+ mouse-CNS 20-section dataset
+    (`/nfs/team361/sb75/DATASETS/silver/smb1-20b_1p`, 20 AnnDatas).
+
+    This is the STARmap-ONLY counterpart to mmb20: the same 20 STARmap+
+    sections WITHOUT the MERFISH section, kept on their NATIVE STARmap gene
+    panel (no MERFISH harmonization -> no `_shared_genes` suffix; read
+    directly from the silver dir). Lives on team361 (like chl59 /
+    squint_hln), not lustre.
+
+    Run order (one-time):
+        python examples/run_squint.py --build-blob --build-blob-dataset smb1-20b_1p
+        -> reads /nfs/team361/sb75/DATASETS/silver/smb1-20b_1p, builds dataset_blob.pt
+
+    Notes:
+      - root data path -> /nfs/team361/sb75/DATASETS.
+      - n_neighs_list [8, 16]: 8 = SQUINT default / smoke; 16 = the
+        s49_v23 / s57 spine (graph_knn(n_neighs=16)). Both precomputed so
+        either sampler depth is available without a rebuild.
+      - batch_key 'batch': the silver AnnDatas carry obs['batch'] = the
+        per-section id, so `build_batch_one_hot_from_obs` densifies cleanly
+        across all 20 sections.
+      - label_names empty: STARmap obs columns vary across sections; the
+        blob loader is defensive and skips missing label columns. Per-cell
+        obs is still carried to inference via `obs_per_batch_id` (matches
+        mmb20).
+      - NO Laplacian spectral embeddings (k: {}): the s49_v23 model uses
+        feature_names=["cell_gene_counts"] and never consumes U_lm_eigvecs,
+        so skipping eigsh (k=128 per graph per section) is the single
+        biggest build speedup over 20 sections (matches mmb239).
+    """
+    return {
+        "experiment": {
+            "name": "in_memory_dataset_blob",
+            "description": (
+                "STARmap+ mouse-CNS, 20 sections, native STARmap gene "
+                "panel (no harmonization)."
+            ),
+        },
+        "dataset": {
+            "name": "smb1-20b_1p",
+            "feature_names": ["cell_gene_counts"],
+            "label_names": [],
+            "graph_kwargs": {
+                "coord_type":         "generic",
+                "spatial_key":        "spatial",
+                "n_neighs_list":      [8, 16],
+                "radius_list":        None,
+                "include_self_loop":  True,
+                "batch_key":          "batch",
+                "k": {},
+            },
+            "data_directory_path": "/nfs/team361/sb75/DATASETS",
+            "pre_transform": None,
+            "pre_filter":    None,
+            "overwrite":     True,
+        },
+        "software_paths": {
+            "deepwalk": "",
+            "gosh":     "",
+        },
+    }
+
+
 def _make_spatch_blob_config(name: str, description: str,
                              label_names: Optional[List[str]] = None) -> dict:
     """
@@ -4777,6 +4842,57 @@ def _patch_dual_mmb239(
     # silver dir of the same name under root_data_dir.
     cfg["dataset"]["dataset_name"] = "mmb0-239b_1p"
     cfg["dataset"]["dataset_tag"]  = "mmb0-239b_1p"
+    return cfg
+
+
+def _patch_dual_smb1_20b(
+        cfg: dict,
+        train_adata_ids: Optional[List[int]] = None,
+        test_adata_ids: Optional[List[int]] = None,
+        batch_size: int = 512,
+        edge_sampling_ratio: float = 2.0,
+        gnn_layers: int = 1,
+        sampler_neighbors: List[int] = [16],
+        nbr_aggregation_hops: int = 1,
+    ) -> dict:
+    """
+    Swap the dataset to /nfs/team361/sb75/DATASETS/silver/smb1-20b_1p (the
+    STARmap+ mouse-CNS 20-section dataset — the STARmap-ONLY counterpart to
+    mmb20, on its native panel). Reuses `_patch_dual_mmb20`'s whole-section
+    split + memory + niche-depth wiring, then overrides the dataset identity
+    AND the data root (team361, not lustre — no `_shared_genes` suffix since
+    there's no MERFISH to harmonize against).
+
+    Defaults reproduce the s49_v23 / s57 spine faithfully (bs=512,
+    edge_sampling=2.0, gnn=1, sampler=[16], nbr_hops=1) — matches
+    `_patch_dual_mmb239`. With `train_adata_ids=None` and
+    `test_adata_ids=None`, train() trains on EVERY section in the blob and
+    the base config's 10% cell-level split provides the val signal (no
+    whole-section test holdout — i.e. produce SQUINT codes across all 20
+    sections).
+
+    !! MEMORY: 20 sections is ~mmb20 scale (mmb20's conservative default was
+    bs=64). bs=512 keeps the static graph (x + edge_index for all 20
+    sections) resident on the GPU and is memory-heavy — faithful to the
+    spine but needs a large-memory GPU. If it OOMs, dial down (in order):
+    `batch_size` (256 -> 128 -> 64), `edge_sampling_ratio` (-> 1.0),
+    `sampler_neighbors` ([16] -> [8]). All are exposed as parameters.
+    """
+    cfg = _patch_dual_mmb20(
+        cfg,
+        train_adata_ids=train_adata_ids,
+        test_adata_ids=test_adata_ids,
+        batch_size=batch_size,
+        edge_sampling_ratio=edge_sampling_ratio,
+        gnn_layers=gnn_layers,
+        sampler_neighbors=sampler_neighbors,
+        nbr_aggregation_hops=nbr_aggregation_hops,
+    )
+    # Override the dataset identity (mmb20 targets the harmonized lustre
+    # dir) -> smb1-20b_1p is read directly from its silver dir on team361.
+    cfg["dataset"]["dataset_name"]  = "smb1-20b_1p"
+    cfg["dataset"]["dataset_tag"]   = "smb1-20b_1p"
+    cfg["dataset"]["root_data_dir"] = "/nfs/team361/sb75/DATASETS"
     return cfg
 
 
@@ -26549,6 +26665,34 @@ batch_size=512,
             _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90))),
             test_batch_idx=[2, 3]),
     },
+    # FiLM-scale REFERENCE (the FULL s57_v19 config) on smb1-20b_1p (STARmap+
+    # mouse-CNS, 20 sections — the STARmap-only counterpart to mmb20, on its
+    # native panel). MULTI-section, so this uses the complete s57_v19 coupling
+    # = cross-batch MNN (wt=10,k=1) + cell-cond niche FiLM scale-only on the
+    # s49_v23 spine (decoupled RVQ (30,90) + cell-VQ diversity). Trains on ALL
+    # 20 sections (10% cell-level val, no whole-section holdout) -> produces
+    # SQUINT codes across the dataset. REQUIRES the smb1-20b_1p blob.
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+smb1-20b_1p": {
+        "description": (
+            "FiLM-scale reference (FULL s57_v19 config) on smb1-20b_1p "
+            "(STARmap+ mouse-CNS, 20 sections, native panel). = the s49_v23 "
+            "spine (decoupled RVQ (30,90) + cell-VQ diversity) + cross-batch "
+            "MNN (wt=10,k=1) + cell-cond niche FiLM scale-only, switched to "
+            "smb1-20b_1p (train ALL 20 sections, 10% cell-level val, no "
+            "whole-section holdout). MULTI-section -> cross-MNN + iLISI/MMD "
+            "integration are meaningful (2nd multi-section replication of the "
+            "FiLM integration result, alongside chl59). Faithful spine: bs=512, "
+            "edge_sampling=2.0, gnn=1, sampler=[16], nbr_hops=1 — MEMORY-HEAVY "
+            "at 20 resident sections; lower batch_size if it OOMs. REQUIRES "
+            "the smb1-20b_1p blob (--build-blob --build-blob-dataset smb1-20b_1p)."
+        ),
+        "patches": [
+            "= s49_v23 spine + cross-batch MNN + cell-cond FiLM scale-only "
+            "+ smb1-20b_1p (train=ALL)",
+        ],
+        "build": lambda: _patch_dual_smb1_20b(
+            _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90)))),
+    },
     # -----------------------------------------------------------------------
     # s49_v23 ablations (canonical-name) — 7 ablations x 2 datasets
     # -----------------------------------------------------------------------
@@ -36216,6 +36360,9 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
     elif dataset == "mmb0-239b_1p":
         cfg = make_dataset_blob_config_mmb239()
         cfg_path = CONFIG_OUT_DIR / "build_blob_mmb0-239b_1p.yaml"
+    elif dataset == "smb1-20b_1p":
+        cfg = make_dataset_blob_config_smb1_20b()
+        cfg_path = CONFIG_OUT_DIR / "build_blob_smb1-20b_1p.yaml"
     elif dataset == "mmb0-1b_smb1-1b_1p":
         cfg = make_dataset_blob_config()
         cfg_path = CONFIG_OUT_DIR / "build_blob_mmb0-1b_smb1-1b_1p.yaml"
@@ -36241,9 +36388,9 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
         raise ValueError(
             f"Unknown --build-blob-dataset {dataset!r}. Choices: "
             f"'mmb0-1b_smb1-1b_1p', 'chl59-8b_1p', 'chl59-2b_1p', "
-            f"'mmb0-1b_smb1-20b_1p', 'mmb0-239b_1p', 'spatch_1p', "
-            f"'spatch_ov_1p', 'spatch_hcc_1p', 'spatch_coad_1p', "
-            f"'squint_hln', 'squint_vht'."
+            f"'mmb0-1b_smb1-20b_1p', 'mmb0-239b_1p', 'smb1-20b_1p', "
+            f"'spatch_1p', 'spatch_ov_1p', 'spatch_hcc_1p', "
+            f"'spatch_coad_1p', 'squint_hln', 'squint_vht'."
         )
     with open(cfg_path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
@@ -38443,6 +38590,7 @@ def main():
                        "chl59-2b_1p",
                        "mmb0-1b_smb1-20b_1p",
                        "mmb0-239b_1p",
+                       "smb1-20b_1p",
                        "spatch_1p",
                        "spatch_ov_1p",
                        "spatch_hcc_1p",
