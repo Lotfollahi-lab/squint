@@ -3081,10 +3081,12 @@ def _patch_dual_cell_conditioned_niche(cfg: dict, mode: str = "bias") -> dict:
     return cfg
 
 
-def _patch_dual_niche_attends_cell_codebook(cfg: dict) -> dict:
-    """[s60 #6] The niche representation attends over the cell codebook
-    prototypes (a soft cell-type-composition descriptor) before the niche VQ."""
-    cfg["model"]["encoder_params"]["niche_attends_cell_codebook"] = {}
+def _patch_dual_niche_attends_cell_codebook(cfg: dict, heads: int = 1) -> dict:
+    """[s60 #6] The niche representation attends (optionally multi-head) over the
+    cell codebook prototypes (a soft cell-type-composition descriptor) before the
+    niche VQ. `heads` must divide the cell-VQ embedding dim."""
+    cfg["model"]["encoder_params"]["niche_attends_cell_codebook"] = {
+        "heads": int(heads)}
     return cfg
 
 
@@ -3103,6 +3105,21 @@ def _patch_dual_cell_niche_alignment(cfg: dict, wt: float = 100.0) -> dict:
     if "cell_niche_alignment_loss" not in losses:
         losses.append("cell_niche_alignment_loss")
     cfg["model"]["loss_params"]["loss_kwargs"]["wt_align"] = float(wt)
+    return cfg
+
+
+def _patch_dual_no_contrastive(cfg: dict) -> dict:
+    """Drop every cell-side contrastive loss (within-batch / cross-batch MNN /
+    global). Used to build the pure NICHE-only single-task baseline so it
+    carries no cell-branch objective."""
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    for ln in (
+        "contrastive_cell_attribute_within_batch_loss",
+        "contrastive_cell_attribute_cross_batch_mnn_loss",
+        "contrastive_cell_attribute_loss",
+    ):
+        if ln in losses:
+            losses.remove(ln)
     return cfg
 
 
@@ -34518,6 +34535,114 @@ VARIANTS["s60_v8_niche-nbr-expr-augment+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = 
     ),
     "patches": ["= s55_v3 spine + niche GNN input augmented w/ nbr-mean(proj(x))"],
     "build": lambda: _patch_dual_niche_nbr_expr_augment(_s56_spine(), dim=32),
+}
+
+
+# ===========================================================================
+# s61 — TWO-SEPARATE-MODELS baseline (reviewer: "is the joint model better than
+# two strong separate single-task models?"). Same decoupled spine + hyperparams
+# as SQUINT (s55_v3), but each variant keeps only ONE task's losses, so its
+# relevant codes are exactly a standalone single-task model's:
+#   * cell-only  = drop ALL niche/spatial losses -> read its CELL codes
+#   * niche-only = drop ALL cell losses (NB + commit + contrastive) -> NICHE codes
+# Compare SQUINT(decoupled, s55_v3) cell vs s61 cell-only, and SQUINT niche vs
+# s61 niche-only: per-task PARITY shows joint training costs nothing, then the
+# shared-encoder variants (s56_v1 coupled / s59_v4 affine) make the efficiency
+# case (both tasks, ~half the encoder params, one training run).
+# ===========================================================================
+VARIANTS["s61_v1_cell-only+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s61 single-task CELL-ONLY baseline: the s55_v3 decoupled spine with ALL "
+        "niche/spatial losses dropped (no nbr-NB, no niche-commit, no adjacency "
+        "BCE) — a standalone cell VQ-VAE (cell NB + commit + cross-batch "
+        "contrastive + decoder cov). Read its CELL codes as the 'separate cell "
+        "model' baseline vs SQUINT's cell codes. Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + drop all niche/spatial losses (cell-only)"],
+    "build": lambda: _patch_dual_no_spatial(_s56_spine()),
+}
+VARIANTS["s61_v2_niche-only+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s61 single-task NICHE-ONLY baseline: the s55_v3 decoupled spine with ALL "
+        "cell-branch losses dropped (cell NB, cell commit, cross-batch "
+        "contrastive) — a standalone niche model (GNN -> niche VQ -> nbr-NB + "
+        "adjacency BCE + niche commit). Read its NICHE codes as the 'separate "
+        "niche model' baseline vs SQUINT's niche codes. Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + drop cell NB/commit + contrastive (niche-only)"],
+    "build": lambda: _patch_dual_no_contrastive(
+        _patch_dual_no_cell_recon(_s56_spine())),
+}
+
+
+# ===========================================================================
+# s62 — FOLLOW-UPS to the two threads that looked on-par / slightly better in
+# s56/s60: (A) Y-shape "mostly-specialised" (s56_v4 64/192 was the best Y-shape)
+# pushed to even smaller shared trunks; (B) cell-conditioned-niche FiLM variants
+# (s60_v5 FiLM lifted Niche iLISI 0.358->0.598**) — pre-VQ / scale-only /
+# continuous-conditioned; (C) multi-head niche->cell-codebook attention (s60_v6
+# nudged integration). Plus the best-resolution + best-integration COMBO.
+# All on the s55_v3 spine. Reference = s55_v3. NOTE: chasing marginal/integration
+# signals — niche iLISI has high baseline variance (ref 0.358±0.125), so any
+# "win" must replicate and not cost resolution/MMD.
+# ===========================================================================
+# A. Y-shape, smaller shared trunk (config-only via _patch_dual_shared_specific_encoders).
+_S62_YSHAPE = [("v1", 48, 208), ("v2", 32, 224), ("v3", 16, 240)]
+for _v, _sd, _pd in _S62_YSHAPE:
+    VARIANTS[f"s62_{_v}_yshape-shared{_sd}-path{_pd}+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+        "description": (
+            f"s62 Y-shape pushed to a SMALLER shared trunk (shared {_sd} / path "
+            f"{_pd}, concat {_sd + _pd}=256) — continues the s56 trend that less "
+            f"sharing (64/192 best) is better. Reference = s55_v3."
+        ),
+        "patches": [f"= s55_v3 spine + Y-shape (shared_last={_sd}, path_last={_pd})"],
+        "build": (lambda sd=_sd, pd=_pd: _patch_dual_shared_specific_encoders(
+            _s56_spine(), shared_last_dim=sd, path_last_dim=pd)),
+    }
+
+# B. Cell-conditioned-niche FiLM variants (reuse _patch_dual_cell_conditioned_niche).
+_S62_FILM = [
+    ("v4", "film-prevq",  "film_prevq"),
+    ("v5", "film-scale",  "film_scale"),
+    ("v6", "film-cont",   "film_cont"),
+]
+for _v, _tag, _mode in _S62_FILM:
+    VARIANTS[f"s62_{_v}_cellcond-{_tag}+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+        "description": (
+            f"s62 cell-conditioned-niche FiLM ablation (mode={_mode}): tweaks the "
+            f"s60_v5 FiLM that lifted Niche iLISI. 'film_prevq' applies the affine "
+            f"to the niche VQ input (vs post-VQ); 'film_scale' is scale-only; "
+            f"'film_cont' generates (gamma,beta) from the continuous cell "
+            f"embedding via a linear hypernetwork. Reference = s55_v3."
+        ),
+        "patches": [f"= s55_v3 spine + cell_conditioned_niche(mode={_mode})"],
+        "build": (lambda mode=_mode: _patch_dual_cell_conditioned_niche(
+            _s56_spine(), mode=mode)),
+    }
+
+# C. Multi-head niche->cell-codebook attention.
+VARIANTS["s62_v7_niche-attends-cell-cb-h4+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s62 multi-head (heads=4) niche->cell-codebook attention — tweaks s60_v6 "
+        "(single-head nudged integration). Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + niche-attends-cell-codebook (heads=4)"],
+    "build": lambda: _patch_dual_niche_attends_cell_codebook(_s56_spine(), heads=4),
+}
+
+# D. Best-resolution (Y-shape 64/192) + best-integration (cell-cond FiLM) combo.
+VARIANTS["s62_v8_yshape64-192+cellcond-film+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s62 COMBINATION: the best resolution-neutral Y-shape (shared 64 / path "
+        "192, = s56_v4) PLUS the cell-conditioned-niche FiLM (post-VQ, = s60_v5) "
+        "that improved Niche iLISI — tests whether the integration gain stacks on "
+        "the Y-shape. Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + Y-shape(64/192) + cell_conditioned_niche(film)"],
+    "build": lambda: _patch_dual_cell_conditioned_niche(
+        _patch_dual_shared_specific_encoders(
+            _s56_spine(), shared_last_dim=64, path_last_dim=192),
+        mode="film"),
 }
 
 

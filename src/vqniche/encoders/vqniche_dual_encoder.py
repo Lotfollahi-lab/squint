@@ -584,24 +584,45 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         if cell_conditioned_niche is not None:
             self.ccn_mode = cell_conditioned_niche.get("mode", "bias")
             _k_cell = int(getattr(self.vq_cell, "codebook_size", 0)) or 1
-            if self.ccn_mode == "film":
+            if self.ccn_mode in ("film", "film_prevq"):
+                # affine (scale+shift) per discrete cell code; applied to
+                # z_q_niche (post-VQ, 'film') or the niche VQ input ('film_prevq')
                 self.ccn_gamma = torch.nn.Embedding(_k_cell, niche_in_channels)
                 self.ccn_beta = torch.nn.Embedding(_k_cell, niche_in_channels)
                 torch.nn.init.ones_(self.ccn_gamma.weight)
                 torch.nn.init.zeros_(self.ccn_beta.weight)
-            else:
+            elif self.ccn_mode == "film_scale":
+                # scale-only per cell code (post-VQ)
+                self.ccn_gamma = torch.nn.Embedding(_k_cell, niche_in_channels)
+                torch.nn.init.ones_(self.ccn_gamma.weight)
+            elif self.ccn_mode == "film_cont":
+                # FiLM generated from the CONTINUOUS (detached) cell embedding via
+                # a small linear hypernetwork: gamma,beta = gen(z_q_cell). Init 0
+                # so z_q_niche -> (1+0)*z_q_niche + 0 = identity at start.
+                self.ccn_gen = torch.nn.Linear(
+                    vq_cell_in_channels, 2 * niche_in_channels)
+                torch.nn.init.zeros_(self.ccn_gen.weight)
+                torch.nn.init.zeros_(self.ccn_gen.bias)
+            else:  # 'bias'
                 self.ccn_bias = torch.nn.Embedding(_k_cell, niche_in_channels)
                 torch.nn.init.zeros_(self.ccn_bias.weight)
         else:
             self.ccn_mode = None
 
         # [#6] NICHE ATTENDS THE CELL CODEBOOK. The niche representation attends
-        # over the K cell-codebook prototypes (a soft cell-type-composition
-        # descriptor) and the result is added to the niche VQ input.
+        # (optionally multi-head) over the K cell-codebook prototypes (a soft
+        # cell-type-composition descriptor) and the result is added to the niche
+        # VQ input. `heads=1` recovers the single-head form.
         if niche_attends_cell_codebook is not None:
+            self.nac_heads = int(niche_attends_cell_codebook.get("heads", 1))
+            if vq_cell_in_channels % self.nac_heads != 0:
+                raise ValueError(
+                    f"niche_attends_cell_codebook heads={self.nac_heads} must "
+                    f"divide the cell-VQ dim {vq_cell_in_channels}."
+                )
             self.nac_q = torch.nn.Linear(niche_in_channels, vq_cell_in_channels)
             self.nac_out = torch.nn.Linear(vq_cell_in_channels, niche_in_channels)
-            self.nac_scale = float(vq_cell_in_channels) ** -0.5
+            self.nac_scale = float(vq_cell_in_channels // self.nac_heads) ** -0.5
         else:
             self.nac_q = None
 
@@ -787,12 +808,20 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             niche_vq_in = niche_vq_in - self.cbr_proj(_cell_res)
         if self.ccn_mode == "bias":                        # [#4] cell-conditioned bias
             niche_vq_in = niche_vq_in + self.ccn_bias(self._code_l0(idx_cell))
+        elif self.ccn_mode == "film_prevq":                # [s62] cell-cond FiLM pre-VQ
+            _cc = self._code_l0(idx_cell)
+            niche_vq_in = self.ccn_gamma(_cc) * niche_vq_in + self.ccn_beta(_cc)
         if self.nac_q is not None:                         # [#6] attend cell codebook
             _cb = self._cell_codebook_embed()
             if _cb is not None:
-                _q = self.nac_q(z_gnn)                      # (N, Dc)
-                _attn = torch.softmax((_q @ _cb.t()) * self.nac_scale, dim=-1)  # (N, K)
-                niche_vq_in = niche_vq_in + self.nac_out(_attn @ _cb)
+                _N, _Dc, _H = z_gnn.shape[0], _cb.shape[1], self.nac_heads
+                _dh = _Dc // _H
+                _q = self.nac_q(z_gnn).reshape(_N, _H, _dh)        # (N,H,dh)
+                _k = _cb.reshape(_cb.shape[0], _H, _dh)            # (K,H,dh)
+                _attn = torch.softmax(
+                    torch.einsum('nhd,khd->nhk', _q, _k) * self.nac_scale, dim=-1)
+                _ctx = torch.einsum('nhk,khd->nhd', _attn, _k).reshape(_N, _Dc)
+                niche_vq_in = niche_vq_in + self.nac_out(_ctx)
 
         # ---- niche quantization (shared codebook routes through vq_cell) ----
         if self.shared_codebook and self.shared_cb_in is not None:
@@ -801,10 +830,16 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         else:
             z_q_niche, idx_niche, _ = self.vq_niche(niche_vq_in)
 
-        # ---- s60: post-VQ couplings ----------------------------------------
-        if self.ccn_mode == "film":                        # [#5] cell-conditioned FiLM
+        # ---- s60/s62: post-VQ couplings ------------------------------------
+        if self.ccn_mode == "film":                        # [#5] cell-cond FiLM (post-VQ)
             _cc = self._code_l0(idx_cell)
             z_q_niche = self.ccn_gamma(_cc) * z_q_niche + self.ccn_beta(_cc)
+        elif self.ccn_mode == "film_scale":                # [s62] cell-cond scale-only
+            _cc = self._code_l0(idx_cell)
+            z_q_niche = self.ccn_gamma(_cc) * z_q_niche
+        elif self.ccn_mode == "film_cont":                 # [s62] FiLM from continuous cell emb
+            _g, _b = self.ccn_gen(z_q_cell.detach()).chunk(2, dim=-1)
+            z_q_niche = (1.0 + _g) * z_q_niche + _b
         if self.vq_shared is not None:                     # [#1] shared-token (additive)
             _z_sh, _, _ = self.vq_shared(self.shared_token_mlp(batch_x))
             z_q_cell = z_q_cell + self.shared_token_proj_cell(_z_sh)
