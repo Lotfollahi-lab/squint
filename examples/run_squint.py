@@ -26524,6 +26524,31 @@ batch_size=512,
                      ]["build"](),
             mode="film_scale"),
     },
+    # FiLM-scale REFERENCE (the FULL s57_v19 config) on chl59-8b_1p (CosMx Lung,
+    # 8 sections). Unlike squint_hln (1 section), chl59 is MULTI-section, so this
+    # uses the complete s57_v19 coupling = cross-batch MNN (wt=10,k=1) + cell-cond
+    # niche FiLM scale-only on the s49_v23 spine (decoupled RVQ (30,90) + cell-VQ
+    # diversity). This is the dataset where the FiLM INTEGRATION gain (iLISI/MMD)
+    # can actually be tested. Holds out sections [2,3] (== the chl59 sweep).
+    # batch_size = chl59 default (128, memory-safe for the Lung panel).
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+chl59-8b_1p": {
+        "description": (
+            "FiLM-scale reference (FULL s57_v19 config) on chl59-8b_1p (CosMx "
+            "Lung, 8 sections). = the s49_v23 spine (decoupled RVQ (30,90) + "
+            "cell-VQ diversity) + cross-batch MNN (wt=10,k=1) + cell-cond niche "
+            "FiLM scale-only, switched to the chl59 dataset with sections [2,3] "
+            "held out. MULTI-section -> cross-MNN + iLISI/MMD integration are "
+            "meaningful, so this is the 2nd-dataset replication of the FiLM "
+            "integration result. REQUIRES the chl59-8b_1p blob."
+        ),
+        "patches": [
+            "= s49_v23 spine + cross-batch MNN + cell-cond FiLM scale-only "
+            "+ chl59-8b_1p (test=[2,3])",
+        ],
+        "build": lambda: _patch_dual_chl59_lung5(
+            _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90))),
+            test_batch_idx=[2, 3]),
+    },
     # -----------------------------------------------------------------------
     # s49_v23 ablations (canonical-name) — 7 ablations x 2 datasets
     # -----------------------------------------------------------------------
