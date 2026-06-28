@@ -26738,6 +26738,34 @@ batch_size=512,
         "build": lambda: _patch_dual_spatch_coad(
             _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90)))),
     },
+    # FiLM-scale REFERENCE + REGION HOLDOUT on mmb0-1b_smb1-1b_1p — the new
+    # SQUINT reference (== the s57_v19 config: cross-MNN + cell-cond FiLM
+    # scale-only on the s49_v23 spine) with a 25%x25% spatial in-painting
+    # holdout (batch 15 upper-left + batch 82 lower-right). Both sections stay
+    # in the train graph; cells inside the patches are masked OUT of the loss
+    # and tagged data_split=test so post-inference Pearson reports on unseen
+    # cells (gene-reconstruction / in-painting downstream task). NOT named
+    # `s57_v19_*` on purpose: that prefix is matched by the ablation
+    # plots/summaries, so a region-holdout sibling under it would collide.
+    # Reuses the mmb blob (no rebuild).
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+region-holdout+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "FiLM-scale reference (the s57_v19 config) + REGION HOLDOUT on "
+            "mmb0-1b_smb1-1b_1p. = the s49_v23 spine + cross-batch MNN "
+            "(wt=10,k=1) + cell-cond niche FiLM scale-only, PLUS a 25%x25% "
+            "spatial holdout patch in batch 15 (upper-left) and batch 82 "
+            "(lower-right). Both sections stay in training; patch cells are "
+            "masked out of the loss + tagged data_split=test so post-inference "
+            "Pearson reports on unseen cells (gene-reconstruction / in-painting "
+            "downstream task). Reuses the mmb blob (no rebuild)."
+        ),
+        "patches": [
+            "= s57_v19 reference (cross-MNN + FiLM scale) "
+            "+ region-holdout (batch15 + batch82, 25%x25% patches)",
+        ],
+        "build": lambda: _patch_holdout_regions(
+            _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90)))),
+    },
     # -----------------------------------------------------------------------
     # s49_v23 ablations (canonical-name) — 7 ablations x 2 datasets
     # -----------------------------------------------------------------------
