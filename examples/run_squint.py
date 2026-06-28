@@ -26499,6 +26499,31 @@ _patch_dual_codebook_diversity(
 batch_size=512,
 ),
     },
+    # FiLM-scale REFERENCE (the s57_v19 coupling) on squint_hln. = the squint_hln
+    # s49_v23 spine above + cell-cond niche FiLM scale-only. NOTE: squint_hln is a
+    # SINGLE CosMx section, so cross-batch MNN and iLISI/MMD are degenerate — this
+    # keeps the within-batch contrastive (cross-MNN reduces to it on one section)
+    # and adds FiLM-scale, the component being replicated. RESOLUTION
+    # (cell_type_annotation / niche_annotation NMI/ARI) is the meaningful output.
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+filmscale+squint_hln": {
+        "description": (
+            "FiLM-scale reference (s57_v19 coupling) on squint_hln (CosMx human "
+            "lymph node, single section, 4 manual niches). = the squint_hln "
+            "s49_v23 spine (decoupled RVQ (30,90) + within-batch contrastive "
+            "wt=10/k=5 + cell-VQ diversity) PLUS cell-cond niche FiLM scale-only. "
+            "Single section -> cross-MNN/iLISI/MMD degenerate; FiLM-scale is the "
+            "replicated component; resolution (cell_type_annotation / "
+            "niche_annotation NMI/ARI) is the meaningful output. REQUIRES the "
+            "squint_hln blob."
+        ),
+        "patches": ["= <squint_hln s49_v23 spine> + cell-cond niche FiLM scale-only"],
+        "build": lambda: _patch_dual_cell_conditioned_niche(
+            VARIANTS["dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32"
+                     "+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec"
+                     "+decoupled-enc+diversity-w10+contrastWB-w10-k5+squint_hln"
+                     ]["build"](),
+            mode="film_scale"),
+    },
     # -----------------------------------------------------------------------
     # s49_v23 ablations (canonical-name) — 7 ablations x 2 datasets
     # -----------------------------------------------------------------------
