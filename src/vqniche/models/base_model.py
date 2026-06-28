@@ -22,6 +22,7 @@ from vqniche.loss import (
     contrastive_cell_attribute_within_batch_loss,
     contrastive_cell_attribute_cross_batch_mnn_loss,
     disentangle_cell_niche_loss,
+    cell_niche_alignment_loss,
     mse_adjacency_reconstruction_loss,
     bce_adjacency_reconstruction_loss,
     bce_cosine_adjacency_reconstruction_loss,
@@ -391,6 +392,20 @@ class BaseModel(pl.LightningModule):
                     'quantizer_input_cell', 'quantizer_input_niche',
                 ]
                 for k in ('wt_disentangle',):
+                    v = loss_kwargs.get(k)
+                    if v is not None:
+                        loss_fn_params[k] = v
+
+            elif loss_fn_name == 'cell_niche_alignment_loss':
+                # Cross-branch ALIGNMENT (Barlow invariance term): pushes the
+                # matched cell/niche feature dims to be correlated — the
+                # opposite sign of the disentanglement penalty. Same two
+                # pre-VQ branch latents.
+                loss_fn = cell_niche_alignment_loss
+                loss_fn_data_keys = [
+                    'quantizer_input_cell', 'quantizer_input_niche',
+                ]
+                for k in ('wt_align',):
                     v = loss_kwargs.get(k)
                     if v is not None:
                         loss_fn_params[k] = v

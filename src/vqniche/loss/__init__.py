@@ -17,7 +17,7 @@ from .contrastive_cell_attribute import (
     contrastive_cell_attribute_within_batch_loss,
     contrastive_cell_attribute_cross_batch_mnn_loss,
 )
-from .disentangle import disentangle_cell_niche_loss
+from .disentangle import disentangle_cell_niche_loss, cell_niche_alignment_loss
 from .mse_adjacency_reconstruction import mse_adjacency_reconstruction_loss
 from .bce_adjacency_reconstruction import bce_adjacency_reconstruction_loss
 from .bce_cosine_adjacency_reconstruction import bce_cosine_adjacency_reconstruction_loss
@@ -48,6 +48,7 @@ __all__ = [
     "contrastive_cell_attribute_within_batch_loss",
     "contrastive_cell_attribute_cross_batch_mnn_loss",
     "disentangle_cell_niche_loss",
+    "cell_niche_alignment_loss",
     "mse_adjacency_reconstruction_loss",
     "bce_adjacency_reconstruction_loss",
     "bce_cosine_adjacency_reconstruction_loss",

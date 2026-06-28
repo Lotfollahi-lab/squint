@@ -73,6 +73,12 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             detach_gnn_input: bool = False,
             cell_to_niche: Optional[dict] = None,
             branch_adapter: Optional[dict] = None,
+            shared_token: Optional[dict] = None,
+            cross_branch_residual: Optional[dict] = None,
+            shared_codebook: bool = False,
+            cell_conditioned_niche: Optional[dict] = None,
+            niche_attends_cell_codebook: Optional[dict] = None,
+            niche_nbr_expr_augment: Optional[dict] = None,
         ):
         """
         Parameters
@@ -368,6 +374,19 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
             self.cell_to_niche_detach = True
             self.cell_to_niche_proj = None
 
+        # ---- [s60 #8] BANKSY/CellCharter-style neighbour-expression augment --
+        # Concatenate a NON-learned neighbourhood-mean of a linear projection of
+        # the raw counts onto the niche GNN input — the domain-standard explicit
+        # niche construction (BANKSY: own features + neighbour-mean [+ AGF];
+        # CellCharter: neighbourhood aggregation of cell embeddings). Grows the
+        # GNN input dim (handled here); the GNN output dim is unchanged.
+        if niche_nbr_expr_augment is not None:
+            _aug_dim = int(niche_nbr_expr_augment.get("dim", 32))
+            self.nbr_aug_proj = torch.nn.Linear(in_channels, _aug_dim)
+            gnn_pre_neck_in_channels = gnn_pre_neck_in_channels + _aug_dim
+        else:
+            self.nbr_aug_proj = None
+
         # ---- Optional per-branch ADAPTER (parameter-efficient coupling) -----
         # A small dim-preserving specializer applied per branch on top of the
         # (typically COUPLED / shared) trunk: cell adapter before VQ_cell, niche
@@ -498,6 +517,94 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         vq_niche_params['dim'] = niche_in_channels
         self.vq_niche = self._init_vq(vq_niche_params)
 
+        # ===================================================================
+        # s60 cross-branch coupling mechanisms (all dim-preserving on the
+        # returned z_q_cell / z_q_niche, so decoders / metrics are unchanged).
+        # Each is guarded so existing variants are byte-identical when unset.
+        # ===================================================================
+        # Several mechanisms need the cell code BEFORE the niche VQ.
+        self._need_early_cell_vq = (
+            (cell_to_niche is not None)
+            or (cross_branch_residual is not None)
+            or (cell_conditioned_niche is not None)
+        )
+
+        # [#1] SHARED-TOKEN factorization (additive). A third shared codebook;
+        # its quantized token is projected and ADDED to BOTH z_q_cell and
+        # z_q_niche, so a single discrete "shared" code couples the branches
+        # while each keeps its private code. Additive -> dims preserved.
+        if shared_token is not None:
+            _st_dim = int(shared_token.get("dim", 64))
+            _st_k = int(shared_token.get("codebook_size", 64))
+            self.shared_token_mlp = MLP_Module(
+                in_channels=in_channels, hidden_channels=[_st_dim],
+            )
+            _st_vq_params = {"vq_name": "VectorQuantize",
+                             "dim": self.shared_token_mlp.out_channels,
+                             "codebook_size": _st_k}
+            self.vq_shared = self._init_vq(_st_vq_params)
+            self.shared_token_proj_cell = torch.nn.Linear(
+                self.shared_token_mlp.out_channels, vq_cell_in_channels)
+            self.shared_token_proj_niche = torch.nn.Linear(
+                self.shared_token_mlp.out_channels, niche_in_channels)
+        else:
+            self.shared_token_mlp = None
+            self.vq_shared = None
+
+        # [#2] CROSS-BRANCH RESIDUAL VQ. The niche VQ quantizes z_gnn AFTER
+        # subtracting a projection of the (detached) cell code, so the niche
+        # token encodes spatial signal BEYOND ego-cell identity.
+        if cross_branch_residual is not None:
+            self.cbr_detach = bool(cross_branch_residual.get("detach", True))
+            self.cbr_proj = torch.nn.Linear(vq_cell_in_channels, niche_in_channels)
+        else:
+            self.cbr_proj = None
+            self.cbr_detach = True
+
+        # [#3] SHARED CODEBOOK. Both branches quantize into ONE codebook
+        # (vq_niche := vq_cell). If the niche GNN output dim differs from the
+        # cell-VQ dim, project in/out around the shared codebook.
+        self.shared_codebook = bool(shared_codebook)
+        if self.shared_codebook:
+            if niche_in_channels != vq_cell_in_channels:
+                self.shared_cb_in = torch.nn.Linear(niche_in_channels, vq_cell_in_channels)
+                self.shared_cb_out = torch.nn.Linear(vq_cell_in_channels, niche_in_channels)
+            else:
+                self.shared_cb_in = None
+                self.shared_cb_out = None
+            self.vq_niche = self.vq_cell        # tie the codebooks
+        else:
+            self.shared_cb_in = None
+            self.shared_cb_out = None
+
+        # [#4/#5] CELL-CONDITIONED NICHE. The niche code is conditioned on the
+        # (detached) level-0 cell code via a per-cell-code embedding:
+        #   mode 'bias' -> add Embed(cell_code) to the niche VQ INPUT.
+        #   mode 'film' -> affine-modulate z_q_niche by (gamma,beta)(cell_code).
+        if cell_conditioned_niche is not None:
+            self.ccn_mode = cell_conditioned_niche.get("mode", "bias")
+            _k_cell = int(getattr(self.vq_cell, "codebook_size", 0)) or 1
+            if self.ccn_mode == "film":
+                self.ccn_gamma = torch.nn.Embedding(_k_cell, niche_in_channels)
+                self.ccn_beta = torch.nn.Embedding(_k_cell, niche_in_channels)
+                torch.nn.init.ones_(self.ccn_gamma.weight)
+                torch.nn.init.zeros_(self.ccn_beta.weight)
+            else:
+                self.ccn_bias = torch.nn.Embedding(_k_cell, niche_in_channels)
+                torch.nn.init.zeros_(self.ccn_bias.weight)
+        else:
+            self.ccn_mode = None
+
+        # [#6] NICHE ATTENDS THE CELL CODEBOOK. The niche representation attends
+        # over the K cell-codebook prototypes (a soft cell-type-composition
+        # descriptor) and the result is added to the niche VQ input.
+        if niche_attends_cell_codebook is not None:
+            self.nac_q = torch.nn.Linear(niche_in_channels, vq_cell_in_channels)
+            self.nac_out = torch.nn.Linear(vq_cell_in_channels, niche_in_channels)
+            self.nac_scale = float(vq_cell_in_channels) ** -0.5
+        else:
+            self.nac_q = None
+
         # Expose dims so the model can size its decoders correctly.
         # `cell_dim` is the dim of `z_q_cell` (= VQ_cell embedding
         # dim), which the cell decoder consumes.
@@ -622,20 +729,28 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         if self.cell_adapter is not None:
             z_mlp = self.cell_adapter(z_mlp)
 
-        # ---- compositional cell->niche coupling -----------------------------
-        # Inject the cell branch's representation as extra GNN node features so
-        # the GNN aggregates neighbours' cell identity (= local cell-type
-        # composition). Requires the cell VQ output, so quantize the cell
-        # branch HERE (once); the tail then reuses z_q_cell / idx_cell.
+        # ---- early cell VQ (needed by cell->niche / residual / conditioned) -
+        # Several couplings need the cell code BEFORE the niche VQ, so quantize
+        # the cell branch HERE (once); the tail reuses z_q_cell / idx_cell.
         z_q_cell = idx_cell = None
-        if self.cell_to_niche_source is not None:
+        if self._need_early_cell_vq:
             z_q_cell, idx_cell, _ = self.vq_cell(z_mlp)
-            cell_sig = z_q_cell if self.cell_to_niche_source == "z_q_cell" else z_mlp
-            if self.cell_to_niche_detach:
-                cell_sig = cell_sig.detach()
-            if self.cell_to_niche_proj is not None:
-                cell_sig = self.cell_to_niche_proj(cell_sig)
-            z_mlp_niche = torch.cat([z_mlp_niche, cell_sig], dim=-1)
+            # compositional cell->niche injection (concat cell signal to GNN in)
+            if self.cell_to_niche_source is not None:
+                cell_sig = z_q_cell if self.cell_to_niche_source == "z_q_cell" else z_mlp
+                if self.cell_to_niche_detach:
+                    cell_sig = cell_sig.detach()
+                if self.cell_to_niche_proj is not None:
+                    cell_sig = self.cell_to_niche_proj(cell_sig)
+                z_mlp_niche = torch.cat([z_mlp_niche, cell_sig], dim=-1)
+
+        # ---- [s60 #8] neighbour-expression augmentation ---------------------
+        # Concatenate a non-learned neighbourhood-mean of a projection of the
+        # raw counts onto the niche GNN input (BANKSY/CellCharter-style).
+        if self.nbr_aug_proj is not None:
+            _projx = self.nbr_aug_proj(batch_x)
+            _nbr_mean = self._neighbor_mean(_projx, batch_edge_index)
+            z_mlp_niche = torch.cat([z_mlp_niche, _nbr_mean], dim=-1)
 
         # ---- per-branch NICHE adapter (parameter-efficient coupling) --------
         # Small identity-initialized specializer on the (shared) trunk output,
@@ -659,14 +774,77 @@ class VQNiche_Dual_Encoder(pl.LightningModule):
         )
         z_gnn = self.gnn_module(gnn_input, batch_edge_index)
 
-        # Cell quantization (skip if already done above for cell->niche).
+        # Cell quantization (skip if already done above).
         # cell-VQ takes `z_mlp` (concat(z_shared, z_mlp_cell_path) in Y-shape
         # mode, else z_mlp_cell_path) — never the niche-side output.
         if z_q_cell is None:
             z_q_cell, idx_cell, _ = self.vq_cell(z_mlp)
-        z_q_niche, idx_niche, _ = self.vq_niche(z_gnn)
+
+        # ---- s60: modify the niche VQ INPUT with cell info ------------------
+        niche_vq_in = z_gnn
+        if self.cbr_proj is not None:                      # [#2] cross-branch residual
+            _cell_res = z_q_cell.detach() if self.cbr_detach else z_q_cell
+            niche_vq_in = niche_vq_in - self.cbr_proj(_cell_res)
+        if self.ccn_mode == "bias":                        # [#4] cell-conditioned bias
+            niche_vq_in = niche_vq_in + self.ccn_bias(self._code_l0(idx_cell))
+        if self.nac_q is not None:                         # [#6] attend cell codebook
+            _cb = self._cell_codebook_embed()
+            if _cb is not None:
+                _q = self.nac_q(z_gnn)                      # (N, Dc)
+                _attn = torch.softmax((_q @ _cb.t()) * self.nac_scale, dim=-1)  # (N, K)
+                niche_vq_in = niche_vq_in + self.nac_out(_attn @ _cb)
+
+        # ---- niche quantization (shared codebook routes through vq_cell) ----
+        if self.shared_codebook and self.shared_cb_in is not None:
+            _zqn, idx_niche, _ = self.vq_niche(self.shared_cb_in(niche_vq_in))
+            z_q_niche = self.shared_cb_out(_zqn)
+        else:
+            z_q_niche, idx_niche, _ = self.vq_niche(niche_vq_in)
+
+        # ---- s60: post-VQ couplings ----------------------------------------
+        if self.ccn_mode == "film":                        # [#5] cell-conditioned FiLM
+            _cc = self._code_l0(idx_cell)
+            z_q_niche = self.ccn_gamma(_cc) * z_q_niche + self.ccn_beta(_cc)
+        if self.vq_shared is not None:                     # [#1] shared-token (additive)
+            _z_sh, _, _ = self.vq_shared(self.shared_token_mlp(batch_x))
+            z_q_cell = z_q_cell + self.shared_token_proj_cell(_z_sh)
+            z_q_niche = z_q_niche + self.shared_token_proj_niche(_z_sh)
 
         return z_mlp, z_gnn, z_q_cell, z_q_niche, idx_cell, idx_niche
+
+    @staticmethod
+    def _code_l0(idx: torch.Tensor) -> torch.Tensor:
+        """Level-0 code indices as a 1-D long tensor (RVQ idx may be (N, Q))."""
+        idx = idx[:, 0] if idx.dim() > 1 else idx
+        return idx.long()
+
+    def _cell_codebook_embed(self):
+        """Cell codebook embeddings as (K, D), or None if unavailable
+        (mirrors the model's RVQ/single-VQ fallback)."""
+        vq = self.vq_cell
+        emb = None
+        try:
+            emb = vq.layers[0]._codebook.embed
+        except (AttributeError, IndexError):
+            try:
+                emb = vq._codebook.embed
+            except AttributeError:
+                emb = None
+        if emb is None:
+            return None
+        return emb.reshape(-1, emb.shape[-1])
+
+    @staticmethod
+    def _neighbor_mean(feat: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        """Mean of `feat` over each node's spatial neighbours (PyG edge_index
+        convention: messages flow edge_index[0] -> edge_index[1])."""
+        src, dst = edge_index[0], edge_index[1]
+        n, d = feat.shape[0], feat.shape[1]
+        out = torch.zeros(n, d, device=feat.device, dtype=feat.dtype)
+        out.index_add_(0, dst, feat[src])
+        cnt = torch.zeros(n, 1, device=feat.device, dtype=feat.dtype)
+        cnt.index_add_(0, dst, torch.ones(dst.shape[0], 1, device=feat.device, dtype=feat.dtype))
+        return out / cnt.clamp(min=1.0)
 
     def encoder_coupling_penalty(self) -> torch.Tensor:
         """

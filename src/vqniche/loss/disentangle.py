@@ -64,3 +64,35 @@ def disentangle_cell_niche_loss(
     c = (zc.T @ zn) / n
     penalty = (c ** 2).mean()
     return wt_disentangle * penalty
+
+
+def cell_niche_alignment_loss(
+        z_cell: torch.Tensor,
+        z_niche: torch.Tensor,
+        wt_align: float = 1.0,
+        eps: float = 1e-5,
+        **kwargs,
+    ) -> torch.Tensor:
+    """
+    Cross-branch ALIGNMENT (the opposite sign of `disentangle_cell_niche_loss`):
+    push the matched cell/niche feature dimensions to be CORRELATED — the
+    Barlow-Twins INVARIANCE term. Tests whether *aligning* the two codes helps
+    where decorrelating them hurt. Batch-normalise each latent per feature,
+    take the diagonal of the cross-correlation over the first
+    m = min(d_cell, d_niche) dims, and penalise its distance from 1:
+
+        wt_align * mean_i (1 - corr(z_cell_i, z_niche_i)) ** 2 .
+
+    Dimension-matched (uses the first m dims of each branch); no extra params.
+    """
+    n = z_cell.shape[0]
+    if n < 2:
+        return z_cell.sum() * 0.0
+    m = min(z_cell.shape[1], z_niche.shape[1])
+    zc = z_cell[:, :m]
+    zn = z_niche[:, :m]
+    zc = (zc - zc.mean(dim=0, keepdim=True)) / (zc.std(dim=0, keepdim=True) + eps)
+    zn = (zn - zn.mean(dim=0, keepdim=True)) / (zn.std(dim=0, keepdim=True) + eps)
+    diag_corr = (zc * zn).mean(dim=0)          # (m,) per-feature correlation
+    penalty = ((1.0 - diag_corr) ** 2).mean()
+    return wt_align * penalty

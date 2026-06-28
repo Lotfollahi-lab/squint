@@ -3048,6 +3048,64 @@ def _patch_dual_branch_adapter(
     return cfg
 
 
+# --- s60 cross-branch coupling patches (all dim-preserving, encoder-contained) ---
+def _patch_dual_shared_token(cfg: dict, dim: int = 64, codebook_size: int = 64) -> dict:
+    """[s60 #1] Additive shared-token factorization: a third shared codebook
+    whose quantized token is projected and ADDED to both z_q_cell and z_q_niche
+    (a single discrete 'shared' code couples the branches; each keeps its
+    private code). Dim-preserving."""
+    cfg["model"]["encoder_params"]["shared_token"] = {
+        "dim": int(dim), "codebook_size": int(codebook_size)}
+    return cfg
+
+
+def _patch_dual_cross_branch_residual(cfg: dict, detach: bool = True) -> dict:
+    """[s60 #2] Cross-branch residual VQ: the niche VQ quantizes z_gnn after
+    subtracting a projection of the (detached) cell code, so the niche token
+    encodes spatial signal beyond ego-cell identity."""
+    cfg["model"]["encoder_params"]["cross_branch_residual"] = {"detach": bool(detach)}
+    return cfg
+
+
+def _patch_dual_shared_codebook(cfg: dict) -> dict:
+    """[s60 #3] Shared codebook: both branches quantize into one codebook."""
+    cfg["model"]["encoder_params"]["shared_codebook"] = True
+    return cfg
+
+
+def _patch_dual_cell_conditioned_niche(cfg: dict, mode: str = "bias") -> dict:
+    """[s60 #4/#5] Cell-conditioned niche: the niche code is conditioned on the
+    (detached) level-0 cell code — 'bias' adds a per-cell-code embedding to the
+    niche VQ input; 'film' affine-modulates z_q_niche by the cell code."""
+    cfg["model"]["encoder_params"]["cell_conditioned_niche"] = {"mode": mode}
+    return cfg
+
+
+def _patch_dual_niche_attends_cell_codebook(cfg: dict) -> dict:
+    """[s60 #6] The niche representation attends over the cell codebook
+    prototypes (a soft cell-type-composition descriptor) before the niche VQ."""
+    cfg["model"]["encoder_params"]["niche_attends_cell_codebook"] = {}
+    return cfg
+
+
+def _patch_dual_niche_nbr_expr_augment(cfg: dict, dim: int = 32) -> dict:
+    """[s60 #8] BANKSY/CellCharter-style: concat a non-learned neighbourhood-mean
+    of a projection of the raw counts onto the niche GNN input."""
+    cfg["model"]["encoder_params"]["niche_nbr_expr_augment"] = {"dim": int(dim)}
+    return cfg
+
+
+def _patch_dual_cell_niche_alignment(cfg: dict, wt: float = 100.0) -> dict:
+    """[s60 #7] Cross-branch ALIGNMENT loss (Barlow invariance term): push the
+    matched cell/niche dims to be correlated (opposite sign of disentanglement).
+    """
+    losses = cfg["model"]["loss_params"]["loss_names"]
+    if "cell_niche_alignment_loss" not in losses:
+        losses.append("cell_niche_alignment_loss")
+    cfg["model"]["loss_params"]["loss_kwargs"]["wt_align"] = float(wt)
+    return cfg
+
+
 def _build_s51_spine_codebook(cell_sizes, niche_sizes):
     """Build the s51_v1 / s49_v23 spine with the given per-branch RVQ codebook
     sizes. This is BYTE-IDENTICAL to the s52_v1 build chain (decoupled-enc +
@@ -34371,6 +34429,96 @@ for _v, _tag, _adk, _pct in _S59_ADAPTERS:
         "patches": [f"= s55_v3 spine -> COUPLED trunk + {_adk['kind']} branch adapter"],
         "build": (lambda adk=_adk: _patch_dual_branch_adapter(_s56_spine(), **adk)),
     }
+
+
+# ===========================================================================
+# s60 — NOVEL cross-branch couplings (none overlap s56/s58/s59): VQ/codebook-
+# level coupling, conditional coupling, dynamic attention, mutual alignment,
+# and a domain-borrowed niche construction. All on the s55_v3 cross-batch-MNN
+# decoupled spine (_s56_spine()), all dim-preserving on z_q_cell / z_q_niche
+# so decoders / metrics are unchanged. Reference = s55_v3.
+# ===========================================================================
+VARIANTS["s60_v1_shared-token+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s60 #1 SHARED-TOKEN factorization: a third shared codebook whose "
+        "quantized token is projected and ADDED to both z_q_cell and z_q_niche, "
+        "so a single discrete shared code couples the branches while each keeps "
+        "its private code. Motivated by the high shared linear subspace (CCA "
+        "0.87). Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + additive shared-token codebook (dim=64,k=64)"],
+    "build": lambda: _patch_dual_shared_token(_s56_spine(), dim=64, codebook_size=64),
+}
+VARIANTS["s60_v2_cross-branch-residual+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s60 #2 CROSS-BRANCH RESIDUAL VQ: the niche VQ quantizes z_gnn after "
+        "subtracting a projection of the (detached) cell code, so the niche "
+        "token encodes spatial signal BEYOND ego-cell identity — structured "
+        "complementarity (architectural, not a penalty). Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + niche VQ on (z_gnn - proj(z_q_cell.detach()))"],
+    "build": lambda: _patch_dual_cross_branch_residual(_s56_spine(), detach=True),
+}
+VARIANTS["s60_v3_shared-codebook+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s60 #3 SHARED CODEBOOK: both branches quantize into ONE codebook "
+        "(vq_niche tied to vq_cell), testing whether a common discrete "
+        "vocabulary couples them / helps cross-platform transfer. "
+        "Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + tied cell/niche codebook"],
+    "build": lambda: _patch_dual_shared_codebook(_s56_spine()),
+}
+VARIANTS["s60_v4_cellcond-niche-bias+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s60 #4 CELL-CONDITIONED NICHE (bias): a per-cell-code embedding "
+        "(indexed by the detached level-0 cell code) is ADDED to the niche VQ "
+        "input — 'given cell type, shift the niche representation'. "
+        "Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + niche VQ input += Embed(cell_code)"],
+    "build": lambda: _patch_dual_cell_conditioned_niche(_s56_spine(), mode="bias"),
+}
+VARIANTS["s60_v5_cellcond-niche-film+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s60 #5 CELL-CONDITIONED NICHE (FiLM): z_q_niche is affine-modulated by "
+        "(gamma,beta) indexed by the detached level-0 cell code — a "
+        "hierarchical 'cell type modulates the niche readout' coupling. "
+        "Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + z_q_niche FiLM-modulated by cell_code"],
+    "build": lambda: _patch_dual_cell_conditioned_niche(_s56_spine(), mode="film"),
+}
+VARIANTS["s60_v6_niche-attends-cell-codebook+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s60 #6 NICHE ATTENDS CELL CODEBOOK: the niche representation attends "
+        "over the K cell-codebook prototypes (a soft cell-type-composition "
+        "descriptor) and the result is added to the niche VQ input — a dynamic, "
+        "input-dependent coupling (vs static cross-stitch). Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + niche cross-attention over cell codebook"],
+    "build": lambda: _patch_dual_niche_attends_cell_codebook(_s56_spine()),
+}
+VARIANTS["s60_v7_cell-niche-alignment-w100+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s60 #7 MUTUAL ALIGNMENT (Barlow invariance term): push the matched "
+        "cell/niche feature dims to be CORRELATED (wt_align=100) — the opposite "
+        "sign of the disentanglement penalty (s58), testing whether aligning "
+        "helps where decorrelating hurt. Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + cell_niche_alignment_loss (wt=100)"],
+    "build": lambda: _patch_dual_cell_niche_alignment(_s56_spine(), wt=100.0),
+}
+VARIANTS["s60_v8_niche-nbr-expr-augment+crossmnn-wt10-k1+mmb0-1b_smb1-1b_1p"] = {
+    "description": (
+        "s60 #8 BANKSY/CellCharter-style niche augmentation: concat a "
+        "non-learned neighbourhood-mean of a 32-d projection of the raw counts "
+        "onto the niche GNN input — the domain-standard explicit niche "
+        "construction. Reference = s55_v3."
+    ),
+    "patches": ["= s55_v3 spine + niche GNN input augmented w/ nbr-mean(proj(x))"],
+    "build": lambda: _patch_dual_niche_nbr_expr_augment(_s56_spine(), dim=32),
+}
 
 
 # Map short dataset tag -> ordered list of sweep variant names. The CLI's
