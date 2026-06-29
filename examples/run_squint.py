@@ -34832,6 +34832,108 @@ for _i, (_tag, _pref) in enumerate(_S57_SPEC, start=1):
 
 
 # ===========================================================================
+# s64 — squint_hln DIAGNOSTIC sweep (single CosMx section, 19,718 cells; SMALL).
+# Both cell & niche resolution are poor on HLN even with correct labels/counts.
+# The reference config is MERFISH-mouse-tuned: bs=512 gives only ~38 steps/epoch
+# on this tiny single section (under-trains the codebook), and wt_adj_reconstr
+# defaults to 1000 (cranked up to balance ~150-nat MOUSE gene-NB losses) which
+# likely DOMINATES the loss on a small dense CosMx graph. This sweep perturbs
+# the small-data-sensitive knobs ONE change at a time vs the FiLM-scale
+# squint_hln reference. RUN SINGLE-SEED. All use the existing squint_hln
+# (full-panel) blob — no rebuild (but that blob must carry labels: cell_type /
+# niche). To diagnose on a gene-set blob instead, wrap each build with
+# _patch_dataset_name(..., 'squint_hln_svg2k').
+# ===========================================================================
+_S64_REF_KEY = (
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16"
+    "+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10"
+    "+contrastWB-w10-k5+filmscale+squint_hln"
+)
+_S64_SPINE_KEY = (
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16"
+    "+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10"
+    "+contrastWB-w10-k5+squint_hln"
+)
+
+
+def _s64_ref():
+    return VARIANTS[_S64_REF_KEY]["build"]()
+
+
+def _s64_spine():
+    return VARIANTS[_S64_SPINE_KEY]["build"]()
+
+
+def _s64_nol1(cell_k, niche_k):
+    """Single-level VQ (drop the residual L1), applied on the spine BEFORE FiLM
+    so the cell-conditioned FiLM embedding sizes to the new cell codebook."""
+    return _patch_dual_cell_conditioned_niche(
+        _patch_dual_vq(
+            _patch_dual_vq(_s64_spine(), branch="niche", codebook_size=niche_k),
+            branch="cell", codebook_size=cell_k),
+        mode="film_scale")
+
+
+# (tag, build) — ONE change vs the FiLM-scale squint_hln reference.
+_S64_SPEC = [
+    # adjacency BCE weight (default 1000 -> reduce; prime suspect on a tiny graph)
+    ("adj250",          lambda: _patch_dual_adj_weight(_s64_ref(), 250.0)),
+    ("adj100",          lambda: _patch_dual_adj_weight(_s64_ref(), 100.0)),
+    ("adj10",           lambda: _patch_dual_adj_weight(_s64_ref(), 10.0)),
+    ("adj1",            lambda: _patch_dual_adj_weight(_s64_ref(), 1.0)),
+    # batch size (default 512 -> ~38 steps/epoch; lower = more steps), sqrt-scaled lr
+    ("bs256-lr5e-4",    lambda: _patch_dual_batch_lr(_s64_ref(), 256, 5e-4)),
+    ("bs128-lr3.5e-4",  lambda: _patch_dual_batch_lr(_s64_ref(), 128, 3.5e-4)),
+    ("bs64-lr2.5e-4",   lambda: _patch_dual_batch_lr(_s64_ref(), 64, 2.5e-4)),
+    ("bs32-lr1.75e-4",  lambda: _patch_dual_batch_lr(_s64_ref(), 32, 1.75e-4)),
+    # contrastive weight (default 10 -> reduce / off)
+    ("contrast1",       lambda: _patch_dual_contrastive_cell_within_batch(
+                            _s64_ref(), wt_contrastive_cell=1.0, k_pos=5)),
+    ("contrast0",       lambda: _patch_dual_no_contrastive(_s64_ref())),
+    # no L1 residual codebook (single-level VQ)
+    ("no-l1-k30",       lambda: _s64_nol1(30, 30)),
+    ("no-l1-gt",        lambda: _s64_nol1(16, 4)),
+    # reconstruction (NB) weights lower (cell + nbr). The NB NLL is summed over
+    # genes and NOT normalized by library size, so it scales with COUNT DEPTH:
+    # ~500 on CosMx HLN (772 counts/cell) vs ~145 on mouse MERFISH. Every other
+    # weight (adj=1000, contrast=10, ...) was tuned to recon~145, so recon now
+    # dominates ~3.4x. wt~145/500~=0.3 restores the mouse balance; 0.5/0.1/0.01
+    # bracket it.
+    ("recon0.5",        lambda: _patch_dual_attr_recon_nbr_weight(
+                            _patch_dual_attr_recon_weight(_s64_ref(), 0.5), 0.5)),
+    ("recon0.3",        lambda: _patch_dual_attr_recon_nbr_weight(
+                            _patch_dual_attr_recon_weight(_s64_ref(), 0.3), 0.3)),
+    ("recon0.1",        lambda: _patch_dual_attr_recon_nbr_weight(
+                            _patch_dual_attr_recon_weight(_s64_ref(), 0.1), 0.1)),
+    ("recon0.01",       lambda: _patch_dual_attr_recon_nbr_weight(
+                            _patch_dual_attr_recon_weight(_s64_ref(), 0.01), 0.01)),
+    # --- recommended extras for small single-section data ---
+    ("knn8",            lambda: _patch_dual_sampler_neighbors(
+                            _patch_dual_graph_knn(_s64_ref(), n_neighs=8),
+                            num_neighbors=[8])),
+    ("vqwarmup",        lambda: _patch_dual_vq_warmup(_s64_ref(), vq_warmup_epochs=10)),
+    ("diversity50",     lambda: _patch_dual_codebook_diversity(_s64_ref(), weight=50.0)),
+    ("lr2e-4",          lambda: _patch_dual_batch_lr(_s64_ref(), 512, 2e-4)),
+    ("no-film",         lambda: _s64_spine()),
+    ("smalldata-combo", lambda: _patch_dual_no_contrastive(
+                            _patch_dual_adj_weight(
+                                _patch_dual_batch_lr(_s64_ref(), 64, 2.5e-4), 10.0))),
+]
+
+for _i, (_tag, _bld) in enumerate(_S64_SPEC, start=1):
+    VARIANTS[f"s64_v{_i}_{_tag}+squint_hln"] = {
+        "description": (
+            f"s64 squint_hln DIAGNOSTIC ({_tag}) — single change vs the FiLM-scale "
+            f"squint_hln reference, to find why HLN resolution is poor (small "
+            f"single-section CosMx; mmb-tuned defaults). Uses the squint_hln "
+            f"(full-panel) blob; run single-seed."
+        ),
+        "patches": [f"s64 diagnostic: {_tag}"],
+        "build": _bld,
+    }
+
+
+# ===========================================================================
 # s58 — INFORMATION-FLOW / COMPLEMENTARITY coupling (beyond trunk-sharing).
 # The s56 trunk-sharing sweep tied with the decoupled baseline -> sharing the
 # trunk is not the lever. s58 instead changes WHAT flows between the branches:
