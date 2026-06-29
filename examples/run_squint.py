@@ -26994,6 +26994,28 @@ batch_size=512,
         "build": lambda: _patch_dual_spatch_coad(
             _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90)))),
     },
+    # FiLM-scale spatch_coad_1p reference with CUSTOM codebooks: cell RVQ =
+    # (16, 48), niche RVQ = (5, 15) [L0 = 16 cell / 5 niche; L1 = 3x L0].
+    # Same model as the +crossmnn+spatch_coad_1p reference, only the RVQ sizes
+    # change — set on the spine via _build_s51_spine_codebook BEFORE FiLM (so
+    # the cell-cond FiLM embedding sizes to cell L0=16). REQUIRES the
+    # spatch_coad_1p blob (2 sections).
+    "dualvq+rvq-cell-16-48+rvq-niche-5-15+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+spatch_coad_1p": {
+        "description": (
+            "FiLM-scale reference (cross-MNN + cell-cond FiLM scale-only) on "
+            "spatch_coad_1p (colon adenocarcinoma, 2 sections) with cell RVQ = "
+            "(16, 48) and niche RVQ = (5, 15) [L0 = 16 cell / 5 niche codes; "
+            "L1 = 3x L0]. = the +crossmnn+spatch_coad_1p reference but with these "
+            "RVQ sizes (vs the (30,90) default). Labels annotation / "
+            "spatial_cluster. REQUIRES the spatch_coad_1p blob."
+        ),
+        "patches": [
+            "+rvq(cell levels=[16, 48], niche levels=[5, 15])",
+            "= <cross-MNN FiLM-scale spatch_coad_1p reference> with custom codebooks",
+        ],
+        "build": lambda: _patch_dual_spatch_coad(
+            _patch_dual_squint_default(_build_s51_spine_codebook((16, 48), (5, 15)))),
+    },
     # FiLM-scale REFERENCE + REGION HOLDOUT on mmb0-1b_smb1-1b_1p — the new
     # SQUINT reference (== the s57_v19 config: cross-MNN + cell-cond FiLM
     # scale-only on the s49_v23 spine) with a 25%x25% spatial in-painting
