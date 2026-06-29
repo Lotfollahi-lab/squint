@@ -676,6 +676,15 @@ def main() -> None:
         help="kNN size for iLISI (default 90).",
     )
     ap.add_argument(
+        "--ilisi-max-cells", type=int, default=100000,
+        help="Cap the number of cells used for iLISI; if the embedding has "
+             "more, a random subsample of this size is used (an unbiased "
+             "estimate of mean iLISI). 0 = no cap. iLISI builds a FULL kNN "
+             "graph with no internal subsampling (unlike MMD/ASW), so on large "
+             "sections (e.g. ~700k cells) it OOMs and kills the whole metrics "
+             "step — capping it keeps memory bounded (default 100000).",
+    )
+    ap.add_argument(
         "--asw-sample-size", type=int, default=10000,
         help="Sub-sample size for sklearn silhouette_score (default 10000).",
     )
@@ -881,7 +890,26 @@ def main() -> None:
                 continue
             print(f"  [{emb_key}]")
 
-            ilisi = compute_ilisi(emb, batch, n_neighbors=args.ilisi_n_neighbors)
+            # iLISI builds a FULL kNN graph (no internal subsampling) — it OOMs
+            # on large sections and, being un-guarded, would kill the whole
+            # metrics step before the CSV is written (resolution metrics, run
+            # earlier, survive — exactly the "no integration metrics" symptom).
+            # Cap the cell count (random subsample = unbiased mean-iLISI
+            # estimate) and guard so a failure can't abort MMD/ASW + the write.
+            try:
+                if args.ilisi_max_cells and len(emb) > args.ilisi_max_cells:
+                    _sub = np.random.default_rng(args.seed).choice(
+                        len(emb), args.ilisi_max_cells, replace=False)
+                    print(f"    iLISI: subsampling {len(emb)} -> "
+                          f"{args.ilisi_max_cells} cells")
+                    ilisi = compute_ilisi(emb[_sub], batch[_sub],
+                                          n_neighbors=args.ilisi_n_neighbors)
+                else:
+                    ilisi = compute_ilisi(emb, batch,
+                                          n_neighbors=args.ilisi_n_neighbors)
+            except Exception as exc:
+                print(f"    iLISI: failed ({exc}); skipping")
+                ilisi = None
             try:
                 asw = float(silhouette_score(
                     emb, batch, metric="euclidean",
