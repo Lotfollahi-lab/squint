@@ -156,22 +156,33 @@ class AnnDataCodeSource:
             x = x.detach().cpu().numpy()
         return np.asarray(x)
 
+    # obs/obsm key prefixes to try per branch. SQUINT's predict pipeline
+    # exports the niche branch under the "neighborhood" prefix
+    # (run_squint.py: obsm['neighborhood_code_indices'] / obs['neighborhood_code_index']),
+    # while the uns alias and some paths use "niche" -- try both.
+    _PREFIX_ALIASES = {"niche": ("niche", "neighborhood")}
+
     def _read_indices(self, adata, b: BranchSpec) -> np.ndarray:
         idx = None
         if b.uns_key in adata.uns:
             idx = self._to_numpy(adata.uns[b.uns_key])
-        else:
-            obsm_key = f"{b.name}_code_indices"
-            obs_key = f"{b.name}_code_index"
-            if obsm_key in adata.obsm:
-                idx = self._to_numpy(adata.obsm[obsm_key])
-            elif obs_key in adata.obs:
-                idx = self._to_numpy(adata.obs[obs_key].values)
+        prefixes = self._PREFIX_ALIASES.get(b.name, (b.name,))
         if idx is None:
+            for pre in prefixes:
+                obsm_key = f"{pre}_code_indices"
+                obs_key = f"{pre}_code_index"
+                if obsm_key in adata.obsm:
+                    idx = self._to_numpy(adata.obsm[obsm_key])
+                    break
+                if obs_key in adata.obs:
+                    idx = self._to_numpy(adata.obs[obs_key].values)
+                    break
+        if idx is None:
+            tried = ", ".join(f"obsm['{p}_code_indices']/obs['{p}_code_index']"
+                              for p in prefixes)
             raise KeyError(
                 f"could not find code indices for branch '{b.name}' "
-                f"(looked for uns['{b.uns_key}'], obsm['{b.name}_code_indices'], "
-                f"obs['{b.name}_code_index'])"
+                f"(looked for uns['{b.uns_key}'], {tried})"
             )
         idx = np.asarray(idx)
         if idx.ndim == 1:
