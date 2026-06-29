@@ -26921,6 +26921,43 @@ batch_size=512,
             _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90))),
             test_batch_idx=[2, 3]),
     },
+    # FiLM-scale REFERENCE on chl59-2b_1p (CosMx Lung, 2-sample subset). Same
+    # cross-MNN + cell-cond FiLM scale-only s49_v23 spine as the chl59-8b
+    # reference, switched to the 2-section subset (train on BOTH sections, no
+    # whole-section holdout; bs=512). MULTI-section -> cross-MNN + iLISI/MMD
+    # meaningful. REQUIRES the chl59-2b_1p blob (--build-blob-dataset chl59-2b_1p).
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+chl59-2b_1p": {
+        "description": (
+            "FiLM-scale reference (cross-MNN + cell-cond FiLM scale-only, == the "
+            "s57_v19 coupling) on chl59-2b_1p (CosMx Lung, 2 sections), DEFAULT "
+            "codebooks cell RVQ=(30,90), niche RVQ=(30,90). Train on both "
+            "sections (10% cell-level val, no holdout). REQUIRES the chl59-2b_1p "
+            "blob."
+        ),
+        "patches": ["= s57_v19 reference (cross-MNN + FiLM scale) + chl59-2b_1p (train=ALL)"],
+        "build": lambda: _patch_dual_chl59_2b_1p(
+            _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90)))),
+    },
+    # Same chl59-2b_1p reference with CUSTOM codebooks: cell RVQ = (10, 30),
+    # niche RVQ = (12, 36) [L0 = 10 cell / 12 niche; L1 = 3x L0]. Codebooks set
+    # on the spine via _build_s51_spine_codebook BEFORE FiLM (cell-cond FiLM
+    # sizes to cell L0=10). REQUIRES the chl59-2b_1p blob.
+    "dualvq+rvq-cell-10-30+rvq-niche-12-36+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+chl59-2b_1p": {
+        "description": (
+            "FiLM-scale reference (cross-MNN + cell-cond FiLM scale-only) on "
+            "chl59-2b_1p (CosMx Lung, 2 sections) with cell RVQ = (10, 30) and "
+            "niche RVQ = (12, 36) [L0 = 10 cell / 12 niche codes; L1 = 3x L0]. = "
+            "the +crossmnn+chl59-2b_1p reference but with these RVQ sizes (vs the "
+            "(30,90) default). Train on both sections. REQUIRES the chl59-2b_1p "
+            "blob."
+        ),
+        "patches": [
+            "+rvq(cell levels=[10, 30], niche levels=[12, 36])",
+            "= <cross-MNN FiLM-scale chl59-2b_1p reference> with custom codebooks",
+        ],
+        "build": lambda: _patch_dual_chl59_2b_1p(
+            _patch_dual_squint_default(_build_s51_spine_codebook((10, 30), (12, 36)))),
+    },
     # FiLM-scale REFERENCE (the FULL s57_v19 config) on smb1-20b_1p (STARmap+
     # mouse-CNS, 20 sections — the STARmap-only counterpart to mmb20, on its
     # native panel). MULTI-section, so this uses the complete s57_v19 coupling
