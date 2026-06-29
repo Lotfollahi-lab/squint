@@ -49,10 +49,11 @@ class SpatialCodeDataset(Dataset):
         length: Optional[int] = None,
         deterministic: bool = False,
         seed: int = 0,
+        restrict_to_train: bool = False,
     ):
         self.source = source
         self.cfg = cfg
-        self.sampler = PatchSampler(source, cfg.data)
+        self.sampler = PatchSampler(source, cfg.data, restrict_to_train=restrict_to_train)
         self.targets = cfg.prediction_targets
         self._length = int(length) if length is not None else self.sampler.epoch_len()
         self.deterministic = deterministic
@@ -114,12 +115,17 @@ class Stage2DataModule:
         num_workers: int = 4,
         val_fraction: float = 0.0,
         val_sections: Optional[Sequence[int]] = None,
+        restrict_train_to_split: bool = False,
     ):
         self.source = source
         self.cfg = cfg
         self.num_workers = num_workers
         self.val_fraction = val_fraction
         self.val_sections = val_sections
+        # When the source carries a data-split mask, confine BOTH train and val
+        # patches to non-held-out cells so neither training nor the val metric
+        # ever touches the held-out region (which is the eval target).
+        self.restrict_to_train = bool(restrict_train_to_split) and source.has_holdout
 
     def train_dataloader(self) -> DataLoader:
         # Patches are i.i.d. random samples, so the "epoch" is artificial and
@@ -129,7 +135,8 @@ class Stage2DataModule:
         # batch size (the raw N/patch_size can be tiny for small sections).
         bs = self.cfg.optim.batch_size
         length = max(self.sampler_len(), 8 * bs, 64)
-        ds = SpatialCodeDataset(self.source, self.cfg, length=length, seed=self.cfg.seed)
+        ds = SpatialCodeDataset(self.source, self.cfg, length=length, seed=self.cfg.seed,
+                                restrict_to_train=self.restrict_to_train)
         return DataLoader(
             ds,
             batch_size=bs,
@@ -145,7 +152,8 @@ class Stage2DataModule:
         bs = self.cfg.optim.batch_size
         length = max(2 * bs, self.sampler_len() // 5, 16)
         ds = SpatialCodeDataset(
-            self.source, self.cfg, length=length, deterministic=True, seed=self.cfg.seed + 1
+            self.source, self.cfg, length=length, deterministic=True, seed=self.cfg.seed + 1,
+            restrict_to_train=self.restrict_to_train,
         )
         return DataLoader(
             ds,
@@ -158,4 +166,6 @@ class Stage2DataModule:
         )
 
     def sampler_len(self) -> int:
-        return PatchSampler(self.source, self.cfg.data).epoch_len()
+        return PatchSampler(
+            self.source, self.cfg.data, restrict_to_train=self.restrict_to_train
+        ).epoch_len()

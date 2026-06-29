@@ -83,6 +83,17 @@ def parse_args(argv=None):
     p.add_argument("--eval-holdout-frac", type=float, default=0.1)
     p.add_argument("--skip-eval", action="store_true")
 
+    # TRUE data-split holdout: in-paint exactly the cells SQUINT held out
+    # (obs[holdout-key] == holdout-split) instead of random synthetic holes.
+    # Held-out cells are then EXCLUDED from stage-2 training/val patches.
+    p.add_argument("--holdout-split", default=None,
+                   help="obs value marking held-out cells (e.g. 'test'). "
+                        "Enables the true region-holdout train/eval protocol.")
+    p.add_argument("--holdout-key", default="data_split",
+                   help="obs column carrying the train/test split (default data_split).")
+    p.add_argument("--eval-chunk-size", type=int, default=0,
+                   help="Max held-out cells per in-painting chunk (0 -> patch_size//2).")
+
     # misc
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--precision", default="32-true",
@@ -159,10 +170,22 @@ def main(argv=None):
     # ---- frozen source ----------------------------------------------------
     print(f"[stage2] reading codes from {args.predicted_adata}")
     source = AnnDataCodeSource(
-        args.predicted_adata, coord_key=args.coord_key, section_key=args.section_key
+        args.predicted_adata, coord_key=args.coord_key, section_key=args.section_key,
+        holdout_key=(args.holdout_key if args.holdout_split else None),
+        holdout_value=(args.holdout_split if args.holdout_split else "test"),
     )
     print(f"[stage2] {source.n_cells} cells, {source.section_ids.size} section(s), "
           f"codebook sizes {source.branch_sizes()}")
+    use_split_eval = bool(args.holdout_split) and source.has_holdout
+    if args.holdout_split and not source.has_holdout:
+        print(f"[stage2] WARNING: no cells with obs['{args.holdout_key}']=="
+              f"'{args.holdout_split}' -- falling back to random-hole eval, "
+              f"training on the full tissue.")
+    elif use_split_eval:
+        n_hold = int(source.holdout_mask.sum())
+        print(f"[stage2] data-split holdout ON: {n_hold} held-out cells "
+              f"(obs['{args.holdout_key}']=='{args.holdout_split}') excluded "
+              f"from training; in-painted at eval.")
 
     # ---- config -----------------------------------------------------------
     cfg, eval_regions = build_config(args, source)
@@ -171,7 +194,8 @@ def main(argv=None):
     print(f"[stage2] targets: {cfg.prediction_targets}")
 
     # ---- data + model -----------------------------------------------------
-    dm = Stage2DataModule(source, cfg, num_workers=args.num_workers)
+    dm = Stage2DataModule(source, cfg, num_workers=args.num_workers,
+                          restrict_train_to_split=use_split_eval)
     lit = Stage2LightningModule(cfg)
     n_params = sum(p.numel() for p in lit.model.parameters())
     print(f"[stage2] model params: {n_params/1e6:.2f}M")
@@ -206,20 +230,34 @@ def main(argv=None):
     save_stage2(out_dir, lit.model, cfg)
     print(f"[stage2] saved model + config to {out_dir}")
 
-    # ---- region-holdout in-painting eval ---------------------------------
+    # ---- in-painting eval -------------------------------------------------
     if not args.skip_eval:
-        from vqniche.stage2.evaluate import region_holdout_eval
-
         device = "cuda" if torch.cuda.is_available() else "cpu"
         lit.model.to(device)
-        summary = region_holdout_eval(
-            lit.model, source, cfg,
-            n_regions=eval_regions, holdout_frac=args.eval_holdout_frac,
-            seed=args.seed, device=device,
-            out_csv=os.path.join(out_dir, "stage2_eval.csv"),
-        )
+        if use_split_eval:
+            # in-paint exactly the cells SQUINT held out (data_split == test)
+            from vqniche.stage2.evaluate import holdout_split_eval
+
+            chunk = args.eval_chunk_size or max(64, cfg.data.patch_size // 2)
+            if args.smoke:
+                chunk = min(chunk, 64)
+            summary = holdout_split_eval(
+                lit.model, source, cfg, chunk_size=chunk, device=device,
+                out_csv=os.path.join(out_dir, "stage2_eval.csv"),
+            )
+            drop_key = "per_chunk"
+        else:
+            from vqniche.stage2.evaluate import region_holdout_eval
+
+            summary = region_holdout_eval(
+                lit.model, source, cfg,
+                n_regions=eval_regions, holdout_frac=args.eval_holdout_frac,
+                seed=args.seed, device=device,
+                out_csv=os.path.join(out_dir, "stage2_eval.csv"),
+            )
+            drop_key = "per_region"
         with open(os.path.join(out_dir, "stage2_eval.json"), "w") as f:
-            json.dump({k: v for k, v in summary.items() if k != "per_region"},
+            json.dump({k: v for k, v in summary.items() if k != drop_key},
                       f, indent=2)
     print("[stage2] DONE.")
     return out_dir

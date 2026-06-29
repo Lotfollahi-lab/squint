@@ -129,8 +129,13 @@ def inpaint(
     holdout_idx,
     cfg: Stage2Config,
     device: Optional[str] = None,
+    observed_rows=None,
 ) -> Dict[str, object]:
     """In-paint a held-out region of a frozen ``predicted_adata``.
+
+    ``observed_rows`` (optional): restrict the context to these cells only
+    (e.g. the section's TRAIN cells for a true data-split holdout) so no other
+    held-out cell's code leaks in as context.
 
     Returns a dict with:
         global_idx     : (n_holdout,) row indices that were predicted
@@ -140,6 +145,7 @@ def inpaint(
     patch = inpainting_patch(
         source, holdout_idx, cfg.data,
         context_radius_mult=cfg.decode.context_radius_mult,
+        observed_rows=observed_rows,
     )
     arrays = patch_to_arrays(patch, cfg.prediction_targets)
     codes = torch.from_numpy(arrays["codes"]).unsqueeze(0)        # (1, P, T)

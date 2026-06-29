@@ -91,6 +91,8 @@ class AnnDataCodeSource:
         branches: Optional[Sequence[BranchSpec]] = None,
         coord_key: str = "spatial",
         section_key: str = "adata_batch_id",
+        holdout_key: Optional[str] = None,
+        holdout_value="test",
     ):
         if isinstance(adata, str):
             import anndata
@@ -99,6 +101,7 @@ class AnnDataCodeSource:
 
         self.coord_key = coord_key
         self.section_key = section_key
+        self.holdout_key = holdout_key
 
         if coord_key not in adata.obsm:
             raise KeyError(f"adata.obsm has no '{coord_key}' (spatial coords)")
@@ -123,6 +126,26 @@ class AnnDataCodeSource:
         self._section_rows = {
             int(s): np.where(self.section == s)[0] for s in self.section_ids
         }
+
+        # optional train / held-out split (e.g. obs['data_split'] == 'test',
+        # tagged by SQUINT's region-holdout predict pipeline). When present, the
+        # held-out cells are EXCLUDED from stage-2 training patches and become
+        # the in-painting target at eval -- so the model never sees their codes.
+        self.holdout_mask = self._read_holdout(adata, holdout_key, holdout_value)
+        if self.holdout_mask is not None:
+            self._train_section_rows = {
+                int(s): rows[~self.holdout_mask[rows]]
+                for s, rows in self._section_rows.items()
+            }
+            self._holdout_section_rows = {
+                int(s): rows[self.holdout_mask[rows]]
+                for s, rows in self._section_rows.items()
+            }
+        else:
+            self._train_section_rows = self._section_rows
+            self._holdout_section_rows = {
+                int(s): np.empty(0, dtype=np.int64) for s in self.section_ids
+            }
 
     # ---- adata readers ----------------------------------------------------
     @staticmethod
@@ -172,6 +195,24 @@ class AnnDataCodeSource:
             sizes = [int(idx[:, q].max()) + 1 for q in range(idx.shape[1])]
         return sizes
 
+    def _read_holdout(self, adata, key, value) -> Optional[np.ndarray]:
+        """Bool mask (n_cells,) of held-out cells, or None if no split applies.
+
+        `key` is an obs column (e.g. 'data_split'); `value` is the label (or a
+        sequence of labels) that marks held-out cells (e.g. 'test'). Returns
+        None when the column is absent or no cell matches -- so callers fall
+        back to the no-holdout behaviour rather than training on nothing.
+        """
+        if not key or key not in adata.obs:
+            return None
+        vals = np.asarray(adata.obs[key].astype(str).values)
+        if isinstance(value, (str, bytes)):
+            targets = {str(value)}
+        else:
+            targets = {str(v) for v in value}
+        mask = np.isin(vals, list(targets))
+        return mask if mask.any() else None
+
     def _read_sections(self, adata) -> np.ndarray:
         if self.section_key in adata.obs:
             raw = adata.obs[self.section_key].values
@@ -197,6 +238,18 @@ class AnnDataCodeSource:
 
     def section_of(self, s: int) -> np.ndarray:
         return self._section_rows[int(s)]
+
+    @property
+    def has_holdout(self) -> bool:
+        return self.holdout_mask is not None
+
+    def train_section_of(self, s: int) -> np.ndarray:
+        """Rows of section ``s`` that are NOT held out (all rows if no split)."""
+        return self._train_section_rows[int(s)]
+
+    def holdout_section_of(self, s: int) -> np.ndarray:
+        """Held-out rows of section ``s`` (empty if no split)."""
+        return self._holdout_section_rows[int(s)]
 
 
 # ---------------------------------------------------------------------------
@@ -233,23 +286,41 @@ def normalise_coords(coords: np.ndarray, mode: str, knn_k: int = 8) -> np.ndarra
 # Patch sampler
 # ---------------------------------------------------------------------------
 class PatchSampler:
-    """Draws connected spatial patches and applies a held-out mask."""
+    """Draws connected spatial patches and applies a held-out mask.
 
-    def __init__(self, source: AnnDataCodeSource, cfg: DataConfig):
+    ``restrict_to_train=True`` (only effective when the source carries a
+    data-split mask) confines every training patch to NON-held-out cells, so
+    the model never sees the held-out region's codes during stage-2 training.
+    """
+
+    def __init__(
+        self,
+        source: AnnDataCodeSource,
+        cfg: DataConfig,
+        restrict_to_train: bool = False,
+    ):
         self.source = source
         self.cfg = cfg
+        self.restrict_to_train = bool(restrict_to_train) and source.has_holdout
+
+    def _rows_of(self, s: int) -> np.ndarray:
+        return (self.source.train_section_of(s) if self.restrict_to_train
+                else self.source.section_of(s))
 
     # ---- patch geometry ---------------------------------------------------
     def _grow_patch(self, rng: np.random.Generator) -> Tuple[int, np.ndarray]:
         """Pick a section + a disk of patch_size cells around a random seed."""
-        # weight sections by their cell count so big sections are sampled more.
-        counts = np.array(
-            [self.source.section_of(s).size for s in self.source.section_ids],
-            dtype=np.float64,
-        )
+        ids = self.source.section_ids
+        # weight sections by their (eligible) cell count so big sections are
+        # sampled more; sections with no eligible cells get zero weight.
+        counts = np.array([self._rows_of(s).size for s in ids], dtype=np.float64)
+        if counts.sum() <= 0:
+            counts = np.ones_like(counts)
         probs = counts / counts.sum()
-        s = int(self.source.section_ids[rng.choice(len(probs), p=probs)])
-        rows = self.source.section_of(s)
+        s = int(ids[rng.choice(len(probs), p=probs)])
+        rows = self._rows_of(s)
+        if rows.size == 0:                      # defensive: fall back to all rows
+            rows = self.source.section_of(s)
         coords = self.source.coords[rows]
 
         p = min(self.cfg.patch_size, rows.size)
@@ -280,7 +351,12 @@ class PatchSampler:
         )
 
     def epoch_len(self) -> int:
-        return max(1, int(self.cfg.oversample * self.source.n_cells / self.cfg.patch_size))
+        if self.restrict_to_train:
+            n = int(sum(self.source.train_section_of(s).size
+                        for s in self.source.section_ids))
+        else:
+            n = self.source.n_cells
+        return max(1, int(self.cfg.oversample * max(n, 1) / self.cfg.patch_size))
 
 
 # ---------------------------------------------------------------------------
@@ -291,37 +367,55 @@ def inpainting_patch(
     holdout_idx: Sequence[int],
     cfg: DataConfig,
     context_radius_mult: float = 2.0,
+    observed_rows: Optional[Sequence[int]] = None,
 ) -> Patch:
     """Build a patch around a KNOWN held-out region for in-painting.
 
-    The held-out cells are masked; a surrounding ring of observed cells (within
-    ``context_radius_mult`` x the region radius, capped at ``patch_size``) is
+    The held-out cells are masked; a surrounding set of observed cells is
     included as context. All held-out cells must share one section.
+
+    ``observed_rows`` (optional): restrict the context to these cells only --
+    used for a true data-split holdout, where the context must be drawn from
+    TRAIN cells exclusively so no other held-out cell's code leaks in. The
+    nearest ``patch_size - n_holdout`` observed cells (by distance to the hole
+    centroid) are taken, guaranteeing context even for an interior chunk far
+    from the hole boundary. When None, the legacy radius-based ring over all
+    cells in the section is used.
     """
     holdout_idx = np.asarray(list(holdout_idx), dtype=np.int64)
     secs = np.unique(source.section[holdout_idx])
     if secs.size != 1:
         raise ValueError("all held-out cells must be in the same section")
     s = int(secs[0])
-    rows = source.section_of(s)
-    coords_all = source.coords[rows]
-
     centre = source.coords[holdout_idx].mean(axis=0)
-    region_r = np.sqrt(
-        np.max(np.sum((source.coords[holdout_idx] - centre) ** 2, axis=1))
-    )
-    d = np.sqrt(np.sum((coords_all - centre) ** 2, axis=1))
 
-    within = d <= context_radius_mult * region_r
-    cand = rows[within]
-    # ensure all held-out cells are present, then cap to patch_size by distance.
-    cand = np.union1d(cand, holdout_idx)
-    if cand.size > cfg.patch_size:
-        dc = np.sqrt(np.sum((source.coords[cand] - centre) ** 2, axis=1))
-        keep = np.argsort(dc, kind="stable")[: cfg.patch_size]
-        cand = np.union1d(cand[keep], holdout_idx)  # never drop a held-out cell
-        if cand.size > cfg.patch_size:              # held-out alone exceeds cap
-            cand = holdout_idx.copy()
+    if observed_rows is not None:
+        obs = np.asarray(list(observed_rows), dtype=np.int64)
+        obs = obs[source.section[obs] == s]            # this section only
+        obs = obs[~np.isin(obs, holdout_idx)]          # never a held-out cell
+        budget = max(0, cfg.patch_size - int(holdout_idx.size))
+        if obs.size > budget:
+            dc = np.sum((source.coords[obs] - centre) ** 2, axis=1)
+            obs = obs[np.argsort(dc, kind="stable")[:budget]]
+        cand = np.union1d(obs, holdout_idx)
+    else:
+        rows = source.section_of(s)
+        coords_all = source.coords[rows]
+        region_r = np.sqrt(
+            np.max(np.sum((source.coords[holdout_idx] - centre) ** 2, axis=1))
+        )
+        d = np.sqrt(np.sum((coords_all - centre) ** 2, axis=1))
+
+        within = d <= context_radius_mult * region_r
+        cand = rows[within]
+        # ensure all held-out cells are present, then cap to patch_size by distance.
+        cand = np.union1d(cand, holdout_idx)
+        if cand.size > cfg.patch_size:
+            dc = np.sqrt(np.sum((source.coords[cand] - centre) ** 2, axis=1))
+            keep = np.argsort(dc, kind="stable")[: cfg.patch_size]
+            cand = np.union1d(cand[keep], holdout_idx)  # never drop a held-out cell
+            if cand.size > cfg.patch_size:              # held-out alone exceeds cap
+                cand = holdout_idx.copy()
 
     coords = source.coords[cand]
     coords_n = normalise_coords(coords, cfg.coord_norm, cfg.knn)
