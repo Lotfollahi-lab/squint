@@ -709,10 +709,13 @@ def make_dataset_blob_config_squint_vht() -> dict:
 
 def make_dataset_blob_config_xhs_3b() -> dict:
     """Xenium human skin, 3 SECTIONS (batches 11, 19, 32 of the xhs1000-39b_1p
-    panel), 1000-gene panel. Reads silver/xhs1000-3b_1p/ — make that dir contain
-    ONLY adata_batch{11,19,32}.h5ad (symlink/copy from silver/xhs1000-39b_1p/) so
-    the blob has exactly these 3 sections. Labels kept under their original obs
-    columns: cell types -> obs['new_annotation'], niches -> obs['niche_type']
+    panel; actually ~4948 genes — the 'xhs1000' prefix is legacy). Populate
+    silver/xhs1000-3b_1p/ with `analysis/data_preparation/prep_xhs_3b.py` (NOT a
+    plain symlink): the raw files lack `uns['batch']` (the blob HARD-ERRORS
+    without it) and have non-unique cell names, so prep stamps a distinct
+    uns['batch']/obs['batch'] per section and makes obs_names globally unique.
+    Labels kept under their original obs columns: cell types ->
+    obs['new_annotation'], niches -> obs['niche_type']
     (both added to compute_inference_metrics' default label keys so they're
     scored automatically). MULTI-section, so cross-batch integration is
     meaningful — the cross-MNN reference variant is the integration-aware
