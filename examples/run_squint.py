@@ -38759,6 +38759,9 @@ def main():
                        "spatch_hcc_1p",
                        "spatch_coad_1p",
                        "squint_hln",
+                       "squint_hln_allgenes",
+                       "squint_hln_hvg2k",
+                       "squint_hln_svg2k",
                        "squint_vht",
                    ],
                    help="Which dataset to build (default: "
