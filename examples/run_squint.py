@@ -26949,6 +26949,28 @@ batch_size=512,
         "build": lambda: _patch_dual_smb1_20b(
             _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90)))),
     },
+    # FiLM-scale smb1-20b_1p reference with CUSTOM codebooks: cell RVQ =
+    # (27, 81), niche RVQ = (106, 318) [L0 = 27 cell / 106 niche; L1 = 3x L0].
+    # Same model as the +crossmnn+smb1-20b_1p reference, only the RVQ sizes
+    # change — set on the spine via _build_s51_spine_codebook BEFORE FiLM (so
+    # the cell-cond FiLM embedding sizes to cell L0=27). Large niche L0 (106)
+    # matches the fine CCF-region granularity. REQUIRES the smb1-20b_1p blob.
+    "dualvq+rvq-cell-27-81+rvq-niche-106-318+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+smb1-20b_1p": {
+        "description": (
+            "FiLM-scale reference (cross-MNN + cell-cond FiLM scale-only) on "
+            "smb1-20b_1p (STARmap+ mouse-CNS, 20 sections) with cell RVQ = "
+            "(27, 81) and niche RVQ = (106, 318) [L0 = 27 cell / 106 niche "
+            "codes; L1 = 3x L0]. = the +crossmnn+smb1-20b_1p reference but with "
+            "these RVQ sizes (vs the (30,90) default). MULTI-section -> cross-MNN "
+            "+ iLISI/MMD meaningful. REQUIRES the smb1-20b_1p blob."
+        ),
+        "patches": [
+            "+rvq(cell levels=[27, 81], niche levels=[106, 318])",
+            "= <cross-MNN FiLM-scale smb1-20b_1p reference> with custom codebooks",
+        ],
+        "build": lambda: _patch_dual_smb1_20b(
+            _patch_dual_squint_default(_build_s51_spine_codebook((27, 81), (106, 318)))),
+    },
     # FiLM-scale REFERENCE (the FULL s57_v19 config) on the three spatch
     # tissue subsets (spatch_ov_1p / spatch_hcc_1p / spatch_coad_1p). Each is
     # MULTI-section (dataset_id_*.h5ad), so all use the complete s57_v19
