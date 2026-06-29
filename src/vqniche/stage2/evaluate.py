@@ -175,6 +175,7 @@ def holdout_split_eval(
     chunk_size: int,
     device: Optional[str] = None,
     out_csv: Optional[str] = None,
+    codes_out: Optional[str] = None,
     verbose: bool = True,
 ) -> Dict[str, object]:
     """In-paint the cells SQUINT actually held out (``source.holdout_mask``).
@@ -190,6 +191,10 @@ def holdout_split_eval(
     targets = cfg.prediction_targets
     rows_out: List[Dict[str, object]] = []
     all_holdout: List[np.ndarray] = []
+    # predicted code stacks per held-out cell, accumulated for `codes_out`
+    # (so the codes->expression decode step can read them without re-running).
+    pred_idx_parts: List[np.ndarray] = []
+    pred_code_parts: Dict[str, List[np.ndarray]] = {b.name: [] for b in source.branches}
 
     for s in source.section_ids:
         hrows = source.holdout_section_of(s)
@@ -207,6 +212,9 @@ def holdout_split_eval(
                           observed_rows=trows)
             gidx = res["global_idx"]
             all_holdout.append(gidx)
+            pred_idx_parts.append(gidx)
+            for b in source.branches:
+                pred_code_parts[b.name].append(np.asarray(res["codes"][b.name]))
             row: Dict[str, object] = {
                 "section": int(s), "chunk": ci,
                 "n_holdout": int(gidx.size), "patch_size": int(res["patch_size"]),
@@ -220,6 +228,17 @@ def holdout_split_eval(
                 acc0 = row.get(f"acc_{targets[0][0]}__{targets[0][1]}", float("nan"))
                 print(f"[eval]   chunk {ci}: n={gidx.size}, patch={res['patch_size']}, "
                       f"acc({targets[0][0]} L{targets[0][1]})={acc0:.3f}")
+
+    # persist predicted code stacks (global row index + per-branch codes) so
+    # examples/stage2_decode_pearson.py can decode them through the frozen
+    # stage-1 decoder without re-running the in-painting.
+    if codes_out and pred_idx_parts:
+        save_kw = {"global_idx": np.concatenate(pred_idx_parts).astype(np.int64)}
+        for b in source.branches:
+            save_kw[f"codes_{b.name}"] = np.concatenate(pred_code_parts[b.name]).astype(np.int64)
+        np.savez(codes_out, **save_kw)
+        if verbose:
+            print(f"[eval] wrote predicted codes -> {codes_out}")
 
     # cell-weighted aggregation over chunks
     counts = np.array([r["n_holdout"] for r in rows_out], float)

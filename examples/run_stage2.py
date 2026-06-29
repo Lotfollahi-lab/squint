@@ -244,6 +244,7 @@ def main(argv=None):
             summary = holdout_split_eval(
                 lit.model, source, cfg, chunk_size=chunk, device=device,
                 out_csv=os.path.join(out_dir, "stage2_eval.csv"),
+                codes_out=os.path.join(out_dir, "stage2_predicted_codes.npz"),
             )
             drop_key = "per_chunk"
         else:
