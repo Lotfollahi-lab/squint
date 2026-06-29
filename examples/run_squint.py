@@ -26675,6 +26675,40 @@ batch_size=512,
                      ]["build"](),
             mode="film_scale"),
     },
+    # FiLM-scale squint_hln reference with GROUND-TRUTH L0 codebooks at the MOUSE
+    # L1:L0 ratio (x3): cell RVQ = (16, 48) [L0=16 = #cell types], niche RVQ =
+    # (4, 12) [L0=4 = #manual niches]. Distinct from the capacity-matched
+    # (16,169)/(4,675) squint_hln variant — here L1=3*L0 mirrors mouse (30,90).
+    # Same FiLM-scale reference model otherwise; RVQ overrides applied to the
+    # spine BEFORE the FiLM patch so the cell-conditioned FiLM embedding sizes to
+    # L0=16. Uses the existing squint_hln blob (no rebuild needed).
+    "dualvq+rvq-cell-16-48+rvq-niche-4-12+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+filmscale+squint_hln": {
+        "description": (
+            "FiLM-scale squint_hln reference with ground-truth L0 codebooks at "
+            "the mouse L1:L0 ratio (x3): cell RVQ = (16, 48) [L0=16 cell types], "
+            "niche RVQ = (4, 12) [L0=4 manual niches: B cell Zone, T cell Zone, "
+            "Medulla, Germinal Center]. = the +filmscale+squint_hln reference but "
+            "with these RVQ sizes (vs the (30,90) default). Distinct from the "
+            "capacity-matched (16,169)/(4,675) variant. Uses the existing "
+            "squint_hln blob (full panel). REQUIRES the squint_hln blob."
+        ),
+        "patches": [
+            "+rvq(cell levels=[16, 48], niche levels=[4, 12])",
+            "= <squint_hln s49_v23 spine> + cell-cond niche FiLM scale-only",
+        ],
+        "build": lambda: _patch_dual_cell_conditioned_niche(
+            _patch_dual_rvq(
+                _patch_dual_rvq(
+                    VARIANTS["dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper"
+                             "+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4"
+                             "+within-sec+decoupled-enc+diversity-w10"
+                             "+contrastWB-w10-k5+squint_hln"]["build"](),
+                    branch="niche", codebook_sizes=(4, 12),
+                ),
+                branch="cell", codebook_sizes=(16, 48),
+            ),
+            mode="film_scale"),
+    },
     # ----------------------------------------------------------------------
     # squint_hln GENE-FILTERING comparison (matches the niche-benchmark paper's
     # feature-selection axis: all detected genes / top-2000 HVG / top-2000 SVG).
