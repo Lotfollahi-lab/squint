@@ -707,6 +707,26 @@ def make_dataset_blob_config_squint_vht() -> dict:
     )
 
 
+def make_dataset_blob_config_xhs_3b() -> dict:
+    """Xenium human skin, 3 SECTIONS (batches 11, 19, 32 of the xhs1000-39b_1p
+    panel), 1000-gene panel. Reads silver/xhs1000-3b_1p/ — make that dir contain
+    ONLY adata_batch{11,19,32}.h5ad (symlink/copy from silver/xhs1000-39b_1p/) so
+    the blob has exactly these 3 sections. Labels kept under their original obs
+    columns: cell types -> obs['new_annotation'], niches -> obs['niche_type']
+    (both added to compute_inference_metrics' default label keys so they're
+    scored automatically). MULTI-section, so cross-batch integration is
+    meaningful — the cross-MNN reference variant is the integration-aware
+    default; the within-batch variant is the direct analog of the squint_hln
+    runs."""
+    return _make_spatch_blob_config(
+        name="xhs1000-3b_1p",
+        description="xhs1000-3b_1p — Xenium human skin, 3 sections "
+                    "(batch 11/19/32), 1000-gene panel.",
+        label_names=["cell_types=new_annotation",
+                     "niche_types=niche_type"],
+    )
+
+
 def make_dataset_blob_config_spatch() -> dict:
     """
     Dataset-blob build config for the `spatch_1p` dataset
@@ -26791,6 +26811,54 @@ batch_size=512,
                      "+squint_hln"]["build"](),
             "squint_hln_svg1k"),
     },
+    # FiLM-scale reference on 3 Xenium human skin sections (xhs batch 11/19/32),
+    # 1000-gene panel. MULTI-section, so cross-batch integration is meaningful.
+    # TWO references, both byte-identical-model to existing SQUINT references,
+    # only the contrastive + dataset differ:
+    #   (a) WITHIN-batch (= the squint_hln reference) — direct analog of the HLN
+    #       runs; (b) CROSS-MNN (= the genuine multi-section SQUINT default, as on
+    #       mmb/chl59) — integration-aware (the within-batch special case was
+    #       forced only by squint_hln being a single section). Both REQUIRE the
+    #       xhs1000-3b_1p blob (build from a silver dir holding adata_batch
+    #       {11,19,32}.h5ad). Recommended for multi-section: the cross-MNN one.
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+filmscale+xhs1000-3b_1p": {
+        "description": (
+            "FiLM-scale squint_hln reference (WITHIN-batch contrastive) redirected "
+            "to 3 Xenium human skin sections (xhs batch 11/19/32, 1000-gene "
+            "panel). Byte-identical model; labels new_annotation / niche_type via "
+            "the xhs1000-3b_1p blob. Direct analog of the HLN runs. REQUIRES that "
+            "blob."
+        ),
+        "patches": ["= <filmscale squint_hln reference (within-batch)> on xhs1000-3b_1p"],
+        "build": lambda: _patch_dataset_name(
+            VARIANTS["dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32"
+                     "+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec"
+                     "+decoupled-enc+diversity-w10+contrastWB-w10-k5+filmscale"
+                     "+squint_hln"]["build"](),
+            "xhs1000-3b_1p"),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+xhs1000-3b_1p": {
+        "description": (
+            "FiLM-scale reference with CROSS-BATCH MNN contrastive (wt=10, k=1) on "
+            "3 Xenium human skin sections (xhs batch 11/19/32). The genuine "
+            "multi-section SQUINT default (= the mmb s57_v19 / chl59 coupling): "
+            "within-batch contrastive swapped for cross-MNN so cross-section "
+            "integration is optimized. Same RVQ (30,90) decoupled + FiLM-scale "
+            "model; labels new_annotation / niche_type. REQUIRES the xhs1000-3b_1p "
+            "blob. RECOMMENDED for this multi-section dataset."
+        ),
+        "patches": [
+            "= <filmscale squint_hln reference> + within->cross-MNN (wt10,k1) on xhs1000-3b_1p",
+        ],
+        "build": lambda: _patch_dataset_name(
+            _patch_dual_contrastive_cross_batch(
+                VARIANTS["dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper"
+                         "+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4"
+                         "+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5"
+                         "+filmscale+squint_hln"]["build"](),
+                wt_cross=10.0, k_cross=1),
+            "xhs1000-3b_1p"),
+    },
     # FiLM-scale REFERENCE (the FULL s57_v19 config) on chl59-8b_1p (CosMx Lung,
     # 8 sections). Unlike squint_hln (1 section), chl59 is MULTI-section, so this
     # uses the complete s57_v19 coupling = cross-batch MNN (wt=10,k=1) + cell-cond
@@ -36714,6 +36782,9 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
     elif dataset == "squint_vht":
         cfg = make_dataset_blob_config_squint_vht()
         cfg_path = CONFIG_OUT_DIR / "build_blob_squint_vht.yaml"
+    elif dataset == "xhs1000-3b_1p":
+        cfg = make_dataset_blob_config_xhs_3b()
+        cfg_path = CONFIG_OUT_DIR / "build_blob_xhs1000-3b_1p.yaml"
     else:
         raise ValueError(
             f"Unknown --build-blob-dataset {dataset!r}. Choices: "
@@ -36721,7 +36792,8 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
             f"'mmb0-1b_smb1-20b_1p', 'mmb0-239b_1p', 'smb1-20b_1p', "
             f"'spatch_1p', 'spatch_ov_1p', 'spatch_hcc_1p', "
             f"'spatch_coad_1p', 'squint_hln', 'squint_hln_allgenes', "
-            f"'squint_hln_hvg2k', 'squint_hln_svg2k', 'squint_vht'."
+            f"'squint_hln_hvg1k', 'squint_hln_hvg2k', 'squint_hln_svg1k', "
+            f"'squint_hln_svg2k', 'squint_vht', 'xhs1000-3b_1p'."
         )
     with open(cfg_path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
@@ -38933,6 +39005,7 @@ def main():
                        "squint_hln_svg1k",
                        "squint_hln_svg2k",
                        "squint_vht",
+                       "xhs1000-3b_1p",
                    ],
                    help="Which dataset to build (default: "
                         "mmb0-1b_smb1-1b_1p — MERFISH + STARmap mouse "
