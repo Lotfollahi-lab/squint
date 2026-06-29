@@ -26726,6 +26726,34 @@ batch_size=512,
                      "+squint_hln"]["build"](),
             "squint_hln_svg2k"),
     },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+filmscale+squint_hln_hvg1k": {
+        "description": (
+            "FiLM-scale squint_hln reference on the top-1000 HVGs (scanpy "
+            "seurat_v3 on raw counts). Identical model to the +squint_hln "
+            "reference; reads the squint_hln_hvg1k blob. REQUIRES that blob."
+        ),
+        "patches": ["= <filmscale squint_hln reference> on the HVG-1000 blob"],
+        "build": lambda: _patch_dataset_name(
+            VARIANTS["dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32"
+                     "+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec"
+                     "+decoupled-enc+diversity-w10+contrastWB-w10-k5+filmscale"
+                     "+squint_hln"]["build"](),
+            "squint_hln_hvg1k"),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+filmscale+squint_hln_svg1k": {
+        "description": (
+            "FiLM-scale squint_hln reference on the top-1000 SVGs (squidpy "
+            "Moran's I). Identical model to the +squint_hln reference; reads "
+            "the squint_hln_svg1k blob. REQUIRES that blob."
+        ),
+        "patches": ["= <filmscale squint_hln reference> on the SVG-1000 blob"],
+        "build": lambda: _patch_dataset_name(
+            VARIANTS["dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32"
+                     "+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec"
+                     "+decoupled-enc+diversity-w10+contrastWB-w10-k5+filmscale"
+                     "+squint_hln"]["build"](),
+            "squint_hln_svg1k"),
+    },
     # FiLM-scale REFERENCE (the FULL s57_v19 config) on chl59-8b_1p (CosMx Lung,
     # 8 sections). Unlike squint_hln (1 section), chl59 is MULTI-section, so this
     # uses the complete s57_v19 coupling = cross-batch MNN (wt=10,k=1) + cell-cond
@@ -36540,7 +36568,8 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
     elif dataset == "squint_hln":
         cfg = make_dataset_blob_config_squint_hln()
         cfg_path = CONFIG_OUT_DIR / "build_blob_squint_hln.yaml"
-    elif dataset in ("squint_hln_allgenes", "squint_hln_hvg2k", "squint_hln_svg2k"):
+    elif dataset in ("squint_hln_allgenes", "squint_hln_hvg1k", "squint_hln_hvg2k",
+                     "squint_hln_svg1k", "squint_hln_svg2k"):
         cfg = make_dataset_blob_config_squint_hln_geneset(dataset)
         cfg_path = CONFIG_OUT_DIR / f"build_blob_{dataset}.yaml"
     elif dataset == "squint_vht":
@@ -38760,7 +38789,9 @@ def main():
                        "spatch_coad_1p",
                        "squint_hln",
                        "squint_hln_allgenes",
+                       "squint_hln_hvg1k",
                        "squint_hln_hvg2k",
+                       "squint_hln_svg1k",
                        "squint_hln_svg2k",
                        "squint_vht",
                    ],
