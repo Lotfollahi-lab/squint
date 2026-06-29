@@ -4,8 +4,8 @@
 # Submit a single GPU LSF job that trains the SQUINT stage-2 spatial code prior
 # (vqniche.stage2) on a frozen predicted_adata.h5ad, then runs a region-holdout
 # in-painting evaluation. Mirrors the env / LSF conventions of
-# submit_multi_seed.sh (venv at /nfs/team361/sb75/.venvs/squint, gpu-lotfollahi,
-# group team361, one exclusive GPU).
+# submit_multi_seed.sh (venv at /nfs/team361/sb75/.venvs/squint, training-parallel
+# GPU queue, group s10396, one exclusive GPU).
 #
 # Usage:
 #   bash examples/submit_stage2.sh <PREDICTED_ADATA> [-- <run_stage2.py args>]
@@ -22,8 +22,8 @@
 #   VENV_PATH    /nfs/team361/sb75/.venvs/squint
 #   SQUINT_REPO  <auto: this script's repo root>
 #   LOG_ROOT     /nfs/team361/sb75/squint-reproducibility/artifacts/logs
-#   LSF_GROUP    team361        (-G; works with gpu-lotfollahi for stage 2)
-#   LSF_QUEUE    gpu-lotfollahi (-q)
+#   LSF_GROUP    s10396           (-G; pairs with training-parallel)
+#   LSF_QUEUE    training-parallel (-q; the GPU queue submit_single_run.sh uses)
 #   LSF_CORES    16
 #   LSF_MEM_MB   128000
 #   LSF_GPU      mode=exclusive_process:num=1:block=yes
@@ -48,8 +48,8 @@ SQUINT_REPO="${SQUINT_REPO:-"$( cd -- "$SCRIPT_DIR/.." &> /dev/null && pwd )"}"
 VENV_PATH="${VENV_PATH:-/nfs/team361/sb75/.venvs/squint}"
 LOG_ROOT="${LOG_ROOT:-/nfs/team361/sb75/squint-reproducibility/artifacts/logs}"
 
-LSF_GROUP="${LSF_GROUP:-team361}"
-LSF_QUEUE="${LSF_QUEUE:-gpu-lotfollahi}"
+LSF_GROUP="${LSF_GROUP:-s10396}"
+LSF_QUEUE="${LSF_QUEUE:-training-parallel}"
 LSF_CORES="${LSF_CORES:-16}"
 LSF_MEM_MB="${LSF_MEM_MB:-128000}"
 LSF_GPU="${LSF_GPU:-mode=exclusive_process:num=1:block=yes}"
