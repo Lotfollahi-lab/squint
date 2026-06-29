@@ -669,6 +669,25 @@ def make_dataset_blob_config_squint_hln() -> dict:
     )
 
 
+def make_dataset_blob_config_squint_hln_geneset(name: str) -> dict:
+    """Gene-filtered squint_hln variant blob config (all / hvg2k / svg2k).
+
+    Identical to `make_dataset_blob_config_squint_hln` except for the dataset
+    `name`, which points the blob at `silver/<name>/` — the gene-filtered
+    AnnData written by `analysis/data_preparation/preprocess_squint_hln.py`
+    (negative-control probes removed, then all-detected / top-2000-HVG /
+    top-2000-SVG). Same single CosMx section, same manual-niche labels.
+    `name` must be one of: squint_hln_allgenes, squint_hln_hvg2k,
+    squint_hln_svg2k."""
+    return _make_spatch_blob_config(
+        name=name,
+        description=f"{name} — CosMx human lymph node (gene-filtered), "
+                    "manual niches (spatial-niche-benchmark).",
+        label_names=["cell_types=cell_type_annotation",
+                     "niche_types=niche_annotation"],
+    )
+
+
 def make_dataset_blob_config_squint_vht() -> dict:
     """Human Tonsil Cell Atlas Visium (silver/squint_vht). Labels kept under
     their original obs columns and registered here:
@@ -4700,6 +4719,22 @@ def _patch_dual_squint_hln(
         edge_sampling_ratio=edge_sampling_ratio,
     )
     return _patch_dual_max_epochs(cfg, max_epochs=max_epochs)
+
+
+def _patch_dataset_name(cfg: dict, dataset_name: str) -> dict:
+    """Redirect a fully-built TRAINING cfg to a different dataset blob by name.
+
+    Only `cfg["dataset"]["dataset_name"]` / `["dataset_tag"]` are changed (the
+    pair `_patch_dual_spatch_subset` writes), so the loaded blob (and its
+    `silver/<dataset_name>/` source + artifact path) switches while the MODEL
+    config stays byte-identical. Used to run the squint_hln FiLM-scale reference
+    on the gene-filtered blobs (squint_hln_allgenes / _hvg2k / _svg2k) produced
+    by `analysis/data_preparation/preprocess_squint_hln.py`. The model's gene
+    input dim is derived from the blob at runtime, so a 2000-gene blob just
+    works without any config change."""
+    cfg["dataset"]["dataset_name"] = dataset_name
+    cfg["dataset"]["dataset_tag"]  = dataset_name
+    return cfg
 
 
 def _patch_dual_spatch(
@@ -26640,6 +26675,57 @@ batch_size=512,
                      ]["build"](),
             mode="film_scale"),
     },
+    # ----------------------------------------------------------------------
+    # squint_hln GENE-FILTERING comparison (matches the niche-benchmark paper's
+    # feature-selection axis: all detected genes / top-2000 HVG / top-2000 SVG).
+    # Each is the EXACT FiLM-scale squint_hln reference above, only redirected to
+    # a gene-filtered blob via `_patch_dataset_name` (model byte-identical; the
+    # gene input dim is derived from the blob at runtime). Build the blobs first
+    # with `preprocess_squint_hln.py` + `--build-blob-dataset squint_hln_<tag>`.
+    # ----------------------------------------------------------------------
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+filmscale+squint_hln_allgenes": {
+        "description": (
+            "FiLM-scale squint_hln reference on ALL detected genes (negative "
+            "controls removed + filter_genes only; no HVG/SVG selection). "
+            "Identical model to the +squint_hln reference; reads the "
+            "squint_hln_allgenes blob. REQUIRES that blob."
+        ),
+        "patches": ["= <filmscale squint_hln reference> on the all-genes blob"],
+        "build": lambda: _patch_dataset_name(
+            VARIANTS["dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32"
+                     "+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec"
+                     "+decoupled-enc+diversity-w10+contrastWB-w10-k5+filmscale"
+                     "+squint_hln"]["build"](),
+            "squint_hln_allgenes"),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+filmscale+squint_hln_hvg2k": {
+        "description": (
+            "FiLM-scale squint_hln reference on the top-2000 HVGs (scanpy "
+            "seurat_v3 on raw counts). Identical model to the +squint_hln "
+            "reference; reads the squint_hln_hvg2k blob. REQUIRES that blob."
+        ),
+        "patches": ["= <filmscale squint_hln reference> on the HVG-2000 blob"],
+        "build": lambda: _patch_dataset_name(
+            VARIANTS["dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32"
+                     "+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec"
+                     "+decoupled-enc+diversity-w10+contrastWB-w10-k5+filmscale"
+                     "+squint_hln"]["build"](),
+            "squint_hln_hvg2k"),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+contrastWB-w10-k5+filmscale+squint_hln_svg2k": {
+        "description": (
+            "FiLM-scale squint_hln reference on the top-2000 SVGs (squidpy "
+            "Moran's I). Identical model to the +squint_hln reference; reads "
+            "the squint_hln_svg2k blob. REQUIRES that blob."
+        ),
+        "patches": ["= <filmscale squint_hln reference> on the SVG-2000 blob"],
+        "build": lambda: _patch_dataset_name(
+            VARIANTS["dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32"
+                     "+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec"
+                     "+decoupled-enc+diversity-w10+contrastWB-w10-k5+filmscale"
+                     "+squint_hln"]["build"](),
+            "squint_hln_svg2k"),
+    },
     # FiLM-scale REFERENCE (the FULL s57_v19 config) on chl59-8b_1p (CosMx Lung,
     # 8 sections). Unlike squint_hln (1 section), chl59 is MULTI-section, so this
     # uses the complete s57_v19 coupling = cross-batch MNN (wt=10,k=1) + cell-cond
@@ -36454,6 +36540,9 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
     elif dataset == "squint_hln":
         cfg = make_dataset_blob_config_squint_hln()
         cfg_path = CONFIG_OUT_DIR / "build_blob_squint_hln.yaml"
+    elif dataset in ("squint_hln_allgenes", "squint_hln_hvg2k", "squint_hln_svg2k"):
+        cfg = make_dataset_blob_config_squint_hln_geneset(dataset)
+        cfg_path = CONFIG_OUT_DIR / f"build_blob_{dataset}.yaml"
     elif dataset == "squint_vht":
         cfg = make_dataset_blob_config_squint_vht()
         cfg_path = CONFIG_OUT_DIR / "build_blob_squint_vht.yaml"
@@ -36463,7 +36552,8 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
             f"'mmb0-1b_smb1-1b_1p', 'chl59-8b_1p', 'chl59-2b_1p', "
             f"'mmb0-1b_smb1-20b_1p', 'mmb0-239b_1p', 'smb1-20b_1p', "
             f"'spatch_1p', 'spatch_ov_1p', 'spatch_hcc_1p', "
-            f"'spatch_coad_1p', 'squint_hln', 'squint_vht'."
+            f"'spatch_coad_1p', 'squint_hln', 'squint_hln_allgenes', "
+            f"'squint_hln_hvg2k', 'squint_hln_svg2k', 'squint_vht'."
         )
     with open(cfg_path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
