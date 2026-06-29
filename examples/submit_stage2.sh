@@ -22,7 +22,7 @@
 #   VENV_PATH    /nfs/team361/sb75/.venvs/squint
 #   SQUINT_REPO  <auto: this script's repo root>
 #   LOG_ROOT     /nfs/team361/sb75/squint-reproducibility/artifacts/logs
-#   LSF_GROUP    team361        (-G; project cost-code group for the GPU queue)
+#   LSF_GROUP    team361        (-G; works with gpu-lotfollahi for stage 2)
 #   LSF_QUEUE    gpu-lotfollahi (-q)
 #   LSF_CORES    16
 #   LSF_MEM_MB   128000
