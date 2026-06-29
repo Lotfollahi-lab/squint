@@ -26862,6 +26862,40 @@ batch_size=512,
                 wt_cross=10.0, k_cross=1),
             "xhs1000-3b_1p"),
     },
+    # Cross-MNN FiLM-scale xhs reference with CUSTOM codebooks: cell RVQ =
+    # (21, 63), niche RVQ = (12, 36) (L0 = 21 cell / 12 niche; L1 = 3x L0).
+    # Same model as the cross-MNN +xhs1000-3b_1p reference, only the RVQ sizes
+    # differ — applied to the spine BEFORE FiLM so the cell-conditioned FiLM
+    # embedding sizes to cell L0=21. REQUIRES the xhs1000-3b_1p blob.
+    "dualvq+rvq-cell-21-63+rvq-niche-12-36+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+xhs1000-3b_1p": {
+        "description": (
+            "Cross-MNN FiLM-scale reference on 3 Xenium human skin sections "
+            "(xhs batch 11/19/32) with cell RVQ = (21, 63) and niche RVQ = "
+            "(12, 36) [L0 = 21 cell / 12 niche codes; L1 = 3x L0]. = the "
+            "+crossmnn+xhs1000-3b_1p reference but with these RVQ sizes (vs the "
+            "(30,90) default). Labels new_annotation / niche_type. REQUIRES the "
+            "xhs1000-3b_1p blob."
+        ),
+        "patches": [
+            "+rvq(cell levels=[21, 63], niche levels=[12, 36])",
+            "= <cross-MNN FiLM-scale xhs reference> with custom codebooks",
+        ],
+        "build": lambda: _patch_dataset_name(
+            _patch_dual_contrastive_cross_batch(
+                _patch_dual_cell_conditioned_niche(
+                    _patch_dual_rvq(
+                        _patch_dual_rvq(
+                            VARIANTS["dualvq+rvq-both+decoder-cov+no-batch-int"
+                                     "+enc-deeper+dec-w32+knn16+sampler16+cell-w1"
+                                     "+bs512+lr7e-4+within-sec+decoupled-enc"
+                                     "+diversity-w10+contrastWB-w10-k5+squint_hln"
+                                     ]["build"](),
+                            branch="niche", codebook_sizes=(12, 36)),
+                        branch="cell", codebook_sizes=(21, 63)),
+                    mode="film_scale"),
+                wt_cross=10.0, k_cross=1),
+            "xhs1000-3b_1p"),
+    },
     # FiLM-scale REFERENCE (the FULL s57_v19 config) on chl59-8b_1p (CosMx Lung,
     # 8 sections). Unlike squint_hln (1 section), chl59 is MULTI-section, so this
     # uses the complete s57_v19 coupling = cross-batch MNN (wt=10,k=1) + cell-cond
