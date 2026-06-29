@@ -657,15 +657,18 @@ def make_dataset_blob_config_squint_hln() -> dict:
     """CosMx human lymph node with MANUAL niche annotations from the
     spatial-niche-benchmark study (silver/squint_hln). Single section.
     Labels are kept under their original obs columns and registered here:
-    cell types -> obs['cell_type_annotation'] (NanoString),
-    niches     -> obs['niche_annotation'] (4 manual niches: B cell Zone,
-                  T cell Zone, Medulla, Germinal Center)."""
+    cell types -> obs['cell_type'] (NanoString),
+    niches     -> obs['niche'] (4 manual niches: B cell Zone,
+                  T cell Zone, Medulla, Germinal Center).
+    NOTE: the silver AnnData stores these as 'cell_type' / 'niche' (NOT the
+    '*_annotation' names) — the blob loader silently skips missing label
+    columns, so a mismatch here yields UNLABELED cells + meaningless NMI/ARI."""
     return _make_spatch_blob_config(
         name="squint_hln",
         description="squint_hln — CosMx human lymph node, manual niches "
                     "(spatial-niche-benchmark).",
-        label_names=["cell_types=cell_type_annotation",
-                     "niche_types=niche_annotation"],
+        label_names=["cell_types=cell_type",
+                     "niche_types=niche"],
     )
 
 
@@ -683,8 +686,8 @@ def make_dataset_blob_config_squint_hln_geneset(name: str) -> dict:
         name=name,
         description=f"{name} — CosMx human lymph node (gene-filtered), "
                     "manual niches (spatial-niche-benchmark).",
-        label_names=["cell_types=cell_type_annotation",
-                     "niche_types=niche_annotation"],
+        label_names=["cell_types=cell_type",
+                     "niche_types=niche"],
     )
 
 
