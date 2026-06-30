@@ -93,7 +93,16 @@ def parse_args(argv=None):
     p.add_argument("--val-check-interval", type=int, default=1000)
 
     # decoding (eval)
-    p.add_argument("--decode-steps", type=int, default=12)
+    p.add_argument("--decode-steps", type=int, default=12,
+                   help="MaskGIT iterative-unmask iterations at decode/eval time.")
+    p.add_argument("--decode-schedule", choices=["cosine", "linear"], default="cosine",
+                   help="Fraction-unmasked schedule across decode steps.")
+    p.add_argument("--decode-temperature", type=float, default=1.0,
+                   help="Sampling temperature (0 -> argmax/greedy commits).")
+    p.add_argument("--decode-noise-anneal", type=float, default=1.0,
+                   help="Gumbel confidence-noise scale (annealed to 0 over steps).")
+    p.add_argument("--decode-context-radius-mult", type=float, default=2.0,
+                   help="Observed-context ring radius = this * masked-region radius.")
     p.add_argument("--eval-regions", type=int, default=8)
     p.add_argument("--eval-holdout-frac", type=float, default=0.1)
     p.add_argument("--skip-eval", action="store_true")
@@ -159,7 +168,11 @@ def build_config(args, source):
                             warmup_steps=args.warmup_steps, max_steps=args.max_steps,
                             grad_clip=args.grad_clip, batch_size=args.batch_size,
                             l0_weight=args.l0_weight)
-        decode = DecodeConfig(steps=args.decode_steps)
+        decode = DecodeConfig(steps=args.decode_steps,
+                              schedule=args.decode_schedule,
+                              temperature=args.decode_temperature,
+                              noise_anneal=args.decode_noise_anneal,
+                              context_radius_mult=args.decode_context_radius_mult)
         eval_regions = args.eval_regions
 
     cfg = Stage2Config(branches=branches, data=data, model=model, decode=decode,

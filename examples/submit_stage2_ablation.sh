@@ -68,6 +68,18 @@ variant_train_flags() {
         arch-graphmae)   echo "--arch graphmae" ;;     # GNN enc -> re-mask -> GNN dec (GraphMAE)
         arch-gps)        echo "--arch gps" ;;          # MPNN + global attention hybrid (GraphGPS)
         arch-diffusion)  echo "--arch diffusion --decode-steps 20" ;;  # timestep-conditioned denoiser (discrete diffusion)
+        # --- DECODE-side sweep around the winning decode20 (decode-only knobs:
+        #     the base model trains identically; only MaskGIT inference differs) ---
+        decode16)        echo "--decode-steps 16" ;;
+        decode24)        echo "--decode-steps 24" ;;
+        decode28)        echo "--decode-steps 28" ;;
+        decode32)        echo "--decode-steps 32" ;;
+        decode40)        echo "--decode-steps 40" ;;
+        decode-linear)   echo "--decode-steps 20 --decode-schedule linear" ;;       # linear unmask schedule
+        decode-temp05)   echo "--decode-steps 20 --decode-temperature 0.5" ;;       # sharper sampling
+        decode-greedy)   echo "--decode-steps 20 --decode-temperature 0.0" ;;       # argmax commits
+        decode-ctx3)     echo "--decode-steps 20 --decode-context-radius-mult 3.0" ;; # wider observed context ring
+        decode-nonoise)  echo "--decode-steps 20 --decode-noise-anneal 0.0" ;;      # no confidence noise
         # --- new-code arms (need the knobs implemented first) ---
         # density)   echo "--density-aware" ;;        # conditioning agent C2
         # distbias)  echo "--attn-dist-exponent 1.5";# attention agent A1

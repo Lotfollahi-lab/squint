@@ -68,12 +68,83 @@ def _hvg_idx(target_log1p: np.ndarray, n_hvg: int) -> np.ndarray:
     return idx
 
 
-def _pearson_rows(target, pred, branch, split, seed, n_hvg=50, log1p=True):
-    """Replicates build_pearson_dataframe's per-(branch,split) rows."""
+def _rankdata_axis(x, axis):
+    from scipy.stats import rankdata
+    try:
+        return rankdata(x, axis=axis).astype(np.float32)
+    except TypeError:                                   # scipy < 1.10: no axis=
+        return np.apply_along_axis(rankdata, axis, x).astype(np.float32)
+
+
+def _spearman_pairwise(a, b, axis):
+    """Spearman == Pearson on average-ranks (transform-invariant)."""
+    return _pearson_pairwise(_rankdata_axis(a, axis), _rankdata_axis(b, axis), axis)
+
+
+def _mse_pairwise(pred, target, axis):
+    return ((np.asarray(pred, np.float32) - np.asarray(target, np.float32)) ** 2).mean(axis=axis)
+
+
+def _finite_mm(vec):
+    v = vec[np.isfinite(vec)]
+    if v.size == 0:
+        return float("nan"), float("nan")
+    return float(v.mean()), float(np.median(v))
+
+
+def _zero_nonzero(pred_raw, target_raw):
+    """Pooled AUROC / AUPRC for recovering nonzero entries on raw counts."""
+    y = (np.asarray(target_raw).ravel() > 0).astype(np.int8)
+    if y.size == 0 or y.min() == y.max():
+        return float("nan"), float("nan")
+    s = np.asarray(pred_raw, np.float32).ravel()
+    ok = np.isfinite(s)
+    y, s = y[ok], s[ok]
+    if y.size == 0 or y.min() == y.max():
+        return float("nan"), float("nan")
+    try:
+        from sklearn.metrics import roc_auc_score, average_precision_score
+        return float(roc_auc_score(y, s)), float(average_precision_score(y, s))
+    except Exception:                                   # noqa: BLE001 (sklearn missing/degenerate)
+        return float("nan"), float("nan")
+
+
+def _marker_idx(target_log1p, labels, n_per_label=10, max_total=100):
+    """Union of top one-vs-rest DE genes per cell type (truth-derived), numpy
+    only. Mirrors _holdout_utils.build_pearson_dataframe's marker selection."""
+    labels = np.asarray(labels)
+    uniq = [u for u in dict.fromkeys(labels.tolist())
+            if u is not None and str(u) != "nan"
+            and not (isinstance(u, float) and u != u)]
+    if len(uniq) < 2 or target_log1p.shape[1] == 0:
+        return np.array([], dtype=int)
+    npl = min(int(n_per_label), target_log1p.shape[1])
+    grand = target_log1p.mean(axis=0)
+    picked = set()
+    for u in uniq:
+        m = labels == u
+        if m.sum() == 0:
+            continue
+        score = target_log1p[m].mean(axis=0) - grand
+        picked.update(int(i) for i in np.argpartition(-score, npl - 1)[:npl])
+    idx = np.array(sorted(picked), dtype=int)
+    if idx.size > max_total:
+        order = np.argsort(-(target_log1p[:, idx].var(axis=0)))
+        idx = np.sort(idx[order[:max_total]])
+    return idx
+
+
+def _pearson_rows(target, pred, branch, split, seed, n_hvg=50, log1p=True,
+                  marker_idx=None):
+    """Full metric panel per (branch, split), identical to
+    _holdout_utils.build_pearson_dataframe: each correlation row carries Pearson
+    + Spearman + MSE/RMSE across gene_wise/cell_wise x log1p/raw x all/hvg/
+    markers; plus entrywise zero/nonzero AUROC+AUPRC rows."""
     target = np.asarray(target, np.float32)
     pred = np.asarray(pred, np.float32)
     n_cells, n_genes = target.shape
     hvg = _hvg_idx(np.log1p(np.clip(target, 0, None)), n_hvg)
+    mk = marker_idx if (marker_idx is not None and len(marker_idx) > 0) else None
 
     transforms = (["log1p", "raw"] if log1p else ["raw"])
     rows = []
@@ -85,25 +156,48 @@ def _pearson_rows(target, pred, branch, split, seed, n_hvg=50, log1p=True):
             t_full, p_full = target, pred
         for axis_name, axis in (("gene_wise", 0), ("cell_wise", 1)):
             subsets = ["all"]
-            if axis_name == "gene_wise" and hvg.size > 0:
-                subsets.append(f"hvg{hvg.size}")
+            if axis_name == "gene_wise":
+                if hvg.size > 0:
+                    subsets.append(f"hvg{hvg.size}")
+                if mk is not None:
+                    subsets.append("markers")
             for gene_subset in subsets:
                 if gene_subset == "all":
                     t_sub, p_sub, ng = t_full, p_full, n_genes
+                elif gene_subset == "markers":
+                    t_sub, p_sub, ng = t_full[:, mk], p_full[:, mk], int(len(mk))
                 else:
                     t_sub, p_sub, ng = t_full[:, hvg], p_full[:, hvg], int(hvg.size)
-                vec = _pearson_pairwise(p_sub, t_sub, axis=axis)
-                vec = vec[np.isfinite(vec)]
-                if vec.size == 0:
+                pv = _pearson_pairwise(p_sub, t_sub, axis=axis)
+                if pv[np.isfinite(pv)].size == 0:
                     continue
+                pm, pmd = _finite_mm(pv)
+                sm, smd = _finite_mm(_spearman_pairwise(p_sub, t_sub, axis))
+                mm, mmd = _finite_mm(_mse_pairwise(p_sub, t_sub, axis))
                 rows.append({
                     "seed": int(seed), "branch": branch, "split": split,
                     "axis": axis_name, "transform": transform,
                     "gene_subset": gene_subset,
-                    "pearson_mean": float(vec.mean()),
-                    "pearson_median": float(np.median(vec)),
+                    "pearson_mean": pm, "pearson_median": pmd,
+                    "spearman_mean": sm, "spearman_median": smd,
+                    "mse_mean": mm, "mse_median": mmd,
+                    "rmse_mean": (float(np.sqrt(mm)) if mm == mm else float("nan")),
                     "n_cells": int(n_cells), "n_genes": int(ng),
                 })
+    # zero/nonzero recovery (entry-wise; raw counts; transform-independent)
+    zsubs = [("all", None)] + ([("markers", mk)] if mk is not None else [])
+    for gs, idx in zsubs:
+        t_z = target if idx is None else target[:, idx]
+        p_z = pred if idx is None else pred[:, idx]
+        au, ap = _zero_nonzero(p_z, t_z)
+        if au != au and ap != ap:
+            continue
+        rows.append({
+            "seed": int(seed), "branch": branch, "split": split,
+            "axis": "entrywise", "transform": "counts", "gene_subset": gs,
+            "auroc_zero": au, "auprc_zero": ap,
+            "n_cells": int(n_cells), "n_genes": int(t_z.shape[1]),
+        })
     return rows
 
 
@@ -321,8 +415,27 @@ def main(argv=None):
 
     # ---- Pearson on the held-out cells ------------------------------------
     target = X[gidx]
-    rows = (_pearson_rows(target, xhat_imp, branch="cell", split="all", seed=args.seed)
-            + _pearson_rows(target, xhat_imp, branch="cell", split="test", seed=args.seed))
+    # marker genes: top one-vs-rest DE per cell type, derived from the TRUTH on
+    # TRAIN cells (so held-out genes never inform selection) — gives the
+    # 'markers' gene-subset metrics, matching build_pearson_dataframe.
+    marker_idx = None
+    _lab = next((k for k in ("cell_type", "cell_types", "new_annotation", "annotation")
+                 if k in adata.obs.columns), None)
+    if _lab is not None:
+        labs = adata.obs[_lab].to_numpy()
+        if "data_split" in adata.obs.columns:
+            tr = adata.obs["data_split"].to_numpy() != "test"
+        else:
+            tr = np.ones(adata.n_obs, dtype=bool)
+        if tr.sum() == 0:
+            tr = np.ones(adata.n_obs, dtype=bool)
+        marker_idx = _marker_idx(np.log1p(np.clip(X[tr], 0, None)), labs[tr])
+        print(f"[decode] markers: {0 if marker_idx is None else len(marker_idx)} "
+              f"genes from label '{_lab}' (train cells)")
+    rows = (_pearson_rows(target, xhat_imp, branch="cell", split="all",
+                          seed=args.seed, marker_idx=marker_idx)
+            + _pearson_rows(target, xhat_imp, branch="cell", split="test",
+                            seed=args.seed, marker_idx=marker_idx))
     df = pd.DataFrame(rows)
 
     os.makedirs(args.out_metrics_dir, exist_ok=True)
