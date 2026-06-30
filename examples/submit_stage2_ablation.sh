@@ -60,6 +60,14 @@ variant_train_flags() {
         nohier)    echo "--no-hierarchical" ;;                            # ablate the cell->niche head conditioning
         bigctx)    echo "--neighbors-k 48 --eval-chunk-size 256 --patch-size 2048" ;;  # more observed context, same model size
         soft)      echo "" ;;                         # same train as base; soft decode (probs saved by run_stage2)
+        # --- ARCHITECTURE ablation: swappable stage-2 backbone (--arch) -----
+        # Same embedding / heads / masked-CE / MaskGIT decode; only the body
+        # differs (vqniche.stage2.backbones). 'base' is the transformer arch.
+        arch-gnn)        echo "--arch gnn" ;;          # spatial-kNN message passing (GraphSAGE)
+        arch-labelprop)  echo "--arch labelprop" ;;    # APPNP propagation + MLP correction (smoothness ceiling)
+        arch-graphmae)   echo "--arch graphmae" ;;     # GNN enc -> re-mask -> GNN dec (GraphMAE)
+        arch-gps)        echo "--arch gps" ;;          # MPNN + global attention hybrid (GraphGPS)
+        arch-diffusion)  echo "--arch diffusion --decode-steps 20" ;;  # timestep-conditioned denoiser (discrete diffusion)
         # --- new-code arms (need the knobs implemented first) ---
         # density)   echo "--density-aware" ;;        # conditioning agent C2
         # distbias)  echo "--attn-dist-exponent 1.5";# attention agent A1

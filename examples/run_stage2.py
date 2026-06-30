@@ -66,6 +66,19 @@ def parse_args(argv=None):
     p.add_argument("--pos-num-freqs", type=int, default=64)
     p.add_argument("--no-hierarchical", action="store_true",
                    help="Disable cell->niche conditioning (branches independent).")
+    # backbone architecture (the stage-2 ablation axis; same embedding/heads/decode)
+    p.add_argument("--arch", default="transformer",
+                   choices=["transformer", "gnn", "labelprop", "graphmae", "gps",
+                            "diffusion"],
+                   help="Stage-2 backbone: transformer (default) | gnn | labelprop "
+                        "| graphmae | gps | diffusion.")
+    p.add_argument("--graph-knn", type=int, default=16,
+                   help="Neighbours/cell for message-passing archs (gnn/gps/labelprop/graphmae).")
+    p.add_argument("--gnn-aggregator", default="mean", choices=["mean", "sum", "max"])
+    p.add_argument("--prop-steps", type=int, default=10,
+                   help="labelprop: APPNP propagation rounds.")
+    p.add_argument("--prop-alpha", type=float, default=0.1,
+                   help="labelprop: APPNP teleport probability.")
 
     # optimisation
     p.add_argument("--batch-size", type=int, default=8)
@@ -121,7 +134,10 @@ def build_config(args, source):
                           coord_key=args.coord_key, section_key=args.section_key)
         model = ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128,
                             dropout=args.dropout, pos_num_freqs=16,
-                            hierarchical=not args.no_hierarchical)
+                            hierarchical=not args.no_hierarchical,
+                            arch=args.arch, graph_knn=args.graph_knn,
+                            gnn_aggregator=args.gnn_aggregator,
+                            prop_steps=args.prop_steps, prop_alpha=args.prop_alpha)
         optim = OptimConfig(lr=args.lr, weight_decay=args.weight_decay,
                             warmup_steps=20, max_steps=80, grad_clip=args.grad_clip,
                             batch_size=min(4, args.batch_size), l0_weight=args.l0_weight)
@@ -135,7 +151,10 @@ def build_config(args, source):
         model = ModelConfig(d_model=args.d_model, n_layers=args.n_layers,
                             n_heads=args.n_heads, d_ff=args.d_ff, dropout=args.dropout,
                             pos_num_freqs=args.pos_num_freqs,
-                            hierarchical=not args.no_hierarchical)
+                            hierarchical=not args.no_hierarchical,
+                            arch=args.arch, graph_knn=args.graph_knn,
+                            gnn_aggregator=args.gnn_aggregator,
+                            prop_steps=args.prop_steps, prop_alpha=args.prop_alpha)
         optim = OptimConfig(lr=args.lr, weight_decay=args.weight_decay,
                             warmup_steps=args.warmup_steps, max_steps=args.max_steps,
                             grad_clip=args.grad_clip, batch_size=args.batch_size,

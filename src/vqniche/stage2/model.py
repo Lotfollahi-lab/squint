@@ -29,9 +29,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .backbones import build_backbone
 from .config import Stage2Config
 from .positional import FourierPositionalEncoding
-from .transformer import TransformerBlock, pairwise_distances
+from .transformer import pairwise_distances
 
 
 TargetKey = Tuple[str, int]
@@ -86,20 +87,12 @@ class SpatialCodeTransformer(nn.Module):
         self.input_norm = nn.LayerNorm(d)
         self.input_drop = nn.Dropout(mc.dropout)
 
-        # ----- transformer body ----------------------------------------------
-        self.blocks = nn.ModuleList(
-            [
-                TransformerBlock(
-                    d_model=d,
-                    n_heads=mc.n_heads,
-                    d_ff=mc.d_ff,
-                    dropout=mc.dropout,
-                    dist_bias=mc.attn_dist_bias,
-                    gamma_init=mc.attn_gamma_init,
-                )
-                for _ in range(mc.n_layers)
-            ]
-        )
+        # ----- backbone body (swappable; see config.model.arch) --------------
+        # Maps embedded tokens -> per-cell hidden states. Default "transformer"
+        # is the distance-biased attention stack; alternatives (gnn / labelprop /
+        # graphmae / gps / diffusion) live in vqniche.stage2.backbones and share
+        # this exact interface, so heads / loss / decode are unchanged.
+        self.backbone = build_backbone(cfg)
         self.final_norm = nn.LayerNorm(d)
 
         # ----- per-target conditioning norms + heads -------------------------
@@ -167,9 +160,8 @@ class SpatialCodeTransformer(nn.Module):
         """
         x = self._embed_inputs(codes, coords, mask)
         dist = pairwise_distances(coords)
-        for blk in self.blocks:
-            x = blk(x, dist, key_padding_mask)
-        return self.final_norm(x)
+        h = self.backbone(x, coords, dist, key_padding_mask, mask)
+        return self.final_norm(h)
 
     def head_logits(
         self,

@@ -145,9 +145,35 @@ class ModelConfig:
     # embeddings (weight sharing, MaskGIT-style).
     tie_code_embeddings: bool = True
 
+    # --- backbone architecture (the stage-2 ablation axis) ---------------
+    # Swappable body mapping embedded tokens -> per-cell hidden states. All
+    # archs share the SAME embedding, heads, loss and (MaskGIT) decode; only
+    # the body differs. See vqniche.stage2.backbones.
+    #   "transformer" : distance-biased full self-attention within a patch (default)
+    #   "gnn"         : spatial-kNN message passing (GraphSAGE-style)
+    #   "labelprop"   : APPNP-style propagation of code embeddings + MLP correction
+    #   "graphmae"    : GNN encoder -> re-mask held-out -> GNN decoder (GraphMAE)
+    #   "gps"         : per-layer MPNN + global attention hybrid (GraphGPS)
+    #   "diffusion"   : timestep(mask-fraction)-conditioned transformer (discrete diffusion)
+    arch: str = "transformer"
+    # message-passing knobs (gnn / gps / labelprop / graphmae)
+    graph_knn: int = 16                 # neighbours per cell for message passing
+    gnn_aggregator: str = "mean"        # "mean" | "max" | "sum"
+    # label-propagation knobs (labelprop)
+    prop_steps: int = 10
+    prop_alpha: float = 0.1             # APPNP teleport prob (keep h0)
+    # discrete-diffusion knobs (diffusion)
+    diffusion_timestep_emb: bool = True
+
+    _ARCHS = ("transformer", "gnn", "labelprop", "graphmae", "gps", "diffusion")
+
     def __post_init__(self) -> None:
         if self.d_model % self.n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
+        if self.arch not in self._ARCHS:
+            raise ValueError(f"arch must be one of {self._ARCHS}, got {self.arch!r}")
+        if self.gnn_aggregator not in ("mean", "max", "sum"):
+            raise ValueError("gnn_aggregator must be 'mean', 'max' or 'sum'")
 
 
 # ---------------------------------------------------------------------------
