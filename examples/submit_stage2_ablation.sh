@@ -80,6 +80,12 @@ variant_train_flags() {
         decode-greedy)   echo "--decode-steps 20 --decode-temperature 0.0" ;;       # argmax commits
         decode-ctx3)     echo "--decode-steps 20 --decode-context-radius-mult 3.0" ;; # wider observed context ring
         decode-nonoise)  echo "--decode-steps 20 --decode-noise-anneal 0.0" ;;      # no confidence noise
+        # --- COMBINED deterministic decode (temperature [code choice] + noise_anneal
+        #     [commit order] are orthogonal, so they stack). The 3 winners pointed
+        #     the same way: less stochasticity -> better imputation (point estimate). ---
+        decode-greedy-nonoise)     echo "--decode-steps 20 --decode-temperature 0.0 --decode-noise-anneal 0.0" ;;
+        decode-temp05-nonoise)     echo "--decode-steps 20 --decode-temperature 0.5 --decode-noise-anneal 0.0" ;;
+        decode-greedy-nonoise-s40) echo "--decode-steps 40 --decode-temperature 0.0 --decode-noise-anneal 0.0" ;;
         # --- new-code arms (need the knobs implemented first) ---
         # density)   echo "--density-aware" ;;        # conditioning agent C2
         # distbias)  echo "--attn-dist-exponent 1.5";# attention agent A1
