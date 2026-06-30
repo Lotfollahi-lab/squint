@@ -183,6 +183,10 @@ class OptimConfig:
     grad_clip: float = 1.0
     label_smoothing: float = 0.0
     batch_size: int = 8                 # patches per step
+    # Ablation knob: multiply the L0 (coarse) code cross-entropy by this weight
+    # (L1 residual stays 1.0). L0 carries most of the decoded-expression signal,
+    # so up-weighting it (>1) trades fine-residual accuracy for coarse accuracy.
+    l0_weight: float = 1.0
 
 
 # ---------------------------------------------------------------------------

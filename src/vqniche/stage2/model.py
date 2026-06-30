@@ -215,10 +215,12 @@ class SpatialCodeTransformer(nn.Module):
         mask: torch.Tensor,                     # (B, P) True == held out (supervised)
         key_padding_mask: Optional[torch.Tensor] = None,
         label_smoothing: float = 0.0,
+        l0_weight: float = 1.0,
     ) -> Dict[str, torch.Tensor]:
         """Masked cross-entropy summed over targets (+ per-target accuracy).
 
         Only real held-out cells contribute: supervised = mask & ~pad.
+        ``l0_weight`` scales the level-0 (coarse) code CE (ablation knob).
         """
         logits = self.forward(
             codes, coords, mask, key_padding_mask, cond_codes=codes
@@ -246,7 +248,7 @@ class SpatialCodeTransformer(nn.Module):
                 acc = (lg.argmax(-1) == tg).float().mean()
             out[f"ce_{key}"] = ce
             out[f"acc_{key}"] = acc
-            total = total + ce
+            total = total + (l0_weight if l == 0 else 1.0) * ce
         out["loss"] = total
         out["n_supervised"] = torch.tensor(float(n_sup), device=device)
         return out

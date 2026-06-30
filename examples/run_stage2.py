@@ -71,6 +71,8 @@ def parse_args(argv=None):
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.05)
+    p.add_argument("--l0-weight", type=float, default=1.0,
+                   help="Ablation: up-weight the L0 (coarse) code CE vs L1.")
     p.add_argument("--max-steps", type=int, default=20000)
     p.add_argument("--warmup-steps", type=int, default=1000)
     p.add_argument("--grad-clip", type=float, default=1.0)
@@ -122,7 +124,7 @@ def build_config(args, source):
                             hierarchical=not args.no_hierarchical)
         optim = OptimConfig(lr=args.lr, weight_decay=args.weight_decay,
                             warmup_steps=20, max_steps=80, grad_clip=args.grad_clip,
-                            batch_size=min(4, args.batch_size))
+                            batch_size=min(4, args.batch_size), l0_weight=args.l0_weight)
         decode = DecodeConfig(steps=6)
         eval_regions = min(3, args.eval_regions)
     else:
@@ -136,7 +138,8 @@ def build_config(args, source):
                             hierarchical=not args.no_hierarchical)
         optim = OptimConfig(lr=args.lr, weight_decay=args.weight_decay,
                             warmup_steps=args.warmup_steps, max_steps=args.max_steps,
-                            grad_clip=args.grad_clip, batch_size=args.batch_size)
+                            grad_clip=args.grad_clip, batch_size=args.batch_size,
+                            l0_weight=args.l0_weight)
         decode = DecodeConfig(steps=args.decode_steps)
         eval_regions = args.eval_regions
 

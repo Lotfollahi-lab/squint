@@ -36,6 +36,7 @@ class Stage2LightningModule(pl.LightningModule):
             mask=batch["mask"],
             key_padding_mask=batch["key_padding_mask"],
             label_smoothing=self.cfg.optim.label_smoothing,
+            l0_weight=self.cfg.optim.l0_weight,
         )
         self.log("train/loss", out["loss"], prog_bar=True, batch_size=batch["codes"].shape[0])
         for (b, l) in self.model.targets:
