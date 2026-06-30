@@ -46,19 +46,23 @@ LSF_CORES="${LSF_CORES:-8}"
 DRY_RUN="${DRY_RUN:-0}"
 SMOKE="${SMOKE:-0}"
 
+# Winning decode config (temp0.5 + no confidence-noise, 20 steps) — held fixed
+# while the t05nn-* arms below ablate TRAINING. Override via _DEC env if needed.
+_DEC="${_DEC:---decode-steps 20 --decode-temperature 0.5 --decode-noise-anneal 0.0}"
+
 # variant -> stage-2 TRAIN flags. Return non-zero for an unknown variant.
 # Flag-only arms (no new code) are runnable today; new-code arms (soft / density
 # / distbias / maskcontig / softlabels / exprloss / gestarch) are TODO.
 variant_train_flags() {
     case "$1" in
         base)      echo "" ;;
-        capacity)  echo "--d-model 512 --n-layers 12 --patch-size 2048 --max-steps 40000 --neighbors-k 48 --eval-chunk-size 256" ;;
+        capacity)  echo "--d-model 512 --n-layers 12 --patch-size 2048 --max-steps 40000 --knn 48 --eval-chunk-size 256" ;;
         l0w4)      echo "--l0-weight 4.0" ;;
         # --- flag-only architectural/config arms (zero new code) ---
         maskmatch) echo "--mask-frac-min 0.20 --mask-frac-max 0.45" ;;   # tighten train masks toward the eval ~25% contiguous hole
         decode20)  echo "--decode-steps 20" ;;                            # more MaskGIT unmask iterations (decode-side, but set at train cfg)
         nohier)    echo "--no-hierarchical" ;;                            # ablate the cell->niche head conditioning
-        bigctx)    echo "--neighbors-k 48 --eval-chunk-size 256 --patch-size 2048" ;;  # more observed context, same model size
+        bigctx)    echo "--knn 48 --eval-chunk-size 256 --patch-size 2048" ;;  # more observed context, same model size
         soft)      echo "" ;;                         # same train as base; soft decode (probs saved by run_stage2)
         # --- ARCHITECTURE ablation: swappable stage-2 backbone (--arch) -----
         # Same embedding / heads / masked-CE / MaskGIT decode; only the body
@@ -86,6 +90,14 @@ variant_train_flags() {
         decode-greedy-nonoise)     echo "--decode-steps 20 --decode-temperature 0.0 --decode-noise-anneal 0.0" ;;
         decode-temp05-nonoise)     echo "--decode-steps 20 --decode-temperature 0.5 --decode-noise-anneal 0.0" ;;
         decode-greedy-nonoise-s40) echo "--decode-steps 40 --decode-temperature 0.0 --decode-noise-anneal 0.0" ;;
+        # --- TRAINING ablations, all decoded with the WINNING decode
+        #     (temp0.5 + noise0, 20 steps): ablate what the MaskGIT model LEARNS
+        #     while holding inference fixed. _DEC is the shared winning-decode tail. ---
+        t05nn-l0w4)      echo "--l0-weight 4.0 $_DEC" ;;                                  # up-weight coarse-code CE (L0 drives expression)
+        t05nn-capacity)  echo "--d-model 512 --n-layers 12 --patch-size 2048 --max-steps 40000 --knn 48 --eval-chunk-size 256 $_DEC" ;;
+        t05nn-maskmatch) echo "--mask-frac-min 0.20 --mask-frac-max 0.45 $_DEC" ;;       # train mask ratio matched to the ~25% eval hole
+        t05nn-maskhi)    echo "--mask-frac-min 0.30 --mask-frac-max 0.60 $_DEC" ;;       # heavier masking -> in-paint larger holes
+        t05nn-ls01)      echo "--label-smoothing 0.1 $_DEC" ;;                           # regularise the code distribution
         # --- new-code arms (need the knobs implemented first) ---
         # density)   echo "--density-aware" ;;        # conditioning agent C2
         # distbias)  echo "--attn-dist-exponent 1.5";# attention agent A1

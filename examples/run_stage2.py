@@ -86,6 +86,9 @@ def parse_args(argv=None):
     p.add_argument("--weight-decay", type=float, default=0.05)
     p.add_argument("--l0-weight", type=float, default=1.0,
                    help="Ablation: up-weight the L0 (coarse) code CE vs L1.")
+    p.add_argument("--label-smoothing", type=float, default=0.0,
+                   help="Label smoothing on the code cross-entropy (regularises "
+                        "the predicted code distribution).")
     p.add_argument("--max-steps", type=int, default=20000)
     p.add_argument("--warmup-steps", type=int, default=1000)
     p.add_argument("--grad-clip", type=float, default=1.0)
@@ -149,7 +152,8 @@ def build_config(args, source):
                             prop_steps=args.prop_steps, prop_alpha=args.prop_alpha)
         optim = OptimConfig(lr=args.lr, weight_decay=args.weight_decay,
                             warmup_steps=20, max_steps=80, grad_clip=args.grad_clip,
-                            batch_size=min(4, args.batch_size), l0_weight=args.l0_weight)
+                            batch_size=min(4, args.batch_size), l0_weight=args.l0_weight,
+                            label_smoothing=args.label_smoothing)
         decode = DecodeConfig(steps=6)
         eval_regions = min(3, args.eval_regions)
     else:
@@ -167,7 +171,8 @@ def build_config(args, source):
         optim = OptimConfig(lr=args.lr, weight_decay=args.weight_decay,
                             warmup_steps=args.warmup_steps, max_steps=args.max_steps,
                             grad_clip=args.grad_clip, batch_size=args.batch_size,
-                            l0_weight=args.l0_weight)
+                            l0_weight=args.l0_weight,
+                            label_smoothing=args.label_smoothing)
         decode = DecodeConfig(steps=args.decode_steps,
                               schedule=args.decode_schedule,
                               temperature=args.decode_temperature,
