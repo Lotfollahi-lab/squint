@@ -176,6 +176,7 @@ def holdout_split_eval(
     device: Optional[str] = None,
     out_csv: Optional[str] = None,
     codes_out: Optional[str] = None,
+    save_soft: bool = False,
     verbose: bool = True,
 ) -> Dict[str, object]:
     """In-paint the cells SQUINT actually held out (``source.holdout_mask``).
@@ -195,6 +196,8 @@ def holdout_split_eval(
     # (so the codes->expression decode step can read them without re-running).
     pred_idx_parts: List[np.ndarray] = []
     pred_code_parts: Dict[str, List[np.ndarray]] = {b.name: [] for b in source.branches}
+    # per-(branch, level) SOFT distributions for the expected-embedding decode
+    pred_prob_parts: Dict[tuple, List[np.ndarray]] = {(b, l): [] for (b, l) in cfg.prediction_targets}
 
     for s in source.section_ids:
         hrows = source.holdout_section_of(s)
@@ -209,12 +212,15 @@ def holdout_split_eval(
             if chunk.size < 1:
                 continue
             res = inpaint(model, source, chunk, cfg, device=device,
-                          observed_rows=trows)
+                          observed_rows=trows, return_probs=save_soft)
             gidx = res["global_idx"]
             all_holdout.append(gidx)
             pred_idx_parts.append(gidx)
             for b in source.branches:
                 pred_code_parts[b.name].append(np.asarray(res["codes"][b.name]))
+            if save_soft and "probs" in res:
+                for (b, l) in targets:
+                    pred_prob_parts[(b, l)].append(np.asarray(res["probs"][b][l]))
             row: Dict[str, object] = {
                 "section": int(s), "chunk": ci,
                 "n_holdout": int(gidx.size), "patch_size": int(res["patch_size"]),
@@ -236,9 +242,14 @@ def holdout_split_eval(
         save_kw = {"global_idx": np.concatenate(pred_idx_parts).astype(np.int64)}
         for b in source.branches:
             save_kw[f"codes_{b.name}"] = np.concatenate(pred_code_parts[b.name]).astype(np.int64)
+        if save_soft and all(pred_prob_parts[(b, l)] for (b, l) in targets):
+            for (b, l) in targets:
+                save_kw[f"probs_{b}_{l}"] = np.concatenate(
+                    pred_prob_parts[(b, l)]).astype(np.float32)
         np.savez(codes_out, **save_kw)
         if verbose:
-            print(f"[eval] wrote predicted codes -> {codes_out}")
+            print(f"[eval] wrote predicted codes{' + soft probs' if save_soft else ''} "
+                  f"-> {codes_out}")
 
     # cell-weighted aggregation over chunks
     counts = np.array([r["n_holdout"] for r in rows_out], float)

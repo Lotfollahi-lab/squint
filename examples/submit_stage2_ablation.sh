@@ -47,20 +47,31 @@ DRY_RUN="${DRY_RUN:-0}"
 SMOKE="${SMOKE:-0}"
 
 # variant -> stage-2 TRAIN flags. Return non-zero for an unknown variant.
+# Flag-only arms (no new code) are runnable today; new-code arms (soft / density
+# / distbias / maskcontig / softlabels / exprloss / gestarch) are TODO.
 variant_train_flags() {
     case "$1" in
-        base)     echo "" ;;
-        capacity) echo "--d-model 512 --n-layers 12 --patch-size 2048 --max-steps 40000 --neighbors-k 48 --eval-chunk-size 256" ;;
-        l0w4)     echo "--l0-weight 4.0" ;;
-        # soft)     echo "" ;;                      # TODO: same train as base
-        # exprloss) echo "--expr-loss-weight 1.0" ;; # TODO: needs expr-loss path
+        base)      echo "" ;;
+        capacity)  echo "--d-model 512 --n-layers 12 --patch-size 2048 --max-steps 40000 --neighbors-k 48 --eval-chunk-size 256" ;;
+        l0w4)      echo "--l0-weight 4.0" ;;
+        # --- flag-only architectural/config arms (zero new code) ---
+        maskmatch) echo "--mask-frac-min 0.20 --mask-frac-max 0.45" ;;   # tighten train masks toward the eval ~25% contiguous hole
+        decode20)  echo "--decode-steps 20" ;;                            # more MaskGIT unmask iterations (decode-side, but set at train cfg)
+        nohier)    echo "--no-hierarchical" ;;                            # ablate the cell->niche head conditioning
+        bigctx)    echo "--neighbors-k 48 --eval-chunk-size 256 --patch-size 2048" ;;  # more observed context, same model size
+        soft)      echo "" ;;                         # same train as base; soft decode (probs saved by run_stage2)
+        # --- new-code arms (need the knobs implemented first) ---
+        # density)   echo "--density-aware" ;;        # conditioning agent C2
+        # distbias)  echo "--attn-dist-exponent 1.5";# attention agent A1
+        # softlabels) echo "--soft-label-temp 0.5" ;; # loss agent L2
+        # exprloss)  echo "--expr-loss-weight 1.0" ;; # loss agent L1 (frozen decoder in training)
         *) return 1 ;;
     esac
 }
 # variant -> stage2_decode_pearson DECODE flags (hard for all current arms).
 variant_decode_flags() {
     case "$1" in
-        # soft) echo "--decode-mode soft" ;;       # TODO: needs soft-decode path
+        soft) echo "--decode-mode soft" ;;
         *) echo "" ;;
     esac
 }

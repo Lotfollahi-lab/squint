@@ -133,16 +133,31 @@ def _codes_to_zq(vq, idx, torch):
     return cb[idx[:, 0]]
 
 
-def decode_cell_xhat(model, idx_cell, idx_niche, cov_idx, read_depth, torch):
+def _soft_zq(vq, probs_list, torch):
+    """Expected embedding from per-level SOFT distributions:
+    z_q = Σ_l p_l @ codebook_l. probs_list: [(N, K_l) per RVQ level]."""
+    if hasattr(vq, "layers") and len(getattr(vq, "layers")) > 0:
+        zq = None
+        for l, p in enumerate(probs_list):
+            contrib = p @ _codebook_matrix(vq.layers[l])    # (N, D)
+            zq = contrib if zq is None else zq + contrib
+        return zq
+    return probs_list[0] @ _codebook_matrix(vq)
+
+
+def decode_cell_xhat(model, idx_cell, idx_niche, cov_idx, read_depth, torch,
+                     z_q_cell=None):
     """Replicate the model's post-VQ -> attribute_decoder_cell path.
 
     Returns X_hat (N, n_genes) = softmax(decoder(z_q_cell [+cov])) * read_depth.
     idx_cell/idx_niche: (N, L) long; cov_idx: (N,) long or None; read_depth: (N,) float.
-    (idx_niche is consumed only so the FiLM coupling can read the cell code; the
-    cell-branch reconstruction does not otherwise depend on the niche codes.)
+    If ``z_q_cell`` is given (e.g. the SOFT expected embedding), it is used
+    directly and idx_cell is ignored. (The cell-branch reconstruction does not
+    depend on the niche codes / FiLM, which modulate the niche branch only.)
     """
     enc = model.encoder
-    z_q_cell = _codes_to_zq(enc.vq_cell, idx_cell, torch)
+    if z_q_cell is None:
+        z_q_cell = _codes_to_zq(enc.vq_cell, idx_cell, torch)
 
     if model.decoder_covariate_dim > 0:
         if cov_idx is None:
@@ -202,6 +217,11 @@ def parse_args(argv=None):
                    help="Dir to write per_seed_pearson_reconstruction.csv into.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None, help="cuda/cpu (default: auto).")
+    p.add_argument("--decode-mode", choices=["hard", "soft"], default="hard",
+                   help="hard = argmax codes -> codebook lookup; soft = expected "
+                        "embedding Σ p(c)·embed(c) from the saved per-level code "
+                        "distributions (GeST-style weighted aggregation; needs the "
+                        "npz to carry probs_* arrays, i.e. run_stage2 save_soft=True).")
     p.add_argument("--selfcheck-min", type=float, default=0.99,
                    help="Min cell-wise Pearson for the true-code self-check (warn below).")
     return p.parse_args(argv)
@@ -279,9 +299,25 @@ def main(argv=None):
     # ---- IMPUTED: decode stage-2's predicted codes ------------------------
     npz = np.load(args.stage2_codes)
     gidx = npz["global_idx"].astype(np.int64)
-    pred_cell = npz["codes_cell"].astype(np.int64)
-    print(f"[decode] {gidx.size} held-out cells with predicted codes")
-    xhat_imp = _decode(pred_cell, None, gidx)
+    print(f"[decode] {gidx.size} held-out cells; decode-mode={args.decode_mode}")
+    if args.decode_mode == "soft":
+        prob_keys = sorted(k for k in npz.files if k.startswith("probs_cell_"))
+        if not prob_keys:
+            raise SystemExit(
+                "--decode-mode soft needs probs_cell_* in the npz. Re-run the "
+                "stage-2 eval with save_soft=True (run_stage2.py does this by "
+                "default now) so soft code distributions are persisted.")
+        probs = [torch.as_tensor(npz[k].astype(np.float32), device=device) for k in prob_keys]
+        rd = torch.as_tensor(X[gidx].sum(axis=1), dtype=torch.float32, device=device)
+        cov = (torch.as_tensor(cov_all[gidx], dtype=torch.long, device=device)
+               if model.decoder_covariate_dim > 0 else None)
+        with torch.no_grad():
+            zq = _soft_zq(model.encoder.vq_cell, probs, torch)      # expected embedding
+            xhat_imp = decode_cell_xhat(model, None, None, cov, rd, torch,
+                                        z_q_cell=zq).detach().cpu().numpy().astype(np.float32)
+    else:
+        pred_cell = npz["codes_cell"].astype(np.int64)
+        xhat_imp = _decode(pred_cell, None, gidx)
 
     # ---- Pearson on the held-out cells ------------------------------------
     target = X[gidx]

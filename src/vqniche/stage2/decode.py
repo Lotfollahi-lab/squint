@@ -46,8 +46,13 @@ def decode_patch(
     mask: torch.Tensor,                      # (B, P) bool, True == held out
     key_padding_mask: Optional[torch.Tensor] = None,
     cfg: Optional[DecodeConfig] = None,
-) -> torch.Tensor:
-    """Return filled code stacks (B, P, T); observed cells unchanged."""
+    return_probs: bool = False,
+):
+    """Return filled code stacks (B, P, T); observed cells unchanged.
+
+    If ``return_probs``, also return per-target SOFT probabilities for every
+    cell, conditioned on the fully-filled patch — ``(work, [softmax (B,P,K_ti)
+    per target])`` — for the expected-embedding ("soft") decode."""
     cfg = cfg or DecodeConfig()
     model.eval()
     device = next(model.parameters()).device
@@ -119,7 +124,17 @@ def decode_patch(
             to_fill[bi, top] = False
         # refresh "still" view for next iteration done at loop top via to_fill
 
-    return work
+    if not return_probs:
+        return work
+    # Final read-out pass: each cell's per-level code distribution conditioned
+    # on the FULLY-FILLED patch (all cells observed). These soft probabilities
+    # feed the expected-embedding decode (Σ p(c)·codebook_embed(c)).
+    h = model.encode(work.clamp_min(0), coords,
+                     torch.zeros_like(to_fill), key_padding_mask)
+    probs = []
+    for ti, K in enumerate(Ks):
+        probs.append(F.softmax(model.head_logits(h, ti, work), dim=-1))  # (B, P, K_ti)
+    return work, probs
 
 
 @torch.no_grad()
@@ -130,6 +145,7 @@ def inpaint(
     cfg: Stage2Config,
     device: Optional[str] = None,
     observed_rows=None,
+    return_probs: bool = False,
 ) -> Dict[str, object]:
     """In-paint a held-out region of a frozen ``predicted_adata``.
 
@@ -141,6 +157,8 @@ def inpaint(
         global_idx     : (n_holdout,) row indices that were predicted
         codes          : {branch: (n_holdout, L) int} predicted code stacks
         patch_size     : number of cells in the assembled patch
+        probs          : (if return_probs) {branch: {level: (n_holdout, K)}} soft
+                         per-level code distributions for the SOFT decode
     """
     patch = inpainting_patch(
         source, holdout_idx, cfg.data,
@@ -154,19 +172,33 @@ def inpaint(
     if device:
         model = model.to(device)
 
-    filled = decode_patch(model, codes, coords, mask, None, cfg.decode)[0]  # (P, T)
-    filled = filled.cpu().numpy()
+    targets = cfg.prediction_targets
+    soft = None
+    if return_probs:
+        filled_t, probs = decode_patch(model, codes, coords, mask, None,
+                                       cfg.decode, return_probs=True)
+        filled = filled_t[0].cpu().numpy()              # (P, T)
+        soft = [p[0].cpu().numpy() for p in probs]      # per-target (P, K_ti)
+    else:
+        filled = decode_patch(model, codes, coords, mask, None, cfg.decode)[0]
+        filled = filled.cpu().numpy()
 
     # gather predicted codes for the held-out cells, per branch
-    targets = cfg.prediction_targets
     hold_local = arrays["mask"]
     out_codes: Dict[str, object] = {}
     for b in cfg.branches:
         L = b.num_levels
         cols = [ti for ti, (bb, _) in enumerate(targets) if bb == b.name]
         out_codes[b.name] = filled[hold_local][:, cols].astype("int64")
-    return {
+    result: Dict[str, object] = {
         "global_idx": patch.global_idx[hold_local],
         "codes": out_codes,
         "patch_size": int(patch.size),
     }
+    if return_probs:
+        # per-(branch, level) soft distributions for the held-out cells
+        probs_out: Dict[str, Dict[int, "object"]] = {}
+        for ti, (b, l) in enumerate(targets):
+            probs_out.setdefault(b, {})[l] = soft[ti][hold_local]   # (n_hold, K_ti)
+        result["probs"] = probs_out
+    return result

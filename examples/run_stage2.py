@@ -248,6 +248,7 @@ def main(argv=None):
                 lit.model, source, cfg, chunk_size=chunk, device=device,
                 out_csv=os.path.join(out_dir, "stage2_eval.csv"),
                 codes_out=os.path.join(out_dir, "stage2_predicted_codes.npz"),
+                save_soft=True,   # also persist soft code distributions for --decode-mode soft
             )
             drop_key = "per_chunk"
         else:
