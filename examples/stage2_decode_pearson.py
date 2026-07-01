@@ -20,10 +20,34 @@ Pipeline
 5. Score Pearson on the held-out cells with the SAME formula the benchmark uses
    and write ``per_seed_pearson_reconstruction.csv`` so the figure can ingest it.
 
-This is the CELL branch only (the niche branch needs neighborhood aggregation of
-the decoder output -- a follow-up). Expression is the true counts in
-``predicted_adata.X``; reconstruction uses the cell's true read depth (the task
-predicts COMPOSITION from spatial context, not sequencing depth).
+Both branches are scored:
+  * CELL  branch -- X_hat[gidx] vs X[gidx] (per-held-out-cell reconstruction).
+  * NICHE branch -- SQUINT's NATIVE niche decoder. Stage-2 predicts the niche
+    codes too (``codes_niche`` / ``probs_niche_*`` in the npz); those are decoded
+    through ``attribute_decoder_niche`` to per-cell ``xhat_niche``, and
+    X_hat_nbr = 1-hop neighborhood-MEAN of xhat_niche -- exactly SQUINT's
+    reconstruction-time niche definition. The per-cell prediction uses the
+    model's own reconstruction (TRUE niche codes) for observed cells + the
+    stage-2 imputation for held-out cells. Target = neighborhood-mean of the TRUE
+    X on the same per-batch spatial kNN graph (self-loops, mean aggregation,
+    ``--nbr-neighs``, matching ``_holdout_utils.compute_X_nbr``). This is the
+    key asymmetry vs GeST / scVI: those have NO niche decoder, so their runners
+    graph-aggregate the CELL prediction; SQUINT uses its own niche branch. (If
+    an OLD npz lacks ``codes_niche``, this falls back to aggregating the cell
+    prediction, with a warning.) Disable with ``--no-nbr``.
+Expression is the true counts in ``predicted_adata.X``; reconstruction uses the
+cell's true read depth (the task predicts COMPOSITION from spatial context, not
+sequencing depth).
+
+RMSE note: RMSE rewards the conditional mean, so a neighbor-averaging smoother
+(GeST's weighted decode = softmax-weighted mean of observed profiles) has an
+intrinsic squared-error edge over a single sampled discrete code path. Pass
+``--decode-samples K`` (K>1) to decode K code configs sampled from the saved
+per-level posteriors and AVERAGE the profiles -- a Monte-Carlo estimate of
+E[profile|context], the RMSE-optimal predictor -- which closes most of that gap
+while keeping the generative model. Needs ``probs_cell_*`` in the npz (run the
+stage-2 eval with save_soft=True). ``--decode-mode soft`` is the cheaper (but
+only approximate) deterministic analog: E[embedding] then one decode.
 """
 
 from __future__ import annotations
@@ -268,6 +292,40 @@ def decode_cell_xhat(model, idx_cell, idx_niche, cov_idx, read_depth, torch,
                                         conditions=None)
 
 
+def decode_niche_xhat(model, idx_niche, cov_idx, read_depth, torch,
+                      z_q_niche=None):
+    """Replicate the model's post-VQ -> attribute_decoder_niche path (the NATIVE
+    niche decoder), so SQUINT's neighborhood prediction uses its own niche
+    branch rather than a graph-aggregation of the cell prediction.
+
+    Returns per-cell xhat_niche (N, n_genes); the niche-level target compares the
+    1-hop MEAN of this against the 1-hop mean of the true X (see main()). The
+    filmscale cell->niche coupling is PRE-VQ (it shapes which niche code is
+    picked), so it is already baked into ``idx_niche`` -- decoding from the final
+    niche indices reproduces z_q_niche without re-applying FiLM (same assumption
+    the ccn_mode guard in main() enforces). Niche decoder covariate uses
+    ``batch_embedding_niche`` under the decoupled-covariate model, else the
+    shared ``batch_embedding`` -- mirroring vqniche_dual.forward.
+    """
+    enc = model.encoder
+    if z_q_niche is None:
+        z_q_niche = _codes_to_zq(enc.vq_niche, idx_niche, torch)
+
+    if model.decoder_covariate_dim > 0:
+        if cov_idx is None:
+            raise ValueError("model has decoder_covariate_dim>0 but cov_idx is None")
+        if getattr(model, "decoupled_decoder_covariate", False):
+            cov = model.batch_embedding_niche(cov_idx)
+        else:
+            cov = model.batch_embedding(cov_idx)
+        z_q_niche_in = torch.cat([z_q_niche, cov], dim=-1)
+    else:
+        z_q_niche_in = z_q_niche
+
+    return model.attribute_decoder_niche(x=z_q_niche_in, read_depth=read_depth,
+                                         conditions=None)
+
+
 # ---------------------------------------------------------------------------
 def _find_ckpt(run_dir, explicit):
     if explicit:
@@ -298,6 +356,48 @@ def _dense(x):
     return np.asarray(x.todense()) if hasattr(x, "todense") else np.asarray(x)
 
 
+# ---------------------------------------------------------------------------
+# Neighborhood (niche) branch: per-batch spatial kNN + mean aggregation, so the
+# cell-level prediction can be scored at the neighborhood level against the
+# neighborhood-mean of the true X. Replicates the recipe in
+# _holdout_utils.spatial_knn_per_batch / compute_X_nbr (squidpy generic kNN with
+# set_diag=True, mean-normalised) using sklearn so this script stays
+# dependency-light; the graph is Euclidean kNN + self-loops just like squidpy's,
+# so X_nbr targets are comparable to the GeST / scVI / NicheCompass niche bars.
+# ---------------------------------------------------------------------------
+def _spatial_knn_selfloop(coords, batch, k):
+    """Binary CSR adjacency: each cell -> its (k nearest + self) within the same
+    batch (no cross-batch edges). Row-sum = neighbor count (for mean agg)."""
+    import scipy.sparse as sp
+    from sklearn.neighbors import NearestNeighbors
+    coords = np.asarray(coords, dtype=np.float32)
+    n = coords.shape[0]
+    rows, cols = [], []
+    for b in np.unique(batch):
+        idx = np.where(batch == b)[0]
+        if idx.size == 0:
+            continue
+        cb = coords[idx]
+        kk = int(min(k + 1, idx.size))            # self + k others (self at dist 0)
+        nn = NearestNeighbors(n_neighbors=kk).fit(cb)
+        _, nbr = nn.kneighbors(cb)                # (m, kk); includes self
+        src = np.repeat(np.arange(idx.size), kk)
+        rows.append(idx[src]); cols.append(idx[nbr.ravel()])
+    r = np.concatenate(rows); c = np.concatenate(cols)
+    A = sp.coo_matrix((np.ones(r.size, np.float32), (r, c)), shape=(n, n)).tocsr()
+    A.data[:] = 1.0                               # binary (collapse any dup edge)
+    return A
+
+
+def _nbr_mean(A, M):
+    """Neighborhood MEAN aggregation A @ M / rowcount (dense out). Matches
+    _holdout_utils.compute_X_nbr(normalize='mean')."""
+    num = np.asarray(A @ np.asarray(M, dtype=np.float32), dtype=np.float32)
+    rs = np.asarray(A.sum(axis=1)).ravel()
+    rs = np.where(rs > 0, rs, 1.0)
+    return (num / rs[:, None]).astype(np.float32)
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -316,6 +416,23 @@ def parse_args(argv=None):
                         "embedding Σ p(c)·embed(c) from the saved per-level code "
                         "distributions (GeST-style weighted aggregation; needs the "
                         "npz to carry probs_* arrays, i.e. run_stage2 save_soft=True).")
+    p.add_argument("--decode-samples", type=int, default=1,
+                   help="K>1: Monte-Carlo decode -- sample K code configs from the "
+                        "saved per-level posteriors (probs_cell_*), decode each, and "
+                        "AVERAGE the profiles ~= E[profile|context], the RMSE-optimal "
+                        "predictor. Beats one sampled config on RMSE while staying "
+                        "generative. K=1 (default) uses --decode-mode. Requires "
+                        "probs_cell_* in the npz (run_stage2 save_soft=True); takes "
+                        "precedence over --decode-mode when K>1.")
+    p.add_argument("--nbr-neighs", type=int, default=16,
+                   help="Spatial kNN neighbors for the niche branch. Default 16 "
+                        "(matches SQUINT's native niche graph + the imputation "
+                        "baselines' new default; was 10).")
+    p.add_argument("--nbr-batch-key", type=str, default="adata_batch_id",
+                   help="obs column defining batches/sections for the per-batch "
+                        "spatial graph (no cross-batch edges). Default adata_batch_id.")
+    p.add_argument("--no-nbr", action="store_true",
+                   help="Skip the neighborhood (niche) branch (cell branch only).")
     p.add_argument("--selfcheck-min", type=float, default=0.99,
                    help="Min cell-wise Pearson for the true-code self-check (warn below).")
     return p.parse_args(argv)
@@ -393,23 +510,49 @@ def main(argv=None):
     # ---- IMPUTED: decode stage-2's predicted codes ------------------------
     npz = np.load(args.stage2_codes)
     gidx = npz["global_idx"].astype(np.int64)
-    print(f"[decode] {gidx.size} held-out cells; decode-mode={args.decode_mode}")
-    if args.decode_mode == "soft":
-        prob_keys = sorted(k for k in npz.files if k.startswith("probs_cell_"))
-        if not prob_keys:
+    K = max(1, int(args.decode_samples))
+    rd = torch.as_tensor(X[gidx].sum(axis=1), dtype=torch.float32, device=device)
+    cov = (torch.as_tensor(cov_all[gidx], dtype=torch.long, device=device)
+           if model.decoder_covariate_dim > 0 else None)
+
+    def _need_prob_keys():
+        keys = sorted(k for k in npz.files if k.startswith("probs_cell_"))
+        if not keys:
             raise SystemExit(
-                "--decode-mode soft needs probs_cell_* in the npz. Re-run the "
-                "stage-2 eval with save_soft=True (run_stage2.py does this by "
-                "default now) so soft code distributions are persisted.")
+                "need probs_cell_* in the npz (soft per-level code posteriors). "
+                "Re-run the stage-2 eval with save_soft=True (run_stage2.py does "
+                "this by default now).")
+        return keys
+
+    if K > 1:
+        # Monte-Carlo E[profile]: sample K code configs from the per-level
+        # posteriors, decode each, AVERAGE the count profiles. The mean profile
+        # is the RMSE-optimal estimator (vs one sampled config). Precedence over
+        # --decode-mode. Averaging in COUNT space (post read-depth scaling) is
+        # what RMSE-vs-true-counts rewards.
+        prob_keys = _need_prob_keys()
+        print(f"[decode] {gidx.size} held-out cells; MC-average over K={K} "
+              f"sampled configs ({len(prob_keys)} RVQ level(s))")
         probs = [torch.as_tensor(npz[k].astype(np.float32), device=device) for k in prob_keys]
-        rd = torch.as_tensor(X[gidx].sum(axis=1), dtype=torch.float32, device=device)
-        cov = (torch.as_tensor(cov_all[gidx], dtype=torch.long, device=device)
-               if model.decoder_covariate_dim > 0 else None)
+        gen = torch.Generator(device=device)
+        acc = np.zeros((gidx.size, X.shape[1]), dtype=np.float64)
+        for s in range(K):
+            gen.manual_seed(int(args.seed) * 100003 + s)     # reproducible per (seed, sample)
+            idx = torch.cat([torch.multinomial(p, 1, generator=gen) for p in probs], dim=1)
+            with torch.no_grad():
+                xk = decode_cell_xhat(model, idx, None, cov, rd, torch)
+            acc += xk.detach().cpu().numpy().astype(np.float64)
+        xhat_imp = (acc / K).astype(np.float32)
+    elif args.decode_mode == "soft":
+        prob_keys = _need_prob_keys()
+        print(f"[decode] {gidx.size} held-out cells; decode-mode=soft (expected embedding)")
+        probs = [torch.as_tensor(npz[k].astype(np.float32), device=device) for k in prob_keys]
         with torch.no_grad():
             zq = _soft_zq(model.encoder.vq_cell, probs, torch)      # expected embedding
             xhat_imp = decode_cell_xhat(model, None, None, cov, rd, torch,
                                         z_q_cell=zq).detach().cpu().numpy().astype(np.float32)
     else:
+        print(f"[decode] {gidx.size} held-out cells; decode-mode=hard (argmax codes)")
         pred_cell = npz["codes_cell"].astype(np.int64)
         xhat_imp = _decode(pred_cell, None, gidx)
 
@@ -436,6 +579,107 @@ def main(argv=None):
                           seed=args.seed, marker_idx=marker_idx)
             + _pearson_rows(target, xhat_imp, branch="cell", split="test",
                             seed=args.seed, marker_idx=marker_idx))
+
+    # ---- NICHE branch: neighborhood-level (X_hat_nbr vs X_nbr) -------------
+    # SQUINT has a NATIVE niche decoder (attribute_decoder_niche): niche codes ->
+    # per-cell xhat_niche, and X_hat_nbr = 1-hop mean of xhat_niche (see
+    # vqniche_dual.forward / _cache_inference_data). So for SQUINT the niche
+    # prediction decodes the stage-2 PREDICTED niche codes through that decoder
+    # (NOT a graph-aggregation of the cell prediction -- that fallback is only
+    # for methods with no niche decoder, e.g. GeST / scVI). The full per-cell
+    # xhat_niche uses the model's own reconstruction (true niche codes) for
+    # observed cells + the imputation for held-out cells, then one mean
+    # aggregation; target = mean-agg of the TRUE X on the same graph.
+    if not args.no_nbr:
+        coords = adata.obsm.get("spatial")
+        has_niche_codes = "codes_niche" in npz.files
+        if coords is None:
+            print("[decode] [nbr] obsm['spatial'] missing -- skipping niche branch.")
+        else:
+            if args.nbr_batch_key in adata.obs.columns:
+                batch = np.asarray(adata.obs[args.nbr_batch_key].values)
+            else:
+                print(f"[decode] [nbr] '{args.nbr_batch_key}' not in obs -- "
+                      f"treating all cells as one section.")
+                batch = np.zeros(adata.n_obs, dtype=np.int64)
+            A = _spatial_knn_selfloop(np.asarray(coords), batch, args.nbr_neighs)
+            X_nbr = _nbr_mean(A, X)                            # true neighborhood mean
+
+            def _cov_t(rows):
+                return (torch.as_tensor(cov_all[rows], dtype=torch.long, device=device)
+                        if model.decoder_covariate_dim > 0 else None)
+
+            def _rd_t(rows):
+                return torch.as_tensor(X[rows].sum(axis=1), dtype=torch.float32, device=device)
+
+            if has_niche_codes:
+                # NATIVE niche decoder for the held-out cells (same hard / soft /
+                # K-sample policy as the cell branch). Aggregation is LINEAR, so
+                # averaging per-cell xhat_niche over K samples then aggregating ==
+                # aggregating then averaging -> exact E[nbr-mean].
+                def _decode_niche_hard(idx_np, rows):
+                    out = np.empty((len(rows), X.shape[1]), np.float32)
+                    for st in range(0, len(rows), 20000):
+                        sl = slice(st, min(st + 20000, len(rows)))
+                        ic = torch.as_tensor(idx_np[sl], dtype=torch.long, device=device)
+                        with torch.no_grad():
+                            out[sl] = (decode_niche_xhat(model, ic, _cov_t(rows[sl]),
+                                                         _rd_t(rows[sl]), torch)
+                                       .detach().cpu().numpy().astype(np.float32))
+                    return out
+
+                if K > 1:
+                    nkeys = sorted(k for k in npz.files if k.startswith("probs_niche_"))
+                    if not nkeys:
+                        raise SystemExit("--decode-samples K>1 needs probs_niche_* for the "
+                                         "niche branch (re-run stage-2 eval with save_soft=True).")
+                    nprobs = [torch.as_tensor(npz[k].astype(np.float32), device=device) for k in nkeys]
+                    ngen = torch.Generator(device=device)
+                    nacc = np.zeros((gidx.size, X.shape[1]), np.float64)
+                    for s in range(K):
+                        ngen.manual_seed(int(args.seed) * 100019 + s)
+                        nidx = torch.cat([torch.multinomial(p, 1, generator=ngen) for p in nprobs], dim=1)
+                        with torch.no_grad():
+                            xk = decode_niche_xhat(model, nidx, _cov_t(gidx), _rd_t(gidx), torch)
+                        nacc += xk.detach().cpu().numpy().astype(np.float64)
+                    xhat_niche_hold = (nacc / K).astype(np.float32)
+                elif args.decode_mode == "soft":
+                    nkeys = sorted(k for k in npz.files if k.startswith("probs_niche_"))
+                    if not nkeys:
+                        raise SystemExit("--decode-mode soft needs probs_niche_* for the niche branch.")
+                    nprobs = [torch.as_tensor(npz[k].astype(np.float32), device=device) for k in nkeys]
+                    with torch.no_grad():
+                        zqn = _soft_zq(model.encoder.vq_niche, nprobs, torch)
+                        xhat_niche_hold = (decode_niche_xhat(model, None, _cov_t(gidx),
+                                                             _rd_t(gidx), torch, z_q_niche=zqn)
+                                           .detach().cpu().numpy().astype(np.float32))
+                else:
+                    xhat_niche_hold = _decode_niche_hard(npz["codes_niche"].astype(np.int64), gidx)
+
+                obs_rows = np.setdiff1d(np.arange(n), gidx)
+                xhat_niche_full = np.empty((n, X.shape[1]), np.float32)
+                if obs_rows.size:
+                    xhat_niche_full[obs_rows] = _decode_niche_hard(true_niche[obs_rows], obs_rows)
+                xhat_niche_full[gidx] = xhat_niche_hold
+                X_hat_nbr = _nbr_mean(A, xhat_niche_full)
+                print(f"[decode] [nbr] NATIVE niche decoder (attribute_decoder_niche); "
+                      f"mean-agg n_neighs={args.nbr_neighs} over "
+                      f"{np.unique(batch).size} section(s)")
+            else:
+                # Older stage-2 run w/o niche codes: fall back to aggregating the
+                # CELL prediction (the GeST/scVI convention). Re-run stage-2 to
+                # get the native niche branch.
+                print("[decode] [nbr] WARNING: no 'codes_niche' in npz -- falling back to "
+                      "aggregating the CELL prediction. Re-run stage-2 for the native "
+                      "niche branch.")
+                X_hat_full = X_hat_stored.copy(); X_hat_full[gidx] = xhat_imp
+                X_hat_nbr = _nbr_mean(A, X_hat_full)
+
+            rows += (_pearson_rows(X_nbr[gidx], X_hat_nbr[gidx], branch="niche",
+                                   split="all", seed=args.seed, marker_idx=marker_idx)
+                     + _pearson_rows(X_nbr[gidx], X_hat_nbr[gidx], branch="niche",
+                                     split="test", seed=args.seed, marker_idx=marker_idx))
+
     df = pd.DataFrame(rows)
 
     os.makedirs(args.out_metrics_dir, exist_ok=True)
