@@ -407,6 +407,11 @@ def compute_pearson_metrics(
                 cache[(branch, "target")] = None
             if pred_key in adata.layers:
                 cache[(branch, "pred")] = _to_dense_2d(adata.layers[pred_key])
+            elif pred_key in adata.uns:
+                # SQUINT's predict saves X_hat / X_hat_nbr to adata.uns (torch
+                # tensors), not layers — mirror the X_nbr target's uns fallback
+                # so the niche branch (X_hat_nbr) is scored instead of skipped.
+                cache[(branch, "pred")] = _to_dense_2d(adata.uns[pred_key])
             else:
                 cache[(branch, "pred")] = None
         if cache[(branch, "target")] is None or cache[(branch, "pred")] is None:
