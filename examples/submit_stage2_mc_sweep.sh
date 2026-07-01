@@ -46,7 +46,8 @@ ABL_ROOT="${ABL_ROOT:-$ART/$DATASET/stage2-ablation}"
 LOG_ROOT="${LOG_ROOT:-$ART/logs/$DATASET/stage2-mc-sweep}"
 
 BASE="${BASE:-decode-temp05-nonoise}"     # trained variant whose npz we re-decode
-KS="${KS:-5 10 20 50}"                     # --decode-samples values to sweep
+KS="${KS:-5 10 20 30 50}"                  # --decode-samples (MC) sweep; 30 included to match GeST's neighbor count
+SMOOTH_KS="${SMOOTH_KS:-30}"               # --smooth-neighs (GeST-style spatial smoothing); 30 = GeST neighbors_k. "" to skip.
 NBR_NEIGHS="${NBR_NEIGHS:-16}"             # niche-branch aggregation graph
 
 LSF_GROUP="${LSF_GROUP:-s10396}"
@@ -58,26 +59,28 @@ LSF_CORES="${LSF_CORES:-8}"
 DRY_RUN="${DRY_RUN:-0}"
 
 echo "=========================================================="
-echo "Stage-2 Monte-Carlo decode sweep (DECODE-ONLY, no retrain)"
-echo "  base variant : $BASE   (re-decoding its saved npz)"
-echo "  K values     : $KS"
-echo "  nbr-neighs   : $NBR_NEIGHS"
-echo "  stage1       : $STAGE1_VARIANT_DIR"
-echo "  seeds        : $SEEDS"
-echo "  abl root     : $ABL_ROOT"
-echo "  LSF          : -G $LSF_GROUP -q $LSF_QUEUE -gpu '$LSF_GPU' -W $LSF_WALL"
+echo "Stage-2 decode sweep (DECODE-ONLY, no retrain)"
+echo "  base variant  : $BASE   (re-decoding its saved npz)"
+echo "  MC K values    : $KS         (--decode-samples: posterior-sample averaging)"
+echo "  smooth K values: ${SMOOTH_KS:-<none>}   (--smooth-neighs: GeST-style spatial smoothing)"
+echo "  nbr-neighs    : $NBR_NEIGHS"
+echo "  stage1        : $STAGE1_VARIANT_DIR"
+echo "  seeds         : $SEEDS"
+echo "  abl root      : $ABL_ROOT"
+echo "  LSF           : -G $LSF_GROUP -q $LSF_QUEUE -gpu '$LSF_GPU' -W $LSF_WALL"
 echo "  DRY_RUN=$DRY_RUN"
 echo "=========================================================="
 
 [[ "$DRY_RUN" == "1" ]] || mkdir -p "$LOG_ROOT"
 n_sub=0
-for K in $KS; do
-    var="${BASE}-mc${K}"
-    job="s2mc-${K}"
-    log_out="$LOG_ROOT/${var}.out"; log_err="$LOG_ROOT/${var}.err"
 
-    # One job per K, looping seeds inside. Submit-time vars expand now; the loop
-    # variable + per-seed paths stay literal (\$...) so they resolve on the node.
+# Submit ONE decode-only re-decode job (loops seeds inside) for a variant.
+#   $1 = variant dir name   $2 = job/log tag   $3 = extra decode flag(s)
+# Submit-time vars expand now; the loop var + per-seed paths stay literal (\$..).
+submit_redecode() {
+    local var="$1" tag="$2" extra="$3"
+    local log_out="$LOG_ROOT/${var}.out" log_err="$LOG_ROOT/${var}.err"
+    local JOB
     read -r -d '' JOB <<EOF || true
 set -euo pipefail
 source "$VENV_PATH/bin/activate"
@@ -89,17 +92,16 @@ for seed in $SEEDS; do
   seednum="\${seed##*_seed}"
   if [[ ! -f "\$codes" ]]; then echo "MISSING codes (skip): \$codes" >&2; continue; fi
   if [[ ! -f "\$pred"  ]]; then echo "MISSING pred  (skip): \$pred"  >&2; continue; fi
-  echo "[mc$K] decode \$seed (seednum=\$seednum) -> \$out"
+  echo "[$tag] decode \$seed (seednum=\$seednum) -> \$out"
   python examples/stage2_decode_pearson.py --predicted-adata "\$pred" \\
     --stage2-codes "\$codes" --out-metrics-dir "\$out/metrics" \\
-    --decode-samples $K --nbr-neighs $NBR_NEIGHS --seed "\$seednum"
+    --nbr-neighs $NBR_NEIGHS $extra --seed "\$seednum"
 done
-echo "[mc$K] DONE"
+echo "[$tag] DONE"
 EOF
-
-    BSUB=( bsub -G "$LSF_GROUP" -q "$LSF_QUEUE" -n "$LSF_CORES" -M "$LSF_MEM_MB"
-           -R "select[mem>$LSF_MEM_MB] rusage[mem=$LSF_MEM_MB]" -R "span[ptile=$LSF_CORES]"
-           -gpu "$LSF_GPU" -W "$LSF_WALL" -J "$job" -o "$log_out" -e "$log_err" )
+    local BSUB=( bsub -G "$LSF_GROUP" -q "$LSF_QUEUE" -n "$LSF_CORES" -M "$LSF_MEM_MB"
+                 -R "select[mem>$LSF_MEM_MB] rusage[mem=$LSF_MEM_MB]" -R "span[ptile=$LSF_CORES]"
+                 -gpu "$LSF_GPU" -W "$LSF_WALL" -J "s2mc-$tag" -o "$log_out" -e "$log_err" )
     if [[ "$DRY_RUN" == "1" ]]; then
         printf '%q ' "${BSUB[@]}"; printf 'bash -lc %q\n\n' "$JOB"
     else
@@ -110,7 +112,16 @@ EOF
         "${BSUB[@]}" bash -lc "$JOB"
     fi
     n_sub=$((n_sub + 1))
+}
+
+# MC (posterior-sample averaging) arms:  <BASE>-mc<K>
+for K in $KS; do
+    submit_redecode "${BASE}-mc${K}" "mc${K}" "--decode-samples $K"
+done
+# GeST-style spatial-smoothing arms:  <BASE>-smooth<K>  (hard decode + smooth)
+for SK in $SMOOTH_KS; do
+    submit_redecode "${BASE}-smooth${SK}" "sm${SK}" "--smooth-neighs $SK"
 done
 
-echo "Submitted $n_sub MC-sweep job(s) (K = $KS) for base=$BASE."
+echo "Submitted $n_sub decode-sweep job(s) for base=$BASE  (MC K=$KS ; smooth K=${SMOOTH_KS:-none})."
 echo "Rank when done:  python analysis/ablations/rank_stage2_ablations.py --include '${BASE}*'"

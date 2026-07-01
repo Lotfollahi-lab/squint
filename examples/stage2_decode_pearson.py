@@ -48,6 +48,13 @@ E[profile|context], the RMSE-optimal predictor -- which closes most of that gap
 while keeping the generative model. Needs ``probs_cell_*`` in the npz (run the
 stage-2 eval with save_soft=True). ``--decode-mode soft`` is the cheaper (but
 only approximate) deterministic analog: E[embedding] then one decode.
+
+``--smooth-neighs K`` is a SEPARATE axis: spatially smooth the cell prediction
+over each held-out cell's K nearest neighbors (self excluded), mimicking GeST
+(which predicts each cell from ~30 observed neighbors). This is spatial
+averaging, not posterior-sample averaging (--decode-samples) — both lower RMSE
+by moving toward a local mean, but at the cost of per-cell sharpness. Cell branch
+only; the native niche branch is unaffected.
 """
 
 from __future__ import annotations
@@ -365,9 +372,14 @@ def _dense(x):
 # dependency-light; the graph is Euclidean kNN + self-loops just like squidpy's,
 # so X_nbr targets are comparable to the GeST / scVI / NicheCompass niche bars.
 # ---------------------------------------------------------------------------
-def _spatial_knn_selfloop(coords, batch, k):
+def _spatial_knn_selfloop(coords, batch, k, include_self=True):
     """Binary CSR adjacency: each cell -> its (k nearest + self) within the same
-    batch (no cross-batch edges). Row-sum = neighbor count (for mean agg)."""
+    batch (no cross-batch edges). Row-sum = neighbor count (for mean agg).
+
+    ``include_self=True`` (niche aggregation): self-loops kept -> k+self per row.
+    ``include_self=False`` (GeST-style smoothing): self-loops stripped -> the k
+    nearest OTHER cells per row (the smoothed cell never sees its own value,
+    matching GeST's predict-from-observed-neighbors)."""
     import scipy.sparse as sp
     from sklearn.neighbors import NearestNeighbors
     coords = np.asarray(coords, dtype=np.float32)
@@ -386,6 +398,8 @@ def _spatial_knn_selfloop(coords, batch, k):
     r = np.concatenate(rows); c = np.concatenate(cols)
     A = sp.coo_matrix((np.ones(r.size, np.float32), (r, c)), shape=(n, n)).tocsr()
     A.data[:] = 1.0                               # binary (collapse any dup edge)
+    if not include_self:
+        A.setdiag(0.0); A.eliminate_zeros()       # drop self -> k nearest OTHERS
     return A
 
 
@@ -428,6 +442,15 @@ def parse_args(argv=None):
                    help="Spatial kNN neighbors for the niche branch. Default 16 "
                         "(matches SQUINT's native niche graph + the imputation "
                         "baselines' new default; was 10).")
+    p.add_argument("--smooth-neighs", type=int, default=0,
+                   help="K>0: SPATIALLY SMOOTH the CELL-level prediction — replace "
+                        "each held-out cell's decoded profile with the mean over its "
+                        "K nearest spatial neighbors (self EXCLUDED), GeST-style "
+                        "(GeST predicts each cell from ~30 observed neighbors). "
+                        "Applied to the cell branch before scoring; the niche branch "
+                        "(native niche decoder) is unaffected. 0 = off (default). "
+                        "This trades sharpness for RMSE (moves toward the local mean) "
+                        "— read the full panel, not just RMSE. Use 30 to match GeST.")
     p.add_argument("--nbr-batch-key", type=str, default="adata_batch_id",
                    help="obs column defining batches/sections for the per-batch "
                         "spatial graph (no cross-batch edges). Default adata_batch_id.")
@@ -555,6 +578,28 @@ def main(argv=None):
         print(f"[decode] {gidx.size} held-out cells; decode-mode=hard (argmax codes)")
         pred_cell = npz["codes_cell"].astype(np.int64)
         xhat_imp = _decode(pred_cell, None, gidx)
+
+    # ---- Optional GeST-style SPATIAL SMOOTHING of the cell prediction ------
+    # Replace each held-out cell's decoded profile with the MEAN over its K
+    # nearest spatial neighbors (self EXCLUDED), like GeST predicting each cell
+    # from ~30 observed neighbors. Neighbors draw from the FULL prediction
+    # (stage-1 recon for observed cells + imputation for held-out). Cell-branch
+    # only; the native niche branch below is untouched. Trades sharpness for RMSE.
+    if args.smooth_neighs and args.smooth_neighs > 0:
+        coords_s = adata.obsm.get("spatial")
+        if coords_s is None:
+            print("[decode] [smooth] obsm['spatial'] missing -- cannot smooth; skipping.")
+        else:
+            batch_s = (np.asarray(adata.obs[args.nbr_batch_key].values)
+                       if args.nbr_batch_key in adata.obs.columns
+                       else np.zeros(adata.n_obs, dtype=np.int64))
+            X_hat_full = X_hat_stored.copy()
+            X_hat_full[gidx] = xhat_imp
+            As = _spatial_knn_selfloop(np.asarray(coords_s), batch_s,
+                                       args.smooth_neighs, include_self=False)
+            xhat_imp = _nbr_mean(As, X_hat_full)[gidx].astype(np.float32)
+            print(f"[decode] [smooth] cell prediction spatially smoothed over "
+                  f"K={args.smooth_neighs} neighbors (GeST-style, self excluded)")
 
     # ---- Pearson on the held-out cells ------------------------------------
     target = X[gidx]
