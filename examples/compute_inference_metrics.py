@@ -550,46 +550,60 @@ def compute_mmd_comparable(
         n_sub: int = 2000,
         n_sigma: int = 1000,
         rng: Optional[np.random.Generator] = None,
+        max_pairs: Optional[int] = None,
     ) -> Optional[float]:
     """
     MMD with median-heuristic RBF bandwidth on standardised embeddings.
-    Uses scipy.spatial.distance.cdist to compute pairwise distances
-    block-wise — avoids the O(n^2 * d) memory blow-up of broadcasting.
-    Defined for exactly two batches; returns None otherwise.
+    Uses scipy.spatial.distance.cdist block-wise (avoids the O(n^2 * d) memory
+    blow-up of broadcasting).
+
+    Multi-batch: for 2 batches this is the two-sample MMD; for >2 batches it is
+    the MEAN of the pairwise MMD over all unordered batch pairs (the standard
+    multi-batch summary — reduces EXACTLY to the 2-batch value). The RBF
+    bandwidth is fixed once (global median heuristic) so every pair is on the
+    same scale. Returns None with <2 non-empty batches. `max_pairs` (optional)
+    subsamples the pair set to bound cost when there are very many batches.
     """
     rng = rng or np.random.default_rng(0)
     X = StandardScaler().fit_transform(emb)
 
-    # sigma via median heuristic on a subsample (median of pairwise distances)
+    # sigma via median heuristic on a subsample (median of pairwise distances).
+    # Global (shared across all pairs) so the MMD scale is comparable.
     idx = rng.choice(len(X), min(n_sigma, len(X)), replace=False)
     sub = X[idx]
     dists = cdist(sub, sub)
     nz = dists[dists > 0]
     sigma = float(np.median(nz)) if nz.size else 1.0
-
-    cats = np.unique(batch)
-    if len(cats) != 2:
-        print(f"    MMD: needs exactly 2 batches, got {len(cats)}; skipping")
-        return None
-    mask0 = batch == cats[0]
-    mask1 = batch == cats[1]
-    b0 = X[mask0]
-    b1 = X[mask1]
-    if len(b0) == 0 or len(b1) == 0:
-        print(f"    MMD: a batch is empty; skipping")
-        return None
-
-    idx0 = rng.choice(len(b0), min(n_sub, len(b0)), replace=False)
-    idx1 = rng.choice(len(b1), min(n_sub, len(b1)), replace=False)
-    b0s, b1s = b0[idx0], b1[idx1]
-
     inv2sigma2 = 1.0 / (2.0 * sigma * sigma)
 
     def rbf_mean(A: np.ndarray, B: np.ndarray) -> float:
         d2 = cdist(A, B, metric="sqeuclidean")
         return float(np.exp(-d2 * inv2sigma2).mean())
 
-    return rbf_mean(b0s, b0s) + rbf_mean(b1s, b1s) - 2.0 * rbf_mean(b0s, b1s)
+    # one sub-sample per NON-EMPTY batch (draw order == np.unique order, so the
+    # 2-batch result is bit-identical to the previous implementation)
+    subs: List[np.ndarray] = []
+    for c in np.unique(batch):
+        bc = X[batch == c]
+        if len(bc) == 0:
+            continue
+        j = rng.choice(len(bc), min(n_sub, len(bc)), replace=False)
+        subs.append(bc[j])
+    if len(subs) < 2:
+        print(f"    MMD: needs >=2 non-empty batches, got {len(subs)}; skipping")
+        return None
+
+    # precompute the within-batch kernel means once (reused across pairs)
+    self_k = [rbf_mean(s, s) for s in subs]
+    pairs = [(i, j) for i in range(len(subs)) for j in range(i + 1, len(subs))]
+    if max_pairs is not None and 0 < max_pairs < len(pairs):
+        keep = sorted(rng.choice(len(pairs), max_pairs, replace=False).tolist())
+        pairs = [pairs[k] for k in keep]
+    vals = [self_k[i] + self_k[j] - 2.0 * rbf_mean(subs[i], subs[j])
+            for (i, j) in pairs]
+    if len(subs) > 2:
+        print(f"    MMD: mean over {len(pairs)} batch pairs ({len(subs)} batches)")
+    return float(np.mean(vals))
 
 
 # ---------------------------------------------------------------------------
@@ -695,6 +709,12 @@ def main() -> None:
     ap.add_argument(
         "--mmd-n-sigma", type=int, default=1000,
         help="Sub-sample for MMD bandwidth median heuristic (default 1000).",
+    )
+    ap.add_argument(
+        "--mmd-max-pairs", type=int, default=0,
+        help="For >2 batches, MMD = mean over batch pairs. Cap the number of "
+             "pairs sampled (0 = all pairs). Use for datasets with many "
+             "batches (e.g. smb1-20b: 20 batches = 190 pairs).",
     )
     ap.add_argument(
         "--seed", type=int, default=0,
@@ -923,6 +943,7 @@ def main() -> None:
                 emb, batch,
                 n_sub=args.mmd_n_sub, n_sigma=args.mmd_n_sigma,
                 rng=np.random.default_rng(args.seed),
+                max_pairs=(args.mmd_max_pairs or None),
             )
 
             if ilisi is not None:
