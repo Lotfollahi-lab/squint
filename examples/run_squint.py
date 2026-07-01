@@ -27103,6 +27103,42 @@ batch_size=512,
         "build": lambda: _patch_holdout_regions(
             _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90)))),
     },
+    # --- BIGGER-DECODER siblings of the FiLM-scale region-holdout reference ---
+    # Identical to the reference above except the cell+niche NB-decoder MLP is
+    # widened from [32] -> [256] / [400, 400] (base default), applied LAST so it
+    # overrides the spine's dec-w[32]. Tests whether decoder capacity lifts the
+    # reconstruction metrics (recon ceiling in a VQ-VAE is usually codebook- not
+    # decoder-limited, so treat these as a capacity check). Reuse the mmb blob.
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w256+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+region-holdout+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Bigger-decoder sibling of the FiLM-scale region-holdout reference: "
+            "same s57_v19 config (cross-MNN + FiLM scale) + region-holdout, but the "
+            "cell+niche NB decoder MLP is widened from [32] to [256] (1 hidden). "
+            "Capacity check for reconstruction. Reuses the mmb blob (no rebuild)."
+        ),
+        "patches": [
+            "= FiLM-scale region-holdout reference + dec-w=[256] (both branches)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_holdout_regions(
+                _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90)))),
+            [256]),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w400x2+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+region-holdout+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "Bigger-decoder sibling of the FiLM-scale region-holdout reference: "
+            "cell+niche NB decoder MLP = [400, 400] (2 hidden, the dual base "
+            "default) vs the reference's [32]. Tests decoder depth+width for "
+            "reconstruction. Reuses the mmb blob (no rebuild)."
+        ),
+        "patches": [
+            "= FiLM-scale region-holdout reference + dec-w=[400, 400] (both branches)",
+        ],
+        "build": lambda: _patch_dual_decoder_width(
+            _patch_holdout_regions(
+                _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90)))),
+            [400, 400]),
+    },
     # -----------------------------------------------------------------------
     # s49_v23 ablations (canonical-name) — 7 ablations x 2 datasets
     # -----------------------------------------------------------------------
