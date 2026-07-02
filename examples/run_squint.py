@@ -35000,6 +35000,16 @@ _S57_EXTRA = [
     (32, "vq1level-k30", lambda: _patch_dual_vq(
         _patch_dual_squint_default(_s57_src_build("s51_v1_")),
         branch="both", codebook_size=30)),
+    # Continuous counterpart of the HEADLINE reference (s57_v19): identical
+    # config (FiLM-scale coupling + cross-batch MNN contrastive on the s51_v1
+    # spine) with the discrete ResidualVQ bottleneck swapped for a continuous
+    # passthrough (ContinuousVQ) on BOTH branches. This is the matched-pair
+    # continuous comparator for the discretization ablation — it isolates
+    # discreteness alone (everything else = headline), unlike s57_v28 which is
+    # continuous on a plain within-batch/no-FiLM spine.
+    (33, "continuous-ref-filmscale", lambda: _patch_dual_continuous_vq(
+        _patch_dual_squint_default(_s57_src_build("s51_v1_")),
+        branch="both")),
 ]
 for _v, _tag, _bld in _S57_EXTRA:
     VARIANTS[f"s57_v{_v}_{_tag}+mmb0-1b_smb1-1b_1p"] = {
