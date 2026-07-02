@@ -412,6 +412,42 @@ def _nbr_mean(A, M):
     return (num / rs[:, None]).astype(np.float32)
 
 
+def _neighbor_read_depth(coords, batch, gidx, L, k):
+    """Leak-free library size for held-out cells: for each held-out cell, the
+    mean library size ``L`` of its ``k`` nearest OBSERVED (non-held-out) cells
+    within the same section. Never reads a held-out cell's own counts -- this
+    mirrors how the GeST / kNN baselines obtain read depth (from observed
+    neighbors only), so the imputation comparison is apples-to-apples. For a
+    contiguous held-out block, interior cells still get a depth from the nearest
+    observed cells at/beyond the block boundary. Falls back to the per-batch
+    (or global) observed mean if a section has no observed cells."""
+    from sklearn.neighbors import NearestNeighbors
+    coords = np.asarray(coords, dtype=np.float64)
+    n = coords.shape[0]
+    held = np.zeros(n, dtype=bool); held[gidx] = True
+    L = np.asarray(L, dtype=np.float32)
+    rd = np.empty(gidx.size, dtype=np.float32)
+    pos = {int(g): i for i, g in enumerate(gidx)}
+    global_obs_mean = float(L[~held].mean()) if (~held).any() else float(L.mean())
+    for b in np.unique(batch):
+        in_b = (batch == b)
+        obs_b = np.where(in_b & ~held)[0]
+        hold_b = np.where(in_b & held)[0]
+        if hold_b.size == 0:
+            continue
+        if obs_b.size == 0:
+            for g in hold_b:
+                rd[pos[int(g)]] = global_obs_mean
+            continue
+        kk = int(min(k, obs_b.size))
+        nn = NearestNeighbors(n_neighbors=kk).fit(coords[obs_b])
+        _, nbr = nn.kneighbors(coords[hold_b])       # (|hold_b|, kk) into obs_b
+        depths = L[obs_b][nbr].mean(axis=1)          # (|hold_b|,)
+        for j, g in enumerate(hold_b):
+            rd[pos[int(g)]] = float(depths[j])
+    return rd
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -454,6 +490,16 @@ def parse_args(argv=None):
     p.add_argument("--nbr-batch-key", type=str, default="adata_batch_id",
                    help="obs column defining batches/sections for the per-batch "
                         "spatial graph (no cross-batch edges). Default adata_batch_id.")
+    p.add_argument("--read-depth-mode", choices=["true", "neighbor"], default="true",
+                   help="Library-size (read depth) used to scale the decoder for "
+                        "HELD-OUT cells. 'true' = the held-out cell's own total "
+                        "counts (leaks the target's depth -- valid only for the "
+                        "reconstruction sanity-check). 'neighbor' = mean library "
+                        "size of the K nearest OBSERVED cells (leak-free, matches "
+                        "the GeST/kNN baselines); USE THIS for imputation.")
+    p.add_argument("--read-depth-neighs", type=int, default=16,
+                   help="K for --read-depth-mode=neighbor (nearest observed cells "
+                        "whose library sizes are averaged). Default 16.")
     p.add_argument("--no-nbr", action="store_true",
                    help="Skip the neighborhood (niche) branch (cell branch only).")
     p.add_argument("--niche-from-cell", action="store_true",
@@ -542,7 +588,33 @@ def main(argv=None):
     npz = np.load(args.stage2_codes)
     gidx = npz["global_idx"].astype(np.int64)
     K = max(1, int(args.decode_samples))
-    rd = torch.as_tensor(X[gidx].sum(axis=1), dtype=torch.float32, device=device)
+    # Read depth (library size) used to scale the decoder. rd_full holds a value
+    # per cell: observed cells keep their own true depth; held-out cells get
+    # either their true depth ('true' mode -- LEAKS, sanity-check only) or the
+    # mean library size of their nearest OBSERVED cells ('neighbor' -- leak-free,
+    # matches GeST/kNN). Both the cell and niche branches read from rd_full.
+    L_all = np.asarray(X.sum(axis=1), dtype=np.float32).ravel()
+    rd_full = L_all.copy()
+    if args.read_depth_mode == "neighbor":
+        coords_rd = adata.obsm.get("spatial")
+        if coords_rd is None:
+            print("[decode] [read-depth] obsm['spatial'] missing -- cannot use "
+                  "neighbor read depth; falling back to TRUE (leaky) depth.")
+        else:
+            batch_rd = (np.asarray(adata.obs[args.nbr_batch_key].values)
+                        if args.nbr_batch_key in adata.obs.columns
+                        else np.zeros(X.shape[0], dtype=np.int64))
+            rd_hold = _neighbor_read_depth(np.asarray(coords_rd), batch_rd,
+                                           gidx, L_all, args.read_depth_neighs)
+            rd_full[gidx] = rd_hold
+            print(f"[decode] [read-depth] LEAK-FREE: held-out depth = mean library "
+                  f"size of {args.read_depth_neighs} nearest OBSERVED cells; "
+                  f"mean {rd_hold.mean():.1f} vs leaked-true {L_all[gidx].mean():.1f}")
+    else:
+        print("[decode] [read-depth] mode=true: held-out cells scaled by their OWN "
+              "true library size (LEAKS target depth -- for sanity-check only, "
+              "not a fair imputation setting).")
+    rd = torch.as_tensor(rd_full[gidx], dtype=torch.float32, device=device)
     cov = (torch.as_tensor(cov_all[gidx], dtype=torch.long, device=device)
            if model.decoder_covariate_dim > 0 else None)
 
@@ -663,7 +735,9 @@ def main(argv=None):
                         if model.decoder_covariate_dim > 0 else None)
 
             def _rd_t(rows):
-                return torch.as_tensor(X[rows].sum(axis=1), dtype=torch.float32, device=device)
+                # rd_full: observed cells -> own depth; held-out -> leak-free
+                # neighbor depth (or true, per --read-depth-mode).
+                return torch.as_tensor(rd_full[rows], dtype=torch.float32, device=device)
 
             if has_niche_codes and not args.niche_from_cell:
                 # NATIVE niche decoder for the held-out cells (same hard / soft /

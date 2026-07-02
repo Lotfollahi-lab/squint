@@ -60,6 +60,13 @@ NICHE_FROM_CELL_KS="${NICHE_FROM_CELL_KS:-}"
 ONLY_NICHE_FROM_CELL="${ONLY_NICHE_FROM_CELL:-}"
 if [[ -n "$ONLY_NICHE_FROM_CELL" ]]; then KS=""; SMOOTH_KS=""; fi
 NBR_NEIGHS="${NBR_NEIGHS:-16}"             # niche-branch aggregation graph
+# Held-out read depth (library size) for imputation. 'neighbor' = mean library
+# size of the K nearest OBSERVED cells (LEAK-FREE, fair vs GeST/kNN). 'true' =
+# the held-out cell's own depth (LEAKS the target -- sanity-check only). Applies
+# to BOTH the cell and niche branches. Use READ_DEPTH_MODE=neighbor for the
+# reported imputation numbers.
+READ_DEPTH_MODE="${READ_DEPTH_MODE:-true}"
+READ_DEPTH_NEIGHS="${READ_DEPTH_NEIGHS:-16}"
 
 LSF_GROUP="${LSF_GROUP:-s10396}"
 LSF_QUEUE="${LSF_QUEUE:-training-parallel}"
@@ -75,6 +82,7 @@ echo "  base variant  : $BASE   (re-decoding its saved npz)"
 echo "  MC K values    : $KS         (--decode-samples: posterior-sample averaging)"
 echo "  smooth K values: ${SMOOTH_KS:-<none>}   (--smooth-neighs: GeST-style spatial smoothing)"
 echo "  nbr-neighs    : $NBR_NEIGHS"
+echo "  read-depth    : $READ_DEPTH_MODE (neighs=$READ_DEPTH_NEIGHS)  [neighbor = leak-free held-out depth]"
 echo "  stage1        : $STAGE1_VARIANT_DIR"
 echo "  seeds         : $SEEDS"
 echo "  abl root      : $ABL_ROOT"
@@ -106,7 +114,7 @@ for seed in $SEEDS; do
   echo "[$tag] decode \$seed (seednum=\$seednum) -> \$out"
   python examples/stage2_decode_pearson.py --predicted-adata "\$pred" \\
     --stage2-codes "\$codes" --out-metrics-dir "\$out/metrics" \\
-    --nbr-neighs $NBR_NEIGHS $extra --seed "\$seednum"
+    --nbr-neighs $NBR_NEIGHS --read-depth-mode $READ_DEPTH_MODE --read-depth-neighs $READ_DEPTH_NEIGHS $extra --seed "\$seednum"
 done
 echo "[$tag] DONE"
 EOF
