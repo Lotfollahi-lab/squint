@@ -456,6 +456,14 @@ def parse_args(argv=None):
                         "spatial graph (no cross-batch edges). Default adata_batch_id.")
     p.add_argument("--no-nbr", action="store_true",
                    help="Skip the neighborhood (niche) branch (cell branch only).")
+    p.add_argument("--niche-from-cell", action="store_true",
+                   help="Build the niche branch by GRAPH-SMOOTHING the CELL "
+                        "prediction (X_hat_nbr = mean-agg of X_hat) INSTEAD of "
+                        "decoding SQUINT's native niche codes. This is the EXACT "
+                        "same neighborhood smoothing applied to the GeST / kNN / "
+                        "scVI bars, so it puts SQUINT's niche bar on an apples-to-"
+                        "apples footing with them (a fair-comparison ablation of "
+                        "the native niche decoder). Default off (native decoder).")
     p.add_argument("--selfcheck-min", type=float, default=0.99,
                    help="Min cell-wise Pearson for the true-code self-check (warn below).")
     return p.parse_args(argv)
@@ -657,7 +665,7 @@ def main(argv=None):
             def _rd_t(rows):
                 return torch.as_tensor(X[rows].sum(axis=1), dtype=torch.float32, device=device)
 
-            if has_niche_codes:
+            if has_niche_codes and not args.niche_from_cell:
                 # NATIVE niche decoder for the held-out cells (same hard / soft /
                 # K-sample policy as the cell branch). Aggregation is LINEAR, so
                 # averaging per-cell xhat_niche over K samples then aggregating ==
@@ -711,14 +719,23 @@ def main(argv=None):
                       f"mean-agg n_neighs={args.nbr_neighs} over "
                       f"{np.unique(batch).size} section(s)")
             else:
-                # Older stage-2 run w/o niche codes: fall back to aggregating the
-                # CELL prediction (the GeST/scVI convention). Re-run stage-2 to
-                # get the native niche branch.
-                print("[decode] [nbr] WARNING: no 'codes_niche' in npz -- falling back to "
-                      "aggregating the CELL prediction. Re-run stage-2 for the native "
-                      "niche branch.")
+                # Aggregate the CELL prediction: X_hat_nbr = mean-agg of X_hat, the
+                # SAME neighborhood smoothing the GeST / scVI / kNN bars get. Two
+                # ways to land here: (a) --niche-from-cell (INTENTIONAL fair-
+                # comparison ablation: smooth SQUINT's cell prediction like the
+                # baselines instead of using its native niche decoder), or (b) an
+                # older stage-2 run with no 'codes_niche' (automatic fallback).
                 X_hat_full = X_hat_stored.copy(); X_hat_full[gidx] = xhat_imp
                 X_hat_nbr = _nbr_mean(A, X_hat_full)
+                if args.niche_from_cell:
+                    print("[decode] [nbr] --niche-from-cell: X_hat_nbr = mean-agg of the "
+                          "CELL prediction (GeST/kNN-style smoothing), NOT the native "
+                          f"niche decoder; n_neighs={args.nbr_neighs} over "
+                          f"{np.unique(batch).size} section(s)")
+                else:
+                    print("[decode] [nbr] WARNING: no 'codes_niche' in npz -- falling back to "
+                          "aggregating the CELL prediction. Re-run stage-2 for the native "
+                          "niche branch.")
 
             rows += (_pearson_rows(X_nbr[gidx], X_hat_nbr[gidx], branch="niche",
                                    split="all", seed=args.seed, marker_idx=marker_idx)

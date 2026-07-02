@@ -48,6 +48,17 @@ LOG_ROOT="${LOG_ROOT:-$ART/logs/$DATASET/stage2-mc-sweep}"
 BASE="${BASE:-decode-temp05-nonoise}"     # trained variant whose npz we re-decode
 KS="${KS:-5 10 20 30 50}"                  # --decode-samples (MC) sweep; 30 included to match GeST's neighbor count
 SMOOTH_KS="${SMOOTH_KS:-30}"               # --smooth-neighs (GeST-style spatial smoothing); 30 = GeST neighbors_k. "" to skip.
+# --niche-from-cell (fair-comparison): build the NICHE branch by graph-smoothing
+# the CELL prediction (like GeST/kNN) instead of SQUINT's native niche decoder.
+# Space-separated list of MC K's to apply it to; "0" (or "hard") = the base
+# hard/K=1 decode. Empty = off. E.g. NICHE_FROM_CELL_KS="0 1000" -> two arms:
+# <BASE>-nichecell (No-MC) + <BASE>-mc1000-nichecell (MC).
+NICHE_FROM_CELL_KS="${NICHE_FROM_CELL_KS:-}"
+# ONLY_NICHE_FROM_CELL=1 -> run ONLY the niche-from-cell arms (skip the MC +
+# smooth sweeps). Needed because `${KS:-default}` treats an empty KS as unset
+# and re-applies the default, so `KS=""` alone won't suppress those arms.
+ONLY_NICHE_FROM_CELL="${ONLY_NICHE_FROM_CELL:-}"
+if [[ -n "$ONLY_NICHE_FROM_CELL" ]]; then KS=""; SMOOTH_KS=""; fi
 NBR_NEIGHS="${NBR_NEIGHS:-16}"             # niche-branch aggregation graph
 
 LSF_GROUP="${LSF_GROUP:-s10396}"
@@ -122,6 +133,17 @@ done
 for SK in $SMOOTH_KS; do
     submit_redecode "${BASE}-smooth${SK}" "sm${SK}" "--smooth-neighs $SK"
 done
+# Niche-from-cell (fair-comparison) arms: <BASE>[-mc<K>]-nichecell — niche branch
+# = graph-smoothed cell prediction (same as GeST/kNN), NOT the native niche
+# decoder. "0"/"hard" = base K=1 decode; a number = that MC K (--decode-samples).
+for NK in $NICHE_FROM_CELL_KS; do
+    if [[ "$NK" == "0" || "$NK" == "hard" ]]; then
+        submit_redecode "${BASE}-nichecell" "ncell" "--niche-from-cell"
+    else
+        submit_redecode "${BASE}-mc${NK}-nichecell" "ncell${NK}" \
+            "--decode-samples $NK --niche-from-cell"
+    fi
+done
 
-echo "Submitted $n_sub decode-sweep job(s) for base=$BASE  (MC K=$KS ; smooth K=${SMOOTH_KS:-none})."
+echo "Submitted $n_sub decode-sweep job(s) for base=$BASE  (MC K=$KS ; smooth K=${SMOOTH_KS:-none} ; niche-from-cell K=${NICHE_FROM_CELL_KS:-none})."
 echo "Rank when done:  python analysis/ablations/rank_stage2_ablations.py --include '${BASE}*'"
