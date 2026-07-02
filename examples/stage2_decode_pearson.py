@@ -559,14 +559,19 @@ def main(argv=None):
             f"from final indices. This script supports None/film_scale/film/film_cont.")
     print(f"[decode] decoder_covariate_dim={model.decoder_covariate_dim}, ccn_mode={ccn}")
 
-    def _decode(idx_cell_np, idx_niche_np, rows):
-        """rows: global row indices into adata; returns X_hat (len(rows), G)."""
+    def _decode(idx_cell_np, idx_niche_np, rows, read_depth=None):
+        """rows: global row indices into adata; returns X_hat (len(rows), G).
+        read_depth: optional (len(rows),) tensor to scale the decoder. If None,
+        uses the rows' TRUE library size -- correct for the self-check and for
+        reconstruction (own counts), but a LEAK for held-out imputation, so the
+        hard-decode imputation path passes the leak-free rd explicitly."""
         ic = torch.as_tensor(idx_cell_np, dtype=torch.long, device=device)
-        rd = torch.as_tensor(X[rows].sum(axis=1), dtype=torch.float32, device=device)
+        rd_ = (read_depth if read_depth is not None
+               else torch.as_tensor(X[rows].sum(axis=1), dtype=torch.float32, device=device))
         cov = (torch.as_tensor(cov_all[rows], dtype=torch.long, device=device)
                if model.decoder_covariate_dim > 0 else None)
         with torch.no_grad():
-            xhat = decode_cell_xhat(model, ic, None, cov, rd, torch)
+            xhat = decode_cell_xhat(model, ic, None, cov, rd_, torch)
         return xhat.detach().cpu().numpy().astype(np.float32)
 
     # ---- SELF-CHECK: true codes must reproduce the stored X_hat -----------
@@ -657,7 +662,7 @@ def main(argv=None):
     else:
         print(f"[decode] {gidx.size} held-out cells; decode-mode=hard (argmax codes)")
         pred_cell = npz["codes_cell"].astype(np.int64)
-        xhat_imp = _decode(pred_cell, None, gidx)
+        xhat_imp = _decode(pred_cell, None, gidx, read_depth=rd)  # rd = leak-free (rd_full[gidx])
 
     # ---- Optional GeST-style SPATIAL SMOOTHING of the cell prediction ------
     # Replace each held-out cell's decoded profile with the MEAN over its K
