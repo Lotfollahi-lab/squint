@@ -32,8 +32,20 @@ SEEDS="${1:-${SEEDS:-0,1,2,3,4}}"
 DRY_RUN="${DRY_RUN:-0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Resolve a Python that can import run_squint (needs py>=3.10 + the squint deps).
+# Prefer the squint venv so this works whether or not the venv is activated
+# (on the head node bare `python` is often not on PATH).
+VENV_PYTHON="${VENV_PYTHON:-/nfs/team361/sb75/.venvs/squint/bin/python}"
+PYTHON="${PYTHON:-}"
+if [[ -z "$PYTHON" ]]; then
+    if [[ -x "$VENV_PYTHON" ]];              then PYTHON="$VENV_PYTHON"
+    elif command -v python  >/dev/null 2>&1; then PYTHON=python
+    elif command -v python3 >/dev/null 2>&1; then PYTHON=python3
+    else echo "No python found (set PYTHON=... or VENV_PYTHON=...)." >&2; exit 1; fi
+fi
+
 # The five EMA-decay-sweep variants (s65_v1..v5), pulled from the registry.
-mapfile -t VARIANTS < <(python -c "
+mapfile -t VARIANTS < <("$PYTHON" -c "
 import sys; sys.path.insert(0, '$SCRIPT_DIR')
 import run_squint
 for k in run_squint.VARIANTS:
