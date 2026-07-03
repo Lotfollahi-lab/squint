@@ -35023,6 +35023,62 @@ for _v, _tag, _bld in _S57_EXTRA:
 
 
 # ===========================================================================
+# s65 — EMA-decay (beta) SENSITIVITY SWEEP on the headline reference (s57_v19).
+# (s64 is already taken by the squint_hln hyperparameter sweep.)
+# Reviewer: "EMA decay beta = 0.8 still asserted, not swept ... a short beta
+# sweep would preempt the obvious question." Each variant is the s57_v19
+# FiLM-scale reference build (cross-batch MNN + cell-cond FiLM scale-only on the
+# s51_v1 RVQ(30,90) spine) with ONLY the codebook EMA decay changed on BOTH
+# branches. beta=0.8 IS the reference itself (s57_v19) — NOT re-registered here,
+# so the sweep is {0.5, 0.7, 0.8(=ref), 0.9, 0.95, 0.99}. Evaluate on CODEBOOK
+# HEALTH (active-code fraction / perplexity / dead codes via
+# report_codebook_usage.py --all-seeds) + the usual downstream NMI/ARI/iLISI/MMD.
+# ===========================================================================
+def _patch_dual_ema_decay(cfg: dict, decay: float) -> dict:
+    """Override the codebook EMA decay (beta) on BOTH VQ branches (cell + niche).
+
+    Touches ONLY the `decay` key of `vq_cell_params` / `vq_niche_params` — NOT
+    the optimizer `weight_decay` or any loss-schedule decay. Raises if neither
+    branch config carries a `decay` key (i.e. not a dual VQ config)."""
+    enc = cfg["model"]["encoder_params"]
+    n_set = 0
+    for _k in ("vq_cell_params", "vq_niche_params"):
+        vp = enc.get(_k)
+        if isinstance(vp, dict) and "decay" in vp:
+            vp["decay"] = float(decay)
+            n_set += 1
+    if n_set == 0:
+        raise ValueError(
+            "_patch_dual_ema_decay: no vq_cell_params/vq_niche_params with a "
+            "'decay' key found — is this a dual VQ config?")
+    return cfg
+
+
+_S65_EMADECAY = [
+    # (vN, slug, beta) — beta=0.8 omitted (== the s57_v19 reference, already run)
+    (1, "0p5",  0.5),
+    (2, "0p7",  0.7),
+    (3, "0p9",  0.9),
+    (4, "0p95", 0.95),
+    (5, "0p99", 0.99),
+]
+for _v, _slug, _beta in _S65_EMADECAY:
+    VARIANTS[f"s65_v{_v}_emadecay-{_slug}+reference-filmscale+mmb0-1b_smb1-1b_1p"] = {
+        "description": (
+            f"s65 EMA-decay sensitivity sweep (beta={_beta}) on the s57_v19 "
+            f"FiLM-scale reference — codebook-health robustness. beta=0.8 = the "
+            f"reference (s57_v19), not re-run here."
+        ),
+        "patches": [f"= s57_v19 reference + codebook EMA decay beta={_beta}"],
+        # default-arg `b=_beta` binds the loop value at def time (avoids the
+        # late-binding closure bug); lambdas are lazy so `_patch_dual_squint_default`
+        # / `_s57_src_build` (defined below/above) resolve fine at build time.
+        "build": (lambda b=_beta: _patch_dual_ema_decay(
+            _patch_dual_squint_default(_s57_src_build("s51_v1_")), b)),
+    }
+
+
+# ===========================================================================
 # s63 — ALL ablations on the NEW DEFAULT spine = cross-batch-MNN + cell-cond
 # niche FiLM scale-only (the coupling that improved spatial-domain integration,
 # = s62_v5). Mirrors s57 but adds `_patch_dual_cell_conditioned_niche(mode=
