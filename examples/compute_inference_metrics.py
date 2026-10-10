@@ -129,15 +129,17 @@ try:
 except Exception:
     _HAS_PYNNDESCENT = False
 
-# Optional: scib_metrics' iLISI implementation. We fall back to a simple
-# inline version if the package is unavailable so the script still runs
-# in minimal environments.
+# scib_metrics' iLISI implementation. Required for iLISI: without it iLISI is
+# skipped. An earlier inline fallback (unscaled, uniformly weighted inverse
+# Simpson mean) returned a different statistic and has been removed.
 try:
     from scib_metrics import ilisi_knn as _scib_ilisi_knn
     from scib_metrics.nearest_neighbors import NeighborsResults
     _HAS_SCIB_METRICS = True
-except Exception:
+    _SCIB_IMPORT_ERROR = None
+except Exception as _exc:
     _HAS_SCIB_METRICS = False
+    _SCIB_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -490,63 +492,43 @@ def compute_pearson_metrics(
 # Batch integration
 # ---------------------------------------------------------------------------
 
-def _ilisi_inline(
-        knn_indices: np.ndarray,
-        batch_labels: np.ndarray,
-    ) -> np.ndarray:
-    """
-    Inverse Simpson Index per cell over its kNN's batch labels (uniform
-    weighting, no Gaussian re-weighting). Higher = more batch-mixed.
-    Equivalent to scib's iLISI up to the kernel weighting used.
-
-    Vectorised with `np.add.at` over (cell, batch) pairs (was a Python
-    `for i in range(n)` loop calling `np.unique` per cell). For 1M
-    cells × 30 neighbours that's ~30M Python iterations → minutes;
-    vectorised version is ~50-100× faster.
-    """
-    nbr_batches = batch_labels[knn_indices]  # (n, k)
-    n, k = nbr_batches.shape
-    if n == 0:
-        return np.empty(0, dtype=np.float64)
-
-    # Densify batch labels to contiguous integer ids in [0, n_batches).
-    unique_batches, dense = np.unique(nbr_batches, return_inverse=True)
-    dense = dense.reshape(n, k)
-    n_batches = int(unique_batches.size)
-
-    # Build a (n, n_batches) count matrix in one vectorised scatter.
-    counts = np.zeros((n, n_batches), dtype=np.float64)
-    rows = np.repeat(np.arange(n), k)
-    cols = dense.ravel()
-    np.add.at(counts, (rows, cols), 1.0)
-
-    p = counts / float(k)             # uniform weighting → divide by k
-    inv_simpson = 1.0 / np.sum(p ** 2, axis=1)
-    return inv_simpson
-
-
 def compute_ilisi(
         emb: np.ndarray,
         batch: np.ndarray,
         n_neighbors: int = 90,
+        seed: int = 0,
     ) -> Optional[float]:
     """
-    Mean iLISI across all cells. Uses pynndescent for the kNN graph
-    (much faster than sklearn for large n). Falls back to a simple
-    inline iLISI when scib_metrics isn't installed.
+    iLISI as scib_metrics.ilisi_knn computes it: per-cell LISI of the batch
+    labels over a k-NN graph (Gaussian kernel, perplexity k/3), median over
+    cells, rescaled to [0, 1] as (median - 1) / (n_batches - 1). Uses
+    pynndescent for the kNN graph (much faster than sklearn for large n).
+
+    Rows are randomly permuted before the neighbour search. Quantized
+    embeddings (e.g. SQUINT's *_emb) contain large groups of identical rows;
+    on rows stored section by section, tie-breaking by row order picks
+    same-section neighbours and understates iLISI. Permuting makes the
+    tie-breaking random. Continuous embeddings are unaffected.
+
+    Returns None (and prints why) if pynndescent or scib_metrics is missing;
+    there is deliberately no fallback statistic.
     """
     if not _HAS_PYNNDESCENT:
         print("    iLISI: pynndescent not installed; skipping")
         return None
-    knn = NNDescent(emb, n_neighbors=min(n_neighbors, len(emb) - 1))
+    if not _HAS_SCIB_METRICS:
+        print(f"    iLISI: scib_metrics not importable ({_SCIB_IMPORT_ERROR}); "
+              f"skipping")
+        return None
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(emb))
+    emb = np.asarray(emb)[perm]
+    batch = np.asarray(batch)[perm]
+    knn = NNDescent(emb, n_neighbors=min(n_neighbors, len(emb) - 1),
+                    random_state=seed)
     indices, distances = knn.neighbor_graph
-
-    if _HAS_SCIB_METRICS:
-        nb = NeighborsResults(indices=indices, distances=distances)
-        return float(np.mean(_scib_ilisi_knn(nb, batch)))
-
-    # Fallback: uniform-weighted iLISI on the kNN indices.
-    return float(np.mean(_ilisi_inline(indices, batch)))
+    nb = NeighborsResults(indices=indices, distances=distances)
+    return float(_scib_ilisi_knn(nb, batch))
 
 
 def compute_mmd_comparable(
@@ -698,7 +680,7 @@ def main() -> None:
         "--ilisi-max-cells", type=int, default=100000,
         help="Cap the number of cells used for iLISI; if the embedding has "
              "more, a random subsample of this size is used (an unbiased "
-             "estimate of mean iLISI). 0 = no cap. iLISI builds a FULL kNN "
+             "estimate of iLISI). 0 = no cap. iLISI builds a FULL kNN "
              "graph with no internal subsampling (unlike MMD/ASW), so on large "
              "sections (e.g. ~700k cells) it OOMs and kills the whole metrics "
              "step — capping it keeps memory bounded (default 100000).",
@@ -919,7 +901,7 @@ def main() -> None:
             # on large sections and, being un-guarded, would kill the whole
             # metrics step before the CSV is written (resolution metrics, run
             # earlier, survive — exactly the "no integration metrics" symptom).
-            # Cap the cell count (random subsample = unbiased mean-iLISI
+            # Cap the cell count (random subsample = unbiased iLISI
             # estimate) and guard so a failure can't abort MMD/ASW + the write.
             try:
                 if args.ilisi_max_cells and len(emb) > args.ilisi_max_cells:
@@ -928,10 +910,12 @@ def main() -> None:
                     print(f"    iLISI: subsampling {len(emb)} -> "
                           f"{args.ilisi_max_cells} cells")
                     ilisi = compute_ilisi(emb[_sub], batch[_sub],
-                                          n_neighbors=args.ilisi_n_neighbors)
+                                          n_neighbors=args.ilisi_n_neighbors,
+                                          seed=args.seed)
                 else:
                     ilisi = compute_ilisi(emb, batch,
-                                          n_neighbors=args.ilisi_n_neighbors)
+                                          n_neighbors=args.ilisi_n_neighbors,
+                                          seed=args.seed)
             except Exception as exc:
                 print(f"    iLISI: failed ({exc}); skipping")
                 ilisi = None
