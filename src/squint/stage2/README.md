@@ -149,42 +149,6 @@ python examples/stage2_decode_pearson.py --predicted-adata $RUN/predicted_adata.
 - `--niche-from-cell` builds the neighbourhood-level prediction by averaging
   the cell-level prediction over the spatial graph, as for the baselines.
 
-## Leak-free (inductive) held-out protocol
-
-The paper's region-holdout model is transductive: in stage 1 the held-out
-cells stay graph neighbours of observed cells, so their counts reach the
-training losses, and the niche codes of observed boundary cells (the stage-2
-context) aggregate held-out expression. The opt-in variants
-`<prefix>+region-holdout-inductive+mmb0-1b_smb1-1b_1p` and
-`<prefix>+region-holdout-inductive-drop+mmb0-1b_smb1-1b_1p` remove every edge
-from a held-out to an observed cell in training, validation and predict. Stage 2
-itself is unchanged and runs with the paper's settings. Their
-`predicted_adata.h5ad` differs from the interface above in two ways:
-
-- `uns['squint']['holdout_graph']` is `rebuild` or `drop` (`transductive`, or
-  absent in older files, for the paper's runs);
-  `examples/check_holdout_leakage.py` audits the stored graph.
-- `uns['codebook_sizes_cell']` and `uns['codebook_sizes_niche']` hold the
-  configured sizes (`[30, 90]`), so stage 2 sizes its heads from the codebooks
-  rather than from the largest index + 1.
-  `uns['squint']['codebook_sizes_differ_from_max1']` records whether the two
-  differ.
-
-`examples/stage2_decode_pearson.py` adds opt-in flags; their defaults reproduce
-the paper's numbers:
-
-- `--stage1-ckpt-policy adata` decodes with the checkpoint that predict used to
-  write the codes and `layers['X_hat']`. The default, `last`, loads `last.ckpt`.
-- `--observed-xhat redecode` re-decodes observed cells from their true codes, in
-  batches without held-out cells.
-- `--nbr-observed-fill truth|heldout_only` sets how observed neighbours enter
-  the neighbourhood score.
-- `--selfcheck-strict` turns the self-check warning into an error.
-
-The decoder also always checks that the npz covers exactly the
-`data_split == 'test'` rows. The runbook is "Leak-free (inductive) imputation"
-in Section 3.2 of the reproducibility repository.
-
 ## Python API
 
 ```python

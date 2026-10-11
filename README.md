@@ -1,5 +1,10 @@
 # SQUINT
 
+> **Branch `leakfree-holdout`.** This branch adds an opt-in leak-free (inductive)
+> protocol for the held-out-region imputation; see
+> [Leak-free (inductive) held-out protocol](#leak-free-inductive-held-out-protocol-this-branch).
+> All defaults, and every command for the reported results, are unchanged.
+
 SQUINT learns two discrete codes per cell from spatial transcriptomics data: a
 cell code that mainly reflects cell-intrinsic identity and a niche code that
 mainly reflects the cell's spatial context. It is a graph vector-quantized
@@ -356,6 +361,50 @@ target; it is only meant for reconstruction checks.
 
 Table 1 to 3 values, their statistics and the figure panels are computed in
 the reproducibility repository.
+
+### Leak-free (inductive) held-out protocol (this branch)
+
+The region-holdout model behind the paper's imputation results is
+transductive: in stage 1 the held-out cells are never training or validation
+seeds, but they stay graph neighbours of observed cells. Their counts
+therefore reach the GNN input, the 1-hop niche target, the adjacency loss and
+the codebook updates of observed boundary cells, and at predict the niche
+codes of those cells, which stage 2 reads as context, aggregate held-out
+expression. This branch adds an opt-in protocol that removes both paths. All
+defaults are unchanged.
+
+- Variants `$H+region-holdout-inductive+mmb0-1b_smb1-1b_1p` (headline) and
+  `$H+region-holdout-inductive-drop+mmb0-1b_smb1-1b_1p` (sensitivity), built
+  as the region-holdout model plus `_patch_holdout_inductive`. In the held-out
+  sections `SpatialBatchSplit` removes every edge from a held-out to an
+  observed cell, for training, validation and predict. `inductive` rebuilds
+  the observed 16-NN graph over observed cells only, with the constructor and
+  symmetrisation of the dataset blob; `inductive-drop` keeps the original
+  observed edges. Edges into held-out cells are kept, so their own codes and
+  reconstruction targets are unchanged. Guards (`assert_inductive_holdout`)
+  raise if a held-out cell enters a training or validation batch or if a
+  held-out-to-observed edge reaches a predict batch.
+- `examples/run_inference.py --holdout-graph rebuild --output-dir <new dir>`
+  applies the inductive graph to an existing run at predict time only.
+- Their `predicted_adata.h5ad` records the protocol in
+  `uns['squint']['holdout_graph']` and stores the configured codebook sizes in
+  `uns['codebook_sizes_cell']` and `uns['codebook_sizes_niche']`, which
+  stage 2 then uses instead of the largest index + 1.
+- `examples/stage2_decode_pearson.py` adds `--stage1-ckpt-policy adata`
+  (decode with the checkpoint that predict used; the default loads
+  `last.ckpt`), `--observed-xhat redecode` (re-decode observed cells from their
+  true codes in batches without held-out cells), `--nbr-observed-fill
+  truth|heldout_only` (how observed neighbours enter the neighbourhood score)
+  and `--selfcheck-strict`. It always checks that the stage-2 codes cover
+  exactly the `data_split == 'test'` rows.
+- `examples/check_holdout_leakage.py` audits a `predicted_adata.h5ad`, and
+  `tests/test_inductive_holdout.py` tests the graph rewrite and the guards
+  (needs torch and PyTorch Geometric).
+
+The farm runbook (stage 1, stage 2 with the paper's settings, decode arms,
+baseline rescoring and Table 2 in separate folders) is "Leak-free (inductive)
+imputation" in Section 3.2 of the README of the reproducibility repository on
+its `leakfree-holdout` branch.
 
 ## Key model options
 
