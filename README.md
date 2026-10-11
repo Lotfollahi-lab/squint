@@ -235,7 +235,6 @@ H="dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+c
 #   $H+chl59-2b_1p                                   CosMx NSCLC (Table 1)
 #   $H+xhs1000-3b_1p                                 Xenium Eczema (Table 1)
 #   $H+region-holdout+mmb0-1b_smb1-1b_1p             Mouse Brain with two held-out regions (Table 2)
-#   $H+chl59-8b_1p                                   CosMx NSCLC cohort, Lung13 and Lung5_Rep3 held out (Fig. 3)
 #   s57_v1_* ... s57_v33_*                           ablations (Table 3, Table S1)
 ```
 
@@ -378,7 +377,7 @@ the values of the paper's models:
 | `model.decoder_covariate_dim_request` | `true` | Section covariate in both decoders |
 | `model.attribute_decoder_{cell,niche}_params.mlp_params.hidden_channels` | `[32]` | Decoder hidden layer |
 | `model.optimizer_params.lr` / `weight_decay` | `7e-4` / `1e-3` | Adam |
-| `datamodule.loader_params.batch_size` | `512` (`128` for `$H+chl59-8b_1p`) | Seed cells per step |
+| `datamodule.loader_params.batch_size` | `512` | Seed cells per step |
 | `trainer.max_epochs` | `80` (`400` on Xenium Eczema) | With early stopping on the validation loss |
 
 ### Codes, levels and iLISI
