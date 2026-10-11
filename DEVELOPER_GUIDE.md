@@ -6,21 +6,21 @@
     - Name the branch according to the following convention: prefix such as `feature/`,  `bugfix/`, `docs/`, `tests/`, `refactor/` and name such as `name-of-feature`.
     - Commit frequently and create a pull request once the branch is ready to be merged.
 - Notebooks:
-    - Place notebooks in `src/vqniche/notebooks`.
+    - Place notebooks in `src/squint/notebooks`.
     - Create this folder if it does not exist.
 - Related Repositories:
-    - Code for our method(s) goes into `vqniche` repository.
-    - Code for reproducibility goes into `vqniche-reproducibility` repository.
+    - Code for our method(s) goes into `squint` repository.
+    - Code for reproducibility goes into `squint-reproducibility` repository.
 
 ## Building a Clean Conda Environment:
 
-Name of Environment: `vqniche-reproducibility`
+Name of Environment: `squint-reproducibility`
 Install packages in the following order to manage package dependencies and avoid conflicts:
 1. Grab a small interactive CPU node session:
     - `bsub -q normal -n4 -M25G -R"select[mem>25G] rusage[mem=25G]" -Is /bin/bash`
 2. Create a blank new environment:
-    - `conda create --name vqniche-reproducibility python=3.10`
-    - `conda activate vqniche-reproducibility`
+    - `conda create --name squint-reproducibility python=3.10`
+    - `conda activate squint-reproducibility`
 3. Add scanpy
     - `pip install scanpy`
 4. Add pytorch (version 2.2) for Cuda 12.1
@@ -53,6 +53,7 @@ Install packages in the following order to manage package dependencies and avoid
     - `pip install wandb`
 18. Add pre-commit
     - `pip install pre-commit`
-19. `vqniche` package in editable mode:
+19. `squint` package in editable mode:
     - `pip install -e .`
-    - **Usage**: The command syntax is `pip install -e path/to/PackageDirectory`, where `path/to/PackageDirectory` is the path to the directory containing the package's `pyproject.toml` file. This means navigating to the root directory of the `vqniche` repository.
+    - **Usage**: The command syntax is `pip install -e path/to/PackageDirectory`, where `path/to/PackageDirectory` is the path to the directory containing the package's `pyproject.toml` file. This means navigating to the root directory of the `squint` repository.
+    - **Existing environments**: if the environment still has the old `vqniche` package installed, run `pip uninstall vqniche` and delete the leftover `src/vqniche` directory first (see "Upgrading an environment from `vqniche`" in the README).

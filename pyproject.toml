@@ -1,7 +1,7 @@
 ###############################################################################
 # Install with uv (recommended):
 #
-#   cd /nfs/team361/sb75/squint
+#   cd squint                             # repository root
 #   uv venv .venv --python 3.10           # create the venv
 #   source .venv/bin/activate
 #   uv sync                                # resolves + installs everything
@@ -25,9 +25,9 @@ build-backend = "hatchling.build"
 requires = [ "hatchling" ]
 
 [project]
-name = "vqniche"
+name = "squint"
 version = "0.0.1"
-description = "VQNiche -- Tokenization for Tissue Sections"
+description = "SQUINT -- Tokenization for Tissue Sections"
 readme = "README.md"
 license = { file = "LICENSE" }
 maintainers = [
@@ -104,6 +104,11 @@ dependencies = [
     "setuptools>=68,<76",
 ]
 
+# docs/conf.py reads the "Source" entry from the installed package metadata.
+[project.urls]
+Source = "https://github.com/Lotfollahi-lab/squint"
+Home-page = "https://github.com/Lotfollahi-lab/squint"
+
 [project.optional-dependencies]
 dev = [
     "pre-commit",
@@ -170,7 +175,7 @@ explicit = true
 ###############################################################################
 
 [tool.coverage.run]
-source = ["vq-niche"]
+source = ["squint"]
 omit = [
     "**/test_*.py",
 ]

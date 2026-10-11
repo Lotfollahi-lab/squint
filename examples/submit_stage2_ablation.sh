@@ -66,7 +66,7 @@ variant_train_flags() {
         soft)      echo "" ;;                         # same train as base; soft decode (probs saved by run_stage2)
         # --- ARCHITECTURE ablation: swappable stage-2 backbone (--arch) -----
         # Same embedding / heads / masked-CE / MaskGIT decode; only the body
-        # differs (vqniche.stage2.backbones). 'base' is the transformer arch.
+        # differs (squint.stage2.backbones). 'base' is the transformer arch.
         arch-gnn)        echo "--arch gnn" ;;          # spatial-kNN message passing (GraphSAGE)
         arch-labelprop)  echo "--arch labelprop" ;;    # APPNP propagation + MLP correction (smoothness ceiling)
         arch-graphmae)   echo "--arch graphmae" ;;     # GNN enc -> re-mask -> GNN dec (GraphMAE)

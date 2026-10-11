@@ -1,5 +1,5 @@
 name: Feature request
-description: Propose a new feature for vqniche
+description: Propose a new feature for SQUINT
 labels: enhancement
 body:
   - type: textarea

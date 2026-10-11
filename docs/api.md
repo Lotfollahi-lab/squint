@@ -3,8 +3,8 @@
 ## Preprocessing
 
 ```{eval-rst}
-.. module:: vqniche.pp
-.. currentmodule:: vqniche
+.. module:: squint.pp
+.. currentmodule:: squint
 
 .. autosummary::
     :toctree: generated
@@ -15,8 +15,8 @@
 ## Tools
 
 ```{eval-rst}
-.. module:: vqniche.tl
-.. currentmodule:: vqniche
+.. module:: squint.tl
+.. currentmodule:: squint
 
 .. autosummary::
     :toctree: generated
@@ -27,8 +27,8 @@
 ## Plotting
 
 ```{eval-rst}
-.. module:: vqniche.pl
-.. currentmodule:: vqniche
+.. module:: squint.pl
+.. currentmodule:: squint
 
 .. autosummary::
     :toctree: generated

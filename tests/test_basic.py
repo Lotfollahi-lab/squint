@@ -1,10 +1,10 @@
 import pytest
 
-import vqniche
+import squint
 
 
 def test_package_has_version():
-    assert vqniche.__version__ is not None
+    assert squint.__version__ is not None
 
 
 @pytest.mark.skip(reason="This decorator should be removed when test passes.")

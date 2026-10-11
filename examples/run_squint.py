@@ -1128,8 +1128,8 @@ def make_train_config_poc() -> dict:
             },
         },
         "model": {
-            "model_name": "VQNiche",
-            "encoder_name": "VQNiche_Encoder",
+            "model_name": "Squint",
+            "encoder_name": "Squint_Encoder",
             "attribute_decoder_name": "MLPSoftmax",
             "adjacency_decoder_name": "MLP_AdjacencyDecoder",
             "predictor_name": "Linear",
@@ -1781,9 +1781,9 @@ def _B():
 
 
 # ---------------------------------------------------------------------------
-# 2c. VQNiche_Dual: dual-codebook config builder
+# 2c. Squint_Dual: dual-codebook config builder
 # ---------------------------------------------------------------------------
-# The dual model (`VQNiche_Dual`) has a separate cell and niche codebook + a
+# The dual model (`Squint_Dual`) has a separate cell and niche codebook + a
 # separate decoder for each branch. The config below is built by starting
 # from the single-codebook POC config and then:
 #   - replacing model_name/encoder_name with the dual classes
@@ -1895,7 +1895,7 @@ def _default_cvq_params(
 
 def make_train_config_dualvq() -> dict:
     """
-    Build the base config for VQNiche_Dual.
+    Build the base config for Squint_Dual.
 
     Defaults (per design D1–D6):
       - encoder: shared MLP [400, 256], GraphSAGE GNN with hidden=256,
@@ -1925,8 +1925,8 @@ def make_train_config_dualvq() -> dict:
     cfg = make_train_config_poc()
 
     # --- model class names ------------------------------------------------
-    cfg["model"]["model_name"]   = "VQNiche_Dual"
-    cfg["model"]["encoder_name"] = "VQNiche_Dual_Encoder"
+    cfg["model"]["model_name"]   = "Squint_Dual"
+    cfg["model"]["encoder_name"] = "Squint_Dual_Encoder"
     cfg["model"]["adjacency_decoder_name"] = None   # not used
 
     # --- encoder: replace single vq_params with two slots ----------------
@@ -2024,7 +2024,7 @@ def _BD():
 
 
 # ---------------------------------------------------------------------------
-# 2d. VQNiche_Dual ablation patches
+# 2d. Squint_Dual ablation patches
 # ---------------------------------------------------------------------------
 
 def _patch_dual_no_adj(cfg: dict) -> dict:
@@ -2271,7 +2271,7 @@ def _patch_dual_no_encoder_film(cfg: dict) -> dict:
     --------------------------------------------------
     The encoder's `conditioning_module` is a SINGLE FiLM instance that
     is called on BOTH `z_mlp_cell_path` and `z_mlp_niche_path` (see
-    `vqniche_dual_encoder.py`, lines ~382 + ~410). Its affine MLP
+    `squint_dual_encoder.py`, lines ~382 + ~410). Its affine MLP
     therefore receives gradients from cell-side losses AND every
     spatial loss in the niche path. Even when the cell and niche MLP
     trunks are fully decoupled via `niche_mlp_params`, the FiLM update
@@ -2280,7 +2280,7 @@ def _patch_dual_no_encoder_film(cfg: dict) -> dict:
 
     This patch shuts that backdoor by removing `condition_list` from
     `encoder_params.conditioning_params`. The encoder build then takes
-    the `else` branch at `vqniche_dual_encoder.py` line 309 and sets
+    the `else` branch at `squint_dual_encoder.py` line 309 and sets
     `self.conditioning_module = None`, so no FiLM module is ever
     instantiated on the encoder side.
 
@@ -2296,7 +2296,7 @@ def _patch_dual_no_encoder_film(cfg: dict) -> dict:
     if not cp:
         return cfg
     # Remove just `condition_list` (the key the encoder checks at build
-    # time, `vqniche_dual_encoder.py:300`). Keep the rest of the dict
+    # time, `squint_dual_encoder.py:300`). Keep the rest of the dict
     # so any downstream consumer that snapshots the cfg sees a sensible
     # record of "FiLM was configured but disabled".
     cp.pop("condition_list", None)
@@ -2312,7 +2312,7 @@ def _patch_dual_niche_neck(
     """
     Insert a niche-side neck MLP between `z_mlp` and the GNN. The
     cell-VQ still consumes `z_mlp` directly; only the GNN input is
-    routed through this extra MLP. See the `VQNiche_Dual_Encoder`
+    routed through this extra MLP. See the `Squint_Dual_Encoder`
     docstring for the schematic.
 
     Why this might help:
@@ -2703,7 +2703,7 @@ def _patch_dual_codebook_orth_reg(
     mutually-orthogonal codes.
 
     The loss reads `codebook_embeddings` from `loss_data` (populated
-    by `VQNiche_Dual._step` to point at the cell-branch L1 codebook).
+    by `Squint_Dual._step` to point at the cell-branch L1 codebook).
     It computes pairwise cosine similarity between codes and penalises
     high off-diagonal similarity → codes get pushed apart in the
     embedding space.
@@ -2838,7 +2838,7 @@ def _patch_dual_contrastive_cell_within_batch(
     Requires
     --------
     `loss_data['node_adata_batch_ids']` must be populated by the
-    model's `_step` (it is, unconditionally, in `VQNiche_Dual._step`).
+    model's `_step` (it is, unconditionally, in `Squint_Dual._step`).
     If absent the loss raises rather than silently falling back to
     the global behaviour.
     """
@@ -3288,7 +3288,7 @@ def _patch_dual_vq_warmup(cfg: dict, vq_warmup_epochs: int = 10) -> dict:
     Defer codebook init + EMA updates for the first `vq_warmup_epochs`
     training epochs.
 
-    Mechanism (see `VQNiche_Dual.on_train_epoch_start` and the
+    Mechanism (see `Squint_Dual.on_train_epoch_start` and the
     `freeze_updates` buffer on `CosineSimCodebook` / `EuclideanCodebook`):
       - During warmup: lazy kmeans-init is held off, EMA updates are
         skipped, dead-code expiry is skipped. Commit losses are zeroed
@@ -3786,7 +3786,7 @@ def _patch_dual_adversarial(
         negated gradient).
 
     The model classifies the FULL `z_mlp` (seeds + sampled GNN neighbours),
-    not only the seed-node prefix — see VQNiche_Dual._step for the rationale.
+    not only the seed-node prefix — see Squint_Dual._step for the rationale.
     This makes the niche branch's GNN aggregate over batch-invariant inputs.
 
     Effect: provides the missing batch-invariance pressure on the latent
@@ -3827,7 +3827,7 @@ def _patch_dual_adversarial(
     cfg["model"]["adversarial_alpha"] = float(alpha)
     if hidden_channels is not None:
         cfg["model"]["adversarial_hidden_channels"] = list(hidden_channels)
-    # `warmup_epochs` is wired through to VQNiche_Dual.__init__ and
+    # `warmup_epochs` is wired through to Squint_Dual.__init__ and
     # consumed inside `_step`: during the first `warmup_epochs`
     # training epochs, the GRL is run with alpha=0 so the encoder
     # gets zero adversarial gradient (codes settle on biology first).
@@ -4153,7 +4153,7 @@ def _patch_dual_decoder_film(
     parameter dicts and configures their FiLM `condition_list` (default
     ['cell_batch_id'], i.e. per-cell batch one-hot). The data loader's
     `attr_decoder_conditions` tensor is then threaded through to each
-    decoder by VQNiche_Dual.forward, and FiLM modulates each decoder
+    decoder by Squint_Dual.forward, and FiLM modulates each decoder
     layer with γ/β derived from the batch one-hot.
 
     Why init_mode defaults to 'small_random', not 'identity'
@@ -4262,7 +4262,7 @@ def _patch_dual_decoupled_decoder_cov(cfg: dict) -> dict:
     Why this matters under `+decoupled-enc`
     --------------------------------------
     Architectural gradient-isolation audit of the dual model under
-    `+decoupled-enc` (`vqniche_dual_encoder.py` + `vqniche_dual.py`):
+    `+decoupled-enc` (`squint_dual_encoder.py` + `squint_dual.py`):
 
       Module                         Per-branch?  Shared?
       ─────────────────────────────  ───────────  ──────────
@@ -12212,7 +12212,7 @@ VARIANTS: dict = {
                             weight=1.0),
     },
     # ========================================================================
-    # VQNiche_Dual variants
+    # Squint_Dual variants
     # ========================================================================
     # Two parallel codebooks: cell (post-MLP, pre-aggregation) and niche
     # (post-GNN). Cell decoder reconstructs per-cell counts; niche decoder
@@ -12221,7 +12221,7 @@ VARIANTS: dict = {
     # ========================================================================
     "dualvq": {
         "description": (
-            "VQNiche_Dual baseline: two single-codebook VQs (k=30 each), "
+            "Squint_Dual baseline: two single-codebook VQs (k=30 each), "
             "shared MLP trunk, GraphSAGE GNN feeding the niche branch. "
             "Joint losses: NB(cell) + NB(nbr) + commit_cell + commit_niche "
             "+ cosine-sim adjacency BCE on z_q_niche. All weights = 1.0."
@@ -37019,12 +37019,12 @@ def build_blob(dataset: str = "mmb0-1b_smb1-1b_1p"):
         yaml.safe_dump(cfg, f, sort_keys=False)
     print(f"Wrote dataset-blob config to {cfg_path}")
 
-    # Make squint's vqniche package importable (in case the active venv hasn't
+    # Make the squint package importable (in case the active venv hasn't
     # been pip-installed editable).
     if str(SQUINT_PKG / "src") not in sys.path:
         sys.path.insert(0, str(SQUINT_PKG / "src"))
 
-    from vqniche.dataset.in_memory_dataset_blob import InMemoryDatasetBlob
+    from squint.dataset.in_memory_dataset_blob import InMemoryDatasetBlob
 
     ds_cfg = cfg["dataset"]
     print(f"Building dataset blob into "
@@ -37188,11 +37188,12 @@ def train(
     import wandb
     from pytorch_lightning.loggers import WandbLogger
 
-    from vqniche.initializers.initialize import (
+    from squint.initializers.initialize import (
         initialize_dataset_blob,
         initialize_databatch,
         initialize_datamodule,
         initialize_model,
+        normalize_model_name,
     )
 
     # Numerical settings (cudnn.benchmark is now controlled by the
@@ -37469,7 +37470,7 @@ def train(
     # model expects `decoder_covariate_dim` to equal the dimensionality of
     # the per-cell batch one-hot. Set it from the data loader here.
     if (
-        cfg["model"].get("model_name") == "VQNiche_Dual"
+        normalize_model_name(cfg["model"].get("model_name")) == "Squint_Dual"
         and cfg["model"].get("decoder_covariate_dim_request") is True
     ):
         cfg["model"]["decoder_covariate_dim"] = _n_distinct_batches(data_batch)
@@ -37477,15 +37478,15 @@ def train(
     # Domain-adversarial batch-invariance head. When requested, sized to
     # the number of distinct batches.
     if (
-        cfg["model"].get("model_name") == "VQNiche_Dual"
+        normalize_model_name(cfg["model"].get("model_name")) == "Squint_Dual"
         and cfg["model"].get("adversarial_batch_dim_request") is True
     ):
         cfg["model"]["adversarial_batch_dim"] = _n_distinct_batches(data_batch)
 
     # Bind FiLM condition dims onto whichever decoder param dicts the
-    # current config carries. Single-codebook configs (VQNiche etc.) use
+    # current config carries. Single-codebook configs (Squint etc.) use
     # `attribute_decoder_params` + `adjacency_decoder_params`. The
-    # dual-codebook config (VQNiche_Dual) uses
+    # dual-codebook config (Squint_Dual) uses
     # `attribute_decoder_cell_params` + `attribute_decoder_niche_params`
     # and has no adjacency decoder.
     for dec_key in ("attribute_decoder_params",
@@ -38158,7 +38159,7 @@ def predict(
     run_dir
         Path to the run directory of the trained model. Two layouts are
         supported (resolved automatically by the helpers in
-        ``vqniche.utils.parse_test_configs``):
+        ``squint.utils.parse_test_configs``):
           (a) flat (current ``train()``): ``<run_dir>/user_specified_config.yaml``
               and ``<run_dir>/checkpoints/*.ckpt`` directly under run_dir.
           (b) legacy wandb-controlled: same files under ``<run_dir>/files/``.
@@ -38220,8 +38221,8 @@ def predict(
     import torch
     import pytorch_lightning as pl
     from predict_model import collate_predict_outputs
-    from vqniche.utils.parse_test_configs import collect_test_configs
-    from vqniche.initializers.initialize import (
+    from squint.utils.parse_test_configs import collect_test_configs
+    from squint.initializers.initialize import (
         initialize_dataset_blob,
         initialize_databatch,
         initialize_datamodule,

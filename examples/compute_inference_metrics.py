@@ -46,8 +46,9 @@ Four metric families, each saved as a CSV in `<predict_dir>/metrics/`:
        comparable.
 
   3. Batch integration on continuous + quantized embeddings
-       - iLISI  (kNN inverse Simpson; needs pynndescent; falls back to
-                 a simple inline implementation if scib_metrics is missing)
+       - iLISI  (scib_metrics ilisi_knn on an NNDescent kNN graph built
+                 over seeded-permuted rows; skipped if scib_metrics or
+                 pynndescent is missing)
        - ASW    (silhouette score on a sub-sample, sklearn)
        - MMD    (RBF, comparable bandwidth via median heuristic on
                  standardised embeddings; uses scipy.spatial.distance.cdist
@@ -660,7 +661,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--legacy-code-key", type=str, default="code_index",
-        help="Single-codebook fallback (legacy VQNiche). Same fallback as above.",
+        help="Single-codebook fallback (legacy Squint). Same fallback as above.",
     )
     ap.add_argument(
         "--cell-label-keys", type=str,

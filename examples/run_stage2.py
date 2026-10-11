@@ -2,7 +2,7 @@
 """
 Train the SQUINT stage-2 spatial code prior on a frozen ``predicted_adata.h5ad``.
 
-The stage-2 model (``vqniche.stage2``) is a graph-native, MaskGIT-style masked
+The stage-2 model (``squint.stage2``) is a graph-native, MaskGIT-style masked
 code transformer: it predicts held-out cells' discrete code stacks from the
 spatial context of observed cells. It NEVER reads expression and NEVER touches
 the stage-1 (SQUINT VQ-VAE) training path -- it consumes only the codes +
@@ -12,7 +12,7 @@ What this script does:
   1. read the frozen codes / positions / sections (AnnDataCodeSource)
   2. build a Stage2Config from the run's actual codebook sizes
   3. train with PyTorch Lightning (masked cross-entropy; contiguous block masks)
-  4. save weights + config (vqniche.stage2.checkpoint)
+  4. save weights + config (squint.stage2.checkpoint)
   5. run a region-holdout in-painting evaluation (decoded top-1 code accuracy)
 
 Example (smoke test on the mmb/smb run):
@@ -32,7 +32,7 @@ import os
 import sys
 import time
 
-# Make `import vqniche` work whether or not the package is pip-installed.
+# Make `import squint` work whether or not the package is pip-installed.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(os.path.dirname(_HERE), "src")
 if os.path.isdir(_SRC) and _SRC not in sys.path:
@@ -131,7 +131,7 @@ def parse_args(argv=None):
 
 
 def build_config(args, source):
-    from vqniche.stage2.config import (
+    from squint.stage2.config import (
         Stage2Config, DataConfig, ModelConfig, DecodeConfig, OptimConfig,
         default_branches,
     )
@@ -190,10 +190,10 @@ def main(argv=None):
 
     import torch
     import pytorch_lightning as pl
-    from vqniche.stage2.data import AnnDataCodeSource
-    from vqniche.stage2.datamodule import Stage2DataModule
-    from vqniche.stage2.lightning import Stage2LightningModule
-    from vqniche.stage2.checkpoint import save_stage2
+    from squint.stage2.data import AnnDataCodeSource
+    from squint.stage2.datamodule import Stage2DataModule
+    from squint.stage2.lightning import Stage2LightningModule
+    from squint.stage2.checkpoint import save_stage2
 
     pl.seed_everything(args.seed, workers=True)
 
@@ -276,7 +276,7 @@ def main(argv=None):
         lit.model.to(device)
         if use_split_eval:
             # in-paint exactly the cells SQUINT held out (data_split == test)
-            from vqniche.stage2.evaluate import holdout_split_eval
+            from squint.stage2.evaluate import holdout_split_eval
 
             chunk = args.eval_chunk_size or max(64, cfg.data.patch_size // 2)
             if args.smoke:
@@ -289,7 +289,7 @@ def main(argv=None):
             )
             drop_key = "per_chunk"
         else:
-            from vqniche.stage2.evaluate import region_holdout_eval
+            from squint.stage2.evaluate import region_holdout_eval
 
             summary = region_holdout_eval(
                 lit.model, source, cfg,

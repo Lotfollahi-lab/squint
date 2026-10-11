@@ -1,0 +1,575 @@
+from typing import List, Optional, Dict
+
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+import networkx as nx
+import anndata as ad
+
+import torch
+from torch_geometric.data import Batch
+from torch_geometric.utils import to_dense_adj
+from torch_geometric.data import InMemoryDataset
+
+
+def _coerce_for_h5ad(values, index, name):
+    """
+    Convert a list-of-mixed (strings/numbers/None) into a `pandas.Series`
+    that anndata's h5ad backend can write without choking.
+
+    h5py's variable-length-string converter rejects Python `None` mixed
+    with strings — that's the failure path when an obs column is present
+    in some input AnnDatas but not others (cells from sources without it
+    get `None`, sources with strings get the string, and h5py can't
+    serialise the mixture). anndata DOES write `pandas.Categorical` and
+    float dtypes natively with NaN as missing, so:
+
+      - All-null      -> float NaN.
+      - All-strings   -> Categorical (NaN where None).
+      - All-numeric   -> float (None coerced to NaN).
+      - Mixed/other   -> stringify everything, write as Categorical.
+    """
+    series = pd.Series(values, index=index, name=name)
+    non_null = series.dropna()
+    if non_null.empty:
+        return series.astype(float)
+    if all(isinstance(v, (str, np.str_, bytes)) for v in non_null):
+        return series.astype("category")
+    if all(isinstance(v, (int, float, np.integer, np.floating, bool, np.bool_))
+           for v in non_null):
+        return pd.to_numeric(series, errors="coerce")
+    # Mixed types — stringify and use Categorical.
+    return (
+        series.where(series.notna(), other=pd.NA)
+              .astype("string")
+              .astype("category")
+    )
+
+
+def sparse_mx_to_float_tensor(
+        sparse_mx: sp.csr_matrix
+    ) -> torch.Tensor:
+    """
+    Convert a scipy sparse matrix to a PyTorch float tensor.
+
+    Parameters:
+    ----------
+    sparse_mx : scipy.sparse.csr_matrix
+        A sparse matrix in Compressed Sparse Row format.
+
+    Returns:
+    --------
+    torch.Tensor
+        A dense PyTorch float tensor with dtype float32.
+
+    Accepts either a scipy sparse matrix or an already-dense numpy array:
+    some silver datasets (e.g. the harmonised mmb0-239b_1p MERFISH brains)
+    store ``adata.X`` as a dense ``numpy.ndarray``, which has no
+    ``.toarray()`` — densify only when the input is actually sparse.
+    """
+    if sp.issparse(sparse_mx):
+        dense = sparse_mx.astype(np.float32).toarray()
+    else:
+        dense = np.asarray(sparse_mx, dtype=np.float32)
+
+    # Convert to a dense PyTorch float tensor
+    dense_tensor = torch.tensor(dense, dtype=torch.float32)
+    return dense_tensor
+
+
+def pandas_to_torch_one_hot(
+        pandas_series: pd.Series,
+        categories: list[str] | None = None
+    ) -> torch.FloatTensor:
+    """
+    Convert a pandas Series of categorical labels to a PyTorch float tensor of one-hot encoded labels.
+
+    Parameters:
+    ----------
+    pandas_series : pd.Series
+        A pandas Series of categorical labels.
+    categories : list[str]
+        A list of categories for the categorical labels.
+
+    Returns:
+    --------
+    torch.FloatTensor
+        A PyTorch float tensor of one-hot encoded labels.
+    """
+    if categories is None:
+        categories = sorted(pandas_series.unique())
+
+    # Create a categorical series with all possible categories
+    cat_series = pd.Categorical(pandas_series, categories=categories)
+
+    # Convert to one-hot using all categories
+    one_hot = pd.get_dummies(cat_series, prefix='', prefix_sep='')
+
+    # Ensure all categories are present (even if they weren't in this batch)
+    for cat in categories:
+        if cat not in one_hot.columns:
+            one_hot[cat] = 0
+
+    # Sort columns to ensure consistent order
+    one_hot = one_hot[sorted(one_hot.columns)]
+
+    return torch.tensor(one_hot.values, dtype=torch.float32)
+
+
+def one_dim_to_one_hot(
+        vector: np.ndarray,
+        n_classes: Optional[int] = None
+    ) -> np.array:
+    """
+    Converts an input 1-D vector of integer labels into a 2-D array of one-hot
+    vectors, where for an i'th input value of j, a '1' will be inserted in the
+    i'th row and j'th column of the output one-hot vector.
+    
+    Implementation is adapted from
+    https://github.com/theislab/scib/blob/29f79d0135f33426481f9ff05dd1ae55c8787142/scib/metrics/lisi.py#L498
+    (05.12.22).
+
+    Parameters
+    ----------
+    vector:
+        Vector to be one-hot-encoded.
+    n_classes:
+        Number of classes to be considered for one-hot-encoding. If `None`, the
+        number of classes will be inferred from `vector`.
+
+    Returns
+    ----------
+    one_hot:
+        2-D NumPy array of one-hot-encoded vectors.
+
+    Example:
+    ```
+    vector = np.array((1, 0, 4))
+    one_hot = one_dim_to_one_hot(vector)
+    print(one_hot)
+    [[0 1 0 0 0]
+     [1 0 0 0 0]
+     [0 0 0 0 1]]
+    ```
+    """
+    if n_classes is None:
+        n_classes = np.max(vector) + 1
+
+    one_hot = np.zeros(shape=(len(vector), n_classes))
+    one_hot[np.arange(len(vector)), vector] = 1
+    return one_hot.astype(int)
+
+
+def edge_index_to_adjacency_tensor(
+        edge_index: torch.Tensor,
+        max_num_nodes: int | None = None
+    ) -> torch.Tensor:
+    """
+    Convert an edge index to a dense adjacency tensor.
+
+    Parameters:
+    ----------
+    edge_index: torch.Tensor
+        The edge index to convert to an adjacency tensor.
+        Dimensions: (2, num_edges)
+    max_num_nodes: int | None
+        The maximum number of nodes in the graph.
+        If None, the maximum node ID in edge_index will be used.
+
+    Returns:
+    --------
+    adjacency_matrix: torch.Tensor
+        The adjacency tensor.
+        Dimensions: (n, n) where n = edge_index.max()+1 if max_num_nodes
+        is None else max_num_nodes.
+
+    Notes
+    -----
+    Implemented via direct `index_put_` rather than PyG's `to_dense_adj`
+    helper. `to_dense_adj` adds a leading batch dim (we slice it off
+    with `[0]`) and goes through several dispatch layers — measurably
+    slower per call when this function is hot inside a per-minibatch
+    loss (e.g. `bce_cosine_adjacency_reconstruction_loss`). Same
+    semantics: 0/1 dense adjacency built from the edge_index entries.
+    """
+    edge_index = edge_index.to(torch.long)
+    if max_num_nodes is None:
+        n = int(edge_index.max().item()) + 1 if edge_index.numel() > 0 else 0
+    else:
+        n = int(max_num_nodes)
+    adjacency_matrix = torch.zeros(
+        (n, n), dtype=torch.float32, device=edge_index.device,
+    )
+    if edge_index.numel() > 0:
+        # row, col -> 1.0
+        adjacency_matrix.index_put_(
+            (edge_index[0], edge_index[1]),
+            torch.ones((), dtype=adjacency_matrix.dtype, device=adjacency_matrix.device),
+            accumulate=False,
+        )
+    return adjacency_matrix
+
+
+def adjacency_tensor_to_networkx(
+        adjacency_matrix: torch.Tensor
+    ) -> nx.Graph:
+    """
+    Convert an adjacency tensor to a networkx graph.
+
+    Parameters
+    ----------
+    - adjacency_matrix: torch.Tensor
+        The adjacency matrix.
+        Dimensions: (num_nodes, num_nodes)
+
+    Returns
+    -------
+    - graph: nx.Graph
+        The networkx graph.
+    """
+    return nx.from_numpy_array(adjacency_matrix.numpy())
+
+
+def torch_one_hot_to_label_name(
+        one_hot: torch.Tensor,
+        label_categories: Optional[list[str]] = None
+    ) -> pd.Series:
+    """
+    Convert a one-hot encoded label tensor to a pandas Series of label names.
+
+    Parameters:
+    ----------
+    one_hot: torch.Tensor
+        The one-hot encoded label tensor.
+    label_categories: Optional[list[str]]
+        The list of label categories where the index of the one-hot encoded label tensor matches the index of the label name in the list.
+        If None, the label categories will be integers.
+
+    Returns:
+    --------
+    pd.Series
+        The pandas Series of label names.
+    """
+    indices = one_hot.argmax(dim=1).cpu().numpy()
+    if label_categories is None:
+        return pd.Series(indices).astype('category')
+    else:
+        return pd.Series([label_categories[i] for i in indices]).astype('category')
+
+
+def inference_data_dict_to_adata(
+        inference_data: Dict,
+        label_categories_dict: Optional[Dict] = None,
+        obs_per_batch_id: Optional[Dict] = None,
+    ) -> ad.AnnData:
+    """
+    Build an AnnData object from inference data dictionary.
+    
+    Parameters
+    ----------
+    inference_data : Dict
+        Dictionary containing inference results with data + model output keys + metadata:
+        - 'X': Input features (torch.Tensor)
+        - 'X_nbr': 1-hop neighbor features (torch.Tensor)
+        - 'Y_cell_types': Cell type labels as one-hot vectors (torch.Tensor)
+        - 'Y_niche_types': Niche type labels as one-hot vectors (torch.Tensor)
+        - 'XY_coordinates': Spatial coordinates (torch.Tensor)
+        - 'adata_batch_ids': Batch IDs (torch.Tensor)
+        - 'edge_index': Edge indices (torch.Tensor)
+
+        - 'H_latent': Latent representations (torch.Tensor)
+        - 'H_quantized': Quantized representations (torch.Tensor, optional) 
+            (cell c_i, i = cell, H_quantized = [N, D], each row is the code embedding for that cell i.)
+        - 'H_adj': Adjacency representations (torch.Tensor)
+        - 'Indices': Quantization indices (torch.Tensor, optional)
+        - 'X_hat': Reconstructed features (torch.Tensor)
+        - 'X_hat_nbr': 1-hop neighbor reconstructed features (torch.Tensor)
+        - 'Logits': Logits (torch.Tensor)
+        
+        - 'codebook_size': Codebook size (int)
+        - 'separate': Whether to separate the data into batches (bool)
+        - 'num_heads': Number of heads (int)
+    label_categories_dict : Optional[Dict]
+        If provided, a dictionary containing 'cell_types' and 'niche_types' as keys and label categories as values.
+        For example, {'cell_types': ['cell_type_1', 'cell_type_2', 'cell_type_3'], 'niche_types': ['niche_type_1', 'niche_type_2', 'niche_type_3']}.
+        If not provided, the label categories will be set to integer categories.
+    obs_per_batch_id : Optional[Dict]
+        Mapping from `adata_batch_id` (int) to that AnnData's full `obs`
+        DataFrame, as collected at blob-build time. When provided AND
+        `inference_data['obs_row_index']` is present, every column that
+        appears in *any* input AnnData is propagated onto the output
+        AnnData's `.obs`. Cells whose source AnnData doesn't carry a
+        given column are NaN-filled for it. Existing obs columns
+        (`adata_batch_ids`, plus any `y_*` labels written above) are
+        kept and not overwritten.
+
+    Returns
+    -------
+    ad.AnnData
+        AnnData object with inference results stored in appropriate slots.
+        
+    TODO:
+    -----
+    - Label categories is hardcoded to 'cell_types' and 'niche_types'. The dataloader needs to be updated to allow for dynamically adding label categories if available.
+    - TODO: Give the adata better structure.
+    """
+    # Create AnnData object with input features
+    adata = ad.AnnData(X=inference_data['X'].cpu().numpy())
+    if 'X' in inference_data:
+        adata.uns['X'] = inference_data['X'].cpu()
+    if 'X_nbr' in inference_data:
+        adata.uns['X_nbr'] = inference_data['X_nbr'].cpu()
+    
+    # Convert one-hot labels to category labels
+    for attr in inference_data.keys():
+        if attr.startswith('y_'):
+            label_name = attr[2:]
+            if label_categories_dict is not None:
+                if label_name in label_categories_dict:
+                    label_categories = label_categories_dict[label_name]
+                else:
+                    label_categories = None
+            else:
+                label_categories = None
+            
+            labels = torch_one_hot_to_label_name(
+                        one_hot=inference_data[attr],
+                        label_categories=label_categories
+                    )
+            labels.index = adata.obs.index
+            adata.obs[label_name] = labels        
+        
+    if 'XY_coordinates' in inference_data:
+        adata.obsm['spatial'] = inference_data['XY_coordinates'].cpu().numpy()
+    if 'adata_batch_ids' in inference_data:
+        adata.obs['adata_batch_ids'] = inference_data['adata_batch_ids'].cpu().numpy()
+    if 'edge_index' in inference_data:
+        adata.uns['edge_index'] = inference_data['edge_index'].cpu()
+    
+    # Store embeddings in obsm
+    if 'H_latent' in inference_data:
+        adata.obsm['H_latent'] = inference_data['H_latent'].cpu().numpy()
+    if 'H_quantized' in inference_data:
+        adata.obsm['H_quantized'] = inference_data['H_quantized'].cpu().numpy()
+    if 'H_adj' in inference_data:
+        adata.obsm['H_adj'] = inference_data['H_adj'].cpu().numpy()
+    if 'Indices' in inference_data:
+        adata.uns['Indices'] = inference_data['Indices']
+    
+    # Store edge index
+    if 'X_hat' in inference_data:
+        adata.uns['X_hat'] = inference_data['X_hat'].cpu()
+    if 'X_hat_nbr' in inference_data:
+        adata.uns['X_hat_nbr'] = inference_data['X_hat_nbr'].cpu()
+    if 'Logits' in inference_data:
+        adata.uns['Logits'] = inference_data['Logits']    
+
+    if 'codebook_size' in inference_data:
+        adata.uns['codebook_size'] = inference_data['codebook_size']
+    if 'separate' in inference_data:
+        adata.uns['separate'] = inference_data['separate']
+    if 'num_heads' in inference_data:
+        adata.uns['num_heads'] = inference_data['num_heads']
+    # Multi-level VQ metadata (RVQ / ConditionalVQ).
+    # Defaults to single-level when absent → propagated as 1 for back-compat.
+    if 'num_quantizers' in inference_data:
+        adata.uns['num_quantizers'] = inference_data['num_quantizers']
+    if 'codebook_sizes' in inference_data:
+        adata.uns['codebook_sizes'] = inference_data['codebook_sizes']
+
+    # ----- Squint_Dual: per-branch keys -----------------------------------
+    # The dual model caches per-branch tensors and metadata under
+    # *_cell / *_niche suffixes. Propagate them all to adata.uns so
+    # downstream analysis can address each branch directly. Where the
+    # legacy single-codebook key (`Indices`, `codebook_size`, etc.) is
+    # missing, alias the *niche* branch into it so the existing
+    # benchmarking utilities (codebook_utilization, etc.) keep working
+    # against the niche codebook by default.
+    for branch_key in ('Indices_cell', 'Indices_niche',
+                       'H_quantized_cell', 'H_quantized_niche',
+                       'H_latent_cell', 'H_latent_niche'):
+        if branch_key in inference_data:
+            adata.uns[branch_key] = inference_data[branch_key]
+    for meta_key in ('codebook_size_cell', 'codebook_size_niche',
+                     'codebook_sizes_cell', 'codebook_sizes_niche',
+                     'num_quantizers_cell', 'num_quantizers_niche'):
+        if meta_key in inference_data:
+            adata.uns[meta_key] = inference_data[meta_key]
+
+    # Back-compat aliases: when the dual model is in use the legacy
+    # single-codebook keys may be unset. Default them to the *niche*
+    # branch so spatial-coherence-oriented benchmarking still has the
+    # right tensor / sizes to read.
+    if 'Indices' not in adata.uns and 'Indices_niche' in adata.uns:
+        adata.uns['Indices'] = adata.uns['Indices_niche']
+    if 'codebook_size' not in adata.uns and 'codebook_size_niche' in adata.uns:
+        adata.uns['codebook_size'] = adata.uns['codebook_size_niche']
+    if 'num_quantizers' not in adata.uns and 'num_quantizers_niche' in adata.uns:
+        adata.uns['num_quantizers'] = adata.uns['num_quantizers_niche']
+    if 'codebook_sizes' not in adata.uns and 'codebook_sizes_niche' in adata.uns:
+        adata.uns['codebook_sizes'] = adata.uns['codebook_sizes_niche']
+    # The dual model has heads=1 and separate=False on both branches —
+    # set sensible defaults if missing.
+    if 'num_heads' not in adata.uns and ('Indices_niche' in adata.uns):
+        adata.uns['num_heads'] = 1
+    if 'separate' not in adata.uns and ('Indices_niche' in adata.uns):
+        adata.uns['separate'] = False
+
+    # ----- Propagate every input obs column to the output adata --------
+    # Each cell carries:
+    #   - `adata_batch_ids[k]`: which input AnnData it came from
+    #   - `obs_row_index[k]`:   its row position INTO that AnnData's `.obs`
+    # Together they form a unique join key. We take the UNION of obs
+    # columns across all input AnnDatas; cells from a source that doesn't
+    # carry a given column get NaN for it. Existing `adata.obs` columns
+    # written above (e.g. label columns from `y_*`, plus
+    # `adata_batch_ids`) are kept and not overwritten.
+    if (
+        obs_per_batch_id
+        and 'obs_row_index' in inference_data
+        and 'adata_batch_ids' in inference_data
+    ):
+        batch_ids_np = inference_data['adata_batch_ids'].cpu().numpy().astype(int)
+        row_idx_np   = inference_data['obs_row_index'].cpu().numpy().astype(int)
+
+        # Union of columns in deterministic order: first-seen across the
+        # sorted batch ids, so the output column order is stable run-to-run.
+        union_cols: list = []
+        seen: set = set()
+        for bid in sorted(obs_per_batch_id.keys()):
+            df = obs_per_batch_id[bid]
+            for col in df.columns:
+                if col not in seen:
+                    seen.add(col)
+                    union_cols.append(col)
+
+        # Build per-cell values for each column.
+        # Vectorised: for each batch_id present in this inference, take
+        # the corresponding `obs_per_batch_id[bid]` DataFrame and
+        # `iloc[row_idx_for_that_bid]` it as a single pandas operation,
+        # then scatter into a result array indexed by the global cell
+        # position. The naive impl was a Python `for k in range(n_cells)`
+        # loop calling `df[col].iloc[ridx]` per cell — multi-minute
+        # cost on mmb20 (1M cells × dozens of obs columns × sub-ms
+        # pandas overhead per scalar lookup).
+        n_cells = len(batch_ids_np)
+        # Precompute, per batch id, the global cell positions and
+        # in-source row indices we need to look up. One pass over
+        # batch_ids_np instead of one-per-column.
+        unique_bids = np.unique(batch_ids_np)
+        per_bid_positions: dict = {}
+        for bid in unique_bids:
+            mask = (batch_ids_np == bid)
+            per_bid_positions[int(bid)] = (
+                np.flatnonzero(mask),
+                row_idx_np[mask],
+            )
+
+        for col in union_cols:
+            if col in adata.obs.columns:
+                # Don't overwrite columns already written by the model
+                # (e.g. one-hot decoded labels, `adata_batch_ids`).
+                continue
+
+            values: list = [None] * n_cells
+            for bid, (cell_positions, source_rows) in per_bid_positions.items():
+                df = obs_per_batch_id.get(bid)
+                if df is None or col not in df.columns:
+                    continue
+                # Bound-safe slice; iloc on an int array is one pandas
+                # call total instead of `n_cells_in_bid` separate calls.
+                valid = (source_rows >= 0) & (source_rows < len(df))
+                if not valid.any():
+                    continue
+                cell_positions = cell_positions[valid]
+                source_rows    = source_rows[valid]
+                col_vals = df[col].iloc[source_rows].to_numpy()
+                for pos, v in zip(cell_positions, col_vals):
+                    values[int(pos)] = v
+            # Cast for h5ad-safe writing. h5py's vlen-string converter
+            # chokes on `None` mixed with strings; anndata DOES write
+            # `Categorical` and float dtypes natively with NaN as
+            # missing, so detect from non-null entries:
+            #   all strings  -> Categorical
+            #   all numeric  -> float (None -> NaN)
+            #   mixed/other  -> stringify + Categorical
+            adata.obs[col] = _coerce_for_h5ad(
+                values, index=adata.obs.index, name=col,
+            )
+
+    return adata
+
+
+def data_batch_to_adata_list(
+        dataset_blob: InMemoryDataset,
+        data_batch: Batch
+    ) -> List[ad.AnnData]:
+    """
+    Convert a PyTorch Geometric Batch object to a list of AnnData objects.
+    Each AnnData object corresponds to a tissue section.
+
+    Parameters:
+    ----------
+    dataset_blob: InMemoryDatasetBlob
+        The dataset blob.
+    data_batch: Batch
+        Combined data batch comprising of multiple tissue sections.
+
+    Returns:
+    --------
+    List[ad.AnnData]
+        A list of AnnData objects, one per tissue section.
+    """
+    adata_list = []
+    for data in data_batch:
+        # ------------------------------------------------------------------------
+        # set features
+        adata = ad.AnnData(X=data.x.cpu().numpy())
+
+        # ------------------------------------------------------------------------
+        # set gene panel
+        adata.var = dataset_blob.gene_panel
+
+        # ------------------------------------------------------------------------
+        # set labels
+        adata.obs['cell_types'] = torch_one_hot_to_label_name(
+                                    data.y_cell_types.cpu(),
+                                    dataset_blob.label_categories['cell_types']
+                                    )
+        adata.obs['niche_types'] = torch_one_hot_to_label_name(
+                                    data.y_niche_types.cpu(),
+                                    dataset_blob.label_categories['niche_types']
+                                    )
+        # ------------------------------------------------------------------------
+        # Convert edge index to dense adjacency matrix
+        adj_matrix: torch.Tensor = to_dense_adj(data.edge_index)[0]
+        # Convert to scipy sparse matrix
+        sparse_adj: sp.csr_matrix = sp.csr_matrix(adj_matrix.cpu().numpy())
+        # Add to adata.obsp
+        adata.obsp['spatial_connectivities'] = sparse_adj
+        # Add metadata
+        adata.uns['spatial_neighbors'] = {
+            'connectivities_key': 'spatial_connectivities',
+            'params': {
+                'n_neighbors': None,
+                'method': 'edge_index',
+                'key_added': 'spatial'
+            }
+        }
+
+        # ------------------------------------------------------------------------
+        # set spatial coordinates
+        adata.obsm['spatial'] = data.xy_coordinates.cpu().numpy()
+
+        # ------------------------------------------------------------------------
+        # set metadata
+        adata.obs['cell_id'] = data.cell_id
+        adata.uns['dataset_id'] = data.dataset_id
+        adata.uns['tissue'] = data.tissue
+        adata.uns['species'] = data.species
+        adata.uns['batch'] = f"batch_{data.batch_idx}"
+
+        # ------------------------------------------------------------------------
+        adata_list.append(adata)
+
+    return adata_list

@@ -17,7 +17,7 @@
 # Each -> 5 seed jobs + 1 aggregator via submit_multi_seed.sh.
 #
 # Reference (decoupled) = s55_v3 — already run; NOT relaunched here.
-# REQUIRES the synced vqniche code on the farm (new encoder cell_to_niche path +
+# REQUIRES the synced squint code on the farm (new encoder cell_to_niche path +
 # disentangle_cell_niche_loss) before launching.
 #
 # Usage:

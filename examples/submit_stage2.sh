@@ -2,7 +2,7 @@
 # submit_stage2.sh
 # -----------------------------------------------------------------------------
 # Submit a single GPU LSF job that trains the SQUINT stage-2 spatial code prior
-# (vqniche.stage2) on a frozen predicted_adata.h5ad, then runs a region-holdout
+# (squint.stage2) on a frozen predicted_adata.h5ad, then runs a region-holdout
 # in-painting evaluation. Mirrors the env / LSF conventions of
 # submit_multi_seed.sh (venv at /nfs/team361/sb75/.venvs/squint, training-parallel
 # GPU queue, group s10396, one exclusive GPU).

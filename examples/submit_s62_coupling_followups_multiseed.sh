@@ -9,7 +9,7 @@
 #   v8    Y-shape 64/192 + cell-cond FiLM combo
 # All on the s55_v3 spine. Each -> 5 seed jobs + 1 aggregator.
 #
-# Reference = s55_v3 (already run). REQUIRES synced vqniche on the farm.
+# Reference = s55_v3 (already run). REQUIRES synced squint on the farm.
 #
 # Usage:
 #   bash examples/submit_s62_coupling_followups_multiseed.sh [SEEDS]

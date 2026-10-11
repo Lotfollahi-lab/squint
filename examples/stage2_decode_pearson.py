@@ -6,7 +6,7 @@ bar for the Pearson benchmark.
 
 Pipeline
 --------
-1. Load the frozen stage-1 model (VQNiche_Dual) from its checkpoint.
+1. Load the frozen stage-1 model (Squint_Dual) from its checkpoint.
 2. Read the held-out cells' PREDICTED code stacks (the npz written by
    ``holdout_split_eval`` during the stage-2 run).
 3. Map codes -> z_q (sum the RVQ levels via the codebook embeddings), re-apply
@@ -233,7 +233,7 @@ def _pearson_rows(target, pred, branch, split, seed, n_hvg=50, log1p=True,
 
 
 # ---------------------------------------------------------------------------
-# Decode-from-codes (replicates VQNiche_Dual forward AFTER quantization).
+# Decode-from-codes (replicates Squint_Dual forward AFTER quantization).
 # ---------------------------------------------------------------------------
 def _codebook_matrix(vq_layer):
     emb = vq_layer._codebook.embed          # (H, K, D) or (K, D)
@@ -312,7 +312,7 @@ def decode_niche_xhat(model, idx_niche, cov_idx, read_depth, torch,
     niche indices reproduces z_q_niche without re-applying FiLM (same assumption
     the ccn_mode guard in main() enforces). Niche decoder covariate uses
     ``batch_embedding_niche`` under the decoupled-covariate model, else the
-    shared ``batch_embedding`` -- mirroring vqniche_dual.forward.
+    shared ``batch_embedding`` -- mirroring squint_dual.forward.
     """
     enc = model.encoder
     if z_q_niche is None:
@@ -545,8 +545,8 @@ def main(argv=None):
     # ---- stage-1 model ----------------------------------------------------
     ckpt = _find_ckpt(run_dir, args.stage1_ckpt)
     print(f"[decode] loading stage-1 model from {ckpt}")
-    from vqniche.models import VQNiche_Dual
-    model = VQNiche_Dual.load_from_checkpoint(ckpt, map_location=device)
+    from squint.models import Squint_Dual
+    model = Squint_Dual.load_from_checkpoint(ckpt, map_location=device)
     model.eval().to(device)
     if model.decoder_covariate_dim not in (0, n_cov):
         print(f"[decode] WARNING: decoder_covariate_dim={model.decoder_covariate_dim} "
@@ -713,7 +713,7 @@ def main(argv=None):
     # ---- NICHE branch: neighborhood-level (X_hat_nbr vs X_nbr) -------------
     # SQUINT has a NATIVE niche decoder (attribute_decoder_niche): niche codes ->
     # per-cell xhat_niche, and X_hat_nbr = 1-hop mean of xhat_niche (see
-    # vqniche_dual.forward / _cache_inference_data). So for SQUINT the niche
+    # squint_dual.forward / _cache_inference_data). So for SQUINT the niche
     # prediction decodes the stage-2 PREDICTED niche codes through that decoder
     # (NOT a graph-aggregation of the cell prediction -- that fallback is only
     # for methods with no niche decoder, e.g. GeST / scVI). The full per-cell

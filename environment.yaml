@@ -1,4 +1,4 @@
-name: vqniche-reproducibility
+name: squint-reproducibility
 channels:
   - conda-forge
 dependencies:
@@ -220,7 +220,8 @@ dependencies:
       - urllib3==1.26.13
       - validators==0.34.0
       - virtualenv==20.27.0
-      - vqniche==0.0.1
+      # squint itself: install editable from this repo (pip install -e .).
+      # Do not pin squint==0.0.1 here: 'squint' on PyPI is an unrelated package.
       - wandb==0.18.5
       - wcwidth==0.2.13
       - wrapt==1.16.0

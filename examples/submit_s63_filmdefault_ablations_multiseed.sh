@@ -8,7 +8,7 @@
 # aggregator via submit_multi_seed.sh.
 #
 # Reference (un-ablated default) = s62_v5 (already run as part of s62).
-# REQUIRES the synced vqniche code on the farm.
+# REQUIRES the synced squint code on the farm.
 #
 # !! LARGE re-run (18 x 5 = 90 jobs). RECOMMENDED to first replicate the FiLM
 #    scale-only integration gain on a 2nd dataset before committing this.

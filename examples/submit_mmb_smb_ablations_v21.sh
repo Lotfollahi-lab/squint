@@ -43,7 +43,7 @@
 #     niche-neck becomes a candidate addition to the spine.
 #
 # Note on v4: this is the first sweep that exercises a NEW
-# architecture knob (`niche_neck_params` in VQNiche_Dual_Encoder).
+# architecture knob (`niche_neck_params` in Squint_Dual_Encoder).
 # The default is `None` (legacy behaviour, identical to before),
 # so all earlier variants continue to produce byte-identical models
 # — only this sweep's v4 turns it on.

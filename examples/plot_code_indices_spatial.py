@@ -6,10 +6,10 @@ Strategy
 --------
 1. Load the predicted AnnData written by `run_squint.py --predict`.
 2. Detect the codebook structure. Three layouts are supported:
-     - VQNiche_Dual: TWO codebooks, addressed under per-branch keys
+     - Squint_Dual: TWO codebooks, addressed under per-branch keys
          adata.obs['cell_code_index']           or adata.obsm['cell_code_indices']
          adata.obs['neighborhood_code_index']   or adata.obsm['neighborhood_code_indices']
-     - Legacy single-codebook (VQNiche):
+     - Legacy single-codebook (Squint):
          adata.obs['code_index']                or adata.obsm['code_indices']
    1D = single-level codebook; 2D = multi-level (RVQ / ConditionalVQ /
    multi-head). Level labels disambiguate "level k" (hierarchical) vs
@@ -140,10 +140,10 @@ def _extract_codebooks(adata: ad.AnnData) -> List[dict]:
          {"name": "neighborhood",  "codes_2d": ..., "labels": [...]}]
 
     Three layouts are supported:
-      1. Dual VQNiche_Dual: per-branch keys
+      1. Dual Squint_Dual: per-branch keys
            obs/obsm: cell_code_index(es), neighborhood_code_index(es)
          -> two codebooks: 'cell' + 'neighborhood'
-      2. Legacy single-codebook (VQNiche etc.): unsuffixed keys
+      2. Legacy single-codebook (Squint etc.): unsuffixed keys
            obs/obsm: code_index, code_indices
          -> one codebook: 'code'
       3. Mixed (newer dual write that also fills the legacy keys for
