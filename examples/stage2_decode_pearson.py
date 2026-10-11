@@ -55,11 +55,33 @@ over each held-out cell's K nearest neighbors (self excluded), mimicking GeST
 averaging, not posterior-sample averaging (--decode-samples) — both lower RMSE
 by moving toward a local mean, but at the cost of per-cell sharpness. Cell branch
 only; the native niche branch is unaffected.
+
+Leak-free held-out protocol knobs (all opt-in; the defaults reproduce the
+legacy decode numbers exactly):
+  * ``--stage1-ckpt-policy {last,best,adata}``: which stage-1 checkpoint to
+    decode with. 'last' (default) = legacy last.ckpt; 'best' = best val_loss
+    checkpoint; 'adata' = the checkpoint predict() used to write the codes and
+    X_hat (uns['squint'|'vqniche']['ckpt']), falling back to 'best'.
+  * ``--observed-xhat {stored,redecode}``: observed rows of the full per-cell
+    prediction come from the stored ``layers['X_hat']`` (default) or are
+    re-decoded from their TRUE cell codes in observed-only chunks with the
+    chosen checkpoint (no co-batching with held-out rows, no checkpoint mix).
+    The CSV column records 'stored (redecode inert)' when the redecoded rows
+    feed no score (native niche path without --smooth-neighs, or
+    --nbr-observed-fill truth / heldout_only).
+  * ``--nbr-observed-fill {stage1,truth,heldout_only}``: how observed
+    neighbours enter the neighbourhood score. 'stage1' (default) = their
+    stage-1 prediction; 'truth' = their true counts; 'heldout_only' = both the
+    prediction and the target aggregate over held-out neighbours plus self.
+  * ``--selfcheck-strict``: raise (instead of warn) when the self-check fails.
+An always-on guard checks that the stage-2 npz covers exactly the
+``obs['data_split']=='test'`` rows of the predicted_adata.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import glob
 import os
 import sys
@@ -346,6 +368,127 @@ def _find_ckpt(run_dir, explicit):
         f"no .ckpt under {run_dir}/checkpoints (pass --stage1-ckpt)")
 
 
+def _meta_str(v):
+    """uns value -> plain str (or None). Handles bytes and size-1 arrays."""
+    if v is None:
+        return None
+    if isinstance(v, np.ndarray) and v.size == 1:
+        v = v.ravel()[0]
+    if isinstance(v, bytes):
+        v = v.decode("utf-8", "replace")
+    return str(v)
+
+
+def _stage1_meta(adata):
+    """Stage-1 provenance dict from ``adata.uns['squint']`` (or the pre-rename
+    ``uns['vqniche']``), plus the key it came from. predict() writes a flat dict
+    of str/int/float/bool; a whole dict stored as a string is parsed with
+    ast.literal_eval. Returns ({}, None) when absent or unparsable; never raises."""
+    found = []
+    for key in ("squint", "vqniche"):
+        try:
+            v = adata.uns.get(key)
+            if v is None:
+                continue
+            if isinstance(v, (str, bytes, np.ndarray)):
+                v = ast.literal_eval(_meta_str(v))
+            d = dict(v)
+        except Exception:                               # noqa: BLE001 (best-effort provenance)
+            continue
+        if "ckpt" in d:
+            return d, key
+        found.append((d, key))
+    return found[0] if found else ({}, None)
+
+
+def _has_ckpt_dir(run_dir):
+    return bool(run_dir) and any(
+        os.path.isdir(os.path.join(run_dir, sub))
+        for sub in ("checkpoints", os.path.join("files", "checkpoints")))
+
+
+def _best_ckpt(run_dir, meta_run_dir=None):
+    """Best val_loss checkpoint (what predict() auto-selects for these runs)
+    via squint.utils.parse_test_configs.find_best_checkpoint. Searches the
+    predicted_adata's dir, else the stage-1 run_dir recorded in uns (the
+    predicted_adata may live in a separate --output-dir)."""
+    from squint.utils.parse_test_configs import find_best_checkpoint
+    d = run_dir
+    if not _has_ckpt_dir(run_dir) and _has_ckpt_dir(meta_run_dir):
+        d = meta_run_dir
+    return str(find_best_checkpoint(d, mode="min", metric_name="val_loss"))
+
+
+def _resolve_stored_ckpt(stored, run_dir, meta_run_dir=None):
+    """Existing file for the uns-recorded ckpt path, or None. Tries the path as
+    stored, then the same file name under the run dir's checkpoints/ (covers
+    relative or moved paths)."""
+    if not stored:
+        return None
+    cands = [stored]
+    base = os.path.basename(stored)
+    for d in (run_dir, meta_run_dir):
+        if d:
+            cands += [os.path.join(d, "checkpoints", base),
+                      os.path.join(d, "files", "checkpoints", base)]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def _same_ckpt(a, b):
+    if not a or not b:
+        return False
+    try:
+        if os.path.exists(a) and os.path.exists(b):
+            return os.path.samefile(a, b)
+    except OSError:
+        pass
+    return os.path.basename(str(a)) == os.path.basename(str(b))
+
+
+def _restrict_cols(A, keep):
+    """Adjacency with only the columns in boolean ``keep`` (others dropped).
+    With keep = held-out mask this is the 'heldout_only' aggregation graph: a
+    held-out row keeps its held-out neighbours plus self (self is a held-out
+    column)."""
+    import scipy.sparse as sp
+    out = (A @ sp.diags(np.asarray(keep, dtype=np.float32))).tocsr()
+    out.eliminate_zeros()
+    return out
+
+
+def _assert_holdout_coverage(adata, gidx, split_key="data_split", split_value="test"):
+    """ALWAYS-ON guard: the stage-2 npz rows (global_idx) must be EXACTLY the
+    held-out rows of this predicted_adata. A held-out row missing from the npz
+    would keep its stage-1 own-count X_hat in the neighbourhood score (a direct
+    leak); extra rows or duplicates mean the npz belongs to another adata."""
+    if split_key not in adata.obs.columns:
+        raise KeyError(f"[decode] coverage check: obs has no '{split_key}' column; "
+                       f"cannot verify the npz covers the held-out cells")
+    want = np.where(adata.obs[split_key].astype(str).to_numpy() == split_value)[0]
+    got = np.unique(gidx)
+    n_dup = int(gidx.size - got.size)
+    if n_dup or not np.array_equal(got, want):
+        n_miss = int(np.setdiff1d(want, got).size)
+        n_extra = int(np.setdiff1d(got, want).size)
+        raise RuntimeError(
+            f"[decode] coverage check FAILED: npz global_idx has {gidx.size} rows "
+            f"({n_dup} duplicate(s)) vs {want.size} rows with obs['{split_key}']=="
+            f"'{split_value}': {n_miss} held-out row(s) missing from the npz, "
+            f"{n_extra} npz row(s) not held out. Was the npz produced from this "
+            f"predicted_adata?")
+    print(f"[decode] coverage OK: npz global_idx == obs['{split_key}']=='{split_value}' "
+          f"({want.size} rows)")
+
+
+# Observed-only chunk size for --observed-xhat redecode (= run_squint's
+# predict_batch_size). The decoder MLP's layer norm normalises over the whole
+# input tensor, so rows are only ever co-batched with other observed rows.
+_REDECODE_CHUNK = 65536
+
+
 def _cov_index(adata):
     """Decoder batch-covariate index = position of each cell's adata_batch_id
     in the sorted unique ids (matches InMemoryDatasetBlob's sorted ordering)."""
@@ -512,6 +655,43 @@ def parse_args(argv=None):
                         "the native niche decoder). Default off (native decoder).")
     p.add_argument("--selfcheck-min", type=float, default=0.99,
                    help="Min cell-wise Pearson for the true-code self-check (warn below).")
+    # ---- leak-free held-out protocol knobs (opt-in; defaults = legacy decode) ----
+    p.add_argument("--selfcheck-strict", action="store_true",
+                   help="RAISE (instead of warn) when the true-code self-check is "
+                        "below --selfcheck-min.")
+    p.add_argument("--stage1-ckpt-policy", choices=["last", "best", "adata"],
+                   default="last",
+                   help="Stage-1 checkpoint to decode with (ignored when "
+                        "--stage1-ckpt is given). 'last' (default, legacy) = "
+                        "last.ckpt under the predicted_adata's dir. 'best' = best "
+                        "val_loss checkpoint (find_best_checkpoint, mode=min). "
+                        "'adata' = the checkpoint stage-1 predict used to write the "
+                        "codes and X_hat (uns['squint'] or legacy uns['vqniche'] "
+                        "'ckpt'), falling back to 'best' if that file is missing. "
+                        "Use 'adata' when the predicted_adata was written to a "
+                        "separate --output-dir.")
+    p.add_argument("--observed-xhat", choices=["stored", "redecode"], default="stored",
+                   help="Observed rows of the full per-cell prediction (used by "
+                        "--niche-from-cell and --smooth-neighs). 'stored' (default) "
+                        "= layers['X_hat'] from stage-1 predict. 'redecode' = decode "
+                        "the observed rows from their TRUE cell codes at their own "
+                        "depth, in observed-only chunks, with the chosen checkpoint "
+                        "(no co-batching with held-out rows, no checkpoint mix). "
+                        "Prints the stored-vs-redecoded agreement. The CSV column "
+                        "observed_xhat reads 'stored (redecode inert)' when the "
+                        "redecoded rows feed no score.")
+    p.add_argument("--nbr-observed-fill", choices=["stage1", "truth", "heldout_only"],
+                   default="stage1",
+                   help="How OBSERVED neighbours of held-out cells enter the "
+                        "neighbourhood computations. 'stage1' (default, legacy) = "
+                        "their stage-1 prediction (X_hat per --observed-xhat, or "
+                        "their native niche decode). 'truth' = their TRUE counts X "
+                        "(deployment-faithful; mirrored by the baseline harness). "
+                        "'heldout_only' = the niche prediction AND target aggregate "
+                        "over held-out neighbours plus self only (so the score "
+                        "measures imputed content only). Also applied to "
+                        "--smooth-neighs (heldout_only: cells left with no held-out "
+                        "neighbour keep their unsmoothed prediction).")
     return p.parse_args(argv)
 
 
@@ -543,7 +723,34 @@ def main(argv=None):
     cov_all, n_cov = _cov_index(adata)
 
     # ---- stage-1 model ----------------------------------------------------
-    ckpt = _find_ckpt(run_dir, args.stage1_ckpt)
+    # Checkpoint policy. 'last' (default) and an explicit --stage1-ckpt keep the
+    # legacy _find_ckpt path; 'best' / 'adata' pick the checkpoint stage-1
+    # predict used to write the codes and X_hat.
+    meta, meta_key = _stage1_meta(adata)
+    stored_ckpt = _meta_str(meta.get("ckpt"))
+    meta_run_dir = _meta_str(meta.get("run_dir"))
+    ckpt_policy = "explicit" if args.stage1_ckpt else args.stage1_ckpt_policy
+    if args.stage1_ckpt or args.stage1_ckpt_policy == "last":
+        if args.stage1_ckpt and args.stage1_ckpt_policy != "last":
+            print(f"[decode] --stage1-ckpt given; ignoring "
+                  f"--stage1-ckpt-policy={args.stage1_ckpt_policy}")
+        ckpt = _find_ckpt(run_dir, args.stage1_ckpt)
+    elif args.stage1_ckpt_policy == "best":
+        ckpt = _best_ckpt(run_dir, meta_run_dir)
+    else:                                               # 'adata'
+        ckpt = _resolve_stored_ckpt(stored_ckpt, run_dir, meta_run_dir)
+        if ckpt is None:
+            print(f"[decode] [ckpt] uns ckpt {stored_ckpt!r} not found on disk; "
+                  f"falling back to the best val_loss checkpoint")
+            ckpt = _best_ckpt(run_dir, meta_run_dir)
+    print(f"[decode] [ckpt] policy={ckpt_policy} -> {ckpt}")
+    if stored_ckpt:
+        print(f"[decode] [ckpt] predict-time ckpt (uns['{meta_key}']['ckpt']) = {stored_ckpt}")
+        if not _same_ckpt(ckpt, _resolve_stored_ckpt(stored_ckpt, run_dir, meta_run_dir)
+                          or stored_ckpt):
+            print("[decode] [ckpt] WARNING: decoding with a DIFFERENT checkpoint than "
+                  "the one that wrote the codes / layers['X_hat'] (codebooks and "
+                  "decoder may have drifted). Use --stage1-ckpt-policy adata.")
     print(f"[decode] loading stage-1 model from {ckpt}")
     from squint.models import Squint_Dual
     model = Squint_Dual.load_from_checkpoint(ckpt, map_location=device)
@@ -588,10 +795,16 @@ def main(argv=None):
               f"The decode path is NOT faithfully reproducing the model -- the "
               f"imputed Pearson below is unreliable. Likely causes: batch-covariate "
               f"index mapping, FiLM coupling, or read-depth. Fix before trusting.")
+        if args.selfcheck_strict:
+            raise RuntimeError(f"[decode] self-check {sc:.4f} < {args.selfcheck_min} "
+                               f"(--selfcheck-strict)")
 
     # ---- IMPUTED: decode stage-2's predicted codes ------------------------
     npz = np.load(args.stage2_codes)
     gidx = npz["global_idx"].astype(np.int64)
+    _assert_holdout_coverage(adata, gidx)               # always on
+    held = np.zeros(n, dtype=bool)
+    held[gidx] = True
     K = max(1, int(args.decode_samples))
     # Read depth (library size) used to scale the decoder. rd_full holds a value
     # per cell: observed cells keep their own true depth; held-out cells get
@@ -664,6 +877,46 @@ def main(argv=None):
         pred_cell = npz["codes_cell"].astype(np.int64)
         xhat_imp = _decode(pred_cell, None, gidx, read_depth=rd)  # rd = leak-free (rd_full[gidx])
 
+    # ---- Observed rows of the full per-cell prediction ---------------------
+    # 'stored' (default): stage-1 layers['X_hat']. 'redecode': observed rows
+    # decoded from their TRUE cell codes at their own depth, in observed-only
+    # chunks (balanced, <= _REDECODE_CHUNK rows) with the chosen checkpoint.
+    X_hat_obs = X_hat_stored
+    if args.observed_xhat == "redecode":
+        obs_rd = np.where(~held)[0]
+        X_hat_obs = X_hat_stored.copy()
+        if obs_rd.size:
+            parts = np.array_split(obs_rd, int(np.ceil(obs_rd.size / _REDECODE_CHUNK)))
+            for part in parts:
+                X_hat_obs[part] = _decode(true_cell[part], None, part)
+            a_rd, b_st = X_hat_obs[obs_rd], X_hat_stored[obs_rd]
+            cw_rd = _pearson_pairwise(a_rd, b_st, axis=1)
+            cw_rd = cw_rd[np.isfinite(cw_rd)]
+            rel = (np.linalg.norm(a_rd - b_st, axis=1)
+                   / np.maximum(np.linalg.norm(b_st, axis=1), 1e-12))
+            print(f"[decode] [observed-xhat] redecode: {obs_rd.size} observed rows in "
+                  f"{len(parts)} observed-only chunk(s); stored vs redecoded cell-wise "
+                  f"Pearson median = "
+                  f"{(float(np.median(cw_rd)) if cw_rd.size else float('nan')):.6f}, "
+                  f"relative L2 median = {float(np.median(rel)):.3e}")
+
+    # Provenance for the observed_xhat CSV column: True once the observed rows
+    # of X_hat_obs reach a score. Only _full_prediction under --nbr-observed-fill
+    # stage1 does that ('truth' uses X; 'heldout_only' drops every observed
+    # column from the held-out rows' aggregation).
+    xhat_obs_scored = False
+
+    def _full_prediction(held_vals):
+        """Per-cell prediction over ALL rows: held-out rows = ``held_vals``;
+        observed rows = true counts X under --nbr-observed-fill truth, else the
+        stage-1 X_hat source (--observed-xhat)."""
+        nonlocal xhat_obs_scored
+        if args.nbr_observed_fill == "stage1":
+            xhat_obs_scored = True
+        full = (X if args.nbr_observed_fill == "truth" else X_hat_obs).copy()
+        full[gidx] = held_vals
+        return full
+
     # ---- Optional GeST-style SPATIAL SMOOTHING of the cell prediction ------
     # Replace each held-out cell's decoded profile with the MEAN over its K
     # nearest spatial neighbors (self EXCLUDED), like GeST predicting each cell
@@ -678,13 +931,21 @@ def main(argv=None):
             batch_s = (np.asarray(adata.obs[args.nbr_batch_key].values)
                        if args.nbr_batch_key in adata.obs.columns
                        else np.zeros(adata.n_obs, dtype=np.int64))
-            X_hat_full = X_hat_stored.copy()
-            X_hat_full[gidx] = xhat_imp
+            X_hat_full = _full_prediction(xhat_imp)
             As = _spatial_knn_selfloop(np.asarray(coords_s), batch_s,
                                        args.smooth_neighs, include_self=False)
-            xhat_imp = _nbr_mean(As, X_hat_full)[gidx].astype(np.float32)
+            if args.nbr_observed_fill == "heldout_only":
+                As = _restrict_cols(As, held)
+                no_nbr = np.asarray(As[gidx].sum(axis=1)).ravel() == 0
+            xhat_sm = _nbr_mean(As, X_hat_full)[gidx].astype(np.float32)
+            if args.nbr_observed_fill == "heldout_only" and no_nbr.any():
+                xhat_sm[no_nbr] = xhat_imp[no_nbr]      # no held-out neighbour: unsmoothed
+                print(f"[decode] [smooth] heldout_only: {int(no_nbr.sum())} held-out "
+                      f"cell(s) have no held-out neighbour; kept unsmoothed")
+            xhat_imp = xhat_sm
             print(f"[decode] [smooth] cell prediction spatially smoothed over "
-                  f"K={args.smooth_neighs} neighbors (GeST-style, self excluded)")
+                  f"K={args.smooth_neighs} neighbors (GeST-style, self excluded; "
+                  f"observed fill={args.nbr_observed_fill})")
 
     # ---- Pearson on the held-out cells ------------------------------------
     target = X[gidx]
@@ -733,7 +994,20 @@ def main(argv=None):
                       f"treating all cells as one section.")
                 batch = np.zeros(adata.n_obs, dtype=np.int64)
             A = _spatial_knn_selfloop(np.asarray(coords), batch, args.nbr_neighs)
-            X_nbr = _nbr_mean(A, X)                            # true neighborhood mean
+            # boundary exposure: share of held-out cells' aggregation weight that
+            # falls on OBSERVED neighbours (what --nbr-observed-fill controls)
+            A_h = A[gidx]
+            w_tot = np.asarray(A_h.sum(axis=1)).ravel()
+            w_obs = np.asarray(A_h @ (~held).astype(np.float32)).ravel()
+            frac_obs = w_obs / np.where(w_tot > 0, w_tot, 1.0)
+            print(f"[decode] [nbr] {int((w_obs > 0).sum())}/{gidx.size} held-out cells "
+                  f"have >=1 observed neighbour; observed share of held-out "
+                  f"aggregation weight = {100.0 * float(frac_obs.mean()):.2f}% "
+                  f"(nbr-observed-fill={args.nbr_observed_fill})")
+            # 'heldout_only': prediction AND target aggregate over held-out
+            # neighbours plus self only (observed columns dropped from the graph)
+            A_agg = _restrict_cols(A, held) if args.nbr_observed_fill == "heldout_only" else A
+            X_nbr = _nbr_mean(A_agg, X)                        # true neighborhood mean
 
             def _cov_t(rows):
                 return (torch.as_tensor(cov_all[rows], dtype=torch.long, device=device)
@@ -791,12 +1065,21 @@ def main(argv=None):
                 obs_rows = np.setdiff1d(np.arange(n), gidx)
                 xhat_niche_full = np.empty((n, X.shape[1]), np.float32)
                 if obs_rows.size:
-                    xhat_niche_full[obs_rows] = _decode_niche_hard(true_niche[obs_rows], obs_rows)
+                    # observed rows: own native niche decode (legacy), or their
+                    # TRUE counts under --nbr-observed-fill truth
+                    xhat_niche_full[obs_rows] = (
+                        X[obs_rows] if args.nbr_observed_fill == "truth"
+                        else _decode_niche_hard(true_niche[obs_rows], obs_rows))
                 xhat_niche_full[gidx] = xhat_niche_hold
-                X_hat_nbr = _nbr_mean(A, xhat_niche_full)
+                X_hat_nbr = _nbr_mean(A_agg, xhat_niche_full)
                 print(f"[decode] [nbr] NATIVE niche decoder (attribute_decoder_niche); "
                       f"mean-agg n_neighs={args.nbr_neighs} over "
                       f"{np.unique(batch).size} section(s)")
+                if args.observed_xhat == "redecode":
+                    print("[decode] [nbr] NOTE: --observed-xhat redecode does not apply "
+                          "to the native niche path (observed rows are decoded from "
+                          "their niche codes); it only feeds --niche-from-cell / "
+                          "--smooth-neighs.")
             else:
                 # Aggregate the CELL prediction: X_hat_nbr = mean-agg of X_hat, the
                 # SAME neighborhood smoothing the GeST / scVI / kNN bars get. Two
@@ -804,8 +1087,10 @@ def main(argv=None):
                 # comparison ablation: smooth SQUINT's cell prediction like the
                 # baselines instead of using its native niche decoder), or (b) an
                 # older stage-2 run with no 'codes_niche' (automatic fallback).
-                X_hat_full = X_hat_stored.copy(); X_hat_full[gidx] = xhat_imp
-                X_hat_nbr = _nbr_mean(A, X_hat_full)
+                # Observed rows follow --observed-xhat / --nbr-observed-fill
+                # (default: stored X_hat, the legacy fill).
+                X_hat_full = _full_prediction(xhat_imp)
+                X_hat_nbr = _nbr_mean(A_agg, X_hat_full)
                 if args.niche_from_cell:
                     print("[decode] [nbr] --niche-from-cell: X_hat_nbr = mean-agg of the "
                           "CELL prediction (GeST/kNN-style smoothing), NOT the native "
@@ -822,6 +1107,19 @@ def main(argv=None):
                                      split="test", seed=args.seed, marker_idx=marker_idx))
 
     df = pd.DataFrame(rows)
+    # leak-free protocol provenance (legacy decode = stored / last / stage1).
+    # observed_xhat records the EFFECTIVE source: a redecode that fed no score
+    # leaves the numbers equal to 'stored', so it is stamped as inert.
+    observed_xhat_eff = args.observed_xhat
+    if args.observed_xhat == "redecode" and not xhat_obs_scored:
+        observed_xhat_eff = "stored (redecode inert)"
+        print(f"[decode] [observed-xhat] NOTE: redecoded observed rows fed no score "
+              f"(nbr-observed-fill={args.nbr_observed_fill}; they only enter via "
+              f"--niche-from-cell, the no-codes_niche fallback or --smooth-neighs "
+              f"under stage1); CSV observed_xhat = '{observed_xhat_eff}'")
+    df["observed_xhat"] = observed_xhat_eff
+    df["ckpt_policy"] = ckpt_policy
+    df["nbr_observed_fill"] = args.nbr_observed_fill
 
     os.makedirs(args.out_metrics_dir, exist_ok=True)
     out_csv = os.path.join(args.out_metrics_dir, "per_seed_pearson_reconstruction.csv")

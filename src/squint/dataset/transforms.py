@@ -1,4 +1,4 @@
-from typing import Dict, Optional, List, Literal, Union
+from typing import Callable, Dict, Optional, List, Literal, Union
 
 import scanpy as sc
 import anndata as ad
@@ -8,6 +8,194 @@ from torch_geometric.data import Data
 import torch_geometric.transforms as T
 
 from ..preprocessors.normalizers import normalize_by_read_depth, normalize_total_log1p
+
+
+# Allowed values of the opt-in inductive held-out-region graph knobs
+# (`SpatialBatchSplit.holdout_graph` / `holdout_test_inedges`).
+HOLDOUT_GRAPH_MODES = ('transductive', 'drop', 'rebuild')
+HOLDOUT_TEST_INEDGES = ('full', 'test_only', 'none')
+
+
+def _blob_knn_adjacency(xy, k: int):
+    """
+    Symmetrised kNN adjacency over `xy` (numpy array, shape (n, 2)), built
+    exactly like the dataset blob builds its `spatial_n_neighs_<k>` graphs
+    (in_memory_dataset_blob.py, "Build Neighborhood Graphs" and "Build Edge
+    Indices"): squint's `spatial_neighbors` wrapper around squidpy with
+    coord_type='generic', delaunay=False, radius=None and
+    include_self_loop=True (the settings of every blob config in
+    examples/run_squint.py), then `A.maximum(A.T)` when A is not symmetric.
+
+    Returns a scipy.sparse matrix of shape (n, n).
+    """
+    import numpy as np
+    import pandas as pd
+    from ..preprocessors.graph_constructors import spatial_neighbors
+
+    xy = np.asarray(xy)
+    n = int(xy.shape[0])
+    k = int(k)
+    if n - 1 < k:
+        # sklearn's kneighbors() (self excluded) needs k < n.
+        print(f"_blob_knn_adjacency: only {n} points, clamping k={k} -> {max(n - 1, 0)}.")
+        k = n - 1
+    if k < 1:
+        import scipy.sparse as sp
+        return sp.identity(n, dtype=np.float32, format='csr')
+
+    adata = ad.AnnData(
+        obs=pd.DataFrame(index=[str(i) for i in range(n)]),
+        obsm={'spatial': xy},
+    )
+    key_added = 'holdout_rebuild'
+    adata = spatial_neighbors(
+        adata,
+        coord_type='generic',
+        spatial_key='spatial',
+        delaunay=False,
+        n_neighs=k,
+        radius=None,
+        include_self_loop=True,
+        key_added=key_added,
+    )
+    A = adata.obsp[f"{key_added}_connectivities"]
+    if (A != A.T).nnz > 0:
+        A = A.maximum(A.T)
+    return A
+
+
+def make_inductive_edge_index(
+        edge_index: torch.Tensor,
+        test_mask: torch.Tensor,
+        xy: torch.Tensor,
+        mode: Literal['drop', 'rebuild'],
+        k: Optional[int] = None,
+        test_inedges: Literal['full', 'test_only', 'none'] = 'full',
+        knn_builder: Optional[Callable] = None,
+    ) -> torch.Tensor:
+    """
+    Rewrite the graph of ONE tissue section so that no held-out
+    (test_mask) cell can send a message to an observed cell.
+
+    PyG convention: edge_index[0] = source, edge_index[1] = target (messages
+    flow src -> dst). NeighborLoader with its default
+    subgraph_type='directional' samples the IN-edges of each seed, so after
+    this rewrite an observed seed can never pull a held-out node into a
+    batch, at any hop depth.
+
+    Parameters:
+    ----------
+    - edge_index: LongTensor [2, E]
+        The section's graph (the blob's symmetrised kNN with self-loops).
+    - test_mask: BoolTensor [N]
+        True for held-out cells.
+    - xy: Tensor [N, 2]
+        Coordinates used by mode='rebuild' (the same coordinates the
+        held-out boxes were computed on).
+    - mode: 'drop' | 'rebuild'
+        Observed -> observed edges. 'drop' keeps the original ones (boundary
+        observed cells lose their held-out neighbours). 'rebuild' replaces
+        them with a symmetrised kNN(k) over observed cells only, built with
+        the same constructor, parameters, symmetrisation and self-loop
+        convention as the dataset blob (see `_blob_knn_adjacency`).
+    - k: int
+        Number of neighbours for mode='rebuild'.
+    - test_inedges: 'full' | 'test_only' | 'none'
+        Edges INTO held-out cells. 'full' keeps all their original in-edges
+        (from observed and held-out sources), 'test_only' keeps only those
+        from held-out sources, 'none' keeps none (self-loop only).
+    - knn_builder: Callable, optional
+        Override for the kNN constructor, called as
+        `knn_builder(xy_obs_numpy, k)` and returning a scipy.sparse (n_obs,
+        n_obs) adjacency. Used by tests that run without squidpy.
+
+    Returns:
+    -------
+    - LongTensor [2, E']
+        Coalesced (sorted by source then target, deduplicated) edge index on
+        the input device and dtype. Guarantees: no edge with a held-out
+        source and an observed target; every node has exactly one self-loop.
+
+    Notes:
+    -----
+    - Coordinates must belong to a single section: a 'rebuild' over a
+      collated multi-section batch would connect sections.
+    """
+    if mode not in ('drop', 'rebuild'):
+        raise ValueError(f"mode must be 'drop' or 'rebuild', got {mode!r}")
+    if test_inedges not in HOLDOUT_TEST_INEDGES:
+        raise ValueError(
+            f"test_inedges must be one of {HOLDOUT_TEST_INEDGES}, got {test_inedges!r}"
+        )
+    if mode == 'rebuild' and (k is None or int(k) < 1):
+        raise ValueError(f"mode='rebuild' needs a positive k, got k={k!r}")
+
+    device = edge_index.device
+    dtype = edge_index.dtype
+    t = test_mask.to(device=device, dtype=torch.bool).reshape(-1)
+    num_nodes = int(t.numel())
+    ei = edge_index.to(dtype=torch.long)
+    if num_nodes == 0:
+        return edge_index[:, :0].clone()
+    if ei.dim() != 2 or ei.size(0) != 2:
+        raise ValueError(f"edge_index must have shape [2, E], got {tuple(ei.shape)}")
+    if ei.numel() > 0 and int(ei.max()) >= num_nodes:
+        raise ValueError(
+            f"edge_index refers to node {int(ei.max())} but test_mask has only {num_nodes} nodes"
+        )
+    src, dst = ei[0], ei[1]
+
+    # Edges INTO held-out cells (never reach an observed cell).
+    keep_in = t[dst]
+    if test_inedges == 'test_only':
+        keep_in = keep_in & t[src]
+    elif test_inedges == 'none':
+        keep_in = keep_in & (src == dst)
+    parts = [ei[:, keep_in]]
+
+    # Observed -> observed edges.
+    if mode == 'drop':
+        parts.append(ei[:, ~t[src] & ~t[dst]])
+    else:
+        obs_idx = torch.nonzero(~t, as_tuple=False).view(-1)
+        if obs_idx.numel() > 0:
+            xy_obs = xy.detach()[obs_idx.to(xy.device)].cpu().numpy()
+            builder = knn_builder if knn_builder is not None else _blob_knn_adjacency
+            A = builder(xy_obs, int(k))
+            n_obs = int(obs_idx.numel())
+            if tuple(A.shape) != (n_obs, n_obs):
+                raise ValueError(
+                    f"knn_builder returned shape {tuple(A.shape)}, expected ({n_obs}, {n_obs})"
+                )
+            # Same conversion as torch_geometric.utils.from_scipy_sparse_matrix
+            # (used by the blob): COO row -> source, COO col -> target.
+            A = A.tocoo()
+            local = torch.stack([
+                torch.from_numpy(A.row).to(torch.long),
+                torch.from_numpy(A.col).to(torch.long),
+            ], dim=0).to(device)
+            parts.append(obs_idx[local])
+
+    # Exactly one self-loop per node (loss_utils' 1-hop aggregation and the
+    # 'none' in-edge mode rely on it); duplicates are removed below.
+    loops = torch.arange(num_nodes, dtype=torch.long, device=device)
+    parts.append(torch.stack([loops, loops], dim=0))
+
+    # Coalesce: sort by (source, target) and drop duplicates, the same
+    # order as torch_geometric.utils.coalesce(sort_by_row=True).
+    out = torch.cat(parts, dim=1)
+    key = torch.unique(out[0] * num_nodes + out[1], sorted=True)
+    out = torch.stack([
+        torch.div(key, num_nodes, rounding_mode='floor'),
+        torch.remainder(key, num_nodes),
+    ], dim=0)
+
+    n_bad = int((t[out[0]] & ~t[out[1]]).sum())
+    if n_bad > 0:
+        raise RuntimeError(
+            f"make_inductive_edge_index: {n_bad} held-out -> observed edges remain."
+        )
+    return out.to(dtype=dtype)
 
 
 def init_gene_count_transforms(
@@ -84,6 +272,12 @@ def init_train_transforms(
         # Per-batch held-out region rectangles for the gene-reconstruction
         # downstream task (SpatialBatchSplit.test_regions).
         test_regions: Optional[Dict[int, Union[dict, List[dict]]]] = None,
+        # Opt-in inductive graph for the test_regions sections
+        # (SpatialBatchSplit.holdout_graph). Defaults keep the legacy
+        # transductive graph.
+        holdout_graph: Literal['transductive', 'drop', 'rebuild'] = 'transductive',
+        holdout_knn_k: Optional[int] = None,
+        holdout_test_inedges: Literal['full', 'test_only', 'none'] = 'full',
     ) -> List[T.BaseTransform]:
     """
     Initialize a list of training-related PyG transforms to be applied to the Data object.
@@ -110,6 +304,9 @@ def init_train_transforms(
         List of batch indices for validation (used with BatchSplit).
     - test_batches: list
         List of batch indices for testing (used with BatchSplit).
+    - holdout_graph, holdout_knn_k, holdout_test_inedges:
+        Inductive held-out-region graph knobs (used with SpatialBatchSplit;
+        see SpatialBatchSplit for details). Defaults keep the legacy graph.
     """
     train_transforms = []
     
@@ -143,6 +340,9 @@ def init_train_transforms(
                 train_val_cell_split=train_val_cell_split,
                 cell_split_seed=cell_split_seed,
                 test_regions=test_regions,
+                holdout_graph=holdout_graph,
+                holdout_knn_k=holdout_knn_k,
+                holdout_test_inedges=holdout_test_inedges,
             )
         )
     
@@ -240,6 +440,9 @@ class SpatialBatchSplit(T.BaseTransform):
             train_val_cell_split: float = 0.0,
             cell_split_seed: int = 0,
             test_regions: Optional[Dict[int, Union[dict, List[dict]]]] = None,
+            holdout_graph: Literal['transductive', 'drop', 'rebuild'] = 'transductive',
+            holdout_knn_k: Optional[int] = None,
+            holdout_test_inedges: Literal['full', 'test_only', 'none'] = 'full',
         ):
         """
         Split nodes based on batch information. Useful when you have multiple tissue sections
@@ -293,6 +496,23 @@ class SpatialBatchSplit(T.BaseTransform):
             test cells only. Independent from `test_batches` (which
             holds out whole sections); the two can be used together if
             needed.
+        - holdout_graph: 'transductive' | 'drop' | 'rebuild'
+            Graph used for the `test_regions` sections. 'transductive'
+            (default, legacy) keeps the full graph, so held-out cells stay
+            neighbours of observed cells. 'drop' and 'rebuild' rewrite
+            `data.edge_index` with `make_inductive_edge_index` so that no
+            edge goes from a held-out cell to an observed cell: 'drop'
+            keeps the original observed -> observed edges, 'rebuild'
+            replaces them with a kNN(`holdout_knn_k`) over observed cells
+            only. Sections without a `test_regions` entry are untouched.
+        - holdout_knn_k: int
+            k for holdout_graph='rebuild' (required there; ignored
+            otherwise). initialize_dataset_blob fills it from
+            `graph_params['n_neighs']` when unset.
+        - holdout_test_inedges: 'full' | 'test_only' | 'none'
+            Edges INTO held-out cells under a non-transductive
+            holdout_graph: 'full' (default) keeps all original in-edges,
+            'test_only' only those from held-out cells, 'none' none.
 
         Example:
         --------
@@ -317,6 +537,32 @@ class SpatialBatchSplit(T.BaseTransform):
         self.test_regions: Dict[int, Union[dict, List[dict]]] = (
             {int(k): v for k, v in (test_regions or {}).items()}
         )
+
+        # Inductive held-out-region graph (opt-in). YAML nulls map to the
+        # legacy defaults.
+        holdout_graph = 'transductive' if holdout_graph is None else str(holdout_graph)
+        holdout_test_inedges = 'full' if holdout_test_inedges is None else str(holdout_test_inedges)
+        if holdout_graph not in HOLDOUT_GRAPH_MODES:
+            raise ValueError(
+                f"holdout_graph must be one of {HOLDOUT_GRAPH_MODES}, got {holdout_graph!r}"
+            )
+        if holdout_test_inedges not in HOLDOUT_TEST_INEDGES:
+            raise ValueError(
+                f"holdout_test_inedges must be one of {HOLDOUT_TEST_INEDGES}, "
+                f"got {holdout_test_inedges!r}"
+            )
+        if holdout_graph == 'rebuild' and holdout_knn_k is None:
+            raise ValueError("holdout_graph='rebuild' requires holdout_knn_k.")
+        if holdout_knn_k is not None and int(holdout_knn_k) < 1:
+            raise ValueError(f"holdout_knn_k must be positive, got {holdout_knn_k!r}")
+        self.holdout_graph = holdout_graph
+        self.holdout_knn_k = None if holdout_knn_k is None else int(holdout_knn_k)
+        self.holdout_test_inedges = holdout_test_inedges
+        if self.holdout_graph != 'transductive' and not self.test_regions:
+            print(
+                f"SpatialBatchSplit: holdout_graph={self.holdout_graph!r} has no "
+                f"effect because test_regions is empty."
+            )
         
     def _is_in_single_region(self, coords, region):
         """
@@ -386,6 +632,51 @@ class SpatialBatchSplit(T.BaseTransform):
             
         return mask
     
+    def _apply_inductive_graph(self, data: Data, test_mask: torch.Tensor, bid_int: int) -> None:
+        """
+        Replace `data.edge_index` in place with the inductive graph from
+        `make_inductive_edge_index` and print what changed.
+        """
+        old_ei = data.edge_index
+        num_nodes = int(test_mask.numel())
+        t = test_mask.to(device=old_ei.device, dtype=torch.bool)
+        new_ei = make_inductive_edge_index(
+            edge_index=old_ei,
+            test_mask=test_mask,
+            xy=data[self.xy_key],
+            mode=self.holdout_graph,
+            k=self.holdout_knn_k,
+            test_inedges=self.holdout_test_inedges,
+        )
+
+        # Bookkeeping for the log line: edges removed / added (as sets),
+        # the observed boundary band (observed cells with >= 1 held-out
+        # in-neighbour in the ORIGINAL graph) and the held-out ring.
+        old_l = old_ei.to(torch.long)
+        new_l = new_ei.to(torch.long)
+        old_key = old_l[0] * num_nodes + old_l[1]
+        new_key = new_l[0] * num_nodes + new_l[1]
+        n_removed = int((~torch.isin(old_key, new_key)).sum())
+        n_added = int((~torch.isin(new_key, old_key)).sum())
+        cross = t[old_l[0]] & ~t[old_l[1]]
+        n_band = int(torch.unique(old_l[1][cross]).numel())
+        n_ring = int(torch.unique(old_l[0][cross]).numel())
+
+        data.edge_index = new_ei
+        # SetExperimentDataKeys stores num_edges explicitly; keep it in sync.
+        if 'num_edges' in data.keys():
+            data.num_edges = int(new_ei.size(1))
+
+        k_str = f", k={self.holdout_knn_k}" if self.holdout_graph == 'rebuild' else ""
+        print(
+            f"SpatialBatchSplit: batch {bid_int} holdout_graph="
+            f"{self.holdout_graph!r}{k_str}, test_inedges="
+            f"{self.holdout_test_inedges!r}: edges {int(old_ei.size(1))} -> "
+            f"{int(new_ei.size(1))} (removed {n_removed}, added {n_added}); "
+            f"n_test={int(t.sum())}, observed boundary band={n_band} cells, "
+            f"held-out ring={n_ring} cells."
+        )
+
     def forward(self, data: Data) -> Data:
         num_nodes = data.x.shape[0]
 
@@ -426,6 +717,13 @@ class SpatialBatchSplit(T.BaseTransform):
             data.test_mask  = test_mask
             data.train_mask = train_mask
             data.val_mask   = val_mask
+
+            # Opt-in inductive graph: cut every held-out -> observed edge
+            # so held-out counts never reach observed cells (train, val
+            # and predict all re-apply this transform). Masks and node
+            # order are unchanged.
+            if self.holdout_graph != 'transductive':
+                self._apply_inductive_graph(data, test_mask, bid_int)
             return data
 
         if data.adata_batch_id in self.train_batches:

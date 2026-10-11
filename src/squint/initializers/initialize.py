@@ -326,6 +326,39 @@ def initialize_dataset_blob(
     # 3. train transforms: e.g. random node split, etc.
     train_transform_names = config['dataset']['train_transform_names']
     train_transform_params = config['dataset']['train_transform_params']
+    # Inductive held-out-region graph (opt-in, SpatialBatchSplit.holdout_graph):
+    # when no k is given, rebuild the observed-only kNN with the same k as the
+    # blob graph selected above. The injected k is written back into the
+    # config (as a new train_transform_params dict) so that the re-saved
+    # run config and predict()'s uns['squint'] provenance record the k the
+    # transform actually used.
+    holdout_graph = train_transform_params.get('holdout_graph', None)
+    if holdout_graph not in (None, 'transductive'):
+        if holdout_graph == 'rebuild' and (
+                graph_params.get('delaunay') or graph_params.get('radius') is not None):
+            raise ValueError(
+                "holdout_graph='rebuild' rebuilds a plain kNN graph and cannot "
+                f"reproduce graph_params={graph_params} (delaunay / radius)."
+            )
+        if train_transform_params.get('holdout_knn_k', None) is None:
+            if graph_params.get('n_neighs') is not None:
+                train_transform_params = {
+                    **train_transform_params,
+                    'holdout_knn_k': int(graph_params['n_neighs']),
+                }
+                config['dataset']['train_transform_params'] = train_transform_params
+                print(
+                    f"initialize_dataset_blob: holdout_graph={holdout_graph!r}, "
+                    f"holdout_knn_k set from graph_params['n_neighs'] = "
+                    f"{train_transform_params['holdout_knn_k']}."
+                )
+        elif (graph_params.get('n_neighs') is not None
+                and int(train_transform_params['holdout_knn_k']) != int(graph_params['n_neighs'])):
+            print(
+                f"initialize_dataset_blob: WARNING holdout_knn_k="
+                f"{train_transform_params['holdout_knn_k']} differs from "
+                f"graph_params['n_neighs']={graph_params['n_neighs']}."
+            )
     TrainTransforms = init_train_transforms(
                         train_transform_names=train_transform_names,
                         **train_transform_params

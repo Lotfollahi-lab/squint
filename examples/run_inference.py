@@ -33,6 +33,16 @@ Usage
         --variant dualvq+narrow+rvq-both+decoder-cov+adv+mmb0-1b_smb1-20b_1p \\
         --timestamp 20260507_120000 \\
         --silver-dir /alt/path/to/silver
+
+    # Predict-time inductive held-out graph on an OLD (transductive)
+    # region-holdout run: observed cells no longer aggregate held-out
+    # neighbours at predict (weights unchanged). Needs a separate
+    # --output-dir; the run's own predicted_adata.h5ad is never touched:
+    python examples/run_inference.py \\
+        --variant <...>+region-holdout+mmb0-1b_smb1-1b_1p \\
+        --timestamp 20260629_023326_seed0 \\
+        --holdout-graph rebuild \\
+        --output-dir <ART>/<dataset>/<variant>__predict-inductive/20260629_023326_seed0
 """
 
 # Silence the same upstream FutureWarnings run_squint.py filters at startup.
@@ -107,6 +117,16 @@ def main() -> None:
              "Defaults to the run_dir itself.",
     )
     p.add_argument(
+        "--holdout-graph", type=str, default=None, choices=["rebuild", "drop"],
+        help="Apply the inductive held-out graph at PREDICT time only "
+             "(predict(holdout_graph_override=...)): no held-out -> observed "
+             "edge, observed kNN rebuilt ('rebuild') or held-out edges "
+             "dropped ('drop'). For region-holdout runs; requires "
+             "--output-dir different from the run_dir and not another "
+             "training run dir. Default: the graph protocol saved in the "
+             "run config.",
+    )
+    p.add_argument(
         "--label-keys", type=str,
         default="cell_type,niche,Sub_molecular_tissue_region,ccf_region_name",
         help="Comma-separated obs columns to colour UMAPs by. Default "
@@ -172,6 +192,7 @@ def main() -> None:
         skip_svg_plots=args.skip_svg_plots,
         skip_umap=args.skip_umap,
         skip_metrics=args.skip_metrics,
+        holdout_graph_override=args.holdout_graph,
     )
 
 

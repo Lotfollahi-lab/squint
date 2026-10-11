@@ -4999,8 +4999,10 @@ def _patch_holdout_regions(
 
     Both source sections stay in the train graph (so the model still
     sees most of each tissue), but the cells inside the per-batch
-    `regions` rectangle become `test_mask=True` and are masked OUT of
-    the training loss. At inference, predict() runs over every cell and
+    `regions` rectangle become `test_mask=True` and are never train /
+    val seeds. They do stay graph neighbours of observed cells
+    (transductive); add `_patch_holdout_inductive` for the leak-free
+    graph. At inference, predict() runs over every cell and
     `compute_inference_metrics.py` reports stratified Pearson on the
     `data_split == "test"` subset only.
 
@@ -5053,6 +5055,71 @@ def _patch_holdout_regions(
     cfg["dataset"]["train_transform_params"]["test_regions"] = {
         int(k): v for k, v in regions.items()
     }
+    return cfg
+
+
+def _patch_holdout_inductive(
+        cfg: dict,
+        mode: str = "rebuild",
+        test_inedges: str = "full",
+    ) -> dict:
+    """
+    Make the region holdout INDUCTIVE (leak-free). Apply on top of
+    `_patch_holdout_regions`.
+
+    With `_patch_holdout_regions` alone the protocol is transductive:
+    held-out cells are excluded as train / val seeds but stay graph
+    nodes, so their counts reach observed cells through the GNN input,
+    the 1-hop niche NB target, the adjacency BCE and the VQ EMA, and at
+    predict observed cells' niche codes aggregate held-out neighbours.
+    This patch makes `SpatialBatchSplit` rewrite the graph of every
+    `test_regions` section so that no edge runs from a held-out source to
+    an observed target (`squint.dataset.transforms.make_inductive_edge_index`).
+
+    Parameters
+    ----------
+    mode : {"rebuild", "drop"}
+        Observed-to-observed graph. "rebuild" = symmetrised kNN over the
+        observed cells only (same k and constructor as the blob graph), so
+        boundary observed cells get a full observed neighbourhood.
+        "drop" = the original observed-to-observed edges only (boundary
+        cells lose their held-out neighbours).
+    test_inedges : {"full", "test_only", "none"}
+        Edges INTO held-out cells (only their own codes / recon outputs
+        depend on these). "full" keeps all original in-edges, so the
+        recon-block targets of held-out cells are unchanged.
+
+    Notes
+    -----
+    - `holdout_knn_k` is pinned to `graph_params.n_neighs`, so apply this
+      AFTER the spine's `_patch_dual_graph_knn`.
+    - Also switches on the datamodule guard
+      (`inference_params.assert_inductive_holdout`) and the model batch
+      guards (`loss_kwargs.assert_inductive_holdout`), which raise if a
+      held-out node ever enters a train / val batch or a held-out ->
+      observed edge reaches a predict batch.
+    """
+    tp = cfg["dataset"]["train_transform_params"]
+    if not tp.get("test_regions"):
+        raise ValueError(
+            "_patch_holdout_inductive: train_transform_params has no "
+            "test_regions; apply _patch_holdout_regions first."
+        )
+    if mode not in ("rebuild", "drop"):
+        raise ValueError(
+            f"_patch_holdout_inductive: mode must be 'rebuild' or 'drop', "
+            f"got {mode!r}."
+        )
+    if test_inedges not in ("full", "test_only", "none"):
+        raise ValueError(
+            f"_patch_holdout_inductive: test_inedges must be 'full', "
+            f"'test_only' or 'none', got {test_inedges!r}."
+        )
+    tp["holdout_graph"] = str(mode)
+    tp["holdout_test_inedges"] = str(test_inedges)
+    tp["holdout_knn_k"] = int(cfg["dataset"]["graph_params"]["n_neighs"])
+    cfg["datamodule"]["inference_params"]["assert_inductive_holdout"] = True
+    cfg["model"]["loss_params"]["loss_kwargs"]["assert_inductive_holdout"] = True
     return cfg
 
 
@@ -27139,6 +27206,60 @@ batch_size=512,
                 _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90)))),
             [400, 400]),
     },
+    # --- INDUCTIVE (leak-free) siblings of the FiLM-scale region-holdout
+    # reference. Identical build + `_patch_holdout_inductive`: the graph of
+    # each held-out section is rewritten so that no edge runs from a held-out
+    # cell to an observed cell (train, val AND predict), plus datamodule and
+    # model guards that raise if one ever does. In the reference above the
+    # held-out cells are excluded only as seeds and still reach observed
+    # cells as graph neighbours. "inductive" = observed kNN16 rebuilt over
+    # observed cells only (headline); "inductive-drop" = held-out edges
+    # dropped, observed edges kept. Edges INTO held-out cells are kept
+    # ("full"), so their own codes / recon targets match the reference.
+    # NOT named `s57_v19_*` (same reason as the reference). Reuses the mmb
+    # blob (no rebuild): the rewrite happens in the runtime transform.
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+region-holdout-inductive+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "INDUCTIVE (leak-free) sibling of the FiLM-scale region-holdout "
+            "reference (the s57_v19 config + 25%x25% holdout patches in batch "
+            "15 upper-left and batch 82 lower-right). Same build, plus the "
+            "held-out graph rewrite: no held-out -> observed edge anywhere "
+            "(train, val, predict); the observed kNN16 is REBUILT over observed "
+            "cells only (same constructor + symmetrisation as the blob), and "
+            "all original in-edges of held-out cells are kept. Datamodule + "
+            "model guards raise on any violation. Reuses the mmb blob (no "
+            "rebuild)."
+        ),
+        "patches": [
+            "= FiLM-scale region-holdout reference "
+            "+ inductive holdout graph (mode=rebuild, test_inedges=full, k=16)",
+        ],
+        "build": lambda: _patch_holdout_inductive(
+            _patch_holdout_regions(
+                _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90)))),
+            mode="rebuild"),
+    },
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+region-holdout-inductive-drop+mmb0-1b_smb1-1b_1p": {
+        "description": (
+            "INDUCTIVE (leak-free) sibling of the FiLM-scale region-holdout "
+            "reference, DROP mode: same build, plus the held-out graph "
+            "rewrite that deletes every held-out -> observed edge and keeps "
+            "the original observed -> observed edges (boundary observed cells "
+            "simply lose their held-out neighbours; no kNN rebuild). All "
+            "original in-edges of held-out cells are kept. Datamodule + model "
+            "guards raise on any violation. Sensitivity check for the "
+            "+region-holdout-inductive (rebuild) headline. Reuses the mmb blob "
+            "(no rebuild)."
+        ),
+        "patches": [
+            "= FiLM-scale region-holdout reference "
+            "+ inductive holdout graph (mode=drop, test_inedges=full)",
+        ],
+        "build": lambda: _patch_holdout_inductive(
+            _patch_holdout_regions(
+                _patch_dual_squint_default(_build_s51_spine_codebook((30, 90), (30, 90)))),
+            mode="drop"),
+    },
     # -----------------------------------------------------------------------
     # s49_v23 ablations (canonical-name) — 7 ablations x 2 datasets
     # -----------------------------------------------------------------------
@@ -35853,6 +35974,15 @@ DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-region-holdout"] = [
     "dualvq+rvq-both+decoder-cov+adv+enc-deeper+dec-w32+region-holdout+mmb0-1b_smb1-1b_1p",
 ]
 
+# Inductive (leak-free) held-out-region task on the FiLM-scale reference:
+# the rebuild headline + the drop sensitivity sibling (see
+# `_patch_holdout_inductive`). For the 5-seed runs use
+# `submit_multi_seed.sh "<variant>" 0,1,2,3,4` per entry.
+DATASET_VARIANTS["mmb0-1b_smb1-1b_1p-region-holdout-inductive"] = [
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+region-holdout-inductive+mmb0-1b_smb1-1b_1p",
+    "dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+region-holdout-inductive-drop+mmb0-1b_smb1-1b_1p",
+]
+
 # v12 — commit-loss exploration. 8 variants varying `wt_commit_cell`,
 # `wt_commit_niche`, and asymmetric combinations off the shared spine
 # `dualvq+wide+rvq-both+decoder-cov+adv+enc-deeper+adv-warmup10`. Maps
@@ -38148,6 +38278,7 @@ def predict(
     precision: Optional[str] = None,
     strategy: Optional[str] = None,
     compression: Optional[str] = None,
+    holdout_graph_override: Optional[str] = None,
 ):
     """
     Run inference on a folder of .h5ad files using a trained SQUINT
@@ -38208,7 +38339,61 @@ def predict(
         Use `"gzip"` for paper / archival outputs; `"lzf"` for
         benchmark sweeps where a downstream metric runner is blocked
         on the write.
+    holdout_graph_override
+        `None` (default) → predict with the graph protocol saved in the
+        run's config (legacy runs: transductive). `"rebuild"` / `"drop"`
+        → apply the inductive held-out graph (see
+        `_patch_holdout_inductive`) at PREDICT time only, e.g. to an old
+        transductive region-holdout run, so observed cells' codes no
+        longer aggregate held-out neighbours (the weights are unchanged).
+        Also switches on the datamodule + model leak guards. Requires
+        `test_regions` in the saved config and an `output_dir` that is
+        neither the run dir nor any other training run dir (no
+        `checkpoints/` or `user_specified_config.yaml`), so no run's own
+        predicted_adata.h5ad is ever overwritten. Like an inductive
+        retrain, the output gets the CONFIGURED stage-2 codebook sizes in
+        `uns['codebook_sizes_cell' / '_niche']`, whereas legacy outputs
+        (incl. the checkpoint-only control) size stage 2 by
+        max(index)+1. So the vocabulary change, if any, is carried by the
+        legacy -> override (L2-only) comparison, not by override ->
+        inductive retrain (same configured sizes);
+        `uns['squint']['codebook_sizes_differ_from_max1']` records whether
+        it is non-zero for this file's codes.
     """
+    # Predict-time inductive held-out graph (L2-only decomposition). Refuse
+    # BEFORE any heavy work unless the output goes to a separate folder, so
+    # the run's own predicted_adata.h5ad is never overwritten.
+    if holdout_graph_override is not None:
+        if holdout_graph_override not in ("rebuild", "drop"):
+            raise ValueError(
+                f"holdout_graph_override must be None, 'rebuild' or 'drop'; "
+                f"got {holdout_graph_override!r}."
+            )
+        if output_dir is None or (
+            Path(output_dir).resolve() == Path(run_dir).resolve()
+        ):
+            raise ValueError(
+                f"holdout_graph_override={holdout_graph_override!r} needs an "
+                f"output_dir that differs from the run dir ({run_dir}); "
+                f"refusing to overwrite the run's own predicted_adata.h5ad. "
+                f"Pass e.g. --output-dir <variant>__predict-inductive/<timestamp>."
+            )
+        # Also refuse ANOTHER training run dir (flat or legacy wandb layout),
+        # e.g. a typo'd seed timestamp, so no old run's outputs are clobbered.
+        _run_markers = [
+            m for m in ("checkpoints", "user_specified_config.yaml",
+                        "files/checkpoints", "files/user_specified_config.yaml")
+            if (Path(output_dir) / m).exists()
+        ]
+        if _run_markers:
+            raise ValueError(
+                f"holdout_graph_override={holdout_graph_override!r}: output_dir "
+                f"{output_dir} looks like a training run dir (has "
+                f"{', '.join(_run_markers)}); refusing to overwrite its "
+                f"predicted_adata.h5ad. Pass e.g. --output-dir "
+                f"<variant>__predict-inductive/<timestamp>."
+            )
+
     # --- Imports done lazily so the script's CLI / config helpers don't
     #     pull torch on every invocation. ---
     if str(REPRO_REPO / "analysis") not in sys.path:
@@ -38246,6 +38431,41 @@ def predict(
         model_ckpt_fname=model_ckpt_fname,
     )
     print(f"Using checkpoint: {config['model']['model_ckpt_fname']}")
+
+    if holdout_graph_override is not None:
+        # Same keys `_patch_holdout_inductive` sets at train time, applied
+        # to the loaded config only (the run's saved yaml is untouched).
+        # `initialize_dataset_blob` below builds `SpatialBatchSplit` from
+        # these keys, and `initialize_datamodule` splats `inference_params`.
+        _tp = config["dataset"]["train_transform_params"]
+        if not _tp.get("test_regions"):
+            raise ValueError(
+                f"holdout_graph_override={holdout_graph_override!r}: the run "
+                f"config has no train_transform_params.test_regions, so there "
+                f"is no held-out region to make inductive."
+            )
+        _prev_graph = _tp.get("holdout_graph") or "transductive"
+        if _prev_graph != "transductive":
+            print(
+                f"NOTE: run was trained with holdout_graph={_prev_graph!r}; "
+                f"predict-time override -> {holdout_graph_override!r}."
+            )
+        _n_neighs = config["dataset"].get("graph_params", {}).get("n_neighs")
+        if _n_neighs is None and holdout_graph_override == "rebuild":
+            raise ValueError(
+                "holdout_graph_override='rebuild' needs "
+                "dataset.graph_params.n_neighs in the run config."
+            )
+        _tp["holdout_graph"] = holdout_graph_override
+        if not _tp.get("holdout_test_inedges"):
+            _tp["holdout_test_inedges"] = "full"
+        _tp["holdout_knn_k"] = int(_n_neighs) if _n_neighs is not None else None
+        config["datamodule"]["inference_params"]["assert_inductive_holdout"] = True
+        print(
+            f"Predict: holdout graph override = {holdout_graph_override!r} "
+            f"(holdout_test_inedges={_tp['holdout_test_inedges']!r}, "
+            f"holdout_knn_k={_tp['holdout_knn_k']}); leak guards ON."
+        )
 
     if silver_dir:
         silver_dir = Path(silver_dir)
@@ -38396,6 +38616,14 @@ def predict(
     Model = set_model_class(config["model"]["model_name"])
     model = Model.load_from_checkpoint(config["model"]["model_ckpt_fname"])
     model.eval()
+    if holdout_graph_override is not None:
+        # The checkpoint's hparams predate the override, so switch the
+        # model's predict-batch leak guard on here (read via
+        # `self.loss_kwargs.get`). Copy, so the hparams dict is not mutated.
+        model.loss_kwargs = {
+            **(getattr(model, "loss_kwargs", None) or {}),
+            "assert_inductive_holdout": True,
+        }
 
     # Resolve optimization overrides. Each kwarg defaults to the legacy
     # training-parity value when not set; the multi-seed runner
@@ -38665,6 +38893,135 @@ def predict(
     adata.uns["squint"]["run_dir"] = run_dir
     adata.uns["squint"]["ckpt"] = str(config["model"]["model_ckpt_fname"])
 
+    # Held-out mask self-check. `data_split` above is RE-DERIVED from the
+    # region spec in float64 numpy, while training masked cells with
+    # `SpatialBatchSplit` on the float32 blob coords. The predict loader
+    # seeds every node in order (input_nodes=None, shuffle=False) and the
+    # AnnData rows follow that inference order, so the datamodule's
+    # `test_mask` must match `data_split == "test"` row-for-row.
+    # Raise only for inductive runs / predict-time overrides; a legacy
+    # transductive re-predict just WARNs (as before this check existed),
+    # since a cell exactly on a float32-rounded box bound can flip.
+    if test_regions:
+        import numpy as _np
+        _strict_mask_check = (
+            holdout_graph_override is not None
+            or ((config.get("dataset", {}).get("train_transform_params", {})
+                 or {}).get("holdout_graph") or "transductive") != "transductive"
+        )
+        _dm_test_mask = getattr(getattr(datamodule, "data", None), "test_mask", None)
+        if _dm_test_mask is None:
+            print("WARN: datamodule.data has no test_mask; skipping the "
+                  "held-out mask self-check.")
+        else:
+            _tm = _np.asarray(_dm_test_mask.detach().cpu().numpy(), dtype=bool).reshape(-1)
+            _ds = _np.asarray(adata.obs["data_split"].astype(str).values) == "test"
+            _mask_msg = None
+            if _tm.shape[0] != _ds.shape[0]:
+                _mask_msg = (
+                    f"Held-out mask self-check: datamodule test_mask has "
+                    f"{_tm.shape[0]} rows but the predicted AnnData has "
+                    f"{_ds.shape[0]}."
+                )
+            else:
+                _n_mismatch = int((_tm != _ds).sum())
+                if _n_mismatch:
+                    _mask_msg = (
+                        f"Held-out mask self-check FAILED: {_n_mismatch} row(s) "
+                        f"differ between the datamodule test_mask "
+                        f"(n_test={int(_tm.sum())}) and obs['data_split']=='test' "
+                        f"(n_test={int(_ds.sum())})."
+                    )
+            if _mask_msg is not None and _strict_mask_check:
+                raise RuntimeError(_mask_msg)
+            if _mask_msg is not None:
+                print(f"WARN: {_mask_msg} (transductive run, no override: "
+                      f"continuing as before.)")
+            else:
+                print(f"Predict: held-out mask self-check OK (datamodule test_mask "
+                      f"== data_split=='test' row-for-row; n_test={int(_ds.sum())}).")
+
+    # Held-out graph provenance, so stage-2 / decode / audit scripts can
+    # tell transductive from inductive predictions. Read from the config
+    # predict actually used (after any holdout_graph_override). Legacy
+    # configs carry none of these keys and resolve to the SpatialBatchSplit
+    # defaults.
+    _tp_eff = config.get("dataset", {}).get("train_transform_params", {}) or {}
+    _holdout_graph = _tp_eff.get("holdout_graph") or "transductive"
+    _holdout_knn_k = _tp_eff.get("holdout_knn_k", None)
+    adata.uns["squint"]["holdout_graph"] = str(_holdout_graph)
+    adata.uns["squint"]["holdout_test_inedges"] = str(
+        _tp_eff.get("holdout_test_inedges") or "full"
+    )
+    adata.uns["squint"]["holdout_knn_k"] = (
+        int(_holdout_knn_k) if _holdout_knn_k is not None else None
+    )
+    adata.uns["squint"]["holdout_graph_override"] = holdout_graph_override
+
+    # Inductive runs only: write the CONFIGURED per-level codebook sizes
+    # where squint.stage2 (`AnnDataCodeSource._resolve_sizes`) looks for
+    # them (`uns['codebook_sizes_cell' / '_niche']`). Without them stage 2
+    # sizes its heads as max(index)+1 over ALL rows, held-out codes
+    # included. Legacy (transductive) outputs are left unchanged. This also
+    # covers the predict-time override (L2-only) arm, so vs a legacy
+    # max(index)+1-sized arm the stage-2 head sizes change iff a level has
+    # dead top codes: the per-level max(index)+1 is printed next to the
+    # configured size and `uns['squint']['codebook_sizes_differ_from_max1']`
+    # records whether any written level differs.
+    if _holdout_graph != "transductive":
+        import numpy as _np
+        _sq = adata.uns["squint"]
+        _sizes_written = False
+        _sizes_differ = False
+        for _branch, _prefix in (("cell", "cell"), ("niche", "neighborhood")):
+            _sizes = _sq.get(f"codebook_sizes_{_branch}")
+            if _sizes is None:
+                _cb = int(_sq.get(f"codebook_size_{_branch}", 0) or 0)
+                _nq = int(_sq.get(f"num_quantizers_{_branch}", 1) or 1)
+                _sizes = [_cb] * _nq if _cb > 0 else None
+            if _sizes is None:
+                print(f"WARN: no codebook sizes for the {_branch} branch; "
+                      f"stage 2 will fall back to max(index)+1.")
+                continue
+            _sizes = [int(s) for s in _sizes]
+            # Same arrays (and max+1 fallback) `_resolve_sizes` would use.
+            if f"{_prefix}_code_indices" in adata.obsm:
+                _codes = _np.asarray(adata.obsm[f"{_prefix}_code_indices"])
+            elif f"{_prefix}_code_index" in adata.obs:
+                _codes = _np.asarray(adata.obs[f"{_prefix}_code_index"].values).reshape(-1, 1)
+            else:
+                _codes = None
+            _n_levels = int(_codes.shape[1]) if _codes is not None else len(_sizes)
+            if len(_sizes) != _n_levels:
+                print(f"WARN: {_branch} codebook sizes {_sizes} do not match "
+                      f"{_n_levels} stored code level(s); not writing "
+                      f"uns['codebook_sizes_{_branch}'] (stage 2 falls back "
+                      f"to max(index)+1).")
+                continue
+            _max1 = None
+            if _codes is not None and _codes.shape[0] > 0:
+                _max1 = [int(_codes[:, q].max()) + 1 for q in range(_n_levels)]
+            # A stored index beyond its configured size would break the
+            # stage-2 heads; keep the max(index)+1 fallback in that case.
+            if _max1 is not None and any(m > s for m, s in zip(_max1, _sizes)):
+                print(f"WARN: {_branch} code indices exceed the configured sizes "
+                      f"({_max1} > {_sizes}); not writing "
+                      f"uns['codebook_sizes_{_branch}'] (stage 2 falls back "
+                      f"to max(index)+1).")
+                continue
+            adata.uns[f"codebook_sizes_{_branch}"] = _sizes
+            _sizes_written = True
+            _note = ""
+            if _max1 is not None:
+                if _max1 != _sizes:
+                    _sizes_differ = True
+                    _note = " (DIFFERS: stage-2 head sizes change vs max+1 sizing)"
+            print(f"Predict: uns['codebook_sizes_{_branch}'] = {_sizes} "
+                  f"(configured sizes; holdout_graph={_holdout_graph!r}); "
+                  f"per-level max(index)+1 = {_max1}{_note}.")
+        if _sizes_written:
+            adata.uns["squint"]["codebook_sizes_differ_from_max1"] = bool(_sizes_differ)
+
     # If the run was produced by the variant-aware layout, surface the variant
     # name + ablation description on the predicted AnnData so plotting scripts
     # can label themselves without re-parsing the path.
@@ -38766,6 +39123,7 @@ def run_inference_and_analysis(
         predict_precision: Optional[str] = None,
         predict_strategy: Optional[str] = None,
         predict_compression: Optional[str] = None,
+        holdout_graph_override: Optional[str] = None,
     ) -> Path:
     """
     Steps 2-6 of the end-to-end pipeline (everything AFTER `train()`):
@@ -38785,6 +39143,10 @@ def run_inference_and_analysis(
     `predicted_adata.h5ad` in the run_dir.
 
     Returns the resolved `predict_dir` (= output_dir if set, else run_dir).
+
+    `holdout_graph_override` ("rebuild" / "drop") is forwarded to
+    `predict()` (predict-time inductive held-out graph; needs an
+    `output_dir` that is not the run dir). Ignored with `skip_predict`.
     """
     import os
     import subprocess
@@ -38809,6 +39171,9 @@ def run_inference_and_analysis(
             raise FileNotFoundError(
                 f"--skip-predict requested but {predicted_adata_path} is missing."
             )
+        if holdout_graph_override is not None:
+            print(f"NOTE: holdout_graph_override={holdout_graph_override!r} "
+                  f"is ignored with --skip-predict.")
     else:
         print()
         print("=" * 78)
@@ -38822,6 +39187,7 @@ def run_inference_and_analysis(
             precision=predict_precision,
             strategy=predict_strategy,
             compression=predict_compression,
+            holdout_graph_override=holdout_graph_override,
         )
         if not predicted_adata_path.exists():
             raise FileNotFoundError(

@@ -21,10 +21,41 @@
 #   SMOKE=1 bash examples/submit_stage2_ablation.sh         # seed0 only, tiny, fast
 #   DRY_RUN=1 bash examples/submit_stage2_ablation.sh       # print bsubs, don't submit
 #
-# Env overrides: STAGE1_VARIANT_DIR, SEEDS, ABL_ROOT, VENV_PATH, LSF_GROUP,
-#   LSF_QUEUE, LSF_GPU, LSF_WALL, LSF_MEM_MB.
+# Leak-free (inductive) stage-1 codes, frozen paper stage-2 settings, separate
+# root, built-in decode skipped (decode afterwards with submit_stage2_mc_sweep.sh
+# using READ_DEPTH_MODE=neighbor; the built-in decode uses the decoder's default
+# read depth, which is the held-out cell's own, leaky, library size):
+#   STAGE1_VARIANT_DIR=$ART/$DATASET/<inductive variant> SEEDS="<TS>_seed0 ..." \
+#   ABL_ROOT=$ART/$DATASET/stage2-ablation-inductive \
+#   LOG_ROOT=$ART/logs/$DATASET/stage2-ablation-inductive \
+#   VARIANTS=decode-temp05-nonoise SKIP_LEAKY_DECODE=1 \
+#     bash examples/submit_stage2_ablation.sh
+#
+# Env overrides: STAGE1_VARIANT_DIR, SEEDS, ABL_ROOT, LOG_ROOT, VENV_PATH,
+#   LSF_GROUP, LSF_QUEUE, LSF_GPU, LSF_WALL, LSF_MEM_MB,
+#   TRAIN_EXTRA (default empty; appended to every run_stage2.py command),
+#   DECODE_EXTRA (default empty; appended to the built-in decode command),
+#   SKIP_LEAKY_DECODE (default 0; 1 = train only, skip the built-in decode).
+#   With the three new vars at their defaults the bsub lines are unchanged.
+#   When any of them is set and LOG_ROOT is not, logs go to
+#   $ART/logs/$DATASET/stage2-ablation__<basename of ABL_ROOT>, so runs that
+#   reuse the paper seeds never append to the paper jobs' LSF logs.
 # -----------------------------------------------------------------------------
 set -euo pipefail
+
+# Canonical spelling of a directory path, used ONLY for the root comparisons
+# below (never in the bsub lines): collapse repeated slashes, strip trailing
+# ones, and resolve symlinks with pwd -P when the directory exists.
+_canon_dir() {
+    local d
+    d="$(printf '%s' "$1" | sed -e 's#//*#/#g')"
+    while [[ "$d" == */ && "$d" != "/" ]]; do d="${d%/}"; done
+    if [[ -n "$d" && -d "$d" ]]; then
+        (cd -- "$d" 2>/dev/null && pwd -P) || printf '%s\n' "$d"
+    else
+        printf '%s\n' "$d"
+    fi
+}
 
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 SQUINT_REPO="${SQUINT_REPO:-"$( cd -- "$SCRIPT_DIR/.." &> /dev/null && pwd )"}"
@@ -35,6 +66,7 @@ DATASET="${DATASET:-mmb0-1b_smb1-1b_1p}"
 STAGE1_VARIANT_DIR="${STAGE1_VARIANT_DIR:-$ART/$DATASET/dualvq+rvq-both+decoder-cov+no-batch-int+enc-deeper+dec-w32+knn16+sampler16+cell-w1+bs512+lr7e-4+within-sec+decoupled-enc+diversity-w10+filmscale+crossmnn-wt10-k1+region-holdout+mmb0-1b_smb1-1b_1p}"
 SEEDS="${SEEDS:-20260629_023326_seed0 20260629_024131_seed1 20260629_025158_seed2 20260629_025456_seed3 20260629_025518_seed4}"
 ABL_ROOT="${ABL_ROOT:-$ART/$DATASET/stage2-ablation}"
+_LOG_ROOT_GIVEN="${LOG_ROOT:+1}"           # empty unless the caller set LOG_ROOT
 LOG_ROOT="${LOG_ROOT:-$ART/logs/$DATASET/stage2-ablation}"
 
 LSF_GROUP="${LSF_GROUP:-s10396}"
@@ -45,6 +77,21 @@ LSF_MEM_MB="${LSF_MEM_MB:-128000}"
 LSF_CORES="${LSF_CORES:-8}"
 DRY_RUN="${DRY_RUN:-0}"
 SMOKE="${SMOKE:-0}"
+TRAIN_EXTRA="${TRAIN_EXTRA:-}"             # extra run_stage2.py flags (all variants)
+DECODE_EXTRA="${DECODE_EXTRA:-}"           # extra stage2_decode_pearson.py flags (built-in decode)
+SKIP_LEAKY_DECODE="${SKIP_LEAKY_DECODE:-0}" # 1 = skip the built-in (default read depth) decode
+PAPER_ROOT_N="$(_canon_dir "$ART/$DATASET/stage2-ablation")"
+ABL_ROOT_N="$(_canon_dir "$ABL_ROOT")"
+NEW_KNOBS=0                                # 1 = any of TRAIN_EXTRA / DECODE_EXTRA / SKIP_LEAKY_DECODE set
+if [[ -n "$TRAIN_EXTRA" || -n "$DECODE_EXTRA" || "$SKIP_LEAKY_DECODE" == "1" ]]; then NEW_KNOBS=1; fi
+# LSF -o appends and log names are <variant>__<seed>, so a new-knob run on the
+# paper seeds must not share the paper logs: without an explicit LOG_ROOT it
+# logs to a dir named after ABL_ROOT.
+LOG_NOTE=""
+if [[ "$NEW_KNOBS" == "1" && -z "$_LOG_ROOT_GIVEN" ]]; then
+    LOG_ROOT="$ART/logs/$DATASET/stage2-ablation__${ABL_ROOT_N##*/}"
+    LOG_NOTE="   (derived from ABL_ROOT; set LOG_ROOT to override)"
+fi
 
 # Winning decode config (temp0.5 + no confidence-noise, 20 steps) — held fixed
 # while the t05nn-* arms below ablate TRAINING. Override via _DEC env if needed.
@@ -113,6 +160,17 @@ variant_decode_flags() {
         *) echo "" ;;
     esac
 }
+# Built-in decode lines of one job (reads var/seed/pred/out/dflags from the
+# loop). Kept as a heredoc so the default job text is unchanged; $(...) only
+# strips the trailing newline, not the trailing space after an empty $dflags.
+decode_block() {
+    cat <<EOF
+echo "[abl] DECODE $var / $seed"
+python examples/stage2_decode_pearson.py --predicted-adata "$pred" \\
+  --stage2-codes "$out/stage2_predicted_codes.npz" \\
+  --out-metrics-dir "$out/metrics" $dflags${DECODE_EXTRA:+ $DECODE_EXTRA}
+EOF
+}
 
 VARIANTS="${VARIANTS:-base capacity l0w4}"
 [[ "$SMOKE" == "1" ]] && SEEDS="$(echo "$SEEDS" | awk '{print $1}')"   # seed0 only
@@ -123,9 +181,27 @@ echo "  stage1 variant : $STAGE1_VARIANT_DIR"
 echo "  seeds          : $SEEDS"
 echo "  variants       : $VARIANTS"
 echo "  abl root       : $ABL_ROOT"
+echo "  log root       : $LOG_ROOT${LOG_NOTE}"
+echo "  train extra    : ${TRAIN_EXTRA:-<none>}"
+echo "  decode extra   : ${DECODE_EXTRA:-<none>}"
+echo "  skip decode    : SKIP_LEAKY_DECODE=$SKIP_LEAKY_DECODE"
 echo "  LSF            : -G $LSF_GROUP -q $LSF_QUEUE -gpu '$LSF_GPU' -W $LSF_WALL"
 echo "  SMOKE=$SMOKE  DRY_RUN=$DRY_RUN"
 echo "=========================================================="
+
+# Never retrain / re-decode with NEW flags into the paper's stage2-ablation
+# root: refuse when any of the new knobs is set and ABL_ROOT is that default.
+# Compared on canonical paths, so a trailing slash or a symlinked spelling is
+# caught too. ALLOW_PAPER_ROOT=1 overrides.
+if [[ "$NEW_KNOBS" == "1" && "$ABL_ROOT_N" == "$PAPER_ROOT_N" && "${ALLOW_PAPER_ROOT:-0}" != "1" ]]; then
+    echo "REFUSING: TRAIN_EXTRA / DECODE_EXTRA / SKIP_LEAKY_DECODE is set but ABL_ROOT is the" \
+         "paper root ($ABL_ROOT), so the paper codes/metrics would be overwritten. Set" \
+         "ABL_ROOT (and LOG_ROOT), or ALLOW_PAPER_ROOT=1 to force." >&2
+    exit 1
+fi
+if [[ "$SKIP_LEAKY_DECODE" == "1" && -n "$DECODE_EXTRA" ]]; then
+    echo "NOTE: SKIP_LEAKY_DECODE=1, so DECODE_EXTRA is unused here (pass it to submit_stage2_mc_sweep.sh)." >&2
+fi
 
 [[ "$DRY_RUN" == "1" ]] || mkdir -p "$LOG_ROOT"
 n_sub=0
@@ -141,6 +217,11 @@ for seed in $SEEDS; do
         smoke_flag=""; [[ "$SMOKE" == "1" ]] && smoke_flag="--smoke"
         job="s2abl-$var-$seed"
         log_out="$LOG_ROOT/${var}__${seed}.out"; log_err="$LOG_ROOT/${var}__${seed}.err"
+        if [[ "$SKIP_LEAKY_DECODE" == "1" ]]; then
+            decode_cmds="echo \"[abl] DECODE skipped (SKIP_LEAKY_DECODE=1): $var / $seed\""
+        else
+            decode_cmds="$(decode_block)"
+        fi
 
         read -r -d '' JOB <<EOF || true
 set -euo pipefail
@@ -148,11 +229,8 @@ source "$VENV_PATH/bin/activate"
 cd "$SQUINT_REPO"
 echo "[abl] TRAIN  $var / $seed -> $out"
 python examples/run_stage2.py --predicted-adata "$pred" --holdout-split test \\
-  --out-dir "$out" $tflags $smoke_flag
-echo "[abl] DECODE $var / $seed"
-python examples/stage2_decode_pearson.py --predicted-adata "$pred" \\
-  --stage2-codes "$out/stage2_predicted_codes.npz" \\
-  --out-metrics-dir "$out/metrics" $dflags
+  --out-dir "$out" $tflags $smoke_flag${TRAIN_EXTRA:+ $TRAIN_EXTRA}
+$decode_cmds
 echo "[abl] DONE $var / $seed"
 EOF
 
@@ -169,4 +247,8 @@ EOF
     done
 done
 echo "[abl] ${n_sub} job(s) $( [[ "$DRY_RUN" == "1" ]] && echo rendered || echo submitted )."
-echo "Outputs: $ABL_ROOT/<variant>/<seed>/metrics/per_seed_pearson_reconstruction.csv"
+if [[ "$SKIP_LEAKY_DECODE" == "1" ]]; then
+    echo "Outputs: $ABL_ROOT/<variant>/<seed>/stage2_predicted_codes.npz (decode with submit_stage2_mc_sweep.sh)"
+else
+    echo "Outputs: $ABL_ROOT/<variant>/<seed>/metrics/per_seed_pearson_reconstruction.csv"
+fi

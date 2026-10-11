@@ -569,6 +569,19 @@ class Squint_Dual(BaseModel):
         """
         batch_size = batch.batch_size
 
+        # Opt-in runtime leak guard (inductive held-out-region protocol):
+        # no held-out (test_mask) node may enter a train or val batch, as
+        # seed or as sampled neighbour.
+        if (mode in ('train', 'val')
+                and self.loss_kwargs.get('assert_inductive_holdout', False)):
+            tm = getattr(batch, 'test_mask', None)
+            if tm is not None and bool(tm.any()):
+                raise RuntimeError(
+                    f"assert_inductive_holdout: {int(tm.sum())} held-out "
+                    f"(test_mask) nodes in a {mode} batch of "
+                    f"{int(tm.numel())} nodes."
+                )
+
         encoder_conditions      = getattr(batch, 'encoder_conditions',      None)
         attr_decoder_conditions = getattr(batch, 'attr_decoder_conditions', None)
         adata_batch_ids         = getattr(batch, 'adata_batch_ids',         None)
@@ -930,6 +943,23 @@ class Squint_Dual(BaseModel):
         the trainer can stitch a final inference dict together.
         """
         batch_size = predict_batch.batch_size
+
+        # Opt-in runtime leak guard (inductive held-out-region protocol):
+        # predict batches may contain held-out nodes (as seeds and as
+        # neighbours of held-out seeds), but no edge may carry a held-out
+        # node's message to an observed node.
+        if self.loss_kwargs.get('assert_inductive_holdout', False):
+            tm = getattr(predict_batch, 'test_mask', None)
+            if tm is not None:
+                tm = tm.bool()
+                ei = predict_batch.edge_index
+                n_bad = int((tm[ei[0]] & ~tm[ei[1]]).sum())
+                if n_bad > 0:
+                    raise RuntimeError(
+                        f"assert_inductive_holdout: {n_bad} held-out->observed "
+                        f"edges in a predict batch of {int(tm.numel())} nodes."
+                    )
+
         encoder_conditions      = getattr(predict_batch, 'encoder_conditions',      None)
         attr_decoder_conditions = getattr(predict_batch, 'attr_decoder_conditions', None)
         adata_batch_ids         = getattr(predict_batch, 'adata_batch_ids',         None)

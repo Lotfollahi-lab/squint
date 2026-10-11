@@ -67,6 +67,7 @@ class InMemoryDataModule(LightningNodeData):
             val_batch_size: Optional[int] = None,
             cache_train_batches: bool = False,
             obs_per_batch_id: Optional[dict] = None,
+            assert_inductive_holdout: bool = False,
         ) -> None:
         """
         This function initializes the InMemoryDataModule class with the given DataLoader and Sampler classes along with their corresponding parameters.
@@ -181,6 +182,13 @@ class InMemoryDataModule(LightningNodeData):
 
             Defaults to False to preserve legacy behaviour; turn on
             via the base config or per-variant patches.
+        - assert_inductive_holdout: bool
+            Static leak guard for the inductive held-out-region protocol
+            (SpatialBatchSplit.holdout_graph 'drop' / 'rebuild'). When
+            True, raise if the loader graph has any edge from a
+            test_mask (held-out) node to an observed node, and print the
+            proof line ('held-out->observed edges: 0'). Loaders are not
+            changed. Default False (legacy, no check).
         """
         assert isinstance(data, Data), f"data must be of type torch_geometric.data.Data, but got {type(data)}."
 
@@ -423,6 +431,30 @@ class InMemoryDataModule(LightningNodeData):
         for key in list(data.keys()):
             if key.startswith('y_'):
                 setattr(data_for_loader, key, data[key])
+
+        # Opt-in static leak guard (inductive held-out-region protocol):
+        # with PyG's default directional neighbour sampling, a graph with
+        # no held-out -> observed edge keeps held-out cells out of every
+        # observed seed's batch.
+        self.assert_inductive_holdout = bool(assert_inductive_holdout)
+        if self.assert_inductive_holdout:
+            tm = data_for_loader.test_mask.bool().view(-1)
+            ei = data_for_loader.edge_index
+            n_bad = int((tm[ei[0]] & ~tm[ei[1]]).sum())
+            n_test = int(tm.sum())
+            n_edges = int(ei.size(1))
+            if n_bad > 0:
+                raise RuntimeError(
+                    f"assert_inductive_holdout: the loader graph has {n_bad} "
+                    f"held-out->observed edges (n_test={n_test}, "
+                    f"n_edges={n_edges}). Expected 0: set "
+                    f"train_transform_params['holdout_graph'] to 'drop' or "
+                    f"'rebuild' for the test_regions sections."
+                )
+            print(
+                f"[InMemoryDataModule] assert_inductive_holdout: "
+                f"held-out->observed edges: 0 (n_test={n_test}, n_edges={n_edges})"
+            )
 
         # call the parent class constructor
         super().__init__(
