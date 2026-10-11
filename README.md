@@ -1,4 +1,4 @@
-# SQUINT: Spatial Quantization for Understanding and In-painting Tissues
+# SQUINT
 
 SQUINT learns two discrete codes per cell from spatial transcriptomics data: a
 cell code that mainly reflects cell-intrinsic identity and a niche code that
