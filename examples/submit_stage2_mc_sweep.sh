@@ -49,15 +49,27 @@
 #   DECODE_EXTRA="--stage1-ckpt-policy adata --observed-xhat redecode" \
 #     bash examples/submit_stage2_mc_sweep.sh
 #
+# Reproduction gate + saved predictions for the paper arms (re-decode into a
+# NEW root, compare each arm/seed CSV with the paper's, keep the npz):
+#   OUT_ROOT=$ART/$DATASET/stage2-ablation-savepred COMPARE_ROOT=$ART/$DATASET/stage2-ablation \
+#   ONLY_NICHE_FROM_CELL=1 NICHE_FROM_CELL_KS="0 1000" READ_DEPTH_MODE=neighbor \
+#   DECODE_EXTRA="--save-pred" bash examples/submit_stage2_mc_sweep.sh
+#   (COMPARE_ROOT adds --compare-csv $COMPARE_ROOT/<arm>/<seed>/metrics/
+#    per_seed_pearson_reconstruction.csv per arm and seed, <arm> WITHOUT
+#    ARM_SUFFIX; add --compare-strict to DECODE_EXTRA to fail the job on a
+#    mismatch, and --compare-branches cell when the niche branch is changed on
+#    purpose, e.g. --nbr-observed-fill truth.)
+#
 # Without LOG_ROOT, a run with a non-default OUT_ROOT / ARM_SUFFIX / DECODE_EXTRA
-# logs to $ART/logs/$DATASET/stage2-mc-sweep__<basename of OUT_ROOT>, so new jobs
-# never append to the paper arms' LSF logs (-o appends).
+# / COMPARE_ROOT logs to $ART/logs/$DATASET/stage2-mc-sweep__<basename of
+# OUT_ROOT>, so new jobs never append to the paper arms' LSF logs (-o appends).
 #
 # Env overrides: BASE, KS, NBR_NEIGHS, STAGE1_VARIANT_DIR, SEEDS, ABL_ROOT,
 #   OUT_ROOT (default $ABL_ROOT), ARM_SUFFIX (default empty), DECODE_EXTRA
-#   (default empty; appended to EVERY decode command), LOG_ROOT,
+#   (default empty; appended to EVERY decode command), COMPARE_ROOT (default
+#   empty = no --compare-csv), LOG_ROOT,
 #   VENV_PATH, SQUINT_REPO, LSF_GROUP, LSF_QUEUE, LSF_GPU, LSF_WALL, LSF_MEM_MB.
-#   With all three new vars at their defaults the bsub lines are unchanged.
+#   With all four new vars at their defaults the bsub lines are unchanged.
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -93,11 +105,13 @@ LOG_ROOT="${LOG_ROOT:-$ART/logs/$DATASET/stage2-mc-sweep}"
 OUT_ROOT="${OUT_ROOT:-$ABL_ROOT}"
 ARM_SUFFIX="${ARM_SUFFIX:-}"               # e.g. -nbrtruth -> <arm>-nbrtruth dirs/logs/job names
 DECODE_EXTRA="${DECODE_EXTRA:-}"           # extra stage2_decode_pearson flags, appended to every arm
+COMPARE_ROOT="${COMPARE_ROOT:-}"           # reference arm root for --compare-csv (empty = off)
 PAPER_ROOT_N="$(_canon_dir "$ART/$DATASET/stage2-ablation")"
 ABL_ROOT_N="$(_canon_dir "$ABL_ROOT")"
 OUT_ROOT_N="$(_canon_dir "$OUT_ROOT")"
-NEW_KNOBS=0                                # 1 = any of OUT_ROOT / ARM_SUFFIX / DECODE_EXTRA non-default
-if [[ "$OUT_ROOT_N" != "$ABL_ROOT_N" || -n "$ARM_SUFFIX" || -n "$DECODE_EXTRA" ]]; then NEW_KNOBS=1; fi
+NEW_KNOBS=0                                # 1 = any of OUT_ROOT / ARM_SUFFIX / DECODE_EXTRA / COMPARE_ROOT non-default
+if [[ "$OUT_ROOT_N" != "$ABL_ROOT_N" || -n "$ARM_SUFFIX" || -n "$DECODE_EXTRA" \
+      || -n "$COMPARE_ROOT" ]]; then NEW_KNOBS=1; fi
 # LSF -o appends, so a new-knob run must not share the paper arms' log files:
 # without an explicit LOG_ROOT it logs to a dir named after OUT_ROOT.
 LOG_NOTE=""
@@ -149,6 +163,7 @@ echo "  seeds         : $SEEDS"
 echo "  abl root      : $ABL_ROOT   (codes read from \$ABL_ROOT/$BASE/<seed>)"
 echo "  out root      : $OUT_ROOT   (arm dirs: <arm>${ARM_SUFFIX})"
 echo "  decode extra  : ${DECODE_EXTRA:-<none>}"
+echo "  compare root  : ${COMPARE_ROOT:-<none>}   (--compare-csv \$COMPARE_ROOT/<arm>/<seed>/metrics/per_seed_pearson_reconstruction.csv)"
 echo "  log root      : $LOG_ROOT${LOG_NOTE}"
 echo "  LSF           : -G $LSF_GROUP -q $LSF_QUEUE -gpu '$LSF_GPU' -W $LSF_WALL"
 echo "  DRY_RUN=$DRY_RUN"
@@ -167,6 +182,16 @@ if [[ -n "$DECODE_EXTRA" && -z "$ARM_SUFFIX" && "$OUT_ROOT_N" == "$PAPER_ROOT_N"
     exit 1
 fi
 
+# --compare-csv must read a reference this run does not overwrite: refuse when
+# the arms would be written over the very CSVs they are compared with.
+if [[ -n "$COMPARE_ROOT" && -z "$ARM_SUFFIX" \
+      && "$OUT_ROOT_N" == "$(_canon_dir "$COMPARE_ROOT")" ]]; then
+    echo "REFUSING: COMPARE_ROOT == OUT_ROOT ($OUT_ROOT) with an empty ARM_SUFFIX, so each" \
+         "arm would overwrite the reference CSV it is compared with. Set OUT_ROOT" \
+         "to a new root." >&2
+    exit 1
+fi
+
 [[ "$DRY_RUN" == "1" ]] || mkdir -p "$LOG_ROOT"
 n_sub=0
 
@@ -177,6 +202,10 @@ submit_redecode() {
     local var="$1" tag="$2" extra="$3"
     local arm="${var}${ARM_SUFFIX}"            # == $var unless ARM_SUFFIX is set
     local log_out="$LOG_ROOT/${arm}.out" log_err="$LOG_ROOT/${arm}.err"
+    local cmp=""                               # reference = the unsuffixed arm under COMPARE_ROOT
+    if [[ -n "$COMPARE_ROOT" ]]; then
+        cmp=" --compare-csv \"$COMPARE_ROOT/$var/\$seed/metrics/per_seed_pearson_reconstruction.csv\""
+    fi
     local JOB
     read -r -d '' JOB <<EOF || true
 set -euo pipefail
@@ -192,7 +221,7 @@ for seed in $SEEDS; do
   echo "[$tag] decode \$seed (seednum=\$seednum) -> \$out"
   python examples/stage2_decode_pearson.py --predicted-adata "\$pred" \\
     --stage2-codes "\$codes" --out-metrics-dir "\$out/metrics" \\
-    --nbr-neighs $NBR_NEIGHS --read-depth-mode $READ_DEPTH_MODE --read-depth-neighs $READ_DEPTH_NEIGHS $extra${DECODE_EXTRA:+ $DECODE_EXTRA} --seed "\$seednum"
+    --nbr-neighs $NBR_NEIGHS --read-depth-mode $READ_DEPTH_MODE --read-depth-neighs $READ_DEPTH_NEIGHS $extra${DECODE_EXTRA:+ $DECODE_EXTRA}$cmp --seed "\$seednum"
 done
 echo "[$tag] DONE"
 EOF

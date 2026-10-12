@@ -74,6 +74,17 @@ legacy decode numbers exactly):
     stage-1 prediction; 'truth' = their true counts; 'heldout_only' = both the
     prediction and the target aggregate over held-out neighbours plus self.
   * ``--selfcheck-strict``: raise (instead of warn) when the self-check fails.
+  * ``--save-pred``: also write ``heldout_predictions.npz`` next to the CSV: the
+    held-out rows in adata order with the per-cell prediction exactly as the
+    cell branch scored it, the true counts it was scored against, section id,
+    coordinates and decode provenance (for external rescoring; join by section
+    + nearest coordinate, never by obs_names).
+  * ``--compare-csv REF``: reproduction gate against a reference CSV (e.g. the
+    paper arm of the same seed): shared cell / niche numeric columns must agree
+    within ``--compare-tol`` and, without --smooth-neighs, each x_hat row must
+    sum to its read_depth. Reports the reference mtime vs commits 6b1389a /
+    fdca41a (the hard No-MC decode used the TRUE held-out library size before
+    fdca41a). ``--compare-strict`` raises on FAIL after writing the outputs.
 An always-on guard checks that the stage-2 npz covers exactly the
 ``obs['data_split']=='test'`` rows of the predicted_adata.
 """
@@ -483,6 +494,146 @@ def _assert_holdout_coverage(adata, gidx, split_key="data_split", split_value="t
           f"({want.size} rows)")
 
 
+def _save_heldout_predictions(path, adata, gidx, xhat, read_depth, x_true, meta):
+    """--save-pred: write the scored held-out per-cell prediction to ``path``.
+
+    ``gidx`` / ``xhat`` / ``read_depth`` / ``x_true`` (the true counts the cell
+    branch scored against, X[gidx]) are in the scoring (stage-2 npz) order;
+    rows are re-ordered to ascending adata row (``global_idx``) and
+    ``stage2_npz_row`` keeps each row's position in the scoring order. Every
+    array is numeric or fixed-width unicode, so np.load needs no allow_pickle.
+    ``meta`` scalars are stored as 0-d arrays (None -> ''). Written to a temp
+    file first, then renamed, so a crash never leaves a truncated npz.
+
+    To align rows with another adata (silver / baseline), join by section
+    (``adata_batch_id``) plus nearest ``spatial[:, :2]`` coordinate, as
+    validate_table2.sh does, and assert a 1:1 test-to-test match (6052/6052 on
+    the Table 2 dataset) with max |x_true - X| == 0. Do not join by
+    ``obs_names``: predicted_adata and load_silver_concat add their concat
+    suffixes independently (sorted batch id vs sorted file name), so the
+    suffixes only agree when those two orders coincide; use them as a
+    secondary check at most."""
+    gidx = np.asarray(gidx, dtype=np.int64)
+    xhat = np.asarray(xhat, dtype=np.float32)
+    x_true = np.asarray(x_true, dtype=np.float32)
+    n_genes = int(adata.n_vars)
+    for name, arr in (("x_hat", xhat), ("x_true", x_true)):
+        if arr.shape != (gidx.size, n_genes):
+            raise ValueError(f"[decode] --save-pred: {name} shape {arr.shape} != "
+                             f"({gidx.size}, {n_genes})")
+    order = np.argsort(gidx, kind="stable")
+    rows = gidx[order]
+    bid = np.asarray(adata.obs["adata_batch_id"].values)[rows]
+    if bid.dtype.kind not in "biuf":
+        bid = bid.astype(str)                       # fixed-width, no pickle
+    out = {
+        "global_idx": rows,
+        "obs_names": np.asarray(adata.obs_names[rows], dtype=str),
+        "var_names": np.asarray(adata.var_names, dtype=str),
+        "spatial": np.asarray(adata.obsm["spatial"], dtype=np.float64)[rows],
+        "adata_batch_id": bid,
+        "x_hat": np.ascontiguousarray(xhat[order]),
+        "x_true": np.ascontiguousarray(x_true[order]),
+        "read_depth": np.asarray(read_depth, dtype=np.float32)[order],
+        "stage2_npz_row": order.astype(np.int64),
+    }
+    for k, v in meta.items():
+        if k in out:
+            raise KeyError(f"[decode] --save-pred: metadata key '{k}' clashes with an array")
+        if v is None:
+            v = ""
+        if isinstance(v, (bool, np.bool_)):
+            out[k] = np.asarray(bool(v))
+        elif isinstance(v, (int, np.integer)):
+            out[k] = np.asarray(int(v), dtype=np.int64)
+        elif isinstance(v, (float, np.floating)):
+            out[k] = np.asarray(float(v), dtype=np.float64)
+        else:
+            out[k] = np.asarray(str(v))
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as fh:
+        np.savez_compressed(fh, **out)
+    os.replace(tmp, path)
+    return out
+
+
+# --compare-csv: rows are aligned on these keys (the _pearson_rows panel).
+_CMP_KEYS = ["seed", "branch", "split", "axis", "transform", "gene_subset"]
+# Decode-code history the reference CSV mtime is reported against (UTC):
+# 6b1389a (2026-07-02 16:07:18 +0200) added --read-depth-mode (before it every
+# held-out decode used the TRUE library size); fdca41a (2026-07-02 16:46:15
+# +0200) made the hard (No-MC) cell decode use the --read-depth-mode depth too
+# (between the two, the hard cell decode still used the TRUE library size).
+_RD_COMMITS_UTC = (("6b1389a", (2026, 7, 2, 14, 7, 18)),
+                   ("fdca41a", (2026, 7, 2, 14, 46, 15)))
+
+
+def _compare_metric_csvs(new_df, ref_df, tol, branches):
+    """--compare-csv gate: compare every numeric column shared by ``new_df``
+    and ``ref_df`` on the shared ``_CMP_KEYS`` rows of ``branches``. A value
+    passes when |new - ref| <= tol * max(1, |ref|) (absolute for correlations
+    and AUCs, relative for MSE / RMSE / counts); NaN only matches NaN. Fails
+    when a reference row is missing from ``new_df``, a branch has no shared
+    rows, or any value is off. Returns (ok, worst scaled diff, report lines)."""
+    import pandas as pd
+    lines = []
+    miss = [k for k in _CMP_KEYS if k not in ref_df.columns]
+    if miss:
+        return False, float("nan"), [f"reference CSV lacks key column(s) {miss}"]
+    a = new_df[new_df["branch"].astype(str).isin(branches)].copy()
+    b = ref_df[ref_df["branch"].astype(str).isin(branches)].copy()
+    for d in (a, b):
+        for k in _CMP_KEYS:
+            d[k] = d[k].astype(str)
+    n_dup = int(a.duplicated(_CMP_KEYS).sum() + b.duplicated(_CMP_KEYS).sum())
+    if n_dup:
+        return False, float("nan"), [f"{n_dup} duplicated key row(s); cannot align"]
+
+    def _num(s):
+        return pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s)
+    cols = [c for c in b.columns
+            if c not in _CMP_KEYS and c in a.columns and _num(a[c]) and _num(b[c])]
+    m = a.merge(b, on=_CMP_KEYS, how="outer", suffixes=("_new", "_ref"),
+                indicator=True)
+    only_new = int((m["_merge"] == "left_only").sum())
+    only_ref = int((m["_merge"] == "right_only").sum())
+    both = m[m["_merge"] == "both"]
+    ok = bool(cols) and only_ref == 0
+    lines.append(f"{len(both)} shared row(s) over {len(cols)} numeric column(s); "
+                 f"{only_ref} reference row(s) missing from this run, {only_new} "
+                 f"row(s) only in this run; tol={tol:g} (x max(1,|ref|))")
+    extra = [c for c in a.columns if c not in b.columns and c not in _CMP_KEYS]
+    if extra:
+        lines.append(f"columns only in this run (not compared): {extra}")
+    worst_all = 0.0
+    for br in branches:
+        sub = both[both["branch"] == br]
+        if sub.empty:
+            ok = False
+            lines.append(f"branch={br}: no shared rows")
+            continue
+        n_bad, worst, where = 0, 0.0, ""
+        for c in cols:
+            x = sub[f"{c}_new"].to_numpy(np.float64)
+            y = sub[f"{c}_ref"].to_numpy(np.float64)
+            eq = (x == y) | (np.isnan(x) & np.isnan(y))
+            with np.errstate(invalid="ignore"):
+                sc_d = np.abs(x - y) / np.maximum(1.0, np.abs(y))
+            bad = ~eq & ~(sc_d <= tol)                  # NaN vs number -> bad
+            n_bad += int(bad.sum())
+            sc_f = np.where(eq, 0.0, np.where(np.isfinite(sc_d), sc_d, np.inf))
+            if sc_f.size and float(sc_f.max()) > worst:
+                j = int(np.argmax(sc_f))
+                worst = float(sc_f[j])
+                where = (f"{c} @ {sub.iloc[j]['split']}/{sub.iloc[j]['axis']}/"
+                         f"{sub.iloc[j]['transform']}/{sub.iloc[j]['gene_subset']}")
+        worst_all = max(worst_all, worst)
+        ok = ok and n_bad == 0
+        lines.append(f"branch={br}: {len(sub)} row(s), {n_bad} value(s) off; max "
+                     f"scaled |diff| {worst:.3g}" + (f" ({where})" if where else ""))
+    return ok, worst_all, lines
+
+
 # Observed-only chunk size for --observed-xhat redecode (= run_squint's
 # predict_batch_size). The decoder MLP's layer norm normalises over the whole
 # input tensor, so rows are only ever co-batched with other observed rows.
@@ -692,6 +843,39 @@ def parse_args(argv=None):
                         "measures imputed content only). Also applied to "
                         "--smooth-neighs (heldout_only: cells left with no held-out "
                         "neighbour keep their unsmoothed prediction).")
+    p.add_argument("--save-pred", action="store_true",
+                   help="Also write <out-metrics-dir>/heldout_predictions.npz: "
+                        "global_idx (the scored held-out rows, in adata order), "
+                        "obs_names, var_names, spatial (obsm['spatial'] rows, "
+                        "float64), adata_batch_id, x_hat (float32; the per-cell held-out "
+                        "prediction exactly as the cell branch scored it, i.e. after "
+                        "MC / soft / hard decode, --read-depth-mode and "
+                        "--smooth-neighs), x_true (float32; X[global_idx], the target "
+                        "it was scored against), read_depth, stage2_npz_row and scalar "
+                        "decode provenance. Join to other adatas by adata_batch_id "
+                        "+ nearest spatial coordinate, not by obs_names. "
+                        "Off by default (no extra file).")
+    p.add_argument("--compare-csv", type=str, default=None,
+                   help="Reproduction gate (off by default): a reference "
+                        "per_seed_pearson_reconstruction.csv (e.g. the paper arm's, "
+                        "same seed and flags). After writing this run's CSV, every "
+                        "shared numeric column of the --compare-branches rows is "
+                        "compared; prints max scaled |diff|, rows missing on either "
+                        "side, the reference mtime vs commits 6b1389a / fdca41a "
+                        "(before fdca41a the hard No-MC decode used each held-out "
+                        "cell's TRUE library size) and the x_hat row sum vs "
+                        "read_depth check. Must not be this run's output CSV.")
+    p.add_argument("--compare-tol", type=float, default=None,
+                   help="--compare-csv tolerance: |new - ref| <= tol * max(1, |ref|). "
+                        "Default 1e-6 for a single (hard / soft) decode, 1e-3 for "
+                        "MC (--decode-samples > 1; RNG / reduction-order noise).")
+    p.add_argument("--compare-branches", type=str, default="cell,niche",
+                   help="Comma-separated branches --compare-csv checks (default "
+                        "cell,niche; use 'cell' when this run changes the niche "
+                        "branch on purpose, e.g. --nbr-observed-fill truth).")
+    p.add_argument("--compare-strict", action="store_true",
+                   help="With --compare-csv: raise after writing the outputs when "
+                        "the gate fails (default: print FAIL only).")
     return p.parse_args(argv)
 
 
@@ -704,12 +888,32 @@ def main(argv=None):
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     run_dir = os.path.dirname(os.path.abspath(args.predicted_adata))
 
+    # --compare-csv: read the reference up front (fail fast, and before this
+    # run's CSV could overwrite it).
+    ref_df = ref_mtime = None
+    cmp_branches = [b.strip() for b in args.compare_branches.split(",") if b.strip()]
+    if args.compare_csv:
+        out_csv_path = os.path.join(args.out_metrics_dir,
+                                    "per_seed_pearson_reconstruction.csv")
+        if os.path.realpath(args.compare_csv) == os.path.realpath(out_csv_path):
+            raise ValueError("--compare-csv is the CSV this run writes; use a new "
+                             "--out-metrics-dir")
+        if not cmp_branches:
+            raise ValueError("--compare-branches is empty")
+        ref_df = pd.read_csv(args.compare_csv)
+        ref_mtime = os.path.getmtime(args.compare_csv)
+
     print(f"[decode] reading {args.predicted_adata}")
     adata = anndata.read_h5ad(args.predicted_adata)
     if "cell_code_indices" not in adata.obsm:
         raise KeyError("predicted_adata.obsm has no 'cell_code_indices' (true cell codes)")
     if "X_hat" not in adata.layers:
         raise KeyError("predicted_adata.layers has no 'X_hat' (needed for the self-check)")
+    if args.save_pred and ("spatial" not in adata.obsm
+                           or "adata_batch_id" not in adata.obs.columns):
+        raise KeyError("--save-pred: predicted_adata needs obsm['spatial'] and "
+                       "obs['adata_batch_id'] (the npz stores them so consumers can "
+                       "join by section + nearest coordinate)")
 
     true_cell = np.asarray(adata.obsm["cell_code_indices"]).astype(np.int64)
     # niche true codes (for the self-check FiLM path); name fallback like the reader
@@ -1125,6 +1329,100 @@ def main(argv=None):
     out_csv = os.path.join(args.out_metrics_dir, "per_seed_pearson_reconstruction.csv")
     df.to_csv(out_csv, index=False)
     print(f"[decode] wrote {out_csv}")
+    rel_rd = rel_true = float("nan")
+    if args.save_pred or args.compare_csv:
+        # Depth check on xhat_imp, the array the cell branch scored above
+        # (never mutated after scoring). The decoder is softmax * depth, so
+        # without --smooth-neighs each row sums to the depth it was scaled by
+        # (rd_full[gidx]). Close to read_depth and away from the TRUE library
+        # size = the --read-depth-mode depth was used, not the held-out truth.
+        rs_h = xhat_imp.sum(axis=1, dtype=np.float64)
+        rd_h = rd_full[gidx].astype(np.float64)
+        L_h = L_all[gidx].astype(np.float64)
+        rel_rd = float(np.max(np.abs(rs_h - rd_h) / np.maximum(rd_h, 1e-12)))
+        rel_true = float(np.median(np.abs(rs_h - L_h) / np.maximum(L_h, 1e-12)))
+        print(f"[decode] [depth-check] x_hat row sum vs read_depth: max rel diff "
+              f"{rel_rd:.2e}; vs true library size: median rel diff {rel_true:.2e} "
+              f"(read_depth={args.read_depth_mode}; expect ~0 vs read_depth unless "
+              f"--smooth-neighs)")
+
+    cmp = {}
+    if args.compare_csv:
+        import datetime as _dt
+        tol = (args.compare_tol if args.compare_tol is not None
+               else (1e-3 if K > 1 else 1e-6))
+        ok_csv, worst, rep = _compare_metric_csvs(df, ref_df, tol, cmp_branches)
+        ref_t = _dt.datetime.fromtimestamp(ref_mtime, tz=_dt.timezone.utc)
+        print(f"[decode] [compare] reference {os.path.abspath(args.compare_csv)}")
+        for ln in rep:
+            print(f"[decode] [compare] {ln}")
+        before = []
+        for sha, t in _RD_COMMITS_UTC:
+            c_t = _dt.datetime(*t, tzinfo=_dt.timezone.utc)
+            if ref_t < c_t:
+                before.append(sha)
+            print(f"[decode] [compare] reference mtime {ref_t.isoformat()} is "
+                  f"{'BEFORE' if ref_t < c_t else 'after'} commit {sha} "
+                  f"({c_t.isoformat()}; indicative only, the farm checkout may "
+                  f"have differed from the commit)")
+        hard = K == 1 and args.decode_mode == "hard"
+        if args.read_depth_mode != "true" and ("6b1389a" in before
+                                               or ("fdca41a" in before and hard)):
+            print("[decode] [compare] NOTE: the reference predates "
+                  + ("6b1389a (every held-out decode used the TRUE library size)"
+                     if "6b1389a" in before else
+                     "fdca41a (its hard No-MC cell decode used each held-out "
+                     "cell's TRUE library size)")
+                  + ", so this run is not expected to reproduce it.")
+        # depth gate: only meaningful when the cell prediction is not smoothed
+        depth_ok = bool(args.smooth_neighs) or rel_rd <= 1e-4
+        if not args.smooth_neighs:
+            print(f"[decode] [compare] depth check {'OK' if depth_ok else 'FAILED'}: "
+                  f"x_hat row sum vs read_depth max rel diff {rel_rd:.2e} (<= 1e-4)")
+        ok = ok_csv and depth_ok
+        print(f"[decode] [compare] {'PASS' if ok else 'FAIL'}: "
+              f"branches={','.join(cmp_branches)}, tol={tol:g}, decode="
+              f"{'mc' if K > 1 else args.decode_mode}, K={K}"
+              + ("" if ok else "; this run does NOT reproduce the reference"))
+        cmp = {"compare_csv": os.path.abspath(args.compare_csv),
+               "compare_csv_mtime_utc": ref_t.isoformat(),
+               "compare_branches": ",".join(cmp_branches),
+               "compare_tol": tol, "compare_max_scaled_diff": worst,
+               "compare_pass": ok}
+
+    if args.save_pred:
+        out_npz = os.path.join(args.out_metrics_dir, "heldout_predictions.npz")
+        meta_npz = {
+            "xhat_rowsum_maxrel_vs_read_depth": rel_rd,
+            "xhat_rowsum_medrel_vs_true_depth": rel_true,
+            "decode_mode": args.decode_mode,
+            "decode_effective": ("mc" if K > 1 else args.decode_mode),
+            "decode_samples": K,
+            "read_depth_mode": args.read_depth_mode,
+            "read_depth_neighs": args.read_depth_neighs,
+            "smooth_neighs": args.smooth_neighs,
+            "niche_from_cell": args.niche_from_cell,
+            "nbr_neighs": args.nbr_neighs,
+            "nbr_observed_fill": args.nbr_observed_fill,
+            "observed_xhat": observed_xhat_eff,
+            "ckpt_policy": ckpt_policy,
+            "stage1_ckpt": os.path.abspath(ckpt),
+            "stage1_ckpt_realpath": os.path.realpath(ckpt),
+            "stage1_ckpt_predict_time": stored_ckpt,
+            "predicted_adata": os.path.abspath(args.predicted_adata),
+            "stage2_codes": os.path.abspath(args.stage2_codes),
+            "seed": args.seed,
+            "selfcheck_cellwise_pearson_median": sc,
+        }
+        meta_npz.update(cmp)                    # gate verdict when --compare-csv
+        _save_heldout_predictions(out_npz, adata, gidx, xhat_imp, rd_full[gidx],
+                                  X[gidx], meta_npz)
+        print(f"[decode] wrote {out_npz} (x_hat {gidx.size}x{X.shape[1]} float32, "
+              f"held-out rows in adata order; decode={'mc' if K > 1 else args.decode_mode}"
+              f", K={K}, read_depth={args.read_depth_mode}, ckpt={os.path.abspath(ckpt)})")
+    if cmp and not cmp["compare_pass"] and args.compare_strict:
+        raise RuntimeError(f"[decode] --compare-strict: this run does not reproduce "
+                           f"{cmp['compare_csv']} (outputs were written for inspection)")
     test_gw = df[(df.split == "test") & (df.axis == "gene_wise")
                  & (df.transform == "raw") & (df.gene_subset == "all")]
     if not test_gw.empty:
